@@ -11,7 +11,7 @@
 use core::sync::atomic::Ordering;
 
 use crate::data_model::{
-    AggregationTemporality, HistogramData, HistogramDataPoint, Metric, MetricData,
+    AggregationTemporality, HistogramData, Metric, MetricData,
 };
 use crate::metric_source::MetricSource;
 
@@ -101,6 +101,9 @@ unsafe fn read_stats() -> (u64, u64, u64, u64, u64, u64, u64) {
         ($ptr:expr) => {
             // ngx_stat_* is a *mut ngx_atomic_t (= *mut c_ulong).
             // We treat the underlying memory as an AtomicU64.
+            // TODO(portability): ngx_atomic_t is c_ulong-wide. This alias is correct
+            // on 64-bit Linux/macOS where c_ulong == u64, but breaks on 32-bit
+            // platforms where c_ulong == u32. Revisit before declaring v1.0 portable.
             unsafe {
                 (*(($ptr) as *const core::sync::atomic::AtomicU64))
                     .load(Ordering::Acquire)

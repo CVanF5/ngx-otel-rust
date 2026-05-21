@@ -167,6 +167,11 @@ pub unsafe fn register_zone(
 ///
 /// # Safety
 /// nginx guarantees the callback args are valid non-null pointers.
+// We deliberately do NOT use SlabPool::from_shm_zone. Slot offsets are
+// pre-computed at zone-init time, so no per-bump allocator is needed —
+// the hot path is fixed-offset atomic increments only. Compare to
+// ngx-rust/examples/shared_dict.rs which uses SlabPool because its
+// keyset grows at runtime.
 pub unsafe extern "C" fn otel_shm_zone_init(
     shm_zone: *mut ngx_shm_zone_t,
     old_data: *mut core::ffi::c_void,
