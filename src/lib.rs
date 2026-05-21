@@ -10,7 +10,7 @@ use core::ptr;
 
 use nginx_sys::{ngx_conf_t, ngx_http_module_t, ngx_module_t, ngx_uint_t, NGX_HTTP_MODULE};
 use ngx::core::Status;
-use ngx::http::{HttpModule, HttpModuleMainConf};
+use ngx::http::{HttpModule, HttpModuleMainConf, add_phase_handler};
 
 mod config;
 mod data_model;
@@ -78,10 +78,10 @@ impl HttpModule for HttpOtelModule {
 
         // Step 6: register log-phase handler only when exporter is configured.
         if amcf.is_configured() {
-            if let Err(e) =
-                metric_source::instrumented::register_log_handler(cf_ref)
+            if add_phase_handler::<metric_source::instrumented::LogPhaseHandler>(cf_ref)
+                .is_err()
             {
-                return e.into();
+                return Status::NGX_ERROR.into();
             }
         }
 
@@ -139,6 +139,27 @@ mod nginx_test_stubs {
 
     #[no_mangle]
     pub static mut ngx_current_msec: nginx_sys::ngx_msec_t = 0;
+
+    // ngx_stat_* are *mut ngx_atomic_t (= *mut c_ulong).
+    // Each stub is a static zero and the pointer variable points at it so
+    // the load!() macro in stub_status.rs can dereference safely.
+    static mut STUB_STAT_ZERO: core::ffi::c_ulong = 0;
+
+    macro_rules! stat_ptr_stub {
+        ($name:ident) => {
+            #[no_mangle]
+            pub static mut $name: *mut nginx_sys::ngx_atomic_t =
+                unsafe { core::ptr::addr_of_mut!(STUB_STAT_ZERO) };
+        };
+    }
+
+    stat_ptr_stub!(ngx_stat_accepted);
+    stat_ptr_stub!(ngx_stat_handled);
+    stat_ptr_stub!(ngx_stat_requests);
+    stat_ptr_stub!(ngx_stat_active);
+    stat_ptr_stub!(ngx_stat_reading);
+    stat_ptr_stub!(ngx_stat_writing);
+    stat_ptr_stub!(ngx_stat_waiting);
 
     // nginx http core module descriptor (used by NgxHttpCoreModule::main_conf_mut).
     #[no_mangle]

@@ -13,9 +13,9 @@ dependencies = [
 
 [[package]]
 name = "allocator-api2"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c583acf993cf4245c4acb0a2cc2ab1f9cc097de73411bb6d3647ff6af2b1013d"
+checksum = "c880a97d28a3681c0267bd29cff89621202715b065127cd445fa0f0fe0aa2880"
 
 [[package]]
 name = "annotate-snippets"
@@ -392,8 +392,6 @@ checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 [[package]]
 name = "nginx-sys"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c85fc3a3b71cdb9269103e3934e989fe5c9f22a34d9068c1b23db1f0349ca79"
 dependencies = [
  "bindgen",
  "cc",
@@ -405,9 +403,7 @@ dependencies = [
 
 [[package]]
 name = "ngx"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "864e7932a9a890586db0d2a00bac6c8e67832bb388aebaa8346190a28513cafd"
+version = "0.5.0"
 dependencies = [
  "allocator-api2",
  "async-task",

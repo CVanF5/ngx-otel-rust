@@ -13,123 +13,96 @@
 
 use core::sync::atomic::Ordering;
 
-use nginx_sys::{
-    ngx_array_push, ngx_conf_t, ngx_http_handler_pt,
-    ngx_http_phases_NGX_HTTP_LOG_PHASE, ngx_http_request_t, ngx_int_t,
-};
 use ngx::core::Status;
-use ngx::http::{HttpModuleMainConf, NgxHttpCoreModule};
+use ngx::http::{HttpModuleMainConf, HttpPhase, HttpRequestHandler, Request};
 
 use crate::shm::{
     worker_slots, BYTES_BOUNDS, DURATION_BOUNDS_MS, N_BYTES_BUCKETS, N_DURATION_BUCKETS,
 };
 use crate::HttpOtelModule;
 
-/// Register the log-phase handler into the nginx phase array.
-///
-/// Called from `postconfiguration` only when `otel_exporter` is configured.
-pub fn register_log_handler(cf: &mut ngx_conf_t) -> Result<(), Status> {
-    let cmcf = NgxHttpCoreModule::main_conf_mut(cf).ok_or(Status::NGX_ERROR)?;
+/// Unit struct for the log-phase handler; all state lives in the shm zone.
+pub struct LogPhaseHandler;
 
-    let h: *mut ngx_http_handler_pt = unsafe {
-        ngx_array_push(
-            &mut cmcf.phases[ngx_http_phases_NGX_HTTP_LOG_PHASE as usize].handlers,
-        )
-    }
-    .cast();
+impl HttpRequestHandler for LogPhaseHandler {
+    const PHASE: HttpPhase = HttpPhase::Log;
+    type Output = Status;
 
-    if h.is_null() {
-        return Err(Status::NGX_ERROR);
-    }
+    /// Called once per request in the Log phase.
+    ///
+    /// # No allocation guarantee
+    /// - Reads fields via typed references only (no raw pointer arithmetic).
+    /// - Calls `histogram.record()` which uses atomic increments only.
+    /// - Does NOT call `Vec::new()`, `Box::new()`, `String::from()`, etc.
+    /// - Does NOT acquire any locks.
+    fn handler(request: &mut Request) -> Status {
+        // Safety: main conf is initialised before any request is handled.
+        let amcf = match HttpOtelModule::main_conf(request) {
+            Some(c) => c,
+            None => return Status::NGX_OK,
+        };
 
-    unsafe { *h = Some(otel_log_handler) };
+        // Obtain base address of the shm zone.
+        let base = match amcf.shm_base() {
+            Some(b) => b,
+            None => return Status::NGX_OK,
+        };
 
-    Ok(())
-}
+        // Determine current worker index (no syscall — nginx global).
+        let worker_id = unsafe { nginx_sys::ngx_worker as usize };
 
-/// Log-phase handler: atomically updates the current worker's shm slot.
-///
-/// # No allocation guarantee
-/// This function:
-/// - Reads fields via raw pointer dereferences only.
-/// - Calls `histogram.record()` which uses atomic increments only.
-/// - Does NOT call `Vec::new()`, `Box::new()`, `String::from()`, etc.
-/// - Does NOT acquire any locks.
-unsafe extern "C" fn otel_log_handler(r: *mut ngx_http_request_t) -> ngx_int_t {
-    // Safety: main conf is initialised before any request is handled.
-    // Use the Request wrapper only for conf access; keep r for raw field reads.
-    let request = unsafe { ngx::http::Request::from_ngx_http_request(r) };
-    let amcf = match HttpOtelModule::main_conf(request) {
-        Some(c) => c,
-        None => return Status::NGX_OK.into(),
-    };
+        // Get our slot. No allocation; pointer arithmetic only.
+        // Safety: zone was sized for ≥ worker_id slots during postconfiguration.
+        let slot = unsafe { &*worker_slots(base, worker_id) };
 
-    // Obtain base address of the shm zone.
-    let base = match amcf.shm_base() {
-        Some(b) => b,
-        None => return Status::NGX_OK.into(),
-    };
+        // Use AsRef to get a typed reference to the underlying ngx_http_request_t.
+        let r = request.as_ref();
 
-    // Determine current worker index (no syscall — nginx global).
-    let worker_id = unsafe { nginx_sys::ngx_worker as usize };
+        // ── request duration in milliseconds ──────────────────────────────
+        // duration_ms = ngx_current_msec - r->start_msec
+        let duration_ms: u64 = unsafe {
+            (nginx_sys::ngx_current_msec as u64).saturating_sub(r.start_msec as u64)
+        };
+        slot.request_duration_ms.record(duration_ms, &DURATION_BOUNDS_MS);
 
-    // Get our slot. No allocation; pointer arithmetic only.
-    // Safety: zone was sized for ≥ worker_id slots during postconfiguration.
-    let slot = unsafe { &*worker_slots(base, worker_id) };
+        // ── request body bytes ────────────────────────────────────────────
+        slot.request_body_bytes.record(r.request_length as u64, &BYTES_BOUNDS);
 
-    // ── raw request pointer (already have it as the function arg) ────────
-    let r: *const ngx_http_request_t = r;
+        // ── response bytes ────────────────────────────────────────────────
+        let resp_bytes = {
+            let conn = request.connection();
+            if conn.is_null() { 0u64 } else { unsafe { (*conn).sent as u64 } }
+        };
+        slot.response_body_bytes.record(resp_bytes, &BYTES_BOUNDS);
 
-    // ── request duration in milliseconds ────────────────────────────────
-    // duration_ms = ngx_current_msec - r->start_msec
-    // Both are u64-compatible (ngx_msec_t = ulong on 64-bit).
-    let duration_ms: u64 = unsafe {
-        let now = nginx_sys::ngx_current_msec as u64;
-        let start = (*r).start_msec as u64;
-        now.saturating_sub(start)
-    };
+        // ── status code class ─────────────────────────────────────────────
+        let status = r.headers_out.status as u16;
+        match status {
+            100..=199 => slot.status_1xx.fetch_add(1, Ordering::Relaxed),
+            200..=299 => slot.status_2xx.fetch_add(1, Ordering::Relaxed),
+            300..=399 => slot.status_3xx.fetch_add(1, Ordering::Relaxed),
+            400..=499 => slot.status_4xx.fetch_add(1, Ordering::Relaxed),
+            _ => slot.status_5xx.fetch_add(1, Ordering::Relaxed),
+        };
 
-    slot.request_duration_ms.record(duration_ms, &DURATION_BOUNDS_MS);
+        // ── upstream timings (if an upstream was used) ────────────────────
+        if let Some(upstream) = request.upstream() {
+            let state = unsafe { (*upstream).state };
+            if !state.is_null() {
+                let resp_ms = unsafe { (*state).response_time as u64 };
+                let hdr_ms = unsafe { (*state).header_time as u64 };
+                let conn_ms = unsafe { (*state).connect_time as u64 };
+                let bytes_rx = unsafe { (*state).bytes_received as u64 };
 
-    // ── request body bytes ───────────────────────────────────────────────
-    let req_bytes = unsafe { (*r).request_length as u64 };
-    slot.request_body_bytes.record(req_bytes, &BYTES_BOUNDS);
-
-    // ── response bytes ───────────────────────────────────────────────────
-    let resp_bytes = unsafe {
-        let conn = (*r).connection;
-        if conn.is_null() { 0u64 } else { (*conn).sent as u64 }
-    };
-    slot.response_body_bytes.record(resp_bytes, &BYTES_BOUNDS);
-
-    // ── status code class ────────────────────────────────────────────────
-    let status = unsafe { (*r).headers_out.status as u16 };
-    match status {
-        100..=199 => slot.status_1xx.fetch_add(1, Ordering::Relaxed),
-        200..=299 => slot.status_2xx.fetch_add(1, Ordering::Relaxed),
-        300..=399 => slot.status_3xx.fetch_add(1, Ordering::Relaxed),
-        400..=499 => slot.status_4xx.fetch_add(1, Ordering::Relaxed),
-        _ => slot.status_5xx.fetch_add(1, Ordering::Relaxed),
-    };
-
-    // ── upstream timings (if an upstream was used) ───────────────────────
-    let upstream = unsafe { (*r).upstream };
-    if !upstream.is_null() {
-        let state = unsafe { (*upstream).state };
-        if !state.is_null() {
-            let resp_ms = unsafe { (*state).response_time as u64 };
-            let hdr_ms = unsafe { (*state).header_time as u64 };
-            let conn_ms = unsafe { (*state).connect_time as u64 };
-            let bytes_rx = unsafe { (*state).bytes_received as u64 };
-
-            slot.upstream_response_ms.record(resp_ms, &DURATION_BOUNDS_MS);
-            slot.upstream_header_ms.record(hdr_ms, &DURATION_BOUNDS_MS);
-            slot.upstream_connect_ms.record(conn_ms, &DURATION_BOUNDS_MS);
-            slot.upstream_bytes_received.record(bytes_rx, &BYTES_BOUNDS);
+                slot.upstream_response_ms.record(resp_ms, &DURATION_BOUNDS_MS);
+                slot.upstream_header_ms.record(hdr_ms, &DURATION_BOUNDS_MS);
+                slot.upstream_connect_ms.record(conn_ms, &DURATION_BOUNDS_MS);
+                slot.upstream_bytes_received.record(bytes_rx, &BYTES_BOUNDS);
+            }
         }
-    }
 
-    Status::NGX_OK.into()
+        Status::NGX_OK
+    }
 }
 
 /// A `MetricSource` that reads all per-worker shm slots and produces
@@ -147,9 +120,7 @@ unsafe impl Sync for InstrumentedSource {}
 
 impl crate::metric_source::MetricSource for InstrumentedSource {
     fn collect(&self) -> std::vec::Vec<crate::data_model::Metric> {
-        use crate::data_model::{
-            AggregationTemporality, HistogramData, HistogramDataPoint, Metric, MetricData,
-        };
+        use crate::data_model::AggregationTemporality;
 
         let now = now_unix_nano();
 
@@ -202,6 +173,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
         let byte_bounds: std::vec::Vec<f64> = BYTES_BOUNDS.iter().map(|&b| b as f64).collect();
 
         std::vec![
+            // ── request metrics ───────────────────────────────────────────
             hist_metric(
                 "http.server.request.duration",
                 "HTTP server request duration",
@@ -225,6 +197,49 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                 "HTTP server response body size",
                 "By",
                 resp_bytes,
+                byte_bounds.clone(),
+                now,
+                AggregationTemporality::Delta,
+            ),
+            // ── status class counters ─────────────────────────────────────
+            counter_metric("http.server.response.status.1xx", "HTTP 1xx responses", s1xx, now),
+            counter_metric("http.server.response.status.2xx", "HTTP 2xx responses", s2xx, now),
+            counter_metric("http.server.response.status.3xx", "HTTP 3xx responses", s3xx, now),
+            counter_metric("http.server.response.status.4xx", "HTTP 4xx responses", s4xx, now),
+            counter_metric("http.server.response.status.5xx", "HTTP 5xx responses", s5xx, now),
+            // ── upstream timings ──────────────────────────────────────────
+            hist_metric(
+                "nginx.upstream.response.duration",
+                "Upstream response time",
+                "ms",
+                up_resp,
+                dur_bounds.clone(),
+                now,
+                AggregationTemporality::Delta,
+            ),
+            hist_metric(
+                "nginx.upstream.header.duration",
+                "Upstream time to first response byte",
+                "ms",
+                up_hdr,
+                dur_bounds.clone(),
+                now,
+                AggregationTemporality::Delta,
+            ),
+            hist_metric(
+                "nginx.upstream.connect.duration",
+                "Upstream connection establishment time",
+                "ms",
+                up_conn,
+                dur_bounds.clone(),
+                now,
+                AggregationTemporality::Delta,
+            ),
+            hist_metric(
+                "nginx.upstream.bytes.received",
+                "Bytes received from upstream",
+                "By",
+                up_bytes,
                 byte_bounds.clone(),
                 now,
                 AggregationTemporality::Delta,
@@ -273,6 +288,38 @@ fn hist_metric<const N: usize>(
                 sum: data.1 as f64,
                 bucket_counts: data.0.to_vec(),
                 explicit_bounds: bounds,
+            }],
+        }),
+    }
+}
+
+/// Build a cumulative scalar counter metric.
+///
+/// Modelled as a degenerate single-bucket histogram (no explicit bounds) so
+/// that the encoder can handle all metrics uniformly via `MetricData::Histogram`.
+fn counter_metric(
+    name: &str,
+    desc: &str,
+    value: u64,
+    time_ns: u64,
+) -> crate::data_model::Metric {
+    use crate::data_model::{
+        AggregationTemporality, HistogramData, HistogramDataPoint, Metric, MetricData,
+    };
+    Metric {
+        name: name.into(),
+        description: desc.into(),
+        unit: "1".into(),
+        data: MetricData::Histogram(HistogramData {
+            aggregation_temporality: AggregationTemporality::Delta,
+            data_points: std::vec![HistogramDataPoint {
+                attributes: std::vec![],
+                start_time_unix_nano: 0,
+                time_unix_nano: time_ns,
+                count: value,
+                sum: value as f64,
+                bucket_counts: std::vec![value],
+                explicit_bounds: std::vec![],
             }],
         }),
     }
