@@ -20,8 +20,10 @@ mod metric_source;
 mod shm;
 mod transport;
 
+use config::NGX_HTTP_OTEL_COMMANDS;
+
 #[derive(Debug)]
-struct HttpOtelModule;
+pub(crate) struct HttpOtelModule;
 
 static NGX_HTTP_OTEL_MODULE_CTX: ngx_http_module_t = ngx_http_module_t {
     preconfiguration: None,
@@ -42,12 +44,12 @@ ngx::ngx_modules!(ngx_http_otel_module);
 #[cfg_attr(not(feature = "export-modules"), no_mangle)]
 pub static mut ngx_http_otel_module: ngx_module_t = ngx_module_t {
     ctx: ptr::addr_of!(NGX_HTTP_OTEL_MODULE_CTX).cast_mut().cast(),
-    commands: ptr::null_mut(),
+    commands: unsafe { ptr::addr_of_mut!(NGX_HTTP_OTEL_COMMANDS[0]) },
     type_: NGX_HTTP_MODULE as ngx_uint_t,
 
     init_master: None,
     init_module: None,
-    init_process: None,
+    init_process: None, // Step 9: will be set to the export loop init
     init_thread: None,
     exit_thread: None,
     exit_process: None,
@@ -65,9 +67,43 @@ impl HttpModule for HttpOtelModule {
         unsafe { &*::core::ptr::addr_of!(ngx_http_otel_module) }
     }
 
-    unsafe extern "C" fn postconfiguration(_cf: *mut ngx_conf_t) -> nginx_sys::ngx_int_t {
-        // Stub: just return OK for now.
-        // Step 2+ will populate this.
+    unsafe extern "C" fn postconfiguration(cf: *mut ngx_conf_t) -> nginx_sys::ngx_int_t {
+        let cf_ref = unsafe { &mut *cf };
+        let amcf = HttpOtelModule::main_conf_mut(cf_ref).expect("otel main conf");
+
+        if let Err(e) = amcf.postconfiguration(cf) {
+            return e.into();
+        }
+
+        // Steps 6, 9: register log-phase handler and spawn export loop here.
+
         Status::NGX_OK.into()
+    }
+}
+
+/// Test-only stubs for nginx built-in slot handlers referenced in the
+/// static commands table.  Without these, macOS's flat-namespace dynamic
+/// linker fails to start the test binary because nginx is not loaded.
+#[cfg(test)]
+mod nginx_test_stubs {
+    use core::ffi::{c_char, c_void};
+    use nginx_sys::{ngx_command_t, ngx_conf_t};
+
+    #[no_mangle]
+    pub extern "C" fn ngx_conf_set_flag_slot(
+        _cf: *mut ngx_conf_t,
+        _cmd: *mut ngx_command_t,
+        _conf: *mut c_void,
+    ) -> *mut c_char {
+        core::ptr::null_mut()
+    }
+
+    #[no_mangle]
+    pub extern "C" fn ngx_conf_set_str_slot(
+        _cf: *mut ngx_conf_t,
+        _cmd: *mut ngx_command_t,
+        _conf: *mut c_void,
+    ) -> *mut c_char {
+        core::ptr::null_mut()
     }
 }
