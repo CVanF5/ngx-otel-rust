@@ -13,12 +13,12 @@ use ngx::core::Status;
 use ngx::http::{HttpModule, HttpModuleMainConf, add_phase_handler};
 
 mod config;
-mod data_model;
-mod encoder;
+pub mod data_model;
+pub mod encoder;
 mod export;
 mod metric_source;
 mod shm;
-mod transport;
+pub mod transport;
 
 use config::NGX_HTTP_OTEL_COMMANDS;
 
