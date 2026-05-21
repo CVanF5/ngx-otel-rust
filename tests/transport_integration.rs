@@ -64,8 +64,23 @@ const METRICS_LOG_PATH: &str =
 // Test helpers
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Returns the current time as Unix nanoseconds.
+fn now_unix_nano() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+}
+
 /// Construct a minimal OTLP batch with a recognisable service.name attribute.
+///
+/// Timestamps reflect the actual wall-clock time so collector logs show
+/// sensible values rather than a hardcoded 2023 date.
 fn make_test_batch() -> Batch {
+    let end_ns = now_unix_nano();
+    // Use a 10-second measurement window ending now.
+    let start_ns = end_ns.saturating_sub(10_000_000_000);
+
     Batch {
         resource: Resource {
             attributes: vec![KeyValue {
@@ -88,8 +103,8 @@ fn make_test_batch() -> Batch {
                         key: "http.response.status_code".to_string(),
                         value: AnyValue::Int(200),
                     }],
-                    start_time_unix_nano: 1_700_000_000_000_000_000,
-                    time_unix_nano: 1_700_000_010_000_000_000,
+                    start_time_unix_nano: start_ns,
+                    time_unix_nano: end_ns,
                     count: 7,
                     sum: 42.0,
                     bucket_counts: vec![1, 2, 3, 1],
