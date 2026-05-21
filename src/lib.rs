@@ -70,8 +70,9 @@ impl HttpModule for HttpOtelModule {
     unsafe extern "C" fn postconfiguration(cf: *mut ngx_conf_t) -> nginx_sys::ngx_int_t {
         let cf_ref = unsafe { &mut *cf };
         let amcf = HttpOtelModule::main_conf_mut(cf_ref).expect("otel main conf");
+        let module_ptr = ::core::ptr::addr_of_mut!(ngx_http_otel_module);
 
-        if let Err(e) = amcf.postconfiguration(cf) {
+        if let Err(e) = amcf.postconfiguration(cf, module_ptr) {
             return e.into();
         }
 
@@ -81,14 +82,15 @@ impl HttpModule for HttpOtelModule {
     }
 }
 
-/// Test-only stubs for nginx built-in slot handlers referenced in the
-/// static commands table.  Without these, macOS's flat-namespace dynamic
-/// linker fails to start the test binary because nginx is not loaded.
+/// Test-only stubs for nginx symbols referenced (but never called) in our code.
+/// On macOS, flat-namespace dynamic linking resolves all external symbols at
+/// process startup; without these stubs the test binary won't start.
 #[cfg(test)]
 mod nginx_test_stubs {
     use core::ffi::{c_char, c_void};
-    use nginx_sys::{ngx_command_t, ngx_conf_t};
+    use nginx_sys::{ngx_command_t, ngx_conf_t, ngx_module_t};
 
+    // Built-in slot handlers used as function pointers in the commands table.
     #[no_mangle]
     pub extern "C" fn ngx_conf_set_flag_slot(
         _cf: *mut ngx_conf_t,
@@ -104,6 +106,21 @@ mod nginx_test_stubs {
         _cmd: *mut ngx_command_t,
         _conf: *mut c_void,
     ) -> *mut c_char {
+        core::ptr::null_mut()
+    }
+
+    // nginx global module descriptor accessed to read ctx_index.
+    #[no_mangle]
+    pub static mut ngx_core_module: ngx_module_t = ngx_module_t::default();
+
+    // nginx shared-memory API.
+    #[no_mangle]
+    pub unsafe extern "C" fn ngx_shared_memory_add(
+        _cf: *mut ngx_conf_t,
+        _name: *mut nginx_sys::ngx_str_t,
+        _size: usize,
+        _tag: *mut c_void,
+    ) -> *mut nginx_sys::ngx_shm_zone_t {
         core::ptr::null_mut()
     }
 }

@@ -7,14 +7,15 @@ use core::ffi::{c_char, c_void};
 use core::{mem, ptr};
 
 use nginx_sys::{
-    ngx_array_t, ngx_command_t, ngx_conf_parse, ngx_conf_t, ngx_flag_t, ngx_str_t, ngx_uint_t,
-    NGX_CONF_BLOCK, NGX_CONF_FLAG, NGX_CONF_NOARGS, NGX_CONF_TAKE1, NGX_CONF_TAKE2,
+    ngx_array_t, ngx_command_t, ngx_conf_parse, ngx_conf_t, ngx_flag_t, ngx_module_t, ngx_str_t,
+    ngx_uint_t, NGX_CONF_BLOCK, NGX_CONF_FLAG, NGX_CONF_NOARGS, NGX_CONF_TAKE1, NGX_CONF_TAKE2,
     NGX_HTTP_MAIN_CONF, NGX_HTTP_MAIN_CONF_OFFSET, NGX_LOG_EMERG,
 };
 use ngx::core::{Status, NGX_CONF_ERROR, NGX_CONF_OK};
 use ngx::http::HttpModuleMainConf;
 use ngx::{ngx_conf_log_error, ngx_string};
 
+use crate::shm;
 use crate::HttpOtelModule;
 
 /* ─────────────────────────── extension helpers ─────────────────────────────── */
@@ -88,6 +89,8 @@ pub struct MainConfig {
     pub status_code_class: ngx_flag_t,
     /// `otel_metric_high_cardinality_attr <attr>` — accumulated list.
     pub high_cardinality_attrs: std::vec::Vec<ngx_str_t>,
+    /// The registered shared memory zone (set during postconfiguration).
+    pub shm_zone: *mut nginx_sys::ngx_shm_zone_t,
 }
 
 impl Default for MainConfig {
@@ -103,6 +106,7 @@ impl Default for MainConfig {
             zone_size: 0,
             status_code_class: UNSET_FLAG,
             high_cardinality_attrs: std::vec::Vec::new(),
+            shm_zone: ptr::null_mut(),
         }
     }
 }
@@ -146,7 +150,13 @@ impl MainConfig {
     }
 
     /// Validate and finalise the configuration after all directives have been parsed.
-    pub fn postconfiguration(&self, cf: *mut ngx_conf_t) -> Result<(), Status> {
+    ///
+    /// Takes `&mut self` to store the shm zone pointer.
+    pub fn postconfiguration(
+        &mut self,
+        cf: *mut ngx_conf_t,
+        module: *mut ngx_module_t,
+    ) -> Result<(), Status> {
         if !self.is_configured() {
             // Module loaded but not configured: zero-cost mode.
             return Ok(());
@@ -169,7 +179,84 @@ impl MainConfig {
             return Err(Status::NGX_ERROR);
         }
 
+        // Register the shared memory zone.
+        self.register_shm_zone(cf, module)?;
+
         Ok(())
+    }
+
+    /// Register the per-worker shared memory zone with nginx.
+    fn register_shm_zone(
+        &mut self,
+        cf: *mut ngx_conf_t,
+        module: *mut ngx_module_t,
+    ) -> Result<(), Status> {
+        // Determine the number of worker processes from ngx_core_conf_t.
+        // ngx_get_conf(cycle->conf_ctx, ngx_core_module) = conf_ctx[ngx_core_module.index]
+        // is a void* pointing to ngx_core_conf_t (typed as void*** in the binding).
+        let n_workers: usize = unsafe {
+            let cycle = (*cf).cycle.as_ref().ok_or(Status::NGX_ERROR)?;
+            let core_idx = nginx_sys::ngx_core_module.index as usize;
+            // conf_ctx is *mut *mut *mut *mut c_void; indexing gives *mut *mut *mut c_void.
+            // The BIT value of that pointer IS the ngx_core_conf_t*.
+            let raw_conf: *mut *mut *mut core::ffi::c_void =
+                *cycle.conf_ctx.add(core_idx);
+            let core_conf: *const nginx_sys::ngx_core_conf_t = raw_conf.cast();
+            if core_conf.is_null() {
+                1 // fallback
+            } else {
+                (*core_conf).worker_processes.max(1) as usize
+            }
+        };
+
+        // Compute required zone size.
+        let required_size = shm::zone_size_for(n_workers);
+
+        // Choose a zone name: use the configured name or default.
+        let default_name = ngx::ngx_string!("ngx_http_otel_zone");
+        let mut zone_name: ngx_str_t = if self.zone_name.is_empty() {
+            default_name
+        } else {
+            self.zone_name
+        };
+
+        // Apply the larger of required size and explicitly configured size.
+        let zone_size = if self.zone_size > 0 {
+            self.zone_size.max(required_size)
+        } else {
+            required_size
+        };
+
+        // Register the zone.
+        let Some(zone) = (unsafe { shm::register_zone(cf, &mut zone_name, zone_size, module) })
+        else {
+            unsafe {
+                ngx_conf_log_error!(
+                    NGX_LOG_EMERG,
+                    &mut *cf,
+                    "otel: failed to register shared memory zone"
+                );
+            }
+            return Err(Status::NGX_ERROR);
+        };
+
+        // Configure the zone init callback.
+        unsafe {
+            (*zone).init = Some(shm::otel_shm_zone_init);
+            (*zone).data = ptr::from_mut(self).cast();
+        }
+
+        self.shm_zone = zone;
+        Ok(())
+    }
+
+    /// Returns the base address of the shared memory zone.
+    ///
+    /// Returns `None` if the zone is not yet initialised.
+    pub fn shm_base(&self) -> Option<*mut u8> {
+        let zone = unsafe { self.shm_zone.as_ref()? };
+        let addr = zone.shm.addr;
+        if addr.is_null() { None } else { Some(addr.cast()) }
     }
 }
 
