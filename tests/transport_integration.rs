@@ -134,6 +134,14 @@ fn send_otlp_to_live_collector() {
     let bytes = encoder.encode(&batch);
     assert!(!bytes.is_empty(), "encoded bytes must be non-empty");
 
+    // ── Record log file position BEFORE the send ─────────────────────────
+    // The collector may flush its JSON log synchronously (before sending the
+    // HTTP 200 response), so we must snapshot the file size *before* the
+    // network round-trip rather than after.
+    let pre_size = std::fs::metadata(METRICS_LOG_PATH)
+        .map(|m| m.len())
+        .unwrap_or(0);
+
     // ── Send via HyperHttpTransport ───────────────────────────────────────
     let mut transport = HyperHttpTransport::new(COLLECTOR_ENDPOINT, vec![])
         .expect("endpoint must parse");
@@ -146,26 +154,24 @@ fn send_otlp_to_live_collector() {
     );
 
     // ── Verify the payload arrived in the collector log ───────────────────
-    // The collector writes one JSON line per received export request.
-    // Give the collector a moment to flush its JSON file log.
+    // Give the collector a moment to flush if it writes asynchronously.
     std::thread::sleep(std::time::Duration::from_millis(300));
 
     let log_content = std::fs::read_to_string(METRICS_LOG_PATH)
         .expect("metrics.json must be readable");
 
+    // Only examine bytes appended after we sent the request.
+    let new_content = if pre_size as usize <= log_content.len() {
+        &log_content[pre_size as usize..]
+    } else {
+        &log_content
+    };
+
     assert!(
-        log_content.contains(TEST_SERVICE_NAME),
-        "metrics.json must contain the test service name '{}'; last 3 lines:\n{}",
+        new_content.contains(TEST_SERVICE_NAME),
+        "newly appended metrics.json content must contain '{}'; new lines:\n{}",
         TEST_SERVICE_NAME,
-        log_content
-            .lines()
-            .rev()
-            .take(3)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>()
-            .join("\n")
+        new_content
     );
 }
 

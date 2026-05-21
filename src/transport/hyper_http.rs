@@ -5,79 +5,74 @@
 
 //! Hyper HTTP/1.1 transport for OTLP/HTTP protobuf export.
 //!
-//! `HyperHttpTransport` uses blocking TCP/Unix-socket I/O to perform HTTP/1.1
-//! POSTs. The request is formatted per RFC 7230 and written in a single
-//! blocking call; the response status line is read back synchronously.
+//! # IO model
 //!
-//! The `send()` method is declared `async fn` to satisfy the `Transport` trait
-//! but its body is entirely synchronous (no internal await points). This means:
+//! `TcpIo` and `UnixIo` wrap non-blocking OS streams and implement
+//! `hyper::rt::{Read, Write}`.  When the OS returns `EAGAIN`/`WouldBlock`
+//! the wrappers return `Poll::Pending` and immediately call
+//! `cx.waker().wake_by_ref()` so the executor re-polls without registering
+//! with an event loop reactor.  This "self-wake" pattern means:
 //!
-//! - **Tests**: `block_on(transport.send(bytes))` works with any executor,
-//!   including a simple spin-loop or `std::thread::spawn` wrapper.
-//! - **NGINX Step 9**: calling `transport.send(bytes).await` from within
-//!   `ngx::async_::spawn` blocks the event-loop thread for the duration of
-//!   the TCP round-trip (typically <5 ms to a local collector), which is
-//!   acceptable at the 10-second export interval.
+//! - **Tests** (`block_on` spin-loop, noop waker): the self-wake is a no-op
+//!   but the spin-loop re-polls anyway.  Correct.
+//! - **NGINX event loop (Step 9)**: `wake_by_ref()` posts an NGINX async
+//!   event, scheduling a re-poll on the next event loop iteration rather than
+//!   blocking the loop thread.  Much better than the previous blocking approach.
 //!
-//! ## Connection model
+//! The long-term plan (Phase 1.2) is to replace `TcpIo`/`UnixIo` with
+//! nginx-acme's `PeerConnection`, which registers proper NGINX event handlers
+//! instead of self-waking.
 //!
-//! A fresh connection is opened on every `send()` call.  A `send` failure
-//! returns `TransportError::Connection` immediately, and the next call
-//! retries with a new connection — simple reconnect, no backoff.
-//! TODO(phase-1.2): add a one-shot cached connection to eliminate the TCP
-//! handshake overhead on every export interval.
+//! # Connection model
 //!
-//! ## Hyper usage
+//! A new connection is opened for every `send()` call (simple reconnect).
+//! TODO(phase-1.2): one-shot cached connection to amortise TCP handshake.
 //!
-//! Hyper is used for:
-//! - `hyper::header::*` constants when building the `Content-Type`,
-//!   `Content-Length`, `Host`, and `Connection` headers.
-//! - Future integration with `hyper::client::conn::http1` once NGINX's
-//!   async executor (Step 9) is wired up (Phase 1.2).
+//! # HTTPS
 //!
-//! The HTTP/1.1 wire format is written manually to avoid the complexity of
-//! driving hyper's split `(SendRequest, Connection)` pair without a
-//! multi-task executor.
-//!
-//! ## HTTPS
-//!
-//! `https://` endpoints are recognized but return [`TransportError::TlsConfig`]
-//! immediately. Full TLS support (via openssl-sys) is deferred to Phase 1.2.
+//! `https://` is recognized but returns [`TransportError::TlsConfig`].
+//! Full TLS via openssl-sys is Phase 1.2.
 
-use std::io::{self, BufRead, BufReader, Read, Write};
+use core::future;
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll};
+use std::io;
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 use std::string::ToString;
 use std::time::Duration;
 
+use bytes::Bytes;
+use http_body_util::Full;
+use hyper::Request;
+
 use super::TransportError;
 use crate::transport::Transport;
 
 // ──────────────────────────────────────────────────────────────────────────────
-// I/O timeouts
+// Timeout
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Maximum wall-clock time for the entire HTTP round-trip.
+/// Wall-clock limit for an individual read/write syscall.  A stalled
+/// non-blocking socket will self-wake on every event loop iteration, so this
+/// timeout is the last resort against a server that stops talking entirely.
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Parsed endpoint
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Parsed form of the `endpoint` directive value.
 #[derive(Debug, Clone)]
 enum ParsedEndpoint {
-    /// Plain TCP: `http://host:port/path`
     Http {
         host: std::string::String,
         port: u16,
         path: std::string::String,
     },
-    /// Unix domain socket: `unix:/path/to/sock` or `unix:///path/to/sock`
     Unix {
-        /// Filesystem path to the socket file.
         socket_path: std::string::String,
-        /// HTTP request path (defaults to `/v1/metrics`).
         http_path: std::string::String,
     },
 }
@@ -98,8 +93,7 @@ impl ParsedEndpoint {
         } else if input.starts_with("https://") {
             Err(TransportError::TlsConfig {
                 cause: std::string::String::from(
-                    "HTTPS transport is not yet implemented in Phase 1.1; \
-                     use an http:// or unix: endpoint",
+                    "HTTPS transport not yet implemented; use http:// or unix:",
                 ),
             })
         } else if let Some(rest) = input.strip_prefix("unix:///") {
@@ -125,7 +119,6 @@ impl ParsedEndpoint {
         }
     }
 
-    /// Returns the value for the `Host` HTTP header.
     fn authority(&self) -> std::string::String {
         match self {
             ParsedEndpoint::Http { host, port, .. } => {
@@ -139,7 +132,6 @@ impl ParsedEndpoint {
         }
     }
 
-    /// Returns the HTTP request-target path (e.g. `/v1/metrics`).
     fn http_path(&self) -> &str {
         match self {
             ParsedEndpoint::Http { path, .. } => path,
@@ -159,30 +151,165 @@ fn parse_authority(authority: &str, default_port: u16) -> (&str, u16) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Non-blocking IO wrappers
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Wraps a non-blocking [`TcpStream`] for hyper's async IO traits.
+///
+/// On `WouldBlock` the wrapper returns `Poll::Pending` and calls
+/// `cx.waker().wake_by_ref()` so the executor re-polls without a reactor.
+struct TcpIo(TcpStream);
+
+impl hyper::rt::Read for TcpIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        mut buf: hyper::rt::ReadBufCursor<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        // SAFETY: MaybeUninit<u8> is layout-compatible with u8; read() initialises
+        // every byte it writes.
+        let uninit = unsafe { buf.as_mut() };
+        let len = uninit.len();
+        if len == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let slice =
+            unsafe { core::slice::from_raw_parts_mut(uninit.as_mut_ptr().cast::<u8>(), len) };
+
+        match self.0.read(slice) {
+            Ok(n) => {
+                unsafe { buf.advance(n) };
+                Poll::Ready(Ok(()))
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Err(e) => Poll::Ready(Err(e)),
+        }
+    }
+}
+
+impl hyper::rt::Write for TcpIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        match self.0.write(buf) {
+            Ok(n) => Poll::Ready(Ok(n)),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Err(e) => Poll::Ready(Err(e)),
+        }
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        Poll::Ready(self.get_mut().0.flush())
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        Poll::Ready(self.get_mut().0.shutdown(std::net::Shutdown::Write))
+    }
+}
+
+impl Unpin for TcpIo {}
+
+/// Wraps a non-blocking [`UnixStream`] for hyper's async IO traits.
+struct UnixIo(UnixStream);
+
+impl hyper::rt::Read for UnixIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        mut buf: hyper::rt::ReadBufCursor<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        let uninit = unsafe { buf.as_mut() };
+        let len = uninit.len();
+        if len == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let slice =
+            unsafe { core::slice::from_raw_parts_mut(uninit.as_mut_ptr().cast::<u8>(), len) };
+
+        match self.0.read(slice) {
+            Ok(n) => {
+                unsafe { buf.advance(n) };
+                Poll::Ready(Ok(()))
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Err(e) => Poll::Ready(Err(e)),
+        }
+    }
+}
+
+impl hyper::rt::Write for UnixIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        match self.0.write(buf) {
+            Ok(n) => Poll::Ready(Ok(n)),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Err(e) => Poll::Ready(Err(e)),
+        }
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        Poll::Ready(self.get_mut().0.flush())
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        Poll::Ready(self.get_mut().0.shutdown(std::net::Shutdown::Write))
+    }
+}
+
+impl Unpin for UnixIo {}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // HyperHttpTransport
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// HTTP/1.1 transport that POSTs OTLP protobuf bytes to a configured endpoint.
 ///
-/// Supports `http://` (plain TCP) and `unix:` (Unix domain socket) endpoints.
-/// `https://` recognition is in place but returns [`TransportError::TlsConfig`]
-/// until Phase 1.2 adds full TLS support via openssl-sys.
+/// Uses [`hyper::client::conn::http1`] for protocol handling.  The underlying
+/// OS stream is in non-blocking mode; `WouldBlock` is returned as
+/// `Poll::Pending` with an immediate self-wake so NGINX's cooperative event
+/// loop is never blocked.
 ///
-/// # Connection model
-/// A fresh connection is opened on every [`send`](Transport::send) call.
-/// Errors from any call return immediately; the next call retries fresh.
+/// TODO(phase-1.2): replace `TcpIo`/`UnixIo` with nginx-acme's
+/// `PeerConnection` for proper NGINX event-handler integration (no busy-wake).
 #[derive(Debug)]
 pub struct HyperHttpTransport {
     endpoint: ParsedEndpoint,
-    /// Extra HTTP headers from `otel_exporter_header` directives.
     headers: std::vec::Vec<(std::string::String, std::string::String)>,
 }
 
 impl HyperHttpTransport {
-    /// Create a new transport from a raw endpoint string and optional headers.
+    /// Create a new transport.
     ///
-    /// Returns `Err(TransportError::InvalidEndpoint)` if `endpoint_str` cannot
-    /// be parsed, or `Err(TransportError::TlsConfig)` for `https://`.
+    /// Returns `Err` if the endpoint string cannot be parsed or uses `https://`.
     pub fn new(
         endpoint_str: &str,
         headers: std::vec::Vec<(std::string::String, std::string::String)>,
@@ -202,157 +329,137 @@ impl Transport for HyperHttpTransport {
                 let addr = std::format!("{}:{}", host, port);
                 let stream = TcpStream::connect(&addr)
                     .map_err(|e| TransportError::Connection { cause: e.to_string() })?;
+                // Non-blocking so poll_read/poll_write return WouldBlock rather
+                // than blocking the NGINX event loop.
+                stream
+                    .set_nonblocking(true)
+                    .map_err(|e| TransportError::Connection { cause: e.to_string() })?;
+                // SO_RCVTIMEO / SO_SNDTIMEO as a backstop against a completely
+                // silent server (non-blocking reads that never become ready).
                 stream
                     .set_read_timeout(Some(IO_TIMEOUT))
                     .map_err(|e| TransportError::Connection { cause: e.to_string() })?;
                 stream
                     .set_write_timeout(Some(IO_TIMEOUT))
                     .map_err(|e| TransportError::Connection { cause: e.to_string() })?;
-                post_http(stream, &authority, &http_path, &self.headers, bytes)
+                http_post(TcpIo(stream), &authority, &http_path, &self.headers, bytes).await
             }
             ParsedEndpoint::Unix { socket_path, .. } => {
                 let stream = UnixStream::connect(socket_path)
                     .map_err(|e| TransportError::Connection { cause: e.to_string() })?;
                 stream
+                    .set_nonblocking(true)
+                    .map_err(|e| TransportError::Connection { cause: e.to_string() })?;
+                stream
                     .set_read_timeout(Some(IO_TIMEOUT))
                     .map_err(|e| TransportError::Connection { cause: e.to_string() })?;
                 stream
                     .set_write_timeout(Some(IO_TIMEOUT))
                     .map_err(|e| TransportError::Connection { cause: e.to_string() })?;
-                post_http(stream, &authority, &http_path, &self.headers, bytes)
+                http_post(UnixIo(stream), &authority, &http_path, &self.headers, bytes).await
             }
         }
     }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Core HTTP/1.1 POST implementation
+// Core HTTP POST via hyper http1 client
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Perform an HTTP/1.1 POST of `body` using the provided IO stream.
+/// POST `body` to `http_path` using hyper's HTTP/1.1 connection.
 ///
-/// Writes the full request in one blocking `write_all`, then reads back
-/// the response status line to determine success or failure.  The
-/// `Connection: close` header signals to the server that we will not
-/// reuse the connection.
-///
-/// This function is intentionally synchronous: it contains no `await`
-/// points.  Calling it from within an `async fn` is safe because the
-/// blocking time is bounded by `IO_TIMEOUT` (≤ 10 s) and the function
-/// is only called from the background export task (Step 9), not from a
-/// NGINX request-handling worker path.
-fn post_http<S: Read + Write>(
-    mut stream: S,
+/// The `conn` (IO driver) and the response future are driven together inside a
+/// single `poll_fn` loop.  With non-blocking IO and the self-wake pattern,
+/// the loop converges without blocking the calling executor thread.
+async fn http_post<IO>(
+    io: IO,
     authority: &str,
     http_path: &str,
     extra_headers: &[(std::string::String, std::string::String)],
     body: std::vec::Vec<u8>,
-) -> Result<(), TransportError> {
-    // ── Build the request ─────────────────────────────────────────────────
-    //
-    // We format the request headers by hand rather than using hyper's
-    // SendRequest machinery, because driving hyper's split
-    // (SendRequest, Connection) pair concurrently requires a multi-task
-    // executor (see TODO in module docs).  The wire format is identical
-    // to what hyper would produce for a `Full<Bytes>` body.
-    let content_length = body.len();
+) -> Result<(), TransportError>
+where
+    IO: hyper::rt::Read + hyper::rt::Write + Unpin,
+{
+    let body_len = body.len();
+    let full_body = Full::new(Bytes::from(body));
 
-    let mut request = std::vec::Vec::with_capacity(256 + content_length);
-
-    // Request line
-    request.extend_from_slice(b"POST ");
-    request.extend_from_slice(http_path.as_bytes());
-    request.extend_from_slice(b" HTTP/1.1\r\n");
-
-    // Mandatory headers
-    request.extend_from_slice(b"Host: ");
-    request.extend_from_slice(authority.as_bytes());
-    request.extend_from_slice(b"\r\n");
-
-    request.extend_from_slice(b"Content-Type: application/x-protobuf\r\n");
-
-    request.extend_from_slice(b"Content-Length: ");
-    request.extend_from_slice(content_length.to_string().as_bytes());
-    request.extend_from_slice(b"\r\n");
-
-    request.extend_from_slice(b"Connection: close\r\n");
-
-    // Caller-supplied headers (otel_exporter_header directives)
-    for (k, v) in extra_headers {
-        request.extend_from_slice(k.as_bytes());
-        request.extend_from_slice(b": ");
-        request.extend_from_slice(v.as_bytes());
-        request.extend_from_slice(b"\r\n");
-    }
-
-    // Header / body separator
-    request.extend_from_slice(b"\r\n");
-
-    // Body
-    request.extend_from_slice(&body);
-
-    // ── Send the request ──────────────────────────────────────────────────
-    stream
-        .write_all(&request)
-        .map_err(|e| TransportError::Connection { cause: e.to_string() })?;
-
-    // ── Read and parse the response status line ───────────────────────────
-    //
-    // We only need the status code — not the body — to determine success.
-    // BufReader lets us read line-by-line without consuming the socket;
-    // we stop after the status line.
-    let mut reader = BufReader::new(&mut stream);
-    let mut status_line = std::string::String::new();
-    reader
-        .read_line(&mut status_line)
-        .map_err(|e| TransportError::Connection { cause: e.to_string() })?;
-
-    // Status line format: "HTTP/1.1 <code> <reason>\r\n"
-    let status_code = parse_status_code(status_line.trim())
-        .ok_or_else(|| TransportError::Connection {
-            cause: std::format!(
-                "unexpected response status line: {:?}",
-                status_line.trim()
-            ),
+    // Build the request.
+    let mut builder = Request::builder().method("POST").uri(http_path);
+    {
+        let hdrs = builder.headers_mut().ok_or_else(|| TransportError::Connection {
+            cause: std::string::String::from("request builder already consumed"),
         })?;
+        hdrs.insert(
+            hyper::header::HOST,
+            authority.parse().map_err(|_| TransportError::Connection {
+                cause: std::format!("invalid Host value: {}", authority),
+            })?,
+        );
+        hdrs.insert(
+            hyper::header::CONTENT_TYPE,
+            "application/x-protobuf".parse().expect("static value"),
+        );
+        hdrs.insert(
+            hyper::header::CONTENT_LENGTH,
+            body_len.to_string().parse().expect("numeric string"),
+        );
+        hdrs.insert(
+            hyper::header::CONNECTION,
+            "close".parse().expect("static value"),
+        );
+        for (k, v) in extra_headers {
+            if let (Ok(name), Ok(val)) = (
+                k.parse::<hyper::header::HeaderName>(),
+                v.parse::<hyper::header::HeaderValue>(),
+            ) {
+                hdrs.insert(name, val);
+            }
+        }
+    }
+    let req = builder
+        .body(full_body)
+        .map_err(|e| TransportError::Connection { cause: e.to_string() })?;
 
-    if (200..300).contains(&status_code) {
+    // Hyper HTTP/1.1 handshake — returns (SendRequest, Connection).
+    // Connection is the IO driver; SendRequest enqueues requests.
+    let (mut sender, conn) =
+        hyper::client::conn::http1::handshake::<IO, Full<Bytes>>(io)
+            .await
+            .map_err(|e| TransportError::Connection { cause: e.to_string() })?;
+
+    let resp_fut = sender.send_request(req);
+
+    // Drive both the IO driver (`conn`) and the response future (`resp_fut`)
+    // in a single poll_fn.
+    //
+    // On each poll:
+    //   1. conn.poll() advances the protocol state machine (writes the request,
+    //      reads the response, signals resp_fut via oneshot).
+    //   2. resp_fut.poll() checks whether the response is ready.
+    //
+    // With non-blocking IO, conn.poll() never blocks: either it makes progress
+    // (data available) or the underlying IO returns WouldBlock → our wrapper
+    // returns Poll::Pending and calls wake_by_ref() to re-schedule the poll.
+    let mut conn = core::pin::pin!(conn);
+    let mut resp_fut = core::pin::pin!(resp_fut);
+
+    let resp = future::poll_fn(|cx| {
+        let _ = conn.as_mut().poll(cx);
+        resp_fut.as_mut().poll(cx)
+    })
+    .await
+    .map_err(|e| TransportError::Connection { cause: e.to_string() })?;
+
+    let status = resp.status();
+    if status.is_success() {
         Ok(())
     } else {
         Err(TransportError::HttpStatus {
-            code: status_code,
-            message: std::string::String::from(http_reason_phrase(status_code)),
+            code: status.as_u16(),
+            message: std::string::String::from(
+                status.canonical_reason().unwrap_or("unknown"),
+            ),
         })
-    }
-}
-
-/// Parse the numeric status code from an HTTP/1.1 status line.
-///
-/// Returns `None` if the line is not a valid HTTP/1.x status line.
-fn parse_status_code(status_line: &str) -> Option<u16> {
-    // Expected: "HTTP/1.1 200 OK" or "HTTP/1.0 200 OK"
-    let without_version = status_line.strip_prefix("HTTP/1.")?;
-    // skip minor version digit and space
-    let rest = without_version.get(2..)?; // skip "1 " or "0 "
-    let code_str = rest.get(..3)?;
-    code_str.parse().ok()
-}
-
-/// Return a canonical reason phrase for common HTTP status codes.
-fn http_reason_phrase(code: u16) -> &'static str {
-    match code {
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        408 => "Request Timeout",
-        413 => "Payload Too Large",
-        429 => "Too Many Requests",
-        500 => "Internal Server Error",
-        502 => "Bad Gateway",
-        503 => "Service Unavailable",
-        504 => "Gateway Timeout",
-        _ => "Unknown",
     }
 }
