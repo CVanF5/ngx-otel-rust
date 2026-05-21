@@ -93,11 +93,13 @@ impl HttpRequestHandler for LogPhaseHandler {
                 let hdr_ms = unsafe { (*state).header_time as u64 };
                 let conn_ms = unsafe { (*state).connect_time as u64 };
                 let bytes_rx = unsafe { (*state).bytes_received as u64 };
+                let bytes_tx = unsafe { (*state).bytes_sent as u64 };
 
                 slot.upstream_response_ms.record(resp_ms, &DURATION_BOUNDS_MS);
                 slot.upstream_header_ms.record(hdr_ms, &DURATION_BOUNDS_MS);
                 slot.upstream_connect_ms.record(conn_ms, &DURATION_BOUNDS_MS);
                 slot.upstream_bytes_received.record(bytes_rx, &BYTES_BOUNDS);
+                slot.upstream_bytes_sent.record(bytes_tx, &BYTES_BOUNDS);
             }
         }
 
@@ -137,6 +139,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
         let mut up_hdr = ([0u64; N_DURATION_BUCKETS], 0u64, 0u64);
         let mut up_conn = ([0u64; N_DURATION_BUCKETS], 0u64, 0u64);
         let mut up_bytes = ([0u64; N_BYTES_BUCKETS], 0u64, 0u64);
+        let mut up_bytes_sent = ([0u64; N_BYTES_BUCKETS], 0u64, 0u64);
 
         for i in 0..self.n_workers {
             let slot = unsafe { &*worker_slots(self.base, i) };
@@ -164,6 +167,8 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
             add_histogram(&mut up_conn, &bc, bs, bcount);
             let (bc, bs, bcount) = slot.upstream_bytes_received.snapshot();
             add_histogram(&mut up_bytes, &bc, bs, bcount);
+            let (bc, bs, bcount) = slot.upstream_bytes_sent.snapshot();
+            add_histogram(&mut up_bytes_sent, &bc, bs, bcount);
         }
 
         use crate::shm::{BYTES_BOUNDS, DURATION_BOUNDS_MS};
@@ -240,6 +245,15 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                 "Bytes received from upstream",
                 "By",
                 up_bytes,
+                byte_bounds.clone(),
+                now,
+                AggregationTemporality::Delta,
+            ),
+            hist_metric(
+                "nginx.upstream.bytes.sent",
+                "Bytes sent to upstream",
+                "By",
+                up_bytes_sent,
                 byte_bounds.clone(),
                 now,
                 AggregationTemporality::Delta,

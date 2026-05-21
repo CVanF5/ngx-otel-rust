@@ -112,6 +112,8 @@ pub struct WorkerSlots {
     pub upstream_connect_ms: Histogram<N_DURATION_BUCKETS>,
     /// `http.server.upstream.bytes.received` (bytes)
     pub upstream_bytes_received: Histogram<N_BYTES_BUCKETS>,
+    /// `http.server.upstream.bytes.sent` (bytes)
+    pub upstream_bytes_sent: Histogram<N_BYTES_BUCKETS>,
 }
 
 impl WorkerSlots {
