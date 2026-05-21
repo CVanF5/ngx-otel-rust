@@ -76,7 +76,16 @@ impl HttpModule for HttpOtelModule {
             return e.into();
         }
 
-        // Steps 6, 9: register log-phase handler and spawn export loop here.
+        // Step 6: register log-phase handler only when exporter is configured.
+        if amcf.is_configured() {
+            if let Err(e) =
+                metric_source::instrumented::register_log_handler(cf_ref)
+            {
+                return e.into();
+            }
+        }
+
+        // Step 9: spawn export loop here.
 
         Status::NGX_OK.into()
     }
@@ -121,6 +130,25 @@ mod nginx_test_stubs {
         _size: usize,
         _tag: *mut c_void,
     ) -> *mut nginx_sys::ngx_shm_zone_t {
+        core::ptr::null_mut()
+    }
+
+    // nginx request-path globals accessed by the log-phase handler.
+    #[no_mangle]
+    pub static mut ngx_worker: nginx_sys::ngx_uint_t = 0;
+
+    #[no_mangle]
+    pub static mut ngx_current_msec: nginx_sys::ngx_msec_t = 0;
+
+    // nginx http core module descriptor (used by NgxHttpCoreModule::main_conf_mut).
+    #[no_mangle]
+    pub static mut ngx_http_core_module: ngx_module_t = ngx_module_t::default();
+
+    // nginx array API used by register_log_handler.
+    #[no_mangle]
+    pub unsafe extern "C" fn ngx_array_push(
+        _a: *mut nginx_sys::ngx_array_t,
+    ) -> *mut c_void {
         core::ptr::null_mut()
     }
 }
