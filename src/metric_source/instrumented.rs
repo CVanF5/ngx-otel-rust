@@ -177,6 +177,21 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
             DURATION_BOUNDS_MS.iter().map(|&b| b as f64).collect();
         let byte_bounds: std::vec::Vec<f64> = BYTES_BOUNDS.iter().map(|&b| b as f64).collect();
 
+        // TODO(fix3b): Per OTel semconv, http.server.request.duration should be
+        // broken down by {http.request.method, http.response.status_code,
+        // network.protocol.version}. Doing this with per-request attributes
+        // requires one histogram slot per {method × status_class} combination
+        // in WorkerSlots (multi-dimensional shm histogram). The current design
+        // has a single aggregated histogram; add the per-combination slots in a
+        // follow-on architectural pass (requires shm layout change + migration).
+        //
+        // The status class totals (s1xx–s5xx) are available for reference but
+        // are not emitted as separate metrics: per OTel semconv the status
+        // breakdown belongs as an attribute on the duration histogram, not as
+        // standalone counters. They will be wired in once the multi-dimensional
+        // histogram slots exist.
+        let _ = (s1xx, s2xx, s3xx, s4xx, s5xx);
+
         std::vec![
             // ── request metrics ───────────────────────────────────────────
             hist_metric(
@@ -206,15 +221,9 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                 now,
                 AggregationTemporality::Delta,
             ),
-            // ── status class counters ─────────────────────────────────────
-            counter_metric("http.server.response.status.1xx", "HTTP 1xx responses", s1xx, now),
-            counter_metric("http.server.response.status.2xx", "HTTP 2xx responses", s2xx, now),
-            counter_metric("http.server.response.status.3xx", "HTTP 3xx responses", s3xx, now),
-            counter_metric("http.server.response.status.4xx", "HTTP 4xx responses", s4xx, now),
-            counter_metric("http.server.response.status.5xx", "HTTP 5xx responses", s5xx, now),
             // ── upstream timings ──────────────────────────────────────────
             hist_metric(
-                "nginx.upstream.response.duration",
+                "http.server.upstream.response.duration",
                 "Upstream response time",
                 "ms",
                 up_resp,
@@ -223,7 +232,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                 AggregationTemporality::Delta,
             ),
             hist_metric(
-                "nginx.upstream.header.duration",
+                "http.server.upstream.header.duration",
                 "Upstream time to first response byte",
                 "ms",
                 up_hdr,
@@ -232,7 +241,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                 AggregationTemporality::Delta,
             ),
             hist_metric(
-                "nginx.upstream.connect.duration",
+                "http.server.upstream.connect.duration",
                 "Upstream connection establishment time",
                 "ms",
                 up_conn,
@@ -241,7 +250,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                 AggregationTemporality::Delta,
             ),
             hist_metric(
-                "nginx.upstream.bytes.received",
+                "http.server.upstream.bytes.received",
                 "Bytes received from upstream",
                 "By",
                 up_bytes,
@@ -250,7 +259,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                 AggregationTemporality::Delta,
             ),
             hist_metric(
-                "nginx.upstream.bytes.sent",
+                "http.server.upstream.bytes.sent",
                 "Bytes sent to upstream",
                 "By",
                 up_bytes_sent,
@@ -302,38 +311,6 @@ fn hist_metric<const N: usize>(
                 sum: data.1 as f64,
                 bucket_counts: data.0.to_vec(),
                 explicit_bounds: bounds,
-            }],
-        }),
-    }
-}
-
-/// Build a cumulative scalar counter metric.
-///
-/// Modelled as a degenerate single-bucket histogram (no explicit bounds) so
-/// that the encoder can handle all metrics uniformly via `MetricData::Histogram`.
-fn counter_metric(
-    name: &str,
-    desc: &str,
-    value: u64,
-    time_ns: u64,
-) -> crate::data_model::Metric {
-    use crate::data_model::{
-        AggregationTemporality, HistogramData, HistogramDataPoint, Metric, MetricData,
-    };
-    Metric {
-        name: name.into(),
-        description: desc.into(),
-        unit: "1".into(),
-        data: MetricData::Histogram(HistogramData {
-            aggregation_temporality: AggregationTemporality::Delta,
-            data_points: std::vec![HistogramDataPoint {
-                attributes: std::vec![],
-                start_time_unix_nano: 0,
-                time_unix_nano: time_ns,
-                count: value,
-                sum: value as f64,
-                bucket_counts: std::vec![value],
-                explicit_bounds: std::vec![],
             }],
         }),
     }
