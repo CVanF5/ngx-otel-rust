@@ -17,8 +17,8 @@ http-body = "1.0.1"
 http-body-util = "0.1.3"
 hyper = { version = "1.6.0", default-features = false, features = ["client", "http1"] }
 libc = "0.2.174"
-nginx-sys = { path = "../ngx-rust/nginx-sys" }
-ngx = { path = "../ngx-rust", features = ["async", "std"] }
+nginx-sys = { git = "https://github.com/nginx/ngx-rust.git", rev = "13c0067" }
+ngx = { git = "https://github.com/nginx/ngx-rust.git", rev = "13c0067", features = ["async", "std"] }
 openssl-sys = { version = "0.9.110", features = ["bindgen"] }
 pin-project-lite = "0.2.16"
 prost = "0.13"
