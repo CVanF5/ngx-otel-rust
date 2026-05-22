@@ -52,10 +52,6 @@ use ngx_http_otel_module::transport::{HyperHttpTransport, Transport};
 /// OTLP endpoint for the local test-harness OTel collector.
 const COLLECTOR_ENDPOINT: &str = "http://127.0.0.1:4318/v1/metrics";
 
-/// Service name embedded in the test payload so we can grep for it in
-/// `test-harness/logs/metrics.json` after the send.
-const TEST_SERVICE_NAME: &str = "ngx-otel-step8-test";
-
 /// Path to the collector JSONL log file (one JSON object per received batch).
 const METRICS_LOG_PATH: &str =
     "/Users/c.vandesande/project-nginx-otel/test-harness/logs/metrics.json";
@@ -72,11 +68,23 @@ fn now_unix_nano() -> u64 {
         .as_nanos() as u64
 }
 
+/// Returns a unique service name for this test run to avoid assertion
+/// collisions when tests run in parallel.  Appends a microsecond timestamp
+/// nonce so the "appended-since-snapshot" check in each test always sees
+/// *its own* service name in the newly written log lines.
+fn unique_service_name(test_fn: &str) -> std::string::String {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros();
+    std::format!("ngx-otel-step8-{}-{}", test_fn, nonce)
+}
+
 /// Construct a minimal OTLP batch with a recognisable service.name attribute.
 ///
 /// Timestamps reflect the actual wall-clock time so collector logs show
 /// sensible values rather than a hardcoded 2023 date.
-fn make_test_batch() -> Batch {
+fn make_test_batch(service_name: &str) -> Batch {
     let end_ns = now_unix_nano();
     // Use a 10-second measurement window ending now.
     let start_ns = end_ns.saturating_sub(10_000_000_000);
@@ -85,7 +93,7 @@ fn make_test_batch() -> Batch {
         resource: Resource {
             attributes: vec![KeyValue {
                 key: "service.name".to_string(),
-                value: AnyValue::String(TEST_SERVICE_NAME.to_string()),
+                value: AnyValue::String(service_name.to_string()),
             }],
         },
         scope: Scope {
@@ -128,8 +136,10 @@ fn make_test_batch() -> Batch {
 #[test]
 #[ignore = "requires the ngx-otel-test-collector container to be up"]
 fn send_otlp_to_live_collector() {
+    let service_name = unique_service_name("send-otlp");
+
     // ── Encode a batch ────────────────────────────────────────────────────
-    let batch = make_test_batch();
+    let batch = make_test_batch(&service_name);
     let encoder = OtlpHttpEncoder;
     let bytes = encoder.encode(&batch);
     assert!(!bytes.is_empty(), "encoded bytes must be non-empty");
@@ -168,9 +178,9 @@ fn send_otlp_to_live_collector() {
     };
 
     assert!(
-        new_content.contains(TEST_SERVICE_NAME),
+        new_content.contains(&service_name),
         "newly appended metrics.json content must contain '{}'; new lines:\n{}",
-        TEST_SERVICE_NAME,
+        service_name,
         new_content
     );
 }
@@ -179,7 +189,8 @@ fn send_otlp_to_live_collector() {
 #[test]
 #[ignore = "requires the ngx-otel-test-collector container to be up"]
 fn send_twice_reconnects_cleanly() {
-    let batch = make_test_batch();
+    let service_name = unique_service_name("reconnect");
+    let batch = make_test_batch(&service_name);
     let encoder = OtlpHttpEncoder;
     let bytes = encoder.encode(&batch);
 
@@ -197,7 +208,8 @@ fn send_twice_reconnects_cleanly() {
 #[test]
 #[ignore = "requires the ngx-otel-test-collector container to be up"]
 fn send_with_custom_headers() {
-    let batch = make_test_batch();
+    let service_name = unique_service_name("custom-headers");
+    let batch = make_test_batch(&service_name);
     let encoder = OtlpHttpEncoder;
     let bytes = encoder.encode(&batch);
 

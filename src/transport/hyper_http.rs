@@ -47,10 +47,14 @@ use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 use std::boxed::Box;
 use std::io;
+#[cfg(any(test, feature = "test-support"))]
 use std::io::{Read, Write};
+#[cfg(any(test, feature = "test-support"))]
 use std::net::TcpStream;
+#[cfg(any(test, feature = "test-support"))]
 use std::os::unix::net::UnixStream;
 use std::string::ToString;
+#[cfg(any(test, feature = "test-support"))]
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -77,6 +81,7 @@ use crate::transport::Transport;
 const DEFAULT_READ_TIMEOUT_MS: nginx_sys::ngx_msec_t = 60_000;
 
 /// Wall-clock limit for `SpinTcpIo` / `SpinUnixIo` (test only).
+#[cfg(any(test, feature = "test-support"))]
 const SPIN_IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -472,11 +477,17 @@ unsafe extern "C" fn ngx_otel_conn_write_handler(ev: *mut ngx_event_t) {
 // cx.waker().wake_by_ref(), which is safe only inside the spin-loop executor
 // (tests/support/mod.rs).  In a NGINX worker process this would busy-spin
 // the event loop thread — do not use there.
+//
+// Gated behind `#[cfg(any(test, feature = "test-support"))]` so that
+// production builds (`cargo build --release`) cannot accidentally reference
+// these types.
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Non-blocking TcpStream adapter.  TEST-ONLY — see module doc.
+#[cfg(any(test, feature = "test-support"))]
 pub struct SpinTcpIo(TcpStream);
 
+#[cfg(any(test, feature = "test-support"))]
 impl hyper::rt::Read for SpinTcpIo {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -500,6 +511,7 @@ impl hyper::rt::Read for SpinTcpIo {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl hyper::rt::Write for SpinTcpIo {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -523,11 +535,14 @@ impl hyper::rt::Write for SpinTcpIo {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Unpin for SpinTcpIo {}
 
 /// Non-blocking UnixStream adapter.  TEST-ONLY — see module doc.
+#[cfg(any(test, feature = "test-support"))]
 pub struct SpinUnixIo(UnixStream);
 
+#[cfg(any(test, feature = "test-support"))]
 impl hyper::rt::Read for SpinUnixIo {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -551,6 +566,7 @@ impl hyper::rt::Read for SpinUnixIo {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl hyper::rt::Write for SpinUnixIo {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -574,15 +590,18 @@ impl hyper::rt::Write for SpinUnixIo {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Unpin for SpinUnixIo {}
 
 /// Enum combining TCP and Unix spin-wait adapters.  Returned by
 /// [`SpinConnector`] so one `connect()` can handle both endpoint types.
+#[cfg(any(test, feature = "test-support"))]
 pub enum SpinIo {
     Tcp(SpinTcpIo),
     Unix(SpinUnixIo),
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl hyper::rt::Read for SpinIo {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -596,6 +615,7 @@ impl hyper::rt::Read for SpinIo {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl hyper::rt::Write for SpinIo {
     fn poll_write(
         self: Pin<&mut Self>,
@@ -621,6 +641,7 @@ impl hyper::rt::Write for SpinIo {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Unpin for SpinIo {}
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -648,8 +669,10 @@ pub(crate) trait Connector: Send {
 /// [`SpinIo`] wrapper that busy-wakes on `WouldBlock`.
 ///
 /// **Do not use in a NGINX worker process.**
+#[cfg(any(test, feature = "test-support"))]
 pub struct SpinConnector;
 
+#[cfg(any(test, feature = "test-support"))]
 impl Connector for SpinConnector {
     type Io = SpinIo;
 
@@ -809,6 +832,7 @@ impl<C: core::fmt::Debug> core::fmt::Debug for HyperHttpTransport<C> {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl core::fmt::Debug for SpinConnector {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("SpinConnector")
@@ -837,6 +861,7 @@ impl<C: Connector> HyperHttpTransport<C> {
 /// Test constructor — uses [`SpinConnector`].
 ///
 /// **Do not call from a NGINX worker process.**
+#[cfg(any(test, feature = "test-support"))]
 impl HyperHttpTransport<SpinConnector> {
     pub fn new(
         endpoint_str: &str,

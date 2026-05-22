@@ -35,6 +35,22 @@ default = ["export-modules"]
 # The exports table is required for building loadable modules with --crate-type cdylib
 # outside of the NGINX buildsystem.
 export-modules = []
+# Expose test-only types (SpinConnector, SpinTcpIo, etc.) so external crates can
+# exercise transport logic without a live NGINX process.  Never enable in production.
+test-support = []
+
+# Integration tests that exercise HyperHttpTransport via SpinConnector require
+# the test-support feature to expose the Spin* types and HyperHttpTransport::new.
+# Run them with: cargo test --features test-support [--test <name>] [-- --ignored]
+[[test]]
+name = "transport_errors"
+path = "tests/transport_errors.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "transport_integration"
+path = "tests/transport_integration.rs"
+required-features = ["test-support"]
 
 [profile.release]
 codegen-units = 1
