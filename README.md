@@ -120,16 +120,58 @@ case rests on.
 - System-wide installation of OpenSSL 1.1.1 or later.
 - Rust toolchain (1.81.0 or later).
 - `pkg-config` or `pkgconf`.
-- `libclang` for rust-bindgen.
-- Optional: a running OTel collector reachable at
-  `127.0.0.1:4318` (OTLP/HTTP).  The integration tests assert against
-  metrics arriving at the collector, so any OTLP/HTTP receiver works.
-  A typical local setup is `otel/opentelemetry-collector-contrib` in
-  Docker with an `otlp/http` receiver and a `debug` or `file`
-  exporter.
+- `libclang` for rust-bindgen (used by `nginx-sys` and `openssl-sys` to
+  parse C headers at build time).
+- `protoc` (Protocol Buffers compiler) for `prost-build` to compile
+  the vendored OTel `.proto` files in `proto/`.
+- Optional: Docker, for the local OTel collector the integration
+  tests use.  Without Docker, point any OTLP/HTTP receiver at
+  `127.0.0.1:4318` and the tests will work against it.
 
 The NGINX and its dependency versions should match the ones you plan to
 deploy, including any patches that change the API.
+
+#### Platform setup
+
+**Debian / Ubuntu:**
+
+```sh
+sudo apt update
+sudo apt install -y \
+    libclang-dev \
+    libssl-dev \
+    libpcre2-dev \
+    zlib1g-dev \
+    pkg-config \
+    build-essential \
+    protobuf-compiler
+# Optional: Docker for the local OTel collector
+sudo apt install -y docker.io docker-compose-plugin
+```
+
+Then install Rust via [rustup](https://rustup.rs/) if you don't have
+it already; the system `rustc` package on Debian stable tends to lag
+the MSRV.
+
+**macOS (Homebrew):**
+
+```sh
+# Xcode command-line tools (provides clang, make, libc headers, libclang)
+xcode-select --install
+
+brew install \
+    openssl@3 \
+    pcre2 \
+    pkg-config \
+    protobuf
+
+# Optional: Docker Desktop (or OrbStack / Colima) for the OTel collector
+brew install --cask docker
+```
+
+Then install Rust via [rustup](https://rustup.rs/).  macOS already
+ships Zlib in the base system, and Xcode's CLI tools provide
+`libclang` — no separate package needed.
 
 > [!TIP]
 > The module built against a specific release of unmodified NGINX Open
