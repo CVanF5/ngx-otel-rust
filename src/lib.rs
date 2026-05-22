@@ -14,15 +14,15 @@
 //!    `add_phase_handler` is called **only** when `amcf.is_configured()` is
 //!    true.  If the exporter is not configured the phase handler is never
 //!    registered and no per-request code runs.
-//!    See: [`HttpOtelModule::postconfiguration`] (the `if amcf.is_configured()`
-//!    block, currently around line 83).
+//!    See [`HttpOtelModule::postconfiguration`] — the `if amcf.is_configured()`
+//!    block surrounding the `add_phase_handler` call.
 //!
 //! 2. **Export-task gate** (`src/lib.rs` — `ngx_otel_init_process`):
 //!    The async export loop is spawned **only** when `amcf.is_configured()` is
 //!    true.  If the exporter is not configured the process hook returns early
 //!    with no allocation, no task spawn, and no background activity.
-//!    See: [`ngx_otel_init_process`] (the `if !amcf.is_configured()` early
-//!    return, currently around line 133).
+//!    See [`ngx_otel_init_process`] — the `if !amcf.is_configured()` early
+//!    return that precedes any `ngx::async_::spawn` or `Pool::allocate` call.
 //!
 //! **Invariant contract:**
 //! - No per-request allocation on the disabled path.
