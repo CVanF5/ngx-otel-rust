@@ -44,6 +44,9 @@ NGINX_BINARY="${NGINX_BINARY:-${REPO_ROOT}/nginx/objs/nginx}"
 NGINX_SOURCE_DIR="${NGINX_SOURCE_DIR:-${REPO_ROOT}/nginx}"
 NGINX_BUILD_DIR="${NGINX_BUILD_DIR:-${REPO_ROOT}/nginx/objs}"
 
+# Source the shared harness library.  Exposes ensure_collector_running.
+. "${CRATE_DIR}/test-harness/lib.sh"
+
 BENCH_ITERATIONS="${BENCH_ITERATIONS:-5}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 SKIP_C3="${SKIP_C3:-0}"
@@ -104,16 +107,13 @@ if ! command -v jq >/dev/null 2>&1; then
     exit 1
 fi
 
-# C3 collector check.
+# C3 collector check (auto-starts via test-harness/lib.sh when needed).
 if [[ "${SKIP_C3}" != "1" ]]; then
-    if ! curl -s --connect-timeout 2 http://127.0.0.1:4318/ >/dev/null 2>&1; then
-        echo "ERROR: OTel collector not reachable at 127.0.0.1:4318" >&2
-        echo "       Start it with: docker compose -f ${REPO_ROOT}/test-harness/docker-compose.yml up -d" >&2
-        echo "       Or set SKIP_C3=1 to skip the C3 (operational) config." >&2
-        echo "       STOP-AND-ASK: C3 requires the local collector to be running." >&2
+    ensure_collector_running || {
+        echo "ERROR: C3 (operational) config requires the local collector." >&2
+        echo "       Set SKIP_C3=1 to skip C3 and run only C1/C2." >&2
         exit 1
-    fi
-    info "OTel collector reachable at 127.0.0.1:4318"
+    }
 else
     info "SKIP_C3=1: skipping C3 (no collector check)"
 fi

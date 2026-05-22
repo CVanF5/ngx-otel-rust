@@ -52,7 +52,9 @@ CRATE_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 REPO_ROOT="$(cd "${CRATE_DIR}/.." && pwd)"
 
 NGINX_BINARY="${NGINX_BINARY:-${REPO_ROOT}/nginx/objs/nginx}"
-METRICS_LOG="${REPO_ROOT}/test-harness/logs/metrics.json"
+# Source the shared harness library.  Sets HARNESS_DIR, METRICS_LOG,
+# COLLECTOR_HTTP_ENDPOINT, and exposes ensure_collector_running.
+. "${CRATE_DIR}/test-harness/lib.sh"
 
 case "$(uname -s)" in
     Darwin) MODULE_EXT="dylib" ;;
@@ -88,10 +90,7 @@ if [[ ! -x "${NGINX_BINARY}" ]]; then
     exit 1
 fi
 
-if ! curl -s --connect-timeout 2 http://127.0.0.1:4318/ >/dev/null 2>&1; then
-    echo "ERROR: OTel collector not reachable at 127.0.0.1:4318" >&2
-    exit 1
-fi
+ensure_collector_running || exit 1
 
 # Verify port 14318 is NOT reachable (that is what makes it a good dead endpoint).
 if curl -s --connect-timeout 1 http://127.0.0.1:14318/ >/dev/null 2>&1; then

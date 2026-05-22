@@ -9,9 +9,10 @@
 #
 # Prerequisites
 # ─────────────
-# 1. The OTel collector container must be running:
-#      docker compose -f ../../test-harness/docker-compose.yml ps
-#    should show ngx-otel-test-collector as Up on 127.0.0.1:4318.
+# 1. Docker available on PATH.  The OTel collector container is
+#    auto-started if not already running (see test-harness/lib.sh).
+#    Set OTEL_COLLECTOR_AUTOSTART=0 to skip auto-start (e.g., CI
+#    environments managing the collector externally).
 #
 # 2. Required environment variables (or sensible defaults will be used):
 #      NGINX_BINARY   — path to the nginx binary (default: auto-detected)
@@ -40,8 +41,11 @@ CRATE_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 REPO_ROOT="$(cd "${CRATE_DIR}/.." && pwd)"
 
 NGINX_BINARY="${NGINX_BINARY:-${REPO_ROOT}/nginx/objs/nginx}"
-METRICS_LOG="${REPO_ROOT}/test-harness/logs/metrics.json"
 CONF_TEMPLATE="${SCRIPT_DIR}/nginx.conf"
+
+# Source the shared harness library.  Sets HARNESS_DIR, METRICS_LOG,
+# COLLECTOR_HTTP_ENDPOINT, and exposes ensure_collector_running.
+. "${CRATE_DIR}/test-harness/lib.sh"
 
 # Detect module extension (macOS = .dylib, Linux = .so)
 case "$(uname -s)" in
@@ -76,11 +80,7 @@ if [[ ! -x "${NGINX_BINARY}" ]]; then
     exit 1
 fi
 
-if ! curl -s --connect-timeout 2 http://127.0.0.1:4318/ >/dev/null 2>&1; then
-    echo "ERROR: OTel collector not reachable at 127.0.0.1:4318" >&2
-    echo "       Start it with: docker compose -f ${REPO_ROOT}/test-harness/docker-compose.yml up -d" >&2
-    exit 1
-fi
+ensure_collector_running || exit 1
 
 # ─── Build the module ────────────────────────────────────────────────────────
 
