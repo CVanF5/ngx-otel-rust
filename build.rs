@@ -21,18 +21,32 @@ fn main() {
 
 /// Generates `ngx_os`, `ngx_feature` and nginx version cfg values.
 fn detect_nginx_features() {
-    // Specify acceptable values for `ngx_feature`
+    // Detect NGX_STAT_STUB from ngx_auto_config.h, which nginx-sys does not
+    // surface as a feature but we gate code on.
+    let stat_stub = detect_stat_stub();
+
+    // Specify acceptable values for `ngx_feature`.
+    // Append "stat_stub" to the list nginx-sys gives us so our #[cfg] guards
+    // don't trigger "unexpected cfg condition value" warnings.
     println!("cargo::rerun-if-env-changed=DEP_NGINX_FEATURES_CHECK");
-    println!(
-        "cargo::rustc-check-cfg=cfg(ngx_feature, values({}))",
-        env::var("DEP_NGINX_FEATURES_CHECK").unwrap_or("any()".to_string())
-    );
+    let features_check = env::var("DEP_NGINX_FEATURES_CHECK").unwrap_or("any()".to_string());
+    if features_check == "any()" {
+        println!("cargo::rustc-check-cfg=cfg(ngx_feature, values(any()))");
+    } else {
+        println!(
+            r#"cargo::rustc-check-cfg=cfg(ngx_feature, values({features_check},"stat_stub"))"#,
+        );
+    }
+
     // Read feature flags detected by nginx-sys and pass to the compiler.
     println!("cargo::rerun-if-env-changed=DEP_NGINX_FEATURES");
     if let Ok(features) = env::var("DEP_NGINX_FEATURES") {
         for feature in features.split(',').map(str::trim) {
             println!("cargo::rustc-cfg=ngx_feature=\"{feature}\"");
         }
+    }
+    if stat_stub {
+        println!("cargo::rustc-cfg=ngx_feature=\"stat_stub\"");
     }
 
     // Specify acceptable values for `ngx_os`
@@ -46,6 +60,25 @@ fn detect_nginx_features() {
     if let Ok(os) = env::var("DEP_NGINX_OS") {
         println!("cargo::rustc-cfg=ngx_os=\"{os}\"");
     }
+}
+
+/// Returns `true` when the nginx build we're linking against was configured
+/// with `--with-http_stub_status_module` (i.e. `NGX_STAT_STUB` is defined).
+///
+/// nginx-sys does not surface this as a feature, so we check directly.
+/// The `DEP_NGINX_BUILD_DIR` env var is set by nginx-sys (via `links = "nginx"`
+/// and `cargo::metadata=build_dir=...`).
+fn detect_stat_stub() -> bool {
+    println!("cargo::rerun-if-env-changed=DEP_NGINX_BUILD_DIR");
+    let build_dir = match env::var("DEP_NGINX_BUILD_DIR") {
+        Ok(d) => PathBuf::from(d),
+        Err(_) => return false,
+    };
+    let auto_config = build_dir.join("ngx_auto_config.h");
+    println!("cargo::rerun-if-changed={}", auto_config.display());
+    std::fs::read_to_string(&auto_config)
+        .map(|s| s.contains("NGX_STAT_STUB"))
+        .unwrap_or(false)
 }
 
 /// Compile OpenTelemetry proto files with prost-build.
