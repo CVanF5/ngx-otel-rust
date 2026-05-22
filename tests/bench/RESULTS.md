@@ -38,8 +38,11 @@ mtime:   2026-05-22 14:14:10 UTC  (epoch 1779455650)
 ```
 
 The benchmark harness asserts at startup that the module mtime is newer than
-every `src/*.rs` source file and that all three sandbox configs reference the
-identical dylib inode.
+every `src/*.rs` source file. All three sandbox configs reference the same
+dylib at the single absolute path above; the harness re-checks that path's
+mtime each time a sandbox is set up, guarding against the dylib being
+mutated mid-run (e.g., a stray rebuild between iterations) rather than
+proving cross-sandbox identity — identity is by-path.
 
 ## wrk
 

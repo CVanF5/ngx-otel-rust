@@ -165,8 +165,17 @@ fi
 # ─── Sandbox factory ─────────────────────────────────────────────────────────
 
 # sandbox_setup <config_name> <conf_template>
-# Creates a per-config prefix directory, substitutes placeholders,
-# and copies the same module dylib in.  Prints the PREFIX path.
+# Creates a per-config prefix directory and substitutes placeholders.
+#
+# All three sandboxes reference the SAME dylib at ${MODULE_PATH} (one
+# absolute path templated into each nginx.conf), so identity-of-artifact
+# is guaranteed by construction, not by per-sandbox copy.  The mtime
+# re-check below guards against the dylib being mutated between sandbox
+# setups (e.g., a stray rebuild during the run) — if that happened the
+# earlier rounds and later rounds would no longer be comparing the same
+# binary.
+#
+# Prints the PREFIX path.
 sandbox_setup() {
     local name="$1"
     local template="$2"
@@ -181,15 +190,16 @@ sandbox_setup() {
         -e "s|@PREFIX@|${prefix}|g" \
         "${template}" > "${prefix}/nginx.conf"
 
-    # Verify the module mtime inside the sandbox dir matches (same file, symlink ok).
-    # We do this by confirming the path in nginx.conf points at the same inode.
+    # Re-verify the dylib's mtime matches the one captured at script start.
+    # All sandboxes reference the same path, so this is a same-file mutation
+    # check, not a cross-sandbox identity check (identity is by-path).
     local conf_module_path
     conf_module_path="$(grep "^load_module" "${prefix}/nginx.conf" | awk '{print $2}' | tr -d ';' || true)"
     if [[ -n "${conf_module_path}" ]]; then
         local conf_mtime
         conf_mtime="$(stat -f "%m" "${conf_module_path}" 2>/dev/null || stat -c "%Y" "${conf_module_path}")"
         if [[ "${conf_mtime}" != "${MODULE_MTIME}" ]]; then
-            echo "ERROR: mtime mismatch for sandbox ${name}: conf references ${conf_module_path} mtime=${conf_mtime}, expected ${MODULE_MTIME}" >&2
+            echo "ERROR: dylib mtime drifted during the run for sandbox ${name}: ${conf_module_path} mtime=${conf_mtime}, expected ${MODULE_MTIME} (was the dylib rebuilt mid-run?)" >&2
             exit 1
         fi
     fi
