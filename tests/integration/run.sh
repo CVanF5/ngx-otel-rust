@@ -218,13 +218,38 @@ else
 fi
 
 # 3. Exactly one "spawning export task" in error.log (Worker 0 only)
-SPAWN_COUNT=$(grep -c "spawning export task" "${PREFIX}/logs/error.log" 2>/dev/null || echo 0)
+SPAWN_COUNT=$(grep -c "spawning export task" "${PREFIX}/logs/error.log" 2>/dev/null) || SPAWN_COUNT=0
 if [[ "${SPAWN_COUNT}" -eq 1 ]]; then
     pass "error.log contains exactly 1 'spawning export task' line (Worker 0 only)"
 else
     fail "error.log contains ${SPAWN_COUNT} 'spawning export task' lines (expected 1).
        Relevant lines:
 $(grep "spawning export task\|init_process" "${PREFIX}/logs/error.log" | head -20)"
+    FAILED=1
+fi
+
+# 4. Conditional graceful-drain integrity check.
+#
+# Background: when SIGQUIT arrives while the export loop is between intervals
+# (asleep on a cancelable ngx-rust timer), nginx exits before the loop wakes
+# and the drain never fires. This is a documented Phase 1.1 limitation (see
+# src/export/mod.rs::graceful_drain). So we CANNOT assert the drain runs
+# unconditionally — the SIGQUIT-vs-sleep race makes that flaky.
+#
+# What we CAN assert: if the drain started, it must also complete. A regression
+# where the drain begins but hangs (e.g., budget logic broken, transport future
+# never resolves) would leave a "graceful drain starting" line with no matching
+# "graceful drain complete" line — that we want to catch.
+DRAIN_START=$(grep -c "graceful drain starting" "${PREFIX}/logs/error.log" 2>/dev/null) || DRAIN_START=0
+DRAIN_END=$(grep -c "graceful drain complete" "${PREFIX}/logs/error.log" 2>/dev/null) || DRAIN_END=0
+if [[ "${DRAIN_START}" -eq 0 ]]; then
+    info "Note: graceful drain did not fire this run (SIGQUIT landed during sleep — documented limitation)."
+elif [[ "${DRAIN_START}" -eq "${DRAIN_END}" ]]; then
+    pass "graceful drain integrity: ${DRAIN_START} start(s), ${DRAIN_END} complete(s)"
+else
+    fail "graceful drain started ${DRAIN_START} time(s) but completed ${DRAIN_END} time(s) — drain hung.
+       Relevant lines:
+$(grep "graceful drain" "${PREFIX}/logs/error.log" | head -20)"
     FAILED=1
 fi
 

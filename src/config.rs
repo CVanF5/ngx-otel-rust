@@ -277,7 +277,10 @@ impl MainConfig {
     /// This is `shm.addr + data_offset()` — past the nginx slab-pool header that
     /// `ngx_init_zone_pool` writes at the very start of every shm zone.
     ///
-    /// Returns `None` if the zone is not yet initialised.
+    /// Returns `None` if either:
+    /// - `shm_zone` is null (no zone registered — module not configured yet), OR
+    /// - `shm_zone.shm.addr` is null (zone declared but not yet mapped — the
+    ///   window between `ngx_shared_memory_add` and `ngx_init_zone`).
     pub fn shm_base(&self) -> Option<*mut u8> {
         let zone = unsafe { self.shm_zone.as_ref()? };
         let addr = zone.shm.addr;

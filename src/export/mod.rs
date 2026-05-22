@@ -85,8 +85,14 @@ enum ShutdownKind {
 
 /// [`MetricSource`] that exposes the export loop's own health as OTel metrics.
 pub struct SelfMetricsSource {
-    /// Configured export interval in milliseconds (emitted as a gauge in seconds).
+    /// Configured export interval in milliseconds (emitted as a gauge in ms).
     pub interval_ms: u64,
+    /// Worker startup time (Unix epoch, nanoseconds). Used as the
+    /// `start_time_unix_nano` for the cumulative monotonic Sums so that
+    /// downstream rate/delta-conversion processors can anchor windows
+    /// correctly. Captured once at [`export_loop`] init; see field
+    /// initialisation in [`collect_all_sources`].
+    pub start_time_unix_nano: u64,
 }
 
 impl MetricSource for SelfMetricsSource {
@@ -94,8 +100,6 @@ impl MetricSource for SelfMetricsSource {
         let now = now_unix_nano();
         let dropped = DROPPED_RECORDS.load(Ordering::Acquire) as i64;
         let failures = SEND_FAILURES.load(Ordering::Acquire) as i64;
-        // Sub-second resolution preserved (configured interval emitted in
-        // milliseconds, unit declared "ms").
         let interval_ms = self.interval_ms as i64;
 
         std::vec![
@@ -104,6 +108,7 @@ impl MetricSource for SelfMetricsSource {
                 "Metric data points dropped due to a full retry buffer",
                 "points",
                 dropped,
+                self.start_time_unix_nano,
                 now,
             ),
             monotonic_sum_metric(
@@ -111,6 +116,7 @@ impl MetricSource for SelfMetricsSource {
                 "Cumulative export send failures since worker startup",
                 "failures",
                 failures,
+                self.start_time_unix_nano,
                 now,
             ),
             gauge_metric(
@@ -173,6 +179,12 @@ pub async fn export_loop(amcf: &'static MainConfig) {
         };
 
     let encoder = OtlpHttpEncoder;
+
+    // Capture worker start time once — used as the start_time_unix_nano
+    // for cumulative monotonic Sum self-metrics so that downstream rate
+    // panels and delta-conversion processors can anchor windows correctly.
+    let worker_start_ns = now_unix_nano();
+
     // Retry buffer: (encoded bytes, number of data points in that batch).
     // Depth is configured (see `MainConfig::retry_buffer_depth`) so that
     // tuning later is a config change, not a code change.
@@ -206,7 +218,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                 log.as_ptr(),
                 "otel export: ngx_exiting set, starting graceful drain"
             );
-            graceful_drain(&mut transport, &mut retry_queue, &encoder, amcf).await;
+            graceful_drain(&mut transport, &mut retry_queue, &encoder, amcf, worker_start_ns).await;
             return;
         }
 
@@ -246,7 +258,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                 log.as_ptr(),
                 "otel export: ngx_exiting set during sleep, starting graceful drain"
             );
-            graceful_drain(&mut transport, &mut retry_queue, &encoder, amcf).await;
+            graceful_drain(&mut transport, &mut retry_queue, &encoder, amcf, worker_start_ns).await;
             return;
         }
 
@@ -284,7 +296,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
         }
 
         // ── Collect fresh metrics from all sources ────────────────────────
-        let batch = collect_all_sources(amcf);
+        let batch = collect_all_sources(amcf, worker_start_ns);
         let n_pts = count_data_points(&batch);
         if n_pts == 0 {
             continue;
@@ -358,6 +370,7 @@ async fn graceful_drain(
     retry_queue: &mut VecDeque<(std::vec::Vec<u8>, u64)>,
     encoder: &OtlpHttpEncoder,
     amcf: &'static MainConfig,
+    worker_start_ns: u64,
 ) {
     let log = ngx::log::ngx_cycle_log();
     let queued = retry_queue.len();
@@ -408,7 +421,7 @@ async fn graceful_drain(
     }
 
     // Final freshly-collected batch.
-    let final_batch = collect_all_sources(amcf);
+    let final_batch = collect_all_sources(amcf, worker_start_ns);
     let n_pts = count_data_points(&final_batch);
     if n_pts > 0 {
         let bytes = encoder.encode(&final_batch);
@@ -539,7 +552,7 @@ fn count_data_points(batch: &Batch) -> u64 {
 }
 
 /// Collect from all configured [`MetricSource`]s and assemble a [`Batch`].
-fn collect_all_sources(amcf: &'static MainConfig) -> Batch {
+fn collect_all_sources(amcf: &'static MainConfig, worker_start_ns: u64) -> Batch {
     let mut metrics = std::vec::Vec::new();
 
     // 1. NGINX connection / request counters (stub_status equivalents).
@@ -558,7 +571,13 @@ fn collect_all_sources(amcf: &'static MainConfig) -> Batch {
     }
 
     // 3. Self-metrics (dropped_records, send_failures, export_interval).
-    metrics.extend(SelfMetricsSource { interval_ms: amcf.interval_ms() }.collect());
+    metrics.extend(
+        SelfMetricsSource {
+            interval_ms: amcf.interval_ms(),
+            start_time_unix_nano: worker_start_ns,
+        }
+        .collect(),
+    );
 
     // ── Build Resource from config ────────────────────────────────────────
     let mut resource_attrs: std::vec::Vec<KeyValue> = std::vec::Vec::new();
@@ -601,11 +620,17 @@ fn now_unix_nano() -> u64 {
 }
 
 /// Build a monotonic cumulative Sum metric carrying a single i64 data point.
+///
+/// `start_time_unix_nano` must be the time the worker (and therefore the
+/// counter) started. OTel cumulative semantics require this so rate
+/// computations across collector restarts work correctly; a `0` start time
+/// means epoch (1970) and confuses delta-conversion processors.
 fn monotonic_sum_metric(
     name: &str,
     desc: &str,
     unit: &str,
     value: i64,
+    start_time_ns: u64,
     time_ns: u64,
 ) -> Metric {
     Metric {
@@ -617,7 +642,7 @@ fn monotonic_sum_metric(
             is_monotonic: true,
             data_points: std::vec![NumberDataPoint {
                 attributes: std::vec![],
-                start_time_unix_nano: 0,
+                start_time_unix_nano: start_time_ns,
                 time_unix_nano: time_ns,
                 value: NumberValue::AsInt(value),
             }],
@@ -696,7 +721,10 @@ mod tests {
     /// SelfMetricsSource must produce exactly 3 metrics with the right names.
     #[test]
     fn self_metrics_source_produces_three_metrics() {
-        let src = SelfMetricsSource { interval_ms: 10_000 };
+        let src = SelfMetricsSource {
+            interval_ms: 10_000,
+            start_time_unix_nano: 1_700_000_000_000_000_000,
+        };
         let metrics = src.collect();
         assert_eq!(metrics.len(), 3, "SelfMetricsSource must emit 3 metrics");
 
