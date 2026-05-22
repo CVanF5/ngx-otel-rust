@@ -259,13 +259,19 @@ else
        Content-A (first 200 chars): $(echo "${CONTENT_A}" | head -c 200)"
 fi
 
-# 2. error.log contains "otel export: send failed" after reload (new worker
-#    targeting the unreachable endpoint B).
+# 2. error.log contains ≥ 2 "otel export: send failed" lines after reload.
+#    Two failures (rather than one) is the meaningful threshold: it proves the
+#    in-memory ngx_otel.send_failures counter advanced past 1 across multiple
+#    phase-B ticks, not just a single transient failure.  We assert ≥ 2 here
+#    because the post-failure counter value can never reach metrics.json
+#    directly (phase-B batches go to the unreachable endpoint B), so the
+#    error-log count is the only available counter-advancement signal.
 SEND_FAIL_COUNT=$(grep -c "otel export: send failed" "${PREFIX}/logs/error.log" 2>/dev/null) || SEND_FAIL_COUNT=0
-if [[ "${SEND_FAIL_COUNT}" -ge 1 ]]; then
-    pass "error.log: ${SEND_FAIL_COUNT} 'otel export: send failed' line(s) (endpoint B is unreachable)"
+if [[ "${SEND_FAIL_COUNT}" -ge 2 ]]; then
+    pass "error.log: ${SEND_FAIL_COUNT} 'otel export: send failed' line(s) (≥ 2: send_failures counter advanced past 1)"
 else
-    fail "error.log: expected ≥ 1 'otel export: send failed' line after reload to endpoint B.
+    fail "error.log: expected ≥ 2 'otel export: send failed' lines (got ${SEND_FAIL_COUNT}).
+       Two failures are required to prove the in-memory counter advanced past 1.
        Relevant lines (export-related):
 $(grep -E 'otel export|send fail|send_failure' "${PREFIX}/logs/error.log" | tail -20)"
 fi
@@ -278,13 +284,24 @@ else
     fail "error.log: expected 1 'otel: SIGHUP reload detected' line, got ${RELOAD_COUNT}"
 fi
 
-# 4. ngx_otel.send_failures metric appears in phase-A content (self-metric
-#    infrastructure is working; value may be 0 in phase A since endpoint A
-#    was reachable).
-if echo "${CONTENT_A}" | grep -q '"ngx_otel.send_failures"'; then
-    pass "metrics.json: ngx_otel.send_failures self-metric present in phase-A content"
+# 4. ngx_otel.send_failures metric in phase A is structurally well-formed and
+#    has the expected initial value (asInt="0").  Phase A's collector was
+#    reachable, so the counter MUST still be 0 there — any non-zero value
+#    would indicate counter leakage from a different worker or malformed JSON.
+#    This tightens the previous "metric present" check, which would have
+#    passed even if the data point was malformed or carried a garbage value.
+#
+#    Why we do not check counter advancement here: phase-B batches all target
+#    the unreachable endpoint B and never reach the collector, so the
+#    post-failure counter values never land in metrics.json.  Counter
+#    advancement evidence is provided by assertion 2 (≥ 2 send-failure log
+#    lines, each corresponding to one in-memory counter increment).
+if echo "${CONTENT_A}" | grep -Eq '"ngx_otel\.send_failures"[^{]*\{[^}]*"asInt":"0"'; then
+    pass "metrics.json: ngx_otel.send_failures present in phase-A with asInt=0 (initial value correct)"
 else
-    fail "metrics.json: ngx_otel.send_failures self-metric not found in phase-A content."
+    fail "metrics.json: ngx_otel.send_failures missing or has non-zero value in phase-A content.
+       Expected asInt=\"0\" because endpoint A was reachable; non-zero indicates counter leakage.
+       Phase-A excerpt: $(echo "${CONTENT_A}" | grep -oE 'ngx_otel\.send_failures[^}]*\}[^}]*\}' | head -1)"
 fi
 
 # ─── Summary ─────────────────────────────────────────────────────────────────
