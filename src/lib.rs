@@ -3,6 +3,37 @@
 // This source code is licensed under the Apache License, Version 2.0 license found in the
 // LICENSE file in the root directory of this source tree.
 
+//! # Zero-cost-when-disabled invariant
+//!
+//! Loading this module without an `otel_exporter { endpoint ... }` directive
+//! MUST impose zero per-request overhead.  The invariant is maintained at
+//! exactly two gating points — both checked against
+//! [`config::MainConfig::is_configured()`]:
+//!
+//! 1. **Log-phase handler gate** (`src/lib.rs` — `postconfiguration`):
+//!    `add_phase_handler` is called **only** when `amcf.is_configured()` is
+//!    true.  If the exporter is not configured the phase handler is never
+//!    registered and no per-request code runs.
+//!    See: [`HttpOtelModule::postconfiguration`] (the `if amcf.is_configured()`
+//!    block, currently around line 83).
+//!
+//! 2. **Export-task gate** (`src/lib.rs` — `ngx_otel_init_process`):
+//!    The async export loop is spawned **only** when `amcf.is_configured()` is
+//!    true.  If the exporter is not configured the process hook returns early
+//!    with no allocation, no task spawn, and no background activity.
+//!    See: [`ngx_otel_init_process`] (the `if !amcf.is_configured()` early
+//!    return, currently around line 133).
+//!
+//! **Invariant contract:**
+//! - No per-request allocation on the disabled path.
+//! - No per-request locking on the disabled path.
+//! - No background tasks on the disabled path.
+//!
+//! This is the load-bearing claim for upstream acceptance; see
+//! `PHASE_1.1_IMPLEMENTATION_PLAN.md` §"Non-negotiable constraints" and
+//! the upstream proposal §2.  Step 11 contains the benchmark harness that
+//! proves this claim statistically.
+
 #![no_std]
 extern crate std;
 

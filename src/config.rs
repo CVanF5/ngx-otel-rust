@@ -801,4 +801,36 @@ mod tests {
         assert_eq!(cfg.batch_size(), DEFAULT_BATCH_SIZE);
         assert!(cfg.status_code_class_enabled()); // UNSET treated as on
     }
+
+    /// Zero-cost-when-disabled invariant: the boolean gate relied upon by both
+    /// the log-phase handler and the export-task spawner.
+    ///
+    /// - No exporter endpoint → `is_configured()` must return `false` so that
+    ///   neither the phase handler is registered nor the export task is spawned.
+    /// - Exporter endpoint set → `is_configured()` must return `true` so that
+    ///   the operational path is enabled.
+    #[test]
+    fn test_is_configured_invariant() {
+        // Unconfigured: no exporter block → gate must be closed.
+        let unconfigured = MainConfig::default();
+        assert!(
+            !unconfigured.is_configured(),
+            "is_configured() must be false when no otel_exporter endpoint is set \
+             (zero-cost-when-disabled invariant)"
+        );
+
+        // Configured: exporter endpoint present → gate must be open.
+        let mut configured = MainConfig::default();
+        // Build a static byte slice for the endpoint string so the ngx_str_t
+        // points at valid memory for the duration of the test.
+        let endpoint_bytes: &'static [u8] = b"http://127.0.0.1:4318/v1/metrics";
+        configured.exporter.endpoint = nginx_sys::ngx_str_t {
+            len: endpoint_bytes.len(),
+            data: endpoint_bytes.as_ptr().cast_mut(),
+        };
+        assert!(
+            configured.is_configured(),
+            "is_configured() must be true when otel_exporter endpoint is set"
+        );
+    }
 }
