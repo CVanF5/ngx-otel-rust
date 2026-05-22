@@ -2,6 +2,11 @@ services:
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.152.0
     container_name: ngx-otel-test-collector
+    # Run as the host user so files written into the bind-mounted logs
+    # volume (metrics.json) are readable by the test scripts. lib.sh
+    # exports OTEL_HOST_UID/OTEL_HOST_GID before `docker compose up`.
+    # Default 10001 matches the image's built-in user when unset.
+    user: "${OTEL_HOST_UID:-10001}:${OTEL_HOST_GID:-10001}"
     command: ["--config=/etc/otelcol/config.yaml"]
     volumes:
       - ./otel-collector-config.yaml:/etc/otelcol/config.yaml:ro

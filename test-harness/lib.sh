@@ -108,7 +108,14 @@ ensure_collector_running() {
         # warming up.  Just wait.
         _harness_info "container ${COLLECTOR_CONTAINER} is running; waiting for endpoint to answer..."
     else
-        _harness_info "starting collector via docker compose..."
+        # The collector image's default user is UID 10001. The host script
+        # later reads test-harness/logs/metrics.json directly, so files
+        # created by the container must be readable by the host user.
+        # Run the container as the host user; docker-compose.yml consumes
+        # these via ${OTEL_HOST_UID}/${OTEL_HOST_GID} substitution.
+        export OTEL_HOST_UID="$(id -u)"
+        export OTEL_HOST_GID="$(id -g)"
+        _harness_info "starting collector via docker compose (uid=${OTEL_HOST_UID} gid=${OTEL_HOST_GID})..."
         if ! ( cd "${HARNESS_DIR}" && docker compose up -d >&2 ); then
             _harness_err "docker compose up failed"
             return 1
