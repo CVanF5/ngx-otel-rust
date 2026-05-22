@@ -1,1 +1,3 @@
 /target/
+# nginx-autoconf build output directories (one per BUILD flavor, see Makefile)
+/objs-*/
