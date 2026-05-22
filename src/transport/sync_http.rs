@@ -5,19 +5,22 @@
 
 //! Synchronous HTTP/1.1 POST client for use in `exit_process` callbacks.
 //!
-//! Provides a minimal blocking HTTP/1.1 POST using [`std::net::TcpStream`]
-//! with 500 ms connect/write/read budgets.  It is designed for use **outside
-//! the NGINX async event loop** — specifically in the `exit_process` module
+//! Provides a minimal blocking HTTP/1.1 POST over either
+//! [`std::net::TcpStream`] or [`std::os::unix::net::UnixStream`] with
+//! 500 ms connect/write/read budgets.  It is designed for use **outside the
+//! NGINX async event loop** — specifically in the `exit_process` module
 //! callback where the event loop is no longer running and
 //! `HyperHttpTransport` cannot be used.
 //!
 //! Does **not** depend on hyper or any other non-std crate.
 //!
-//! Only plain TCP endpoints (`http://`) are supported; `unix://` and
-//! `https://` return [`SyncSendError::UnsupportedScheme`].
+//! Plain TCP (`http://`) and Unix socket (`unix:`) endpoints are supported;
+//! `https://` returns [`SyncSendError::UnsupportedScheme`] because TLS is
+//! deferred to Phase 1.2.
 
 use std::io::{Read, Write};
 use std::net::ToSocketAddrs;
+use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use super::hyper_http::ParsedEndpoint;
@@ -45,8 +48,8 @@ pub enum SyncSendError {
     /// Reading the HTTP response failed.  Includes timeout when the read
     /// budget (`READ_TIMEOUT`) expires.
     Read(std::io::Error),
-    /// The configured endpoint uses a scheme (`unix://` or `https://`) that
-    /// requires non-blocking or TLS I/O; the sync TCP client cannot serve it.
+    /// The configured endpoint uses a scheme (`https://`) that requires TLS;
+    /// the sync client does not implement TLS (deferred to Phase 1.2).
     UnsupportedScheme,
 }
 
@@ -72,7 +75,7 @@ impl core::fmt::Display for SyncSendError {
             SyncSendError::UnsupportedScheme => write!(
                 f,
                 "endpoint scheme unsupported by sync client \
-                 (unix:// and https:// require the async transport)"
+                 (https:// requires TLS, deferred to Phase 1.2)"
             ),
         }
     }
@@ -96,8 +99,8 @@ impl core::fmt::Display for SyncSendError {
 ///
 /// # Errors
 /// Returns `SyncSendError` on connection failure, write failure, or read
-/// failure (including timeouts).  Unix socket and HTTPS endpoints return
-/// `SyncSendError::UnsupportedScheme`.
+/// failure (including timeouts).  HTTPS endpoints return
+/// `SyncSendError::UnsupportedScheme` (TLS deferred to Phase 1.2).
 pub fn sync_post(
     endpoint_str: &str,
     extra_headers: &[(std::string::String, std::string::String)],
@@ -108,45 +111,77 @@ pub fn sync_post(
     let endpoint = ParsedEndpoint::parse(endpoint_str)
         .map_err(|_| SyncSendError::UnsupportedScheme)?;
 
-    let (host, port, path) = match &endpoint {
-        ParsedEndpoint::Http { host, port, path } => (host.as_str(), *port, path.as_str()),
-        // Unix sockets need UnixStream; HTTPS needs TLS — both are out of scope
-        // for the sync client.  The exit_process path logs UnsupportedScheme and
-        // skips the flush gracefully.
-        ParsedEndpoint::Unix { .. } => return Err(SyncSendError::UnsupportedScheme),
-    };
+    match endpoint {
+        ParsedEndpoint::Http { host, port, path } => {
+            // Build the HTTP/1.1 request using host:port as the authority,
+            // matching HyperHttpTransport's behaviour for TCP endpoints.
+            let authority = if port == 80 {
+                std::string::String::from(&host)
+            } else {
+                std::format!("{}:{}", host, port)
+            };
+            let request = build_http_request(&authority, &path, extra_headers, body);
 
-    // Resolve the address.  DNS is blocking; that is acceptable here because
-    // exit_process runs outside the NGINX async event loop.
-    let addr = (host, port)
-        .to_socket_addrs()
-        .map_err(SyncSendError::Connect)?
-        .next()
-        .ok_or_else(|| {
-            SyncSendError::Connect(std::io::Error::new(
-                std::io::ErrorKind::AddrNotAvailable,
-                "no addresses resolved for endpoint host",
-            ))
-        })?;
+            // Resolve the address.  DNS is blocking; that is acceptable here
+            // because exit_process runs outside the NGINX async event loop.
+            let addr = (host.as_str(), port)
+                .to_socket_addrs()
+                .map_err(SyncSendError::Connect)?
+                .next()
+                .ok_or_else(|| {
+                    SyncSendError::Connect(std::io::Error::new(
+                        std::io::ErrorKind::AddrNotAvailable,
+                        "no addresses resolved for endpoint host",
+                    ))
+                })?;
 
-    // Connect with a hard deadline so a refused or unreachable collector
-    // does not stall worker exit beyond the 500 ms budget.
-    let mut stream = std::net::TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
-        .map_err(SyncSendError::Connect)?;
-    stream
-        .set_write_timeout(Some(WRITE_TIMEOUT))
-        .map_err(SyncSendError::Write)?;
-    stream
-        .set_read_timeout(Some(READ_TIMEOUT))
-        .map_err(SyncSendError::Read)?;
+            // Connect with a hard deadline so a refused or unreachable
+            // collector does not stall worker exit beyond the 500 ms budget.
+            let mut stream = std::net::TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
+                .map_err(SyncSendError::Connect)?;
+            stream
+                .set_write_timeout(Some(WRITE_TIMEOUT))
+                .map_err(SyncSendError::Write)?;
+            stream
+                .set_read_timeout(Some(READ_TIMEOUT))
+                .map_err(SyncSendError::Read)?;
 
-    // Build the HTTP/1.1 request.
-    let authority = if port == 80 {
-        std::string::String::from(host)
-    } else {
-        std::format!("{}:{}", host, port)
-    };
+            send_request_and_read_response(&mut stream, &request)
+        }
+        ParsedEndpoint::Unix { socket_path, http_path } => {
+            // Unix-socket endpoints use "localhost" as the Host header, matching
+            // HyperHttpTransport::authority() for the Unix variant.
+            let request = build_http_request("localhost", &http_path, extra_headers, body);
 
+            // UnixStream::connect has no built-in timeout, but a local
+            // Unix-socket connect is sub-millisecond — if the server isn't
+            // there, connect fails immediately with ECONNREFUSED.  The 500 ms
+            // write/read timeouts below bound the rest of the send window so
+            // a wedged peer cannot stall worker exit.
+            let mut stream = UnixStream::connect(&socket_path)
+                .map_err(SyncSendError::Connect)?;
+            stream
+                .set_write_timeout(Some(WRITE_TIMEOUT))
+                .map_err(SyncSendError::Write)?;
+            stream
+                .set_read_timeout(Some(READ_TIMEOUT))
+                .map_err(SyncSendError::Read)?;
+
+            send_request_and_read_response(&mut stream, &request)
+        }
+    }
+}
+
+/// Build the on-wire HTTP/1.1 request bytes for a sync POST.
+///
+/// Used by both the TCP and Unix-socket paths so the two stay byte-identical
+/// modulo authority (`host:port` vs `localhost`) and path.
+fn build_http_request(
+    authority: &str,
+    path: &str,
+    extra_headers: &[(std::string::String, std::string::String)],
+    body: &[u8],
+) -> std::vec::Vec<u8> {
     let mut request = std::format!(
         "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/x-protobuf\r\nContent-Length: {}\r\nConnection: close\r\n",
         path,
@@ -162,15 +197,22 @@ pub fn sync_post(
     request.extend_from_slice(b"\r\n");
     // Body.
     request.extend_from_slice(body);
+    request
+}
 
-    // One write: headers + body together.
-    stream.write_all(&request).map_err(SyncSendError::Write)?;
-
-    // One read: enough to receive the response status line.  We do not parse
-    // the status code — the collector either got it or it didn't.
+/// Write the request and read up to 512 response bytes.
+///
+/// Generic over the stream type so both `TcpStream` and `UnixStream` share
+/// the same write-then-read sequence.  We do not parse the response status —
+/// the collector either got the bytes before the read budget elapsed or it
+/// didn't.
+fn send_request_and_read_response<S: Read + Write>(
+    stream: &mut S,
+    request: &[u8],
+) -> Result<(), SyncSendError> {
+    stream.write_all(request).map_err(SyncSendError::Write)?;
     let mut buf = [0u8; 512];
     stream.read(&mut buf).map_err(SyncSendError::Read)?;
-
     Ok(())
 }
 
@@ -215,6 +257,77 @@ mod tests {
             raw.starts_with("POST /v1/metrics HTTP/1.1\r\n"),
             "request line mismatch; got: {:?}",
             raw.get(..60.min(raw.len())).unwrap_or(&raw)
+        );
+        assert!(
+            raw.contains("Content-Type: application/x-protobuf\r\n"),
+            "Content-Type header missing; raw request: {:?}",
+            raw.get(..200.min(raw.len())).unwrap_or(&raw)
+        );
+        let expected_cl = std::format!("Content-Length: {}\r\n", body.len());
+        assert!(
+            raw.contains(expected_cl.as_str()),
+            "Content-Length header missing or wrong; expected {:?}",
+            expected_cl
+        );
+    }
+
+    /// Same shape as the TCP test, but with a unix-socket endpoint.  Verifies:
+    ///   - the unix-socket branch is wired up at all (was previously rejected
+    ///     with `UnsupportedScheme`)
+    ///   - the request line is `POST /v1/metrics HTTP/1.1\r\n` (the hardcoded
+    ///     http_path from `ParsedEndpoint::parse` for unix endpoints)
+    ///   - the `Host` header is `localhost` (matches HyperHttpTransport)
+    ///   - Content-Type / Content-Length are well-formed
+    #[test]
+    fn sync_post_via_unix_socket_sends_correct_http_request() {
+        use std::os::unix::net::UnixListener;
+
+        // Build a unique socket path under /tmp so parallel test runs don't
+        // collide.  Pid + nanos is sufficient; we clean up at the end.
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let socket_path = std::format!("/tmp/ngx-otel-sync-uds-{}-{}.sock", pid, nanos);
+
+        // Defensive: remove any stale file at the path so bind() succeeds.
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path).expect("bind unix socket");
+
+        let cleanup_path = socket_path.clone();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().expect("accept");
+            let mut buf = std::vec![0u8; 8192];
+            let n = conn.read(&mut buf).expect("read request");
+            buf.truncate(n);
+            conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .expect("write response");
+            let _ = std::fs::remove_file(&cleanup_path);
+            buf
+        });
+
+        let body = b"\x00\x01\x02\x03protobuf-payload";
+        let endpoint = std::format!("unix:{}", socket_path);
+        let result = sync_post(&endpoint, &[], body);
+        let request_bytes = server.join().expect("server thread panicked");
+
+        assert!(
+            result.is_ok(),
+            "sync_post over unix must succeed: {:?}",
+            result.err()
+        );
+
+        let raw = std::string::String::from_utf8_lossy(&request_bytes);
+        assert!(
+            raw.starts_with("POST /v1/metrics HTTP/1.1\r\n"),
+            "request line mismatch; got: {:?}",
+            raw.get(..60.min(raw.len())).unwrap_or(&raw)
+        );
+        assert!(
+            raw.contains("Host: localhost\r\n"),
+            "Host header should be 'localhost' for unix sockets; raw request: {:?}",
+            raw.get(..200.min(raw.len())).unwrap_or(&raw)
         );
         assert!(
             raw.contains("Content-Type: application/x-protobuf\r\n"),
