@@ -20,17 +20,25 @@
 //!
 //! # Step 10 note
 //! `MainConfig` is captured at spawn time (worker 0 startup).  On SIGHUP
-//! reload NGINX creates a new cycle and a new config; the export loop must be
-//! restarted.  Step 10 will handle the reload handoff — this step does not
-//! address it.
+//! reload NGINX creates a new cycle and a new config; the export loop is
+//! restarted naturally in each new worker generation by `init_process`.
+//! `MainConfig::old_config` provides the hook for Phase 1.2 cross-cycle
+//! state transfer (TLS connection reuse, etc.).
+//!
+//! The documented Phase 1.1 graceful-drain limitation (SIGQUIT during sleep)
+//! is closed in Step 10 by the `exit_process` callback in `src/lib.rs`,
+//! which calls [`exit_process_flush`].  See [`graceful_drain`] for details.
 //!
 //! # Documented Phase 1.1 limitation — graceful drain on SIGQUIT
 //! When SIGQUIT arrives while the loop is between intervals (asleep), the
 //! drain may not fire: ngx-rust's `Sleep` registers a cancelable nginx timer,
 //! and nginx's worker exit logic does not wait for cancelable timers. The
 //! drain fires reliably only when SIGQUIT arrives during the active part of
-//! the loop body. See [`graceful_drain`] for the full diagnosis and the
-//! Phase 1.2 follow-up.
+//! the loop body. See [`graceful_drain`] for the full diagnosis.
+//!
+//! **This limitation is closed in Step 10**: the `exit_process` callback in
+//! `src/lib.rs` calls [`exit_process_flush`], which performs a synchronous
+//! final send that fires unconditionally when the worker exits.
 
 use core::future::Future;
 use core::pin::Pin;
@@ -61,6 +69,17 @@ pub static DROPPED_RECORDS: AtomicU64 = AtomicU64::new(0);
 
 /// Cumulative count of transport send failures since worker startup.
 pub static SEND_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// Unix epoch nanoseconds when this worker's export loop started.
+///
+/// Written once by [`export_loop`] immediately after computing `worker_start_ns`.
+/// Read by [`exit_process_flush`] to anchor the final batch's
+/// `start_time_unix_nano`. Value 0 means the loop has not yet started
+/// (e.g., SIGQUIT arrived before the first async task iteration ran).
+///
+/// Process-global static: each forked worker inherits a zeroed copy and
+/// sets its own value independently. No cross-process coordination needed.
+pub static WORKER_START_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Wall-clock budget for the graceful drain on `ngx_exiting`. Each send attempt
 /// inside the drain is capped at this duration so a dead collector cannot
@@ -184,6 +203,9 @@ pub async fn export_loop(amcf: &'static MainConfig) {
     // for cumulative monotonic Sum self-metrics so that downstream rate
     // panels and delta-conversion processors can anchor windows correctly.
     let worker_start_ns = now_unix_nano();
+    // Publish to the process-global atomic so that exit_process_flush can
+    // read the same epoch anchor without re-computing it (see WORKER_START_NS).
+    WORKER_START_NS.store(worker_start_ns, Ordering::Relaxed);
 
     // Retry buffer: (encoded bytes, number of data points in that batch).
     // Depth is configured (see `MainConfig::retry_buffer_depth`) so that
@@ -360,11 +382,12 @@ pub async fn export_loop(amcf: &'static MainConfig) {
 /// it. The drain DOES fire reliably when SIGQUIT arrives during the active
 /// part of the loop body (collect/encode/send/retry).
 ///
-/// Full fix is deferred to Phase 1.2:
-///   - either an `exit_process` module callback that does a synchronous final
-///     send (bypasses the cancelable-timer issue entirely), or
-///   - an upstream patch to ngx-rust adding a non-cancelable `Sleep` variant.
-/// Step 10 (SIGHUP reload) faces the same constraint and will resolve both.
+/// **This limitation is closed in Step 10** by the `exit_process` callback
+/// in `src/lib.rs`, which calls [`exit_process_flush`]. That callback fires
+/// unconditionally when the worker exits — bypassing the cancelable-timer
+/// race entirely. Both paths may fire when SIGQUIT arrives during the active
+/// part of the loop body; the worst case is a duplicate batch at the
+/// collector, which it deduplicates via timestamps.
 async fn graceful_drain(
     transport: &mut HyperHttpTransport<NgxConnector>,
     retry_queue: &mut VecDeque<(std::vec::Vec<u8>, u64)>,
@@ -552,7 +575,12 @@ fn count_data_points(batch: &Batch) -> u64 {
 }
 
 /// Collect from all configured [`MetricSource`]s and assemble a [`Batch`].
-fn collect_all_sources(amcf: &'static MainConfig, worker_start_ns: u64) -> Batch {
+///
+/// Accepts `&MainConfig` rather than `&'static MainConfig` so it can be
+/// called from both the async export loop (which holds `'static`) and from
+/// synchronous paths like [`exit_process_flush`] that hold a shorter-lived
+/// reference to the current cycle's config.
+fn collect_all_sources(amcf: &MainConfig, worker_start_ns: u64) -> Batch {
     let mut metrics = std::vec::Vec::new();
 
     // 1. NGINX connection / request counters (stub_status equivalents).
@@ -664,6 +692,104 @@ fn gauge_metric(name: &str, desc: &str, unit: &str, value: i64, time_ns: u64) ->
                 value: NumberValue::AsInt(value),
             }],
         }),
+    }
+}
+
+// ── exit_process flush ────────────────────────────────────────────────────────
+
+/// Synchronous final flush for the `exit_process` module callback.
+///
+/// Collects one final batch from all configured [`MetricSource`]s, encodes it,
+/// and ships it via the synchronous HTTP client in
+/// [`crate::transport::sync_http`].  Uses a 500 ms budget for each I/O phase.
+///
+/// This function **closes the Phase 1.1 graceful-drain limitation** described
+/// in [`graceful_drain`]: the async drain may not fire when SIGQUIT arrives
+/// while the export loop is between intervals (asleep on a cancelable timer).
+/// `exit_process_flush` fires unconditionally when the worker exits, covering
+/// that gap.
+///
+/// If both the async drain and `exit_process_flush` fire (e.g., SIGQUIT
+/// arrives during the active part of the loop body), the worst case is a
+/// duplicate batch arriving at the collector; the collector deduplicates via
+/// timestamps.
+///
+/// # Called from
+/// `ngx_otel_exit_process` in `src/lib.rs`, gated on Worker 0 / single-process
+/// mode.  Do not call from other contexts.
+pub fn exit_process_flush(amcf: &MainConfig) {
+    let log = ngx::log::ngx_cycle_log();
+
+    // Read the epoch anchor published by export_loop at startup.
+    let worker_start_ns = WORKER_START_NS.load(Ordering::Acquire);
+    if worker_start_ns == 0 {
+        // export_loop never ran its first iteration (e.g., SIGQUIT arrived
+        // before the async task was polled).  Nothing to flush.
+        return;
+    }
+
+    ngx::ngx_log_error!(
+        NGX_LOG_NOTICE,
+        log.as_ptr(),
+        "exit_process: sync flush starting"
+    );
+
+    let batch = collect_all_sources(amcf, worker_start_ns);
+    let n_pts = count_data_points(&batch);
+
+    if n_pts == 0 {
+        return;
+    }
+
+    let encoder = OtlpHttpEncoder;
+    let bytes = encoder.encode(&batch);
+
+    let endpoint_str = match core::str::from_utf8(amcf.exporter.endpoint.as_bytes()) {
+        Ok(s) => s,
+        Err(_) => {
+            ngx::ngx_log_error!(
+                NGX_LOG_ERR,
+                log.as_ptr(),
+                "exit_process: sync flush: endpoint is not valid UTF-8, skipping"
+            );
+            return;
+        }
+    };
+
+    let headers: std::vec::Vec<(std::string::String, std::string::String)> = amcf
+        .exporter_headers
+        .iter()
+        .filter_map(|kv| {
+            let k = std::string::String::from(core::str::from_utf8(kv.key.as_bytes()).ok()?);
+            let v = std::string::String::from(core::str::from_utf8(kv.value.as_bytes()).ok()?);
+            Some((k, v))
+        })
+        .collect();
+
+    match crate::transport::sync_http::sync_post(endpoint_str, &headers, &bytes) {
+        Ok(()) => {
+            ngx::ngx_log_error!(
+                NGX_LOG_NOTICE,
+                log.as_ptr(),
+                "exit_process: sync flush complete ({} data points)",
+                n_pts
+            );
+        }
+        Err(ref e) if e.is_timeout() => {
+            ngx::ngx_log_error!(
+                NGX_LOG_NOTICE,
+                log.as_ptr(),
+                "exit_process: sync flush timed out"
+            );
+        }
+        Err(ref e) => {
+            ngx::ngx_log_error!(
+                NGX_LOG_ERR,
+                log.as_ptr(),
+                "exit_process: sync flush failed: {}",
+                e
+            );
+        }
     }
 }
 

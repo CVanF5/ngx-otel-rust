@@ -55,7 +55,7 @@ pub static mut ngx_http_otel_module: ngx_module_t = ngx_module_t {
     init_process: Some(ngx_otel_init_process),
     init_thread: None,
     exit_thread: None,
-    exit_process: None,
+    exit_process: Some(ngx_otel_exit_process),
     exit_master: None,
 
     ..ngx_module_t::default()
@@ -163,6 +163,46 @@ extern "C" fn ngx_otel_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
     }
 
     Status::NGX_OK.into()
+}
+
+// ── exit_process callback ─────────────────────────────────────────────────────
+
+/// Called by NGINX when the worker process is exiting (SIGQUIT, SIGHUP-induced
+/// shutdown, or natural exit).
+///
+/// Performs a synchronous final flush via [`export::exit_process_flush`] to
+/// close the Phase 1.1 graceful-drain limitation: the async drain in
+/// `graceful_drain` may not fire when SIGQUIT arrives while the export loop is
+/// between intervals (asleep on a cancelable timer).  This callback fires
+/// unconditionally and sends one final batch via the sync HTTP client before
+/// the worker exits.
+///
+/// Only runs for Worker 0 or single-process mode — the designated worker that
+/// holds the export state.  Other workers return immediately.
+unsafe extern "C" fn ngx_otel_exit_process(cycle: *mut ngx_cycle_t) {
+    let process_type = unsafe { nginx_sys::ngx_process } as u32;
+    let worker_num = unsafe { nginx_sys::ngx_worker };
+
+    let is_designated = matches!(
+        (process_type, worker_num as u32),
+        (nginx_sys::NGX_PROCESS_WORKER, 0) | (nginx_sys::NGX_PROCESS_SINGLE, _)
+    );
+
+    if !is_designated {
+        return;
+    }
+
+    // Retrieve the main HTTP config for this cycle.
+    let cycle_ref = unsafe { &mut *cycle };
+    let Some(amcf) = HttpOtelModule::main_conf(cycle_ref) else {
+        return;
+    };
+
+    if !amcf.is_configured() {
+        return;
+    }
+
+    export::exit_process_flush(amcf);
 }
 
 /// Test-only stubs for nginx symbols referenced (but never called) in our code.

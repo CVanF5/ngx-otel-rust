@@ -102,7 +102,7 @@ pub(crate) enum ParsedEndpoint {
 }
 
 impl ParsedEndpoint {
-    fn parse(input: &str) -> Result<Self, TransportError> {
+    pub(crate) fn parse(input: &str) -> Result<Self, TransportError> {
         if let Some(rest) = input.strip_prefix("http://") {
             let (authority, path) = match rest.find('/') {
                 Some(i) => (&rest[..i], std::string::String::from(&rest[i..])),

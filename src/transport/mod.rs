@@ -11,6 +11,7 @@
 //! sockets. HTTPS support is reserved for a later phase.
 
 pub mod hyper_http;
+pub mod sync_http;
 
 use thiserror::Error;
 
