@@ -76,8 +76,7 @@ if [[ ! -x "${NGINX_BINARY}" ]]; then
     exit 1
 fi
 
-if ! curl -sf http://127.0.0.1:4318/ >/dev/null 2>&1 && \
-   ! curl -sf http://127.0.0.1:4318/v1/metrics -X POST -d '{}' >/dev/null 2>&1; then
+if ! curl -s --connect-timeout 2 http://127.0.0.1:4318/ >/dev/null 2>&1; then
     echo "ERROR: OTel collector not reachable at 127.0.0.1:4318" >&2
     echo "       Start it with: docker compose -f ${REPO_ROOT}/test-harness/docker-compose.yml up -d" >&2
     exit 1
@@ -101,7 +100,18 @@ info "Module built: ${MODULE_PATH}"
 # ─── Sandbox prefix directory ────────────────────────────────────────────────
 
 PREFIX="$(mktemp -d /tmp/ngx-otel-step9.XXXXXX)"
-trap 'info "Tearing down ${PREFIX}"; rm -rf "${PREFIX}"; [[ -n "${NGINX_PID:-}" ]] && kill "${NGINX_PID}" 2>/dev/null || true' EXIT
+cleanup() {
+    [[ -n "${NGINX_PID:-}" ]] && kill "${NGINX_PID}" 2>/dev/null || true
+    echo ""
+    echo "=== error.log (first 40 lines) ==="
+    head -40 "${PREFIX}/logs/error.log" 2>/dev/null || echo "(not found)"
+    echo "..."
+    echo "=== error.log (last 30 lines) ==="
+    tail -30 "${PREFIX}/logs/error.log" 2>/dev/null
+    info "Tearing down ${PREFIX}"
+    rm -rf "${PREFIX}"
+}
+trap cleanup EXIT
 
 mkdir -p "${PREFIX}/logs"
 mkdir -p "${PREFIX}/client_body_temp"
@@ -125,10 +135,12 @@ info "metrics.json pre-size: ${PRE_SIZE} bytes"
 # ─── Start NGINX ─────────────────────────────────────────────────────────────
 
 info "Starting nginx (worker_processes 4)..."
+# Note: error_log is already set in nginx.conf; do NOT pass -g "error_log ..."
+# here as that would create a second log target and double every line, causing
+# the "exactly 1 spawning export task" assertion to fail.
 "${NGINX_BINARY}" \
     -p "${PREFIX}" \
-    -c "${PREFIX}/nginx.conf" \
-    -g "error_log ${PREFIX}/logs/error.log debug;" &
+    -c "${PREFIX}/nginx.conf" &
 NGINX_PID=$!
 
 # Give nginx time to fork workers and run init_process.

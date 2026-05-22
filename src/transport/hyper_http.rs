@@ -800,8 +800,13 @@ fn build_ipv4_sockaddr(
         let sa = &mut *ptr;
         sa.sin_family = libc::AF_INET as libc::sa_family_t;
         sa.sin_port   = port.to_be();
-        // v4.octets() is already in network byte order.
-        sa.sin_addr.s_addr = u32::from_be_bytes(v4.octets());
+        // v4.octets() gives the four address bytes in network (big-endian) order.
+        // `from_ne_bytes` reinterprets those bytes in the machine's native order
+        // so that when the u32 is later read byte-by-byte by the kernel it sees
+        // the original network-order bytes — i.e. 127.0.0.1 stays 127.0.0.1.
+        // Using `from_be_bytes` would produce the WRONG layout on little-endian
+        // hosts (the bytes would be reversed, mapping 127.0.0.1 → 1.0.0.127).
+        sa.sin_addr.s_addr = u32::from_ne_bytes(v4.octets());
     }
 
     Ok(ptr.cast::<nginx_sys::sockaddr>())
