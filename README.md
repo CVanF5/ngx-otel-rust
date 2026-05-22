@@ -37,14 +37,60 @@ What works today:
 
 What's pending in Phase 1.1:
 
-- Step 12 stress + acceptance test suite (10-min sustained load,
-  collector-downtime injection, 24h soak harness, acceptance criteria
-  sweep).  See [`RALPH_STEP_12.md`](../RALPH_STEP_12.md).
+- Step 12 stress + acceptance test suite — 10-minute sustained load
+  with bounded memory growth, collector-downtime injection via
+  `docker stop` (drops accounted via `ngx_otel.dropped_records`
+  self-metric), a 24-hour soak harness, and a sweep of the Phase 1.1
+  acceptance criteria.  Tracked in F5-internal development notes;
+  not on this repo's roadmap until after Phase B (Test::Nginx
+  migration) lands.
 
 Phase 1.2 onward (logs, traces, NGINX Plus, OTAP) is out of scope here.
 See the Confluence proposal (link below) for the full phase plan.
 
-## Architecture (one paragraph)
+## Architecture
+
+```mermaid
+flowchart LR
+    Req((HTTP<br/>requests))
+
+    subgraph workers["NGINX worker processes"]
+        direction TB
+        W0["Worker 0<br/>(designated)"]
+        W1[Worker 1]
+        WN[Worker N]
+    end
+
+    subgraph shm["Per-worker shm slots<br/>(no cross-worker writes)"]
+        direction TB
+        S0[("Slot 0")]
+        S1[("Slot 1")]
+        SN[("Slot N")]
+    end
+
+    subgraph loop["Async export loop on Worker 0<br/>(every otel_metric_interval)"]
+        direction LR
+        Src["MetricSource"] --> Enc["Encoder<br/>OTLP protobuf"] --> Tx["Transport<br/>hyper on NgxConnIo"]
+    end
+
+    NS[("ngx_stat_*<br/>atomics")]
+    Coll[("OTel<br/>Collector")]
+
+    Req --> W0
+    Req --> W1
+    Req --> WN
+
+    W0 -->|"Log-phase<br/>atomic +="| S0
+    W1 -->|"Log-phase<br/>atomic +="| S1
+    WN -->|"Log-phase<br/>atomic +="| SN
+
+    S0 -.read.-> Src
+    S1 -.read.-> Src
+    SN -.read.-> Src
+    NS -.read.-> Src
+
+    Tx -->|"HTTP/1.1 POST<br/>/v1/metrics"| Coll
+```
 
 Per-worker shm counter slots for instrumented metrics; atomic increments
 from a Log-phase handler write to the worker's own slot only (no
@@ -56,6 +102,12 @@ and sends via [hyper] 1.x driven on a `NgxConnIo` adapter that wraps
 readiness wakeup (no spinning, no blocking).  Three trait boundaries —
 `MetricSource`, `Encoder`, `Transport` — keep an eventual OTAP /
 columnar migration a swap, not a rewrite.
+
+When `otel_exporter` is not configured the Log-phase handler is not
+registered and the export task is not spawned — no work runs on the
+request path, no background task runs in any worker.  This is the
+"zero-cost-when-disabled" invariant the module's upstream-acceptance
+case rests on.
 
 [hyper]: https://hyper.rs/
 
@@ -69,10 +121,12 @@ columnar migration a swap, not a rewrite.
 - Rust toolchain (1.81.0 or later).
 - `pkg-config` or `pkgconf`.
 - `libclang` for rust-bindgen.
-- Optional: Docker for the local OTel collector harness used by
-  integration tests (see `test-harness/` under the parent directory in
-  the source tree this repo was developed in; setting up your own
-  OTLP/HTTP receiver on `127.0.0.1:4318` is the only requirement).
+- Optional: a running OTel collector reachable at
+  `127.0.0.1:4318` (OTLP/HTTP).  The integration tests assert against
+  metrics arriving at the collector, so any OTLP/HTTP receiver works.
+  A typical local setup is `otel/opentelemetry-collector-contrib` in
+  Docker with an `otlp/http` receiver and a `debug` or `file`
+  exporter.
 
 The NGINX and its dependency versions should match the ones you plan to
 deploy, including any patches that change the API.
@@ -308,5 +362,4 @@ ngx-otel-rust/
 
 ## License
 
-Apache-2.0.  See [`LICENSE`](LICENSE) when present, or `Cargo.toml`'s
-`license` field.
+Apache-2.0.  See [`LICENSE`](LICENSE).
