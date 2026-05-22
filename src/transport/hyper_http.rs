@@ -743,11 +743,23 @@ impl Connector for NgxConnector {
 
                 // Build and install the sockaddr into pc before connecting.
                 let sockaddr_ptr = build_ipv4_sockaddr(&io.pool, host, *port)?;
+
+                // Build and install pc.name.  REQUIRED under `--with-debug`:
+                // `ngx_event_connect_peer` logs `"connect to %V, fd:%d #%uA"`
+                // via `ngx_log_debug3` (ngx_event_connect.c:206) which
+                // dereferences `pc->name` as `ngx_str_t *`.  With NGX_DEBUG
+                // undefined the macro expands to nothing (ngx_log.h:221) so
+                // a NULL `pc.name` is harmless; with `--with-debug` it
+                // expands to an active call (ngx_log.h:185-187) and the NULL
+                // deref crashes the worker.  See nginx-acme's
+                // `PeerConnection::connect` for the precedent.
+                let name_ptr = build_pc_name(&io.pool, host, *port)?;
                 {
                     let this = io.as_mut().get_mut();
                     this.pc.sockaddr = sockaddr_ptr;
                     this.pc.socklen  =
                         core::mem::size_of::<libc::sockaddr_in>() as nginx_sys::socklen_t;
+                    this.pc.name     = name_ptr;
                 }
 
                 future::poll_fn(|cx| io.as_mut().poll_connect(cx))
@@ -763,6 +775,59 @@ impl Connector for NgxConnector {
             }),
         }
     }
+}
+
+/// Allocate an `ngx_str_t` ("host:port") in `pool` for `pc.name`.
+///
+/// Required by `ngx_event_connect_peer`, which logs the peer name via
+/// `ngx_log_debug3(...,"connect to %V, fd:%d #%uA", pc->name, ...)`
+/// (`nginx/src/event/ngx_event_connect.c:206`).  The `%V` formatter
+/// dereferences `pc->name` as `ngx_str_t *`.  Under release nginx the
+/// `ngx_log_debug3` macro expands to nothing (`ngx_log.h:221`) so a NULL
+/// `pc.name` is harmless; under `--with-debug` (NGX_DEBUG=1) the macro
+/// expands to an active log call (`ngx_log.h:185-187`) and the NULL
+/// dereference crashes the worker on every connect attempt.
+///
+/// Symptom before this fix: workers SIGSEGV at every `otel_metric_interval`
+/// tick under debug builds, immediately after the `"stream socket %d"`
+/// debug line in `ngx_event_connect.c:43` and before the `"connect to %V"`
+/// line in `ngx_event_connect.c:206` ever appears.
+///
+/// Both the byte buffer and the `ngx_str_t` struct are allocated in the
+/// connection's pool, so they live exactly as long as the `NgxConnIo` that
+/// owns them.  `Drop for OwnedNgxPool` calls `ngx_destroy_pool` — no leak.
+///
+/// Mirrors the precedent in `nginx-acme/src/net/peer_conn.rs:170-180`.
+fn build_pc_name(
+    pool: &Pool,
+    host: &str,
+    port: u16,
+) -> Result<*mut nginx_sys::ngx_str_t, TransportError> {
+    let s     = std::format!("{}:{}", host, port);
+    let bytes = s.as_bytes();
+    let len   = bytes.len();
+
+    let data_ptr = unsafe { ngx_palloc(pool.as_ptr(), len) } as *mut u8;
+    if data_ptr.is_null() {
+        return Err(TransportError::Connection {
+            cause: std::string::String::from("pool alloc for pc.name data failed"),
+        });
+    }
+    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), data_ptr, len) };
+
+    let name_ptr = unsafe {
+        ngx_palloc(pool.as_ptr(), core::mem::size_of::<nginx_sys::ngx_str_t>())
+    } as *mut nginx_sys::ngx_str_t;
+    if name_ptr.is_null() {
+        return Err(TransportError::Connection {
+            cause: std::string::String::from("pool alloc for pc.name struct failed"),
+        });
+    }
+    unsafe {
+        (*name_ptr).len  = len;
+        (*name_ptr).data = data_ptr;
+    }
+    Ok(name_ptr)
 }
 
 /// Allocate a `sockaddr_in` in `pool` for the given host:port.
