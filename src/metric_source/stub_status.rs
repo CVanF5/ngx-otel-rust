@@ -207,9 +207,11 @@ mod tests {
         assert!(names.contains(&"nginx.connections.writing"));
         assert!(names.contains(&"nginx.connections.waiting"));
 
-        // Each metric has exactly one data point.
+        // Each metric has exactly one data point (stub_status only emits histograms).
         for m in &metrics {
-            let MetricData::Histogram(ref h) = m.data;
+            let MetricData::Histogram(ref h) = m.data else {
+                panic!("stub_status must only emit histogram metrics; got non-histogram for {}", m.name);
+            };
             assert_eq!(h.data_points.len(), 1, "metric {} has wrong #points", m.name);
         }
     }

@@ -41,6 +41,9 @@ const UNSET_U64: u64 = u64::MAX;
 const DEFAULT_INTERVAL_MS: u64 = 10_000;
 // Default batch size
 const DEFAULT_BATCH_SIZE: u64 = 100;
+/// Default retry-buffer depth used by [`MainConfig::retry_buffer_depth`].
+/// See the spec-inconsistency note on that method.
+const DEFAULT_RETRY_BUFFER_DEPTH: usize = 4;
 
 /// Per-worker key-value pair stored in NGINX pool memory.
 /// Both key and value are ngx_str_t slices into the configuration file buffer.
@@ -126,13 +129,32 @@ impl MainConfig {
         }
     }
 
-    /// Effective batch size.
+    /// Effective batch size (max data points per encoded batch).
+    ///
+    /// **NOTE — currently unused.** The export loop emits one batch per
+    /// interval regardless of size; the directive is reserved for a future
+    /// iteration that chunks large collections. Do not remove without
+    /// updating the directive table.
+    #[allow(dead_code)]
     pub fn batch_size(&self) -> u64 {
         if self.metric_batch_size == UNSET_U64 {
             DEFAULT_BATCH_SIZE
         } else {
             self.metric_batch_size
         }
+    }
+
+    /// Maximum number of *unsent* batches the export loop holds in its retry
+    /// buffer on send failure. Older entries are evicted oldest-first.
+    ///
+    /// Distinct from [`batch_size`](Self::batch_size), which is points-per-batch.
+    /// The Step 9 spec's claim that "depth from otel_metric_batch_size, default
+    /// reasonable 4-8 batches" is internally inconsistent (batch_size defaults
+    /// to 100, which would buffer 10k+ points). The "reasonable default" reading
+    /// wins here. Currently a constant; promotable to a directive if operators
+    /// need to tune it.
+    pub fn retry_buffer_depth(&self) -> usize {
+        DEFAULT_RETRY_BUFFER_DEPTH
     }
 
     /// Whether HTTP status code class bucketing is enabled (default: true).
@@ -250,13 +272,19 @@ impl MainConfig {
         Ok(())
     }
 
-    /// Returns the base address of the shared memory zone.
+    /// Returns the base address of our WorkerSlots data within the shared memory zone.
+    ///
+    /// This is `shm.addr + data_offset()` — past the nginx slab-pool header that
+    /// `ngx_init_zone_pool` writes at the very start of every shm zone.
     ///
     /// Returns `None` if the zone is not yet initialised.
     pub fn shm_base(&self) -> Option<*mut u8> {
         let zone = unsafe { self.shm_zone.as_ref()? };
         let addr = zone.shm.addr;
-        if addr.is_null() { None } else { Some(addr.cast()) }
+        if addr.is_null() {
+            return None;
+        }
+        Some(unsafe { addr.cast::<u8>().add(crate::shm::data_offset()) })
     }
 }
 

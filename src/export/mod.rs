@@ -23,17 +23,29 @@
 //! reload NGINX creates a new cycle and a new config; the export loop must be
 //! restarted.  Step 10 will handle the reload handoff — this step does not
 //! address it.
+//!
+//! # Documented Phase 1.1 limitation — graceful drain on SIGQUIT
+//! When SIGQUIT arrives while the loop is between intervals (asleep), the
+//! drain may not fire: ngx-rust's `Sleep` registers a cancelable nginx timer,
+//! and nginx's worker exit logic does not wait for cancelable timers. The
+//! drain fires reliably only when SIGQUIT arrives during the active part of
+//! the loop body. See [`graceful_drain`] for the full diagnosis and the
+//! Phase 1.2 follow-up.
 
+use core::future::Future;
+use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
+use core::task::{Context, Poll};
 use core::time::Duration;
 use std::collections::VecDeque;
 
 use nginx_sys::{NGX_LOG_ERR, NGX_LOG_NOTICE};
+use pin_project_lite::pin_project;
 
 use crate::config::MainConfig;
 use crate::data_model::{
-    AggregationTemporality, AnyValue, Batch, HistogramData, HistogramDataPoint, KeyValue, Metric,
-    MetricData, Resource, Scope,
+    AggregationTemporality, AnyValue, Batch, GaugeData, KeyValue, Metric, MetricData,
+    NumberDataPoint, NumberValue, Resource, Scope, SumData,
 };
 use crate::encoder::{Encoder, OtlpHttpEncoder};
 use crate::metric_source::MetricSource;
@@ -50,9 +62,24 @@ pub static DROPPED_RECORDS: AtomicU64 = AtomicU64::new(0);
 /// Cumulative count of transport send failures since worker startup.
 pub static SEND_FAILURES: AtomicU64 = AtomicU64::new(0);
 
-/// Maximum number of unsent batches held in the retry buffer.
-/// Oldest entries are evicted when this depth is reached.
-const RETRY_BUFFER_DEPTH: usize = 4;
+/// Wall-clock budget for the graceful drain on `ngx_exiting`. Each send attempt
+/// inside the drain is capped at this duration so a dead collector cannot
+/// stall worker shutdown.
+const GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET: Duration = Duration::from_secs(2);
+
+/// Maximum slice of the export interval that may pass between `ngx_exiting`
+/// polls. Chunked sleep ensures shutdown is responsive even with a long
+/// configured `otel_metric_interval` — we never wait more than this between
+/// shutdown checks. The cost is one extra timer wake per chunk; negligible.
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Why the chunked sleep terminated early, if it did.
+#[derive(Copy, Clone)]
+enum ShutdownKind {
+    None,
+    Exiting,
+    Terminate,
+}
 
 // ── Self-metrics source ──────────────────────────────────────────────────────
 
@@ -65,30 +92,32 @@ pub struct SelfMetricsSource {
 impl MetricSource for SelfMetricsSource {
     fn collect(&self) -> std::vec::Vec<Metric> {
         let now = now_unix_nano();
-        let dropped = DROPPED_RECORDS.load(Ordering::Acquire);
-        let failures = SEND_FAILURES.load(Ordering::Acquire);
-        let interval_s = self.interval_ms / 1000;
+        let dropped = DROPPED_RECORDS.load(Ordering::Acquire) as i64;
+        let failures = SEND_FAILURES.load(Ordering::Acquire) as i64;
+        // Sub-second resolution preserved (configured interval emitted in
+        // milliseconds, unit declared "ms").
+        let interval_ms = self.interval_ms as i64;
 
         std::vec![
-            counter_scalar(
+            monotonic_sum_metric(
                 "ngx_otel.dropped_records",
                 "Metric data points dropped due to a full retry buffer",
                 "points",
                 dropped,
                 now,
             ),
-            counter_scalar(
+            monotonic_sum_metric(
                 "ngx_otel.send_failures",
                 "Cumulative export send failures since worker startup",
                 "failures",
                 failures,
                 now,
             ),
-            gauge_scalar(
-                "ngx_otel.export_interval_seconds",
+            gauge_metric(
+                "ngx_otel.export_interval",
                 "Configured metric export interval",
-                "s",
-                interval_s,
+                "ms",
+                interval_ms,
                 now,
             ),
         ]
@@ -145,14 +174,18 @@ pub async fn export_loop(amcf: &'static MainConfig) {
 
     let encoder = OtlpHttpEncoder;
     // Retry buffer: (encoded bytes, number of data points in that batch).
+    // Depth is configured (see `MainConfig::retry_buffer_depth`) so that
+    // tuning later is a config change, not a code change.
+    let retry_buffer_depth = amcf.retry_buffer_depth();
     let mut retry_queue: VecDeque<(std::vec::Vec<u8>, u64)> = VecDeque::new();
 
     ngx::ngx_log_error!(
         NGX_LOG_NOTICE,
         log.as_ptr(),
-        "otel export: export loop started, endpoint={}, interval={}ms",
+        "otel export: export loop started, endpoint={}, interval={}ms, retry_depth={}",
         endpoint_str,
-        amcf.interval_ms()
+        amcf.interval_ms(),
+        retry_buffer_depth
     );
 
     loop {
@@ -177,19 +210,41 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             return;
         }
 
-        // ── Sleep for the configured export interval ──────────────────────
+        // ── Chunked sleep for the configured export interval ──────────────────
+        // We must check ngx_exiting at least every SHUTDOWN_POLL_INTERVAL so
+        // that SIGQUIT during a long sleep doesn't cause the worker to exit
+        // before our drain runs. The Task's only chance to drain is while the
+        // event loop is still polling it.
         let interval = Duration::from_millis(amcf.interval_ms());
-        ngx::async_::sleep(interval).await;
+        let mut slept = Duration::ZERO;
+        let mut shutdown_during_sleep = ShutdownKind::None;
+        while slept < interval {
+            let chunk = (interval - slept).min(SHUTDOWN_POLL_INTERVAL);
+            ngx::async_::sleep(chunk).await;
+            slept += chunk;
+            if unsafe { nginx_sys::ngx_terminate } != 0 {
+                shutdown_during_sleep = ShutdownKind::Terminate;
+                break;
+            }
+            if unsafe { nginx_sys::ngx_exiting } != 0 {
+                shutdown_during_sleep = ShutdownKind::Exiting;
+                break;
+            }
+        }
 
         // ── Re-check shutdown flags after sleep ───────────────────────────
-        if unsafe { nginx_sys::ngx_terminate } != 0 {
+        if matches!(shutdown_during_sleep, ShutdownKind::Terminate)
+            || unsafe { nginx_sys::ngx_terminate } != 0
+        {
             return;
         }
-        if unsafe { nginx_sys::ngx_exiting } != 0 {
+        if matches!(shutdown_during_sleep, ShutdownKind::Exiting)
+            || unsafe { nginx_sys::ngx_exiting } != 0
+        {
             ngx::ngx_log_error!(
                 NGX_LOG_NOTICE,
                 log.as_ptr(),
-                "otel export: ngx_exiting set after sleep, starting graceful drain"
+                "otel export: ngx_exiting set during sleep, starting graceful drain"
             );
             graceful_drain(&mut transport, &mut retry_queue, &encoder, amcf).await;
             return;
@@ -202,7 +257,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
         while let Some((bytes, n_pts)) = queue_snapshot.pop_front() {
             if drain_failed {
                 // Transport is down; re-enqueue remaining items without sending.
-                enqueue_with_eviction(&mut retry_queue, bytes, n_pts, log.as_ptr());
+                enqueue_with_eviction(&mut retry_queue, bytes, n_pts, retry_buffer_depth, log.as_ptr());
                 continue;
             }
             match transport.send(bytes.clone()).await {
@@ -222,7 +277,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                         e
                     );
                     SEND_FAILURES.fetch_add(1, Ordering::Relaxed);
-                    enqueue_with_eviction(&mut retry_queue, bytes, n_pts, log.as_ptr());
+                    enqueue_with_eviction(&mut retry_queue, bytes, n_pts, retry_buffer_depth, log.as_ptr());
                     drain_failed = true;
                 }
             }
@@ -253,7 +308,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                     "otel export: send failed ({}); queuing for retry",
                     e
                 );
-                enqueue_with_eviction(&mut retry_queue, bytes, n_pts, log.as_ptr());
+                enqueue_with_eviction(&mut retry_queue, bytes, n_pts, retry_buffer_depth, log.as_ptr());
                 SEND_FAILURES.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -262,11 +317,42 @@ pub async fn export_loop(amcf: &'static MainConfig) {
 
 // ── Graceful drain ────────────────────────────────────────────────────────────
 
-/// Called when `ngx_exiting` is detected.  Flushes the retry buffer and sends
-/// one final batch, then returns so NGINX can complete its graceful shutdown.
+/// Called when `ngx_exiting` is detected from inside [`export_loop`].
 ///
-/// Best-effort: a single send attempt per queued batch, then one final
-/// collection.  Does not block indefinitely if the collector is unreachable.
+/// Best-effort: attempt to flush the retry queue (one send per queued batch)
+/// and then send one final freshly-collected batch. Each send is wrapped in a
+/// short wall-clock budget ([`GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET`]) so that an
+/// unreachable collector cannot stall worker shutdown.
+///
+/// # Lifetime safety
+///
+/// `ngx_exiting` only marks the worker as draining — the event loop is still
+/// running, the cycle pool is still live, and our spawned task is still being
+/// polled. The same primitives are used unguarded by `nginx-acme`'s
+/// `ngx_http_acme_main_loop` (see `nginx-acme/src/lib.rs:194-206`). The Task
+/// handle is dropped at cycle-pool teardown, which happens *after* this
+/// function returns. Awaiting `transport.send()` here is safe.
+///
+/// # Documented limitation — drain may not fire on SIGQUIT during sleep
+///
+/// `ngx_event_no_timers_left()` returns `NGX_OK` (worker may exit) when the
+/// only pending timers are `cancelable`. The ngx-rust SDK marks every
+/// [`ngx::async_::sleep`] timer as cancelable
+/// (`ngx-rust/src/async_/sleep.rs:94: ev.set_cancelable(1)`), so when SIGQUIT
+/// arrives while [`export_loop`] is between intervals, nginx treats the worker
+/// as idle and exits before our timer fires. Our task is then dropped from
+/// the cycle pool without running this drain.
+///
+/// Mitigation: the export loop chunks its sleep into
+/// [`SHUTDOWN_POLL_INTERVAL`] slices, narrowing the window but not closing
+/// it. The drain DOES fire reliably when SIGQUIT arrives during the active
+/// part of the loop body (collect/encode/send/retry).
+///
+/// Full fix is deferred to Phase 1.2:
+///   - either an `exit_process` module callback that does a synchronous final
+///     send (bypasses the cancelable-timer issue entirely), or
+///   - an upstream patch to ngx-rust adding a non-cancelable `Sleep` variant.
+/// Step 10 (SIGHUP reload) faces the same constraint and will resolve both.
 async fn graceful_drain(
     transport: &mut HyperHttpTransport<NgxConnector>,
     retry_queue: &mut VecDeque<(std::vec::Vec<u8>, u64)>,
@@ -282,16 +368,76 @@ async fn graceful_drain(
         queued
     );
 
-    // Flush retry queue (one attempt each, ignore errors).
-    while let Some((bytes, _)) = retry_queue.pop_front() {
-        let _ = transport.send(bytes).await;
+    // Flush retry queue (one bounded attempt each, ignore errors).
+    while let Some((bytes, n_pts)) = retry_queue.pop_front() {
+        match with_deadline(transport.send(bytes), GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                ngx::ngx_log_error!(
+                    NGX_LOG_ERR,
+                    log.as_ptr(),
+                    "otel export: drain: queued batch ({} pts) send failed: {}",
+                    n_pts,
+                    e
+                );
+                // Other queued batches likely fail too; stop and let the
+                // remainder be dropped when the loop returns.
+                let remaining: u64 = retry_queue.iter().map(|(_, n)| n).sum();
+                if remaining > 0 {
+                    DROPPED_RECORDS.fetch_add(remaining, Ordering::Relaxed);
+                }
+                retry_queue.clear();
+                break;
+            }
+            Err(DeadlineExceeded) => {
+                ngx::ngx_log_error!(
+                    NGX_LOG_NOTICE,
+                    log.as_ptr(),
+                    "otel export: drain: queued batch ({} pts) timed out after {:?}",
+                    n_pts,
+                    GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET
+                );
+                let remaining: u64 = retry_queue.iter().map(|(_, n)| n).sum();
+                if remaining > 0 {
+                    DROPPED_RECORDS.fetch_add(remaining, Ordering::Relaxed);
+                }
+                retry_queue.clear();
+                break;
+            }
+        }
     }
 
-    // Final collection + send.
-    let batch = collect_all_sources(amcf);
-    let bytes = encoder.encode(&batch);
-    if !bytes.is_empty() {
-        let _ = transport.send(bytes).await;
+    // Final freshly-collected batch.
+    let final_batch = collect_all_sources(amcf);
+    let n_pts = count_data_points(&final_batch);
+    if n_pts > 0 {
+        let bytes = encoder.encode(&final_batch);
+        match with_deadline(transport.send(bytes), GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET).await {
+            Ok(Ok(())) => {
+                ngx::ngx_log_error!(
+                    NGX_LOG_NOTICE,
+                    log.as_ptr(),
+                    "otel export: drain: final batch sent ({} data points)",
+                    n_pts
+                );
+            }
+            Ok(Err(e)) => {
+                ngx::ngx_log_error!(
+                    NGX_LOG_ERR,
+                    log.as_ptr(),
+                    "otel export: drain: final batch failed: {}",
+                    e
+                );
+            }
+            Err(DeadlineExceeded) => {
+                ngx::ngx_log_error!(
+                    NGX_LOG_NOTICE,
+                    log.as_ptr(),
+                    "otel export: drain: final batch timed out after {:?}",
+                    GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET
+                );
+            }
+        }
     }
 
     ngx::ngx_log_error!(
@@ -301,28 +447,76 @@ async fn graceful_drain(
     );
 }
 
+// ── Deadline-bounded future ─────────────────────────────────────────────────
+
+/// Sentinel returned by [`with_deadline`] when the timer fires before the
+/// inner future completes.
+struct DeadlineExceeded;
+
+pin_project! {
+    /// Races an inner future against an [`ngx::async_::Sleep`]. Whichever
+    /// resolves first wins. No allocation, no `select!` machinery.
+    struct WithDeadline<F> {
+        #[pin]
+        fut: F,
+        #[pin]
+        timer: ngx::async_::Sleep,
+    }
+}
+
+impl<F: Future> Future for WithDeadline<F> {
+    type Output = Result<F::Output, DeadlineExceeded>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        if let Poll::Ready(output) = this.fut.poll(cx) {
+            return Poll::Ready(Ok(output));
+        }
+        if let Poll::Ready(()) = this.timer.poll(cx) {
+            return Poll::Ready(Err(DeadlineExceeded));
+        }
+        Poll::Pending
+    }
+}
+
+/// Wraps `fut` so it resolves at most after `timeout`. On timeout the inner
+/// future is dropped — for a hyper send this means the in-flight connection
+/// future is cancelled cleanly via [`Drop`].
+fn with_deadline<F: Future>(fut: F, timeout: Duration) -> WithDeadline<F> {
+    WithDeadline {
+        fut,
+        timer: ngx::async_::sleep(timeout),
+    }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Enqueue a batch for retry.  If the queue is already at [`RETRY_BUFFER_DEPTH`],
+/// Enqueue a batch for retry.  If the queue is already at `max_depth`,
 /// the oldest entry is dropped and `DROPPED_RECORDS` is incremented.
 ///
 /// Returns the number of data points dropped (0 if the queue was not full).
+///
+/// `log` may be null; the eviction-logging path is guarded against that so the
+/// unit test can call this directly without constructing an `ngx_log_t`.
 #[inline]
 fn enqueue_with_eviction(
     retry_queue: &mut VecDeque<(std::vec::Vec<u8>, u64)>,
     bytes: std::vec::Vec<u8>,
     n_pts: u64,
+    max_depth: usize,
     log: *mut nginx_sys::ngx_log_t,
 ) -> u64 {
-    if retry_queue.len() >= RETRY_BUFFER_DEPTH {
+    if retry_queue.len() >= max_depth {
         if let Some((_, dropped_pts)) = retry_queue.pop_front() {
             DROPPED_RECORDS.fetch_add(dropped_pts, Ordering::Relaxed);
-            ngx::ngx_log_error!(
-                NGX_LOG_ERR,
-                log,
-                "otel export: retry buffer full, dropped {} data points",
-                dropped_pts
-            );
+            if !log.is_null() {
+                ngx::ngx_log_error!(
+                    NGX_LOG_ERR,
+                    log,
+                    "otel export: retry buffer full, dropped {} data points",
+                    dropped_pts
+                );
+            }
             retry_queue.push_back((bytes, n_pts));
             return dropped_pts;
         }
@@ -338,6 +532,8 @@ fn count_data_points(batch: &Batch) -> u64 {
         .iter()
         .map(|m| match &m.data {
             MetricData::Histogram(h) => h.data_points.len() as u64,
+            MetricData::Sum(s) => s.data_points.len() as u64,
+            MetricData::Gauge(g) => g.data_points.len() as u64,
         })
         .sum()
 }
@@ -353,12 +549,15 @@ fn collect_all_sources(amcf: &'static MainConfig) -> Batch {
     if let Some(base) = amcf.shm_base() {
         let n_workers = unsafe {
             let zone = &*amcf.shm_zone;
-            (zone.shm.size / core::mem::size_of::<crate::shm::WorkerSlots>()).max(1)
+            // zone.shm.size includes the slab-pool header; subtract it to get
+            // the usable portion, then divide by slot size to get worker count.
+            let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
+            (avail / core::mem::size_of::<crate::shm::WorkerSlots>()).max(1)
         };
         metrics.extend(InstrumentedSource { base, n_workers }.collect());
     }
 
-    // 3. Self-metrics (dropped_records, send_failures, export_interval_seconds).
+    // 3. Self-metrics (dropped_records, send_failures, export_interval).
     metrics.extend(SelfMetricsSource { interval_ms: amcf.interval_ms() }.collect());
 
     // ── Build Resource from config ────────────────────────────────────────
@@ -401,36 +600,43 @@ fn now_unix_nano() -> u64 {
         .as_nanos() as u64
 }
 
-fn counter_scalar(name: &str, desc: &str, unit: &str, value: u64, time_ns: u64) -> Metric {
-    scalar_hist(name, desc, unit, value, time_ns, AggregationTemporality::Cumulative)
-}
-
-fn gauge_scalar(name: &str, desc: &str, unit: &str, value: u64, time_ns: u64) -> Metric {
-    scalar_hist(name, desc, unit, value, time_ns, AggregationTemporality::Unspecified)
-}
-
-fn scalar_hist(
+/// Build a monotonic cumulative Sum metric carrying a single i64 data point.
+fn monotonic_sum_metric(
     name: &str,
     desc: &str,
     unit: &str,
-    value: u64,
+    value: i64,
     time_ns: u64,
-    temp: AggregationTemporality,
 ) -> Metric {
     Metric {
         name: name.into(),
         description: desc.into(),
         unit: unit.into(),
-        data: MetricData::Histogram(HistogramData {
-            aggregation_temporality: temp,
-            data_points: std::vec![HistogramDataPoint {
+        data: MetricData::Sum(SumData {
+            aggregation_temporality: AggregationTemporality::Cumulative,
+            is_monotonic: true,
+            data_points: std::vec![NumberDataPoint {
                 attributes: std::vec![],
                 start_time_unix_nano: 0,
                 time_unix_nano: time_ns,
-                count: 1,
-                sum: value as f64,
-                bucket_counts: std::vec![1],
-                explicit_bounds: std::vec![],
+                value: NumberValue::AsInt(value),
+            }],
+        }),
+    }
+}
+
+/// Build a Gauge metric carrying a single i64 data point.
+fn gauge_metric(name: &str, desc: &str, unit: &str, value: i64, time_ns: u64) -> Metric {
+    Metric {
+        name: name.into(),
+        description: desc.into(),
+        unit: unit.into(),
+        data: MetricData::Gauge(GaugeData {
+            data_points: std::vec![NumberDataPoint {
+                attributes: std::vec![],
+                start_time_unix_nano: 0,
+                time_unix_nano: time_ns,
+                value: NumberValue::AsInt(value),
             }],
         }),
     }
@@ -442,47 +648,43 @@ fn scalar_hist(
 mod tests {
     use super::*;
 
-    /// Verify that the retry queue never exceeds RETRY_BUFFER_DEPTH and that
-    /// DROPPED_RECORDS is incremented by the correct data-point count.
+    /// Verify that the retry queue never exceeds the configured depth and that
+    /// `DROPPED_RECORDS` is incremented by the correct data-point count when
+    /// items are evicted. Exercises the **real** `enqueue_with_eviction` helper
+    /// (not an inlined copy) by passing `null_mut()` as the log — the helper
+    /// guards against that.
     #[test]
     fn retry_buffer_stays_bounded_and_drops_are_counted() {
         // Snapshot the counter before; other tests run concurrently so we use
         // a relative delta rather than an absolute value.
         let before = DROPPED_RECORDS.load(Ordering::SeqCst);
 
+        let depth: usize = 4;
         let mut queue: VecDeque<(std::vec::Vec<u8>, u64)> = VecDeque::new();
 
-        // Enqueue RETRY_BUFFER_DEPTH + 2 items with distinct data-point counts
+        // Enqueue depth + 2 items with distinct data-point counts
         // (n_pts = i + 1 so we can verify which items were dropped).
-        for i in 0..(RETRY_BUFFER_DEPTH + 2) as u64 {
-            // Pass a null log pointer — the eviction logging path dereferences
-            // it, so we need a valid (even if minimal) ngx_log_t.  To avoid
-            // that, use a depth count that keeps the queue empty first and only
-            // triggers eviction for the last two insertions.
-            // Use the raw helper to avoid the ngx_log_error! invocation.
-            if queue.len() < RETRY_BUFFER_DEPTH {
-                queue.push_back((std::vec![i as u8], i + 1));
-            } else {
-                // Evict oldest manually (same logic as enqueue_with_eviction,
-                // without the log call).
-                if let Some((_, dropped_pts)) = queue.pop_front() {
-                    DROPPED_RECORDS.fetch_add(dropped_pts, Ordering::Relaxed);
-                }
-                queue.push_back((std::vec![i as u8], i + 1));
-            }
+        for i in 0..(depth + 2) as u64 {
+            enqueue_with_eviction(
+                &mut queue,
+                std::vec![i as u8],
+                i + 1,
+                depth,
+                core::ptr::null_mut(),
+            );
         }
 
         let after = DROPPED_RECORDS.load(Ordering::SeqCst);
 
-        // Queue must be bounded at RETRY_BUFFER_DEPTH.
+        // Queue must be bounded at depth.
         assert_eq!(
             queue.len(),
-            RETRY_BUFFER_DEPTH,
-            "retry queue must not exceed RETRY_BUFFER_DEPTH={}",
-            RETRY_BUFFER_DEPTH
+            depth,
+            "retry queue must not exceed configured depth = {}",
+            depth
         );
 
-        // Two items were evicted: those with n_pts=1 and n_pts=2.
+        // The two evicted items had n_pts = 1 and n_pts = 2.
         let expected_dropped: u64 = 1 + 2;
         assert_eq!(
             after - before,
@@ -501,6 +703,6 @@ mod tests {
         let names: std::vec::Vec<&str> = metrics.iter().map(|m| m.name.as_str()).collect();
         assert!(names.contains(&"ngx_otel.dropped_records"));
         assert!(names.contains(&"ngx_otel.send_failures"));
-        assert!(names.contains(&"ngx_otel.export_interval_seconds"));
+        assert!(names.contains(&"ngx_otel.export_interval"));
     }
 }

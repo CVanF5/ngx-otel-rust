@@ -62,10 +62,19 @@ pub struct Metric {
     pub data: MetricData,
 }
 
-/// The data payload of a metric — only histograms in Phase 1.1.
+/// The data payload of a metric.
+///
+/// Phase 1.1 carries three shapes: histograms for the request-duration /
+/// upstream-latency surface, sums for monotonic counters (`ngx_otel.dropped_records`,
+/// `ngx_otel.send_failures`), and gauges for non-monotonic instantaneous
+/// readings (`ngx_otel.export_interval_seconds`).  Per OTLP semantics these
+/// must be distinct variants — emitting a counter as a single-bucket histogram
+/// causes downstream backends to misclassify the metric type.
 #[derive(Debug, Clone)]
 pub enum MetricData {
     Histogram(HistogramData),
+    Sum(SumData),
+    Gauge(GaugeData),
 }
 
 /// A histogram metric aggregation.
@@ -73,6 +82,39 @@ pub enum MetricData {
 pub struct HistogramData {
     pub aggregation_temporality: AggregationTemporality,
     pub data_points: std::vec::Vec<HistogramDataPoint>,
+}
+
+/// A sum metric aggregation (monotonic counter or non-monotonic gauge-summed).
+///
+/// Use `is_monotonic = true` for counters that only increase
+/// (e.g. `ngx_otel.dropped_records`).
+#[derive(Debug, Clone)]
+pub struct SumData {
+    pub aggregation_temporality: AggregationTemporality,
+    pub is_monotonic: bool,
+    pub data_points: std::vec::Vec<NumberDataPoint>,
+}
+
+/// A gauge metric — a non-aggregated instantaneous value.
+#[derive(Debug, Clone)]
+pub struct GaugeData {
+    pub data_points: std::vec::Vec<NumberDataPoint>,
+}
+
+/// A scalar data point used by both Sum and Gauge metrics.
+#[derive(Debug, Clone)]
+pub struct NumberDataPoint {
+    pub attributes: std::vec::Vec<KeyValue>,
+    pub start_time_unix_nano: u64,
+    pub time_unix_nano: u64,
+    pub value: NumberValue,
+}
+
+/// The numeric value of a [`NumberDataPoint`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NumberValue {
+    AsInt(i64),
+    AsDouble(f64),
 }
 
 /// Aggregation temporality (DELTA or CUMULATIVE).
@@ -172,7 +214,9 @@ mod tests {
         assert_eq!(batch.metrics.len(), 1);
         assert_eq!(batch.metrics[0].name, "http.server.request.duration");
 
-        let MetricData::Histogram(ref hist) = batch.metrics[0].data;
+        let MetricData::Histogram(ref hist) = batch.metrics[0].data else {
+            panic!("expected Histogram variant");
+        };
         assert_eq!(hist.data_points.len(), 1);
 
         let dp = &hist.data_points[0];

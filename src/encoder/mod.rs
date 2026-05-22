@@ -10,7 +10,7 @@
 
 use prost::Message;
 
-use crate::data_model::{AggregationTemporality, AnyValue, Batch, MetricData};
+use crate::data_model::{AggregationTemporality, AnyValue, Batch, MetricData, NumberValue};
 
 // ── Generated protobuf types ─────────────────────────────────────────────────
 // Include the files emitted by prost-build in the build script.
@@ -139,18 +139,27 @@ fn convert_any_value(v: &AnyValue) -> common::AnyValue {
 fn convert_metric(m: &crate::data_model::Metric) -> metrics_proto::Metric {
     use metrics_proto::{metric::Data as PD, AggregationTemporality as ProtoAT};
 
-    let data = match &m.data {
-        MetricData::Histogram(h) => {
-            let temporality = match h.aggregation_temporality {
-                AggregationTemporality::Unspecified => ProtoAT::Unspecified as i32,
-                AggregationTemporality::Delta => ProtoAT::Delta as i32,
-                AggregationTemporality::Cumulative => ProtoAT::Cumulative as i32,
-            };
-            PD::Histogram(metrics_proto::Histogram {
-                data_points: h.data_points.iter().map(convert_hdp).collect(),
-                aggregation_temporality: temporality,
-            })
+    let proto_temporality = |t: AggregationTemporality| -> i32 {
+        match t {
+            AggregationTemporality::Unspecified => ProtoAT::Unspecified as i32,
+            AggregationTemporality::Delta => ProtoAT::Delta as i32,
+            AggregationTemporality::Cumulative => ProtoAT::Cumulative as i32,
         }
+    };
+
+    let data = match &m.data {
+        MetricData::Histogram(h) => PD::Histogram(metrics_proto::Histogram {
+            data_points: h.data_points.iter().map(convert_hdp).collect(),
+            aggregation_temporality: proto_temporality(h.aggregation_temporality),
+        }),
+        MetricData::Sum(s) => PD::Sum(metrics_proto::Sum {
+            data_points: s.data_points.iter().map(convert_ndp).collect(),
+            aggregation_temporality: proto_temporality(s.aggregation_temporality),
+            is_monotonic: s.is_monotonic,
+        }),
+        MetricData::Gauge(g) => PD::Gauge(metrics_proto::Gauge {
+            data_points: g.data_points.iter().map(convert_ndp).collect(),
+        }),
     };
 
     metrics_proto::Metric {
@@ -159,6 +168,22 @@ fn convert_metric(m: &crate::data_model::Metric) -> metrics_proto::Metric {
         unit: m.unit.clone(),
         data: Some(data),
         metadata: std::vec![],
+    }
+}
+
+fn convert_ndp(dp: &crate::data_model::NumberDataPoint) -> metrics_proto::NumberDataPoint {
+    use metrics_proto::number_data_point::Value as PV;
+    let value = match dp.value {
+        NumberValue::AsInt(i) => PV::AsInt(i),
+        NumberValue::AsDouble(d) => PV::AsDouble(d),
+    };
+    metrics_proto::NumberDataPoint {
+        attributes: dp.attributes.iter().map(convert_kv).collect(),
+        start_time_unix_nano: dp.start_time_unix_nano,
+        time_unix_nano: dp.time_unix_nano,
+        exemplars: std::vec![],
+        flags: 0,
+        value: Some(value),
     }
 }
 
