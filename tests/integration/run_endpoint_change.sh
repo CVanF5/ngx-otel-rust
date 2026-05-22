@@ -17,11 +17,16 @@
 # Assertions:
 #   1. metrics.json received batches under service.name = ngx-otel-step10-epchange
 #      during phase A (endpoint A worked).
-#   2. error.log contains at least one "otel export: send failed" line after
-#      the reload (new worker targeting the unreachable endpoint).
+#   2. error.log contains ≥ 2 "otel export: send failed" lines after the reload.
+#      Two failures (rather than one) proves the in-memory send_failures counter
+#      advanced past 1; this is the only available counter-advancement signal
+#      because phase-B batches never reach metrics.json (endpoint B is
+#      unreachable by construction).
 #   3. error.log contains "otel: SIGHUP reload detected" exactly once.
-#   4. ngx_otel.send_failures value in metrics.json from phase A is well-formed
-#      (sum metric with asInt present).
+#   4. ngx_otel.send_failures data point in phase-A content has asInt="0".
+#      Phase A's collector was reachable so the counter MUST still be 0 there;
+#      any non-zero value would indicate counter leakage from a different
+#      worker or malformed JSON.
 #
 # Prerequisites
 # ─────────────

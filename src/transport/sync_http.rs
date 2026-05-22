@@ -153,11 +153,19 @@ pub fn sync_post(
             // HyperHttpTransport::authority() for the Unix variant.
             let request = build_http_request("localhost", &http_path, extra_headers, body);
 
-            // UnixStream::connect has no built-in timeout, but a local
-            // Unix-socket connect is sub-millisecond — if the server isn't
-            // there, connect fails immediately with ECONNREFUSED.  The 500 ms
-            // write/read timeouts below bound the rest of the send window so
-            // a wedged peer cannot stall worker exit.
+            // UnixStream::connect has no built-in timeout.  In the typical
+            // /run/otel.sock deployment shape this is fine:
+            //   - server present: local connect is sub-millisecond
+            //   - server absent: fails fast with ECONNREFUSED, ENOENT, or
+            //     EACCES on the socket inode
+            //   - peer wedged after connect: bounded by the 500 ms write/read
+            //     timeouts set below
+            //
+            // The one edge case left uncovered is a socket file sitting on a
+            // hung NFS/9P/FUSE mount — there the kernel-side connect() can
+            // stall beyond 500 ms.  Such a deployment shape is exotic for a
+            // local collector unix socket; if it does occur, the worker's
+            // configured `worker_shutdown_timeout` is the outer backstop.
             let mut stream = UnixStream::connect(&socket_path)
                 .map_err(SyncSendError::Connect)?;
             stream
