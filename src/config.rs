@@ -9,7 +9,7 @@ use core::{mem, ptr};
 use nginx_sys::{
     ngx_array_t, ngx_command_t, ngx_conf_parse, ngx_conf_t, ngx_flag_t, ngx_module_t, ngx_str_t,
     ngx_uint_t, NGX_CONF_BLOCK, NGX_CONF_FLAG, NGX_CONF_NOARGS, NGX_CONF_TAKE1, NGX_CONF_TAKE2,
-    NGX_HTTP_MAIN_CONF, NGX_HTTP_MAIN_CONF_OFFSET, NGX_LOG_EMERG,
+    NGX_HTTP_MAIN_CONF, NGX_HTTP_MAIN_CONF_OFFSET, NGX_LOG_DEBUG, NGX_LOG_EMERG,
 };
 use ngx::core::{Status, NGX_CONF_ERROR, NGX_CONF_OK};
 use ngx::http::HttpModuleMainConf;
@@ -163,6 +163,19 @@ impl MainConfig {
     }
 
     /// Obtain the main config from the previous NGINX cycle (used for SIGHUP reload).
+    ///
+    /// Returns `None` on the initial startup cycle or if the old cycle had no config.
+    ///
+    /// # Safety
+    /// The returned reference borrows from the old cycle's config pool, which remains
+    /// valid until the old cycle is destroyed — after all new workers are up and old
+    /// workers have exited. Callers must not store the reference past
+    /// `postconfiguration` completion (the lifetime `'a` is widened via an unsafe
+    /// transmute of the cycle pool borrow, matching the acme `AcmeMainConfig::old_config`
+    /// precedent in `nginx-acme/src/conf.rs`).
+    ///
+    /// Phase 1.2 will use this hook for TLS connection reuse and related cross-cycle
+    /// state transfer. In Phase 1.1 the hook is read-only: we log and return.
     pub fn old_config<'a>(cf: &mut ngx_conf_t) -> Option<&'a MainConfig> {
         let old_cycle = unsafe { cf.cycle.as_ref()?.old_cycle.as_ref()? };
         if old_cycle.conf_ctx.is_null() {
@@ -179,6 +192,31 @@ impl MainConfig {
         cf: *mut ngx_conf_t,
         module: *mut ngx_module_t,
     ) -> Result<(), Status> {
+        // Check for SIGHUP reload: look for the previous cycle's config.
+        // Phase 1.2 will use this hook for TLS connection reuse and related
+        // cross-cycle state transfer. In Phase 1.1 we only log.
+        if let Some(old) = unsafe { Self::old_config(&mut *cf) } {
+            if self.is_configured() {
+                unsafe {
+                    ngx_conf_log_error!(
+                        NGX_LOG_DEBUG,
+                        &mut *cf,
+                        "otel: SIGHUP reload detected (old endpoint={}, new endpoint={})",
+                        old.exporter.endpoint,
+                        self.exporter.endpoint
+                    );
+                }
+            } else {
+                unsafe {
+                    ngx_conf_log_error!(
+                        NGX_LOG_DEBUG,
+                        &mut *cf,
+                        "otel: SIGHUP reload detected: new config has no otel_exporter block"
+                    );
+                }
+            }
+        }
+
         if !self.is_configured() {
             // Module loaded but not configured: zero-cost mode.
             return Ok(());
