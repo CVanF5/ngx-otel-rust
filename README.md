@@ -356,7 +356,7 @@ ngx-otel-rust/
 - ACME module precedent: [`nginx/nginx-acme`](https://github.com/nginx/nginx-acme).
   This project's build-system shape (Makefile + `config` + `auto/rust`
   + `build/*.mk`) was migrated to match nginx-acme's; see commits
-  `0838b64`, `44a7790`, `e376839` for the migration.
+  `6f3133b`, `fdd521c`, `4555185` for the migration.
 - OTAP / Arrow project: [`open-telemetry/otel-arrow`](https://github.com/open-telemetry/otel-arrow).
   Phase 5 target for the columnar encoder swap.
 
