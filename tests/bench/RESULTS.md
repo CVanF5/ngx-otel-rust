@@ -157,6 +157,24 @@ locking the request path — consistent with the Phase 1.1 architecture
 
 ---
 
+## Reproducing this analysis
+
+The tables above are not narrative — they are derived from the committed
+JSON file under `tests/bench/results/`.  To re-derive them (or to validate
+a new run from `zero_cost.sh`):
+
+```
+bash tests/bench/analyse.sh                            # most recent run
+bash tests/bench/analyse.sh tests/bench/results/<file> # specific run
+TOLERANCE_PCT=2.0 bash tests/bench/analyse.sh          # tighter threshold
+```
+
+`analyse.sh` exits 0 if all tolerance checks pass and 2 if any fail.
+Step 12 reuses this script for its own pass/fail check on the soak-run
+JSON (likely with a different threshold for production-shape hardware).
+
+---
+
 ## Conclusion
 
 The Step 11 benchmark proves statistically that:
