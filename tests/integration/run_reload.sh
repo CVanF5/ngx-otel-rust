@@ -44,11 +44,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CRATE_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 REPO_ROOT="$(cd "${CRATE_DIR}/.." && pwd)"
 
-NGINX_BINARY="${NGINX_BINARY:-${REPO_ROOT}/nginx/objs/nginx}"
-
 # Source the shared harness library.  Sets HARNESS_DIR, METRICS_LOG,
-# COLLECTOR_HTTP_ENDPOINT, and exposes ensure_collector_running.
+# COLLECTOR_HTTP_ENDPOINT, and exposes ensure_collector_running and
+# resolve_nginx_binary.
 . "${CRATE_DIR}/test-harness/lib.sh"
+resolve_nginx_binary || true   # missing-binary error is produced by the preflight below
 
 case "$(uname -s)" in
     Darwin) MODULE_EXT="dylib" ;;

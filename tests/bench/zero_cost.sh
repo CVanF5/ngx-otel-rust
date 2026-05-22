@@ -40,12 +40,13 @@ CRATE_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 REPO_ROOT="$(cd "${CRATE_DIR}/.." && pwd)"
 RESULTS_DIR="${SCRIPT_DIR}/results"
 
-NGINX_BINARY="${NGINX_BINARY:-${REPO_ROOT}/nginx/objs/nginx}"
 NGINX_SOURCE_DIR="${NGINX_SOURCE_DIR:-${REPO_ROOT}/nginx}"
 NGINX_BUILD_DIR="${NGINX_BUILD_DIR:-${REPO_ROOT}/nginx/objs}"
 
-# Source the shared harness library.  Exposes ensure_collector_running.
+# Source the shared harness library.  Exposes ensure_collector_running
+# and resolve_nginx_binary.
 . "${CRATE_DIR}/test-harness/lib.sh"
+resolve_nginx_binary || true   # missing-binary error is produced by the preflight below
 
 BENCH_ITERATIONS="${BENCH_ITERATIONS:-5}"
 SKIP_BUILD="${SKIP_BUILD:-0}"

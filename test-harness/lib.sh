@@ -30,6 +30,8 @@ _NGX_OTEL_HARNESS_LIB_LOADED=1
 
 # Resolve our own location so callers don't need to compute it.
 HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The crate root is the parent of test-harness/.
+HARNESS_CRATE_DIR="$(dirname "${HARNESS_DIR}")"
 
 COLLECTOR_CONTAINER="${COLLECTOR_CONTAINER:-ngx-otel-test-collector}"
 COLLECTOR_HTTP_ENDPOINT="${COLLECTOR_HTTP_ENDPOINT:-http://127.0.0.1:4318}"
@@ -132,6 +134,38 @@ collector_status() {
     else
         echo "collector ${COLLECTOR_CONTAINER} is NOT running"
     fi
+}
+
+# Resolve NGINX_BINARY by checking candidate paths in priority order.
+# Honors a pre-existing NGINX_BINARY env value if it points at an
+# executable.  Otherwise prefers the make-built artifacts under the
+# crate's objs-<flavor>/ directories, falling back to a pre-built
+# sibling nginx checkout (../nginx/objs/nginx — the pre-Phase-A
+# prototyping path).
+#
+# Returns 0 if NGINX_BINARY was set to a real executable, 1 otherwise.
+# In the failure case, NGINX_BINARY is left set to the last candidate
+# so the caller's preflight check produces an actionable error message.
+resolve_nginx_binary() {
+    if [[ -n "${NGINX_BINARY:-}" && -x "${NGINX_BINARY}" ]]; then
+        return 0
+    fi
+    local candidates=(
+        "${HARNESS_CRATE_DIR}/objs-debug/nginx"
+        "${HARNESS_CRATE_DIR}/objs-release/nginx"
+        "${HARNESS_CRATE_DIR}/../nginx/objs/nginx"
+    )
+    local c
+    for c in "${candidates[@]}"; do
+        if [[ -x "$c" ]]; then
+            NGINX_BINARY="$c"
+            return 0
+        fi
+    done
+    # No match; expose the last candidate so the caller's "binary not
+    # found at X" message points somewhere recognisable.
+    NGINX_BINARY="${candidates[-1]}"
+    return 1
 }
 
 # Stop the collector (idempotent).
