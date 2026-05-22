@@ -23,7 +23,7 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::{mem, ptr};
 
-use nginx_sys::{ngx_conf_t, ngx_int_t, ngx_shared_memory_add, ngx_shm_zone_t};
+use nginx_sys::{ngx_conf_t, ngx_int_t, ngx_shared_memory_add, ngx_shm_zone_t, ngx_slab_pool_t};
 use ngx::core::Status;
 
 /// Duration histogram bucket boundaries in **milliseconds**.
@@ -141,10 +141,25 @@ pub unsafe fn worker_slots(base_addr: *mut u8, worker_id: usize) -> *mut WorkerS
     unsafe { base_addr.add(offset).cast() }
 }
 
-/// Minimum zone size for `n_workers` worker processes.
+/// Byte offset from `shm.addr` to the start of our WorkerSlots data.
+///
+/// nginx calls `ngx_init_zone_pool` before our zone-init callback, placing
+/// an `ngx_slab_pool_t` header at the very beginning of every shared-memory
+/// zone.  `ngx_unlock_mutexes` (called on every worker exit from within the
+/// master's SIGCHLD handler) dereferences `((ngx_slab_pool_t*)shm.addr)->mutex.lock`.
+/// If we zero those bytes our module would null-ptr-crash the master.
+///
+/// We therefore place our WorkerSlots array **after** the slab-pool header and
+/// never touch the first `data_offset()` bytes of the zone.
+#[inline]
+pub fn data_offset() -> usize {
+    mem::size_of::<ngx_slab_pool_t>()
+}
+
+/// Minimum zone size for `n_workers` worker processes (including slab pool header).
 #[inline]
 pub fn zone_size_for(n_workers: usize) -> usize {
-    n_workers * mem::size_of::<WorkerSlots>()
+    data_offset() + n_workers * mem::size_of::<WorkerSlots>()
 }
 
 /// Register the shared memory zone with nginx from `postconfiguration`.
@@ -167,28 +182,39 @@ pub unsafe fn register_zone(
 ///
 /// # Safety
 /// nginx guarantees the callback args are valid non-null pointers.
-// We deliberately do NOT use SlabPool::from_shm_zone. Slot offsets are
-// pre-computed at zone-init time, so no per-bump allocator is needed —
-// the hot path is fixed-offset atomic increments only. Compare to
-// ngx-rust/examples/shared_dict.rs which uses SlabPool because its
-// keyset grows at runtime.
+///
+/// # IMPORTANT — do NOT touch the slab-pool header
+///
+/// nginx calls `ngx_init_zone_pool` immediately *before* this callback.
+/// That function writes an `ngx_slab_pool_t` header at `shm.addr[0..]`
+/// and initialises its mutex (`sp->mutex.lock = &sp->lock`).  When any
+/// worker later exits the master's SIGCHLD handler calls
+/// `ngx_unlock_mutexes` → `ngx_shmtx_force_unlock(&sp->mutex, pid)`
+/// which dereferences `sp->mutex.lock`.  If we zero the header we null
+/// that pointer and crash the master process.
+///
+/// Our WorkerSlots data lives at `data_offset()` bytes past `shm.addr`,
+/// safely beyond the slab-pool header.
 pub unsafe extern "C" fn otel_shm_zone_init(
     shm_zone: *mut ngx_shm_zone_t,
     old_data: *mut core::ffi::c_void,
 ) -> ngx_int_t {
-    let zone = unsafe { &mut *shm_zone };
-    let base: *mut u8 = zone.shm.addr.cast();
-    let size = zone.shm.size;
-
     if !old_data.is_null() {
-        // SIGHUP reload: shm was re-mapped; the zone data pointer is already valid.
-        // Counter values carry over automatically because the same physical pages are
-        // re-mapped into the new address space. No re-initialisation needed.
+        // SIGHUP reload: the same physical shm pages are re-mapped.
+        // Counter values carry over automatically; no re-initialisation needed.
         return Status::NGX_OK.into();
     }
 
-    // Fresh start: zero every byte in the zone.
-    unsafe { ptr::write_bytes(base, 0, size) };
+    // Fresh start: zero only the WorkerSlots area — never the slab-pool header.
+    // (The OS provides zero-filled pages for new mmap regions, but we zero
+    //  explicitly here for clarity and to handle edge cases.)
+    let zone = unsafe { &*shm_zone };
+    let offset = data_offset();
+    if zone.shm.size > offset {
+        let base: *mut u8 = unsafe { zone.shm.addr.cast::<u8>().add(offset) };
+        let size = zone.shm.size - offset;
+        unsafe { ptr::write_bytes(base, 0, size) };
+    }
 
     Status::NGX_OK.into()
 }
@@ -264,9 +290,11 @@ mod tests {
 
     #[test]
     fn zone_size_alignment() {
-        // Zone size must accommodate the expected slot count.
-        assert!(zone_size_for(4) == 4 * mem::size_of::<WorkerSlots>());
-        assert!(zone_size_for(1) >= mem::size_of::<WorkerSlots>());
+        // Zone size must accommodate the slab-pool header plus the slot array.
+        let slab = data_offset();
+        assert!(slab > 0, "slab pool offset must be positive");
+        assert_eq!(zone_size_for(4), slab + 4 * mem::size_of::<WorkerSlots>());
+        assert!(zone_size_for(1) >= slab + mem::size_of::<WorkerSlots>());
     }
 
     #[test]
