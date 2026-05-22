@@ -1,0 +1,13 @@
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.152.0
+    container_name: ngx-otel-test-collector
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+      - ./logs:/var/log/otel
+    ports:
+      - "127.0.0.1:4317:4317"   # OTLP/gRPC (Phase 1.2)
+      - "127.0.0.1:4318:4318"   # OTLP/HTTP (Phase 1.1)
+      - "127.0.0.1:13133:13133" # health check
+    restart: unless-stopped

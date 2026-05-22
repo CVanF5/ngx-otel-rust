@@ -1,3 +1,6 @@
 /target/
 # nginx-autoconf build output directories (one per BUILD flavor, see Makefile)
 /objs-*/
+# Test-harness OTel collector file-exporter output (generated at runtime)
+/test-harness/logs/*.json
+/test-harness/logs/*.json.*
