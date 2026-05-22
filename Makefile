@@ -143,6 +143,25 @@ clean: ## Cleanup everything
 	rm -rf $(NGINX_BUILD_DIR)
 	$(NGX_CARGO) clean
 
+# ── OTel collector lifecycle (wraps test-harness/lib.sh) ────────────────────
+# These targets manage the local OTel collector container the integration
+# tests need.  `make test` does NOT depend on `collector-up` because each
+# test script auto-starts the collector via test-harness/lib.sh; but
+# operators can use these for explicit control.
+
+HARNESS_DIR	= $(CURDIR)/test-harness
+
+.PHONY: collector-up collector-down collector-status
+
+collector-up: ## Start the local OTel collector (idempotent)
+	@bash -c '. $(HARNESS_DIR)/lib.sh && ensure_collector_running'
+
+collector-down: ## Stop the local OTel collector
+	@bash -c '. $(HARNESS_DIR)/lib.sh && collector_down'
+
+collector-status: ## Show local OTel collector status
+	@bash -c '. $(HARNESS_DIR)/lib.sh && collector_status'
+
 # GNU make convenience targets. Will be ignored by other implementations.
 
 build-%: ## Build with the specified configuration. E.g. make build-sanitize.
