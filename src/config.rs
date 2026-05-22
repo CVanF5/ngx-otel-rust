@@ -166,13 +166,18 @@ impl MainConfig {
     ///
     /// Returns `None` on the initial startup cycle or if the old cycle had no config.
     ///
-    /// # Safety
-    /// The returned reference borrows from the old cycle's config pool, which remains
-    /// valid until the old cycle is destroyed — after all new workers are up and old
-    /// workers have exited. Callers must not store the reference past
-    /// `postconfiguration` completion (the lifetime `'a` is widened via an unsafe
-    /// transmute of the cycle pool borrow, matching the acme `AcmeMainConfig::old_config`
-    /// precedent in `nginx-acme/src/conf.rs`).
+    /// # Lifetime
+    /// No `unsafe` transmute is performed here. The widening from the borrow of
+    /// `cf.cycle.old_cycle` to `&'a MainConfig` is provided by the ngx-rust trait
+    /// [`HttpModuleMainConf::main_conf`], which yields `&'static Self::MainConf`
+    /// (`ngx-rust/src/http/conf.rs:161`). The trait's `'static` is sound because
+    /// the cycle's config pool outlives this Rust function call — the old cycle
+    /// remains live through SIGHUP until all old workers have exited.
+    ///
+    /// In practice we only consult this inside `postconfiguration`, well before
+    /// any old-cycle teardown, so the lifetime question is moot for current use.
+    ///
+    /// Mirrors `AcmeMainConfig::old_config` in `nginx-acme/src/conf.rs:667-676`.
     ///
     /// Phase 1.2 will use this hook for TLS connection reuse and related cross-cycle
     /// state transfer. In Phase 1.1 the hook is read-only: we log and return.
