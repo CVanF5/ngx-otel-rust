@@ -30,6 +30,7 @@ tower-service = "0.3"
 
 [build-dependencies]
 prost-build = "0.13"
+tonic-build = { version = "0.14", default-features = false }
 
 [features]
 default = ["export-modules"]
@@ -52,6 +53,11 @@ required-features = ["test-support"]
 [[test]]
 name = "transport_integration"
 path = "tests/transport_integration.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "grpc_smoke"
+path = "tests/grpc_smoke.rs"
 required-features = ["test-support"]
 
 [profile.release]

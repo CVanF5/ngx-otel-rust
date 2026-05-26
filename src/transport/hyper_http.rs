@@ -488,6 +488,14 @@ unsafe extern "C" fn ngx_otel_conn_write_handler(ev: *mut ngx_event_t) {
 pub struct SpinTcpIo(TcpStream);
 
 #[cfg(any(test, feature = "test-support"))]
+impl SpinTcpIo {
+    /// Wrap an already-opened non-blocking `TcpStream`.
+    pub fn new(stream: TcpStream) -> Self {
+        Self(stream)
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
 impl hyper::rt::Read for SpinTcpIo {
     fn poll_read(
         mut self: Pin<&mut Self>,
