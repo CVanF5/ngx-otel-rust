@@ -17,7 +17,7 @@ bytes = "1.10.1"
 http = "1.4.0"
 http-body = "1.0.1"
 http-body-util = "0.1.3"
-hyper = { version = "1.6.0", default-features = false, features = ["client", "http1"] }
+hyper = { version = "1.6.0", default-features = false, features = ["client", "http1", "http2"] }
 libc = "0.2.174"
 nginx-sys = { git = "https://github.com/nginx/ngx-rust.git", rev = "13c0067" }
 ngx = { git = "https://github.com/nginx/ngx-rust.git", rev = "13c0067", features = ["async", "std"] }
@@ -25,6 +25,8 @@ openssl-sys = { version = "0.9.110", features = ["bindgen"] }
 pin-project-lite = "0.2.16"
 prost = "0.13"
 thiserror = { version = "2.0.12", default-features = false }
+tonic = { version = "0.14", default-features = false }
+tower-service = "0.3"
 
 [build-dependencies]
 prost-build = "0.13"

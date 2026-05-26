@@ -25,3 +25,4 @@
 //! ```
 
 pub mod executor;
+pub mod shim;
