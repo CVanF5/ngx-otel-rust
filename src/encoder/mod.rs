@@ -17,8 +17,10 @@ use crate::data_model::{AggregationTemporality, AnyValue, Batch, MetricData, Num
 
 /// Generated protobuf types — module hierarchy mirrors the proto package path
 /// so that the `super::super::...` cross-references inside the generated code
-/// resolve correctly.
-mod opentelemetry {
+/// resolve correctly.  `pub(crate)` so other in-crate modules (e.g. the
+/// gRPC smoke harness in `transport::grpc::smoke`) can use the same prost
+/// types without duplicating the `include!` hierarchy.
+pub(crate) mod opentelemetry {
     pub mod proto {
         pub mod common {
             pub mod v1 {

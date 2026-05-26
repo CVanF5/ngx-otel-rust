@@ -26,3 +26,8 @@
 
 pub mod executor;
 pub mod shim;
+
+// In-worker gRPC viability harness: gated behind `test-support` so it never
+// compiles into production builds.  See `smoke.rs` for the rationale.
+#[cfg(any(test, feature = "test-support"))]
+pub mod smoke;

@@ -92,6 +92,16 @@ pub struct MainConfig {
     pub status_code_class: ngx_flag_t,
     /// `otel_metric_high_cardinality_attr <attr>` — accumulated list.
     pub high_cardinality_attrs: std::vec::Vec<ngx_str_t>,
+    /// `otel_grpc_smoke_endpoint <url>` — TEST-ONLY trigger for the
+    /// Phase 1.2 Item 1 in-worker gRPC viability harness.  When set
+    /// (and the crate is built with the `test-support` feature),
+    /// Worker 0's `init_process` fires one unary OTLP/gRPC export via
+    /// `NgxExecutor` + `SendRequestService` + `NgxConnIo` to verify
+    /// the §7.3 pipeline works end-to-end on real nginx event-loop
+    /// infrastructure under `--with-debug`.  In production (non-test)
+    /// builds the directive is parsed but ignored; documented as such
+    /// in `src/transport/grpc/smoke.rs`.
+    pub grpc_smoke_endpoint: ngx_str_t,
     /// The registered shared memory zone (set during postconfiguration).
     pub shm_zone: *mut nginx_sys::ngx_shm_zone_t,
 }
@@ -109,6 +119,7 @@ impl Default for MainConfig {
             zone_size: 0,
             status_code_class: UNSET_FLAG,
             high_cardinality_attrs: std::vec::Vec::new(),
+            grpc_smoke_endpoint: ngx_str_t::default(),
             shm_zone: ptr::null_mut(),
         }
     }
@@ -436,7 +447,7 @@ extern "C" fn cmd_exporter_block_handler(
 /* ─────────────────────────── top-level commands ────────────────────────────── */
 
 /// Number of top-level commands + 1 (terminator).
-const NCMDS: usize = 10;
+const NCMDS: usize = 11;
 
 pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; NCMDS] = [
     // otel_exporter { endpoint ...; trusted_certificate ...; }
@@ -509,6 +520,18 @@ pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; NCMDS] = [
         set: Some(nginx_sys::ngx_conf_set_flag_slot),
         conf: NGX_HTTP_MAIN_CONF_OFFSET,
         offset: mem::offset_of!(MainConfig, status_code_class),
+        post: ptr::null_mut(),
+    },
+    // otel_grpc_smoke_endpoint <url>;  TEST-ONLY (Phase 1.2 Item 1
+    // in-worker gRPC viability harness; see src/transport/grpc/smoke.rs).
+    // Parsed in all builds but only acted on when the `test-support`
+    // feature is enabled.
+    ngx_command_t {
+        name: ngx_string!("otel_grpc_smoke_endpoint"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(nginx_sys::ngx_conf_set_str_slot),
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+        offset: mem::offset_of!(MainConfig, grpc_smoke_endpoint),
         post: ptr::null_mut(),
     },
     // otel_metric_high_cardinality_attr <attr>;

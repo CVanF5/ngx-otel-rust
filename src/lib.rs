@@ -193,6 +193,84 @@ extern "C" fn ngx_otel_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
         return Status::NGX_ERROR.into();
     }
 
+    // ── Phase 1.2 Item 1: in-worker gRPC viability harness ──────────────────
+    //
+    // Only compiled when the `test-support` feature is enabled.  When set,
+    // and the `otel_grpc_smoke_endpoint` directive carries a non-empty value,
+    // fire one unary OTLP/gRPC export from Worker 0 via
+    // `NgxExecutor` + `SendRequestService` + `NgxConnIo` — the real Phase 1.2
+    // production stack — to verify viability on the nginx event loop under
+    // `--with-debug`.  Result is logged at NOTICE; the integration test in
+    // `tests/integration/run_grpc_smoke.sh` greps for the success line.
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        if !amcf.grpc_smoke_endpoint.is_empty() {
+            let endpoint_bytes = amcf.grpc_smoke_endpoint.as_bytes();
+            if let Ok(endpoint_str) = core::str::from_utf8(endpoint_bytes) {
+                let endpoint_owned = std::string::String::from(endpoint_str);
+                let log_nn = match core::ptr::NonNull::new(log) {
+                    Some(p) => p,
+                    None => {
+                        ngx::ngx_log_error!(
+                            nginx_sys::NGX_LOG_ERR,
+                            log,
+                            "grpc smoke: null log pointer; skipping"
+                        );
+                        return Status::NGX_OK.into();
+                    }
+                };
+
+                ngx::ngx_log_error!(
+                    nginx_sys::NGX_LOG_NOTICE,
+                    log,
+                    "grpc smoke: firing one unary OTLP/gRPC export (endpoint={})",
+                    endpoint_owned
+                );
+
+                let smoke_task = ngx::async_::spawn(async move {
+                    let result = crate::transport::grpc::smoke::fire_one_grpc_export(
+                        &endpoint_owned,
+                        log_nn,
+                    ).await;
+                    let log_ptr = log_nn.as_ptr();
+                    match result {
+                        Ok(()) => {
+                            // This exact line is what `run_grpc_smoke.sh` asserts on.
+                            ngx::ngx_log_error!(
+                                nginx_sys::NGX_LOG_NOTICE,
+                                log_ptr,
+                                "grpc smoke: export complete"
+                            );
+                        }
+                        Err(e) => {
+                            ngx::ngx_log_error!(
+                                nginx_sys::NGX_LOG_ERR,
+                                log_ptr,
+                                "grpc smoke: export failed: {}",
+                                e
+                            );
+                        }
+                    }
+                });
+
+                if pool.allocate(smoke_task).is_null() {
+                    ngx::ngx_log_error!(
+                        nginx_sys::NGX_LOG_ERR,
+                        log,
+                        "grpc smoke: pool allocation for smoke task failed"
+                    );
+                    // Non-fatal: the export task above is already running.
+                }
+            } else {
+                ngx::ngx_log_error!(
+                    nginx_sys::NGX_LOG_ERR,
+                    log,
+                    "grpc smoke: otel_grpc_smoke_endpoint is not valid UTF-8; skipping"
+                );
+            }
+        }
+    }
+
     Status::NGX_OK.into()
 }
 
