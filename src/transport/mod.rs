@@ -10,6 +10,7 @@
 //! Phase 1.1; it POSTs OTLP/HTTP protobuf bytes over plain TCP or Unix
 //! sockets. HTTPS support is reserved for a later phase.
 
+pub mod grpc;
 pub mod hyper_http;
 pub mod sync_http;
 
