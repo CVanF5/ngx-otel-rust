@@ -262,46 +262,76 @@ pub async fn fire_one_grpc_export(
     //    eventual gRPC traffic will flow through `NgxConnIo`'s
     //    `poll_read`/`poll_write` with C-handler-driven wakeups (no spin).
     let connector = NgxConnector::new(log);
+    let log_ptr = log.as_ptr();
     let io = connector.connect(&endpoint).await
         .map_err(|e| SmokeError::Connect(std::format!("{e:?}")))?;
 
-    // 4. HTTP/2 handshake driven by NgxExecutor.  Isolation step:
-    //    we DON'T issue a gRPC call this iteration.  Just complete the
-    //    h2 handshake and log when it returns.  The previous attempt
-    //    showed h2 stalls reading the server's SETTINGS frame even
-    //    though the collector is responding on the wire.  Dropping
-    //    tonic/gRPC layer narrows the failing surface: if THIS hangs,
-    //    the bug is in hyper-h2 + NgxConnIo and not in our shim.
+    // 4. HTTP/2 handshake driven by NgxExecutor.  The handshake performs
+    //    the SETTINGS exchange and returns:
+    //      - `sender`: hyper's `SendRequest`, our handle for issuing requests.
+    //      - `conn`: hyper's `Connection` — the user-side request dispatcher.
     //
-    //    The turbofish `<_, _, tonic::body::Body>` is just to give h2 a
-    //    body type to compile against; no actual body is sent.
-    let _origin = origin;  // unused this iteration; will be used when gRPC
-                           // layer is re-enabled in a follow-up.
+    //    Hyper's docs require that `conn` be polled (typically by spawning
+    //    `conn.await` on the same executor) for `sender` to actually send
+    //    requests.  The underlying h2-frame-level ConnTask was already
+    //    spawned by hyper internally inside `handshake.await` (via the
+    //    `Http2ClientConnExec` impl on `NgxExecutor`); the `conn` we get
+    //    back is the request-stream dispatcher on top of that.
+    //
+    //    The turbofish `<_, _, tonic::body::Body>` is required because the
+    //    body type `B` can't be inferred from the handshake call alone —
+    //    it's determined by what the returned `SendRequest` will be used
+    //    for downstream (tonic's body type).
+    //
+    //    Background — what this fix relies on:
+    //    h2's `Streams::drop` calls `task.wake()` while holding its
+    //    `Arc<Mutex<Inner>>` guard.  Prior to the ngx-rust patch on the
+    //    `ngx-otel-rust-deadlock-fix` branch (see ngx-rust/src/async_/
+    //    spawn.rs::schedule), `Waker::wake()` synchronously re-polled the
+    //    parked task on the same call stack, which then tried to re-acquire
+    //    the same Mutex — deadlock.  Patched `schedule()` always defers
+    //    via `ngx_post_event`, matching what every other "custom executor
+    //    for h2" (Tokio's LocalSet, async-executor) does by design.
     let handshake_fut = hyper::client::conn::http2::handshake::<
         _,
         _,
         tonic::body::Body,
     >(NgxExecutor, io);
 
-    // Drive the handshake co-polled with nothing (the future is its
-    // own driver).  Just await it and log when it returns.  If this
-    // hangs, the bug is in h2-over-NgxConnIo.
-    let (_sender, _conn) = handshake_fut.await
+    ngx::ngx_log_debug!(log_ptr, "smoke: awaiting h2 handshake");
+    let (sender, conn) = handshake_fut.await
         .map_err(|e| SmokeError::Handshake(std::format!("{e}")))?;
+    ngx::ngx_log_debug!(log_ptr, "smoke: h2 handshake completed");
 
-    // If we got here, h2 handshake completed — server's SETTINGS frame
-    // was received and our ACK was sent.  Connection is now usable.
-    // For this isolation iteration we don't go further; the
-    // `_sender` and `_conn` are dropped, the connection closes, and
-    // we return Ok(()).  The integration test asserts on the
-    // "export complete" line emitted by init_process, which fires
-    // on this Ok(()).
-    let _ = SendRequestService::new(_sender);  // silence unused warning
-    let _ = ProstCodec::<ExportMetricsServiceRequest, ExportMetricsServiceResponse>::new();
-    let _ = build_export_request();
-    let _ = PathAndQuery::from_static(
+    // 5. Drive `conn` (the request-stream dispatcher) on the NGINX event
+    //    loop so requests can complete.  Detached: we don't await its
+    //    Output (which only resolves when the connection closes).
+    ngx::async_::spawn(async move {
+        let _ = conn.await;
+    }).detach();
+
+    // 6. Build the tonic gRPC client over our SendRequestService shim.
+    let svc = SendRequestService::new(sender);
+    let mut grpc = tonic::client::Grpc::with_origin(svc, origin);
+
+    // 7. Wait until the gRPC client is ready (poll_ready returns Ready/Ok).
+    //    Without this, `grpc.unary(...)` could return ChannelClosed if it
+    //    races the handshake completion at the dispatch layer.
+    ngx::ngx_log_debug!(log_ptr, "smoke: awaiting grpc.ready()");
+    grpc.ready().await
+        .map_err(|e| SmokeError::GrpcReady(std::format!("{e}")))?;
+
+    // 8. Issue the unary `Export(ExportMetricsServiceRequest)` call.
+    let request = tonic::Request::new(build_export_request());
+    let path = PathAndQuery::from_static(
         "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
     );
+    let codec = ProstCodec::<ExportMetricsServiceRequest, ExportMetricsServiceResponse>::new();
+
+    ngx::ngx_log_debug!(log_ptr, "smoke: awaiting grpc.unary()");
+    let _resp = grpc.unary(request, path, codec).await
+        .map_err(|status| SmokeError::GrpcCall(std::format!("{status}")))?;
+    ngx::ngx_log_debug!(log_ptr, "smoke: grpc.unary() returned OK");
 
     Ok(())
 }

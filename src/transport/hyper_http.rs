@@ -316,6 +316,11 @@ impl NgxConnIo {
                     unsafe {
                         nginx_sys::ngx_add_timer((*this.pc.connection).read, DEFAULT_READ_TIMEOUT_MS);
                     }
+                    let log = unsafe { (*this.pc.connection).log };
+                    ngx::ngx_log_debug!(
+                        log,
+                        "NgxConnIo::poll_connect NGX_AGAIN: storing rev+wev wakers"
+                    );
                 }
                 this.rev = Some(cx.waker().clone());
                 this.wev = Some(cx.waker().clone());
@@ -381,7 +386,27 @@ impl hyper::rt::Read for NgxConnIo {
         if n == NGX_AGAIN as isize {
             // No data yet — store waker; C handler fires wake() on readiness.
             // NO wake_by_ref(): that would busy-spin the NGINX worker thread.
-            self.get_mut().rev = Some(cx.waker().clone());
+            //
+            // The debug line below logs `prev_was_some` because — with multiple
+            // task contexts polling the same `NgxConnIo` (e.g., hyper's h2 client
+            // spawning a `ConnTask` driver via `NgxExecutor`) — overwriting a
+            // previously-stored waker silently loses a wakeup for the other task.
+            // The Phase 1.2 Item 1 investigation (`INVESTIGATION_h2_wake_stall.md`)
+            // used this exact log to rule out H1 (waker-overwrite race); the
+            // actual root cause turned out to be a deadlock during `_conn` drop
+            // (h2's `Streams::drop` calls `Waker::wake()` while holding its
+            // internal mutex, which ngx-rust's old `schedule()` would resolve
+            // by synchronously re-polling — see the corresponding ngx-rust
+            // patch on the `ngx-otel-rust-deadlock-fix` branch).
+            let log = unsafe { (*c).log };
+            let this = self.get_mut();
+            let prev_was_some = this.rev.is_some();
+            this.rev = Some(cx.waker().clone());
+            ngx::ngx_log_debug!(
+                log,
+                "NgxConnIo::poll_read storing rev waker (prev_was_some={})",
+                prev_was_some
+            );
             return Poll::Pending;
         }
 
@@ -409,7 +434,15 @@ impl hyper::rt::Write for NgxConnIo {
 
         if n == NGX_AGAIN as isize {
             // Store waker; C handler fires wake() when fd is write-ready.
-            self.get_mut().wev = Some(cx.waker().clone());
+            let log = unsafe { (*c).log };
+            let this = self.get_mut();
+            let prev_was_some = this.wev.is_some();
+            this.wev = Some(cx.waker().clone());
+            ngx::ngx_log_debug!(
+                log,
+                "NgxConnIo::poll_write storing wev waker (prev_was_some={})",
+                prev_was_some
+            );
             return Poll::Pending;
         }
 
@@ -452,7 +485,15 @@ impl Drop for NgxConnIo {
 unsafe extern "C" fn ngx_otel_conn_read_handler(ev: *mut ngx_event_t) {
     let c: *mut ngx_connection_t = unsafe { (*ev).data.cast() };
     let this: *mut NgxConnIo    = unsafe { (*c).data.cast() };
-    if let Some(waker) = unsafe { (*this).rev.take() } {
+    let waker_opt = unsafe { (*this).rev.take() };
+    let rev_was_some = waker_opt.is_some();
+    let log = unsafe { (*c).log };
+    ngx::ngx_log_debug!(
+        log,
+        "ngx_otel_conn_read_handler: rev_was_some={}",
+        rev_was_some
+    );
+    if let Some(waker) = waker_opt {
         waker.wake();
     }
 }
@@ -462,7 +503,15 @@ unsafe extern "C" fn ngx_otel_conn_read_handler(ev: *mut ngx_event_t) {
 unsafe extern "C" fn ngx_otel_conn_write_handler(ev: *mut ngx_event_t) {
     let c: *mut ngx_connection_t = unsafe { (*ev).data.cast() };
     let this: *mut NgxConnIo    = unsafe { (*c).data.cast() };
-    if let Some(waker) = unsafe { (*this).wev.take() } {
+    let waker_opt = unsafe { (*this).wev.take() };
+    let wev_was_some = waker_opt.is_some();
+    let log = unsafe { (*c).log };
+    ngx::ngx_log_debug!(
+        log,
+        "ngx_otel_conn_write_handler: wev_was_some={}",
+        wev_was_some
+    );
+    if let Some(waker) = waker_opt {
         waker.wake();
     } else {
         // No pending write-waker: just re-arm (mirrors nginx-acme).

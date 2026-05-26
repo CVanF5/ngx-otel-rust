@@ -150,7 +150,7 @@ worker_processes 1;
 # nginx -s quit; the script's wait-for-exit loop then times out and leaks
 # the worker to the next run as a port-9103 conflict.
 worker_shutdown_timeout 3s;
-error_log ${PREFIX}/logs/error.log notice;
+error_log ${PREFIX}/logs/error.log debug;
 pid       ${PREFIX}/logs/nginx.pid;
 
 load_module ${MODULE_PATH};
