@@ -65,6 +65,18 @@ name = "grpc_smoke"
 path = "tests/grpc_smoke.rs"
 required-features = ["test-support"]
 
+[dev-dependencies]
+# Test-only echo server for Phase 1.2 Item 2 bidi smoke.  Dev-deps do NOT
+# propagate into release builds of the module dylib; `cargo tree --edges normal`
+# must show no tokio at the crate root.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync"] }
+# tokio-stream: needed for ReceiverStream in examples/bidi_echo_server.rs.
+# Already a transitive dep via tonic; made explicit here for the example.
+tokio-stream = { version = "0.1", features = ["net"] }
+# tonic server feature (for EchoServer trait impl in examples/bidi_echo_server.rs)
+# The existing tonic under [dependencies] already covers the client side.
+tonic = { version = "0.14", default-features = false, features = ["server", "transport", "router"] }
+
 [profile.release]
 codegen-units = 1
 lto = true
