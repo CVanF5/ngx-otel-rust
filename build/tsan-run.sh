@@ -88,6 +88,26 @@ make -f "${PLAIN_OBJS}/Makefile" binary
 cd /work/ngx-otel-rust
 echo "[tsan-run] Step 2: OK — plain TSAN nginx at ${PLAIN_OBJS}/nginx"
 
+# ── Step 2.5: Pre-build bidi_echo_server example without TSAN ────────────────
+
+# The bidi smoke script builds examples/bidi_echo_server (Tokio-based test-only
+# gRPC echo server) before launching nginx.  Building it under TSAN fails to
+# link: the example is a standalone binary so its TSAN runtime symbols
+# (__tsan_func_entry, __tsan_read16, etc.) are unresolved — unlike the cdylib
+# which inherits the TSAN runtime from nginx's -fsanitize=thread link line.
+#
+# More importantly we don't WANT the example TSAN-instrumented: it runs Tokio's
+# multi-thread runtime, and TSAN findings inside tokio internals would be noise
+# (upstream code, not module-under-test).  Pre-build it without TSAN now, then
+# the script picks it up via the ECHO_BINARY env override.
+echo "[tsan-run] Step 2.5: Pre-building bidi_echo_server example (no TSAN)..."
+(
+    cd /work/ngx-otel-rust
+    cargo build --example bidi_echo_server
+)
+export ECHO_BINARY=/work/ngx-otel-rust/target/debug/examples/bidi_echo_server
+echo "[tsan-run] Step 2.5: OK — example at ${ECHO_BINARY}"
+
 # ── Step 3: Export TSAN env for integration scripts ──────────────────────────
 
 echo "[tsan-run] Step 3: Exporting TSAN env for integration scripts..."

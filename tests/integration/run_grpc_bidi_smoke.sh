@@ -113,19 +113,26 @@ info "Module built: ${MODULE_PATH}"
 
 # ─── Build the echo server example ───────────────────────────────────────────
 
-info "Building bidi echo server example..."
-(
-    cd "${CRATE_DIR}"
-    NGINX_SOURCE_DIR="${NGINX_SOURCE_DIR}" \
-    NGINX_BUILD_DIR="${NGINX_BUILD_DIR}" \
-    cargo build --example bidi_echo_server 2>&1
-)
-# Same CARGO_BUILD_TARGET handling as MODULE_PATH above — cargo writes the
-# example to target/<triple>/debug/examples/ when --target is in effect.
-if [[ -n "${CARGO_BUILD_TARGET:-}" ]]; then
-    ECHO_BINARY="${CRATE_DIR}/target/${CARGO_BUILD_TARGET}/debug/examples/bidi_echo_server"
+# ECHO_BINARY env override: the TSAN gate pre-builds the example without
+# TSAN flags (Tokio runtime is upstream code; TSAN findings there are
+# noise, not module-under-test bugs) and sets ECHO_BINARY so this script
+# uses it instead of rebuilding under the caller's RUSTFLAGS.  Default
+# path follows MODULE_PATH's CARGO_BUILD_TARGET-aware shape.
+if [[ -z "${ECHO_BINARY:-}" ]]; then
+    info "Building bidi echo server example..."
+    (
+        cd "${CRATE_DIR}"
+        NGINX_SOURCE_DIR="${NGINX_SOURCE_DIR}" \
+        NGINX_BUILD_DIR="${NGINX_BUILD_DIR}" \
+        cargo build --example bidi_echo_server 2>&1
+    )
+    if [[ -n "${CARGO_BUILD_TARGET:-}" ]]; then
+        ECHO_BINARY="${CRATE_DIR}/target/${CARGO_BUILD_TARGET}/debug/examples/bidi_echo_server"
+    else
+        ECHO_BINARY="${CRATE_DIR}/target/debug/examples/bidi_echo_server"
+    fi
 else
-    ECHO_BINARY="${CRATE_DIR}/target/debug/examples/bidi_echo_server"
+    info "Using ECHO_BINARY override: ${ECHO_BINARY}"
 fi
 if [[ ! -x "${ECHO_BINARY}" ]]; then
     echo "ERROR: bidi_echo_server binary not found at ${ECHO_BINARY}" >&2
