@@ -46,7 +46,6 @@ use std::rc::Rc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::time::Duration;
 
-use bytes::Buf as _;
 use http::uri::PathAndQuery;
 
 use ngx_http_otel_module::transport::grpc::shim::SendRequestService;
@@ -109,76 +108,6 @@ use opentelemetry::proto::metrics::v1::{
     NumberDataPoint, ResourceMetrics, ScopeMetrics,
 };
 use opentelemetry::proto::resource::v1::Resource;
-
-// ── Prost codec ──────────────────────────────────────────────────────────────
-//
-// tonic 0.14's codec module does not re-export a built-in ProstCodec so we
-// implement the three traits inline.  These are the exact trait definitions
-// from `tonic::codec`:
-//   - `Codec`   – owns an Encoder and Decoder
-//   - `Encoder` – encodes a message into `EncodeBuf<'_>` (implements BufMut)
-//   - `Decoder` – decodes a message from `DecodeBuf<'_>` (implements Buf)
-
-use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
-use tonic::Status;
-
-struct ProstEncoder<M>(std::marker::PhantomData<M>);
-struct ProstDecoder<M>(std::marker::PhantomData<M>);
-
-impl<M> Encoder for ProstEncoder<M>
-where
-    M: prost::Message + Default + Send + 'static,
-{
-    type Item = M;
-    type Error = Status;
-
-    fn encode(&mut self, item: M, dst: &mut EncodeBuf<'_>) -> Result<(), Status> {
-        item.encode(dst)
-            .map_err(|e| Status::internal(e.to_string()))
-    }
-}
-
-impl<M> Decoder for ProstDecoder<M>
-where
-    M: prost::Message + Default + Send + 'static,
-{
-    type Item = M;
-    type Error = Status;
-
-    fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<M>, Status> {
-        // `DecodeBuf` implements `bytes::Buf`; copy everything out and decode.
-        let bytes = src.copy_to_bytes(src.remaining());
-        let msg = M::decode(bytes).map_err(|e| Status::internal(e.to_string()))?;
-        Ok(Some(msg))
-    }
-}
-
-struct ProstCodec<E, D>(std::marker::PhantomData<(E, D)>);
-
-impl<E, D> ProstCodec<E, D> {
-    fn new() -> Self {
-        Self(std::marker::PhantomData)
-    }
-}
-
-impl<E, D> Codec for ProstCodec<E, D>
-where
-    E: prost::Message + Default + Send + Sync + 'static,
-    D: prost::Message + Default + Send + Sync + 'static,
-{
-    type Encode = E;
-    type Decode = D;
-    type Encoder = ProstEncoder<E>;
-    type Decoder = ProstDecoder<D>;
-
-    fn encoder(&mut self) -> ProstEncoder<E> {
-        ProstEncoder(std::marker::PhantomData)
-    }
-
-    fn decoder(&mut self) -> ProstDecoder<D> {
-        ProstDecoder(std::marker::PhantomData)
-    }
-}
 
 // ── Task-queue executor ───────────────────────────────────────────────────────
 //
@@ -369,7 +298,7 @@ fn grpc_smoke_unary_export() {
     let path = PathAndQuery::from_static(
         "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
     );
-    let codec = ProstCodec::<ExportMetricsServiceRequest, ExportMetricsServiceResponse>::new();
+    let codec = tonic_prost::ProstCodec::<ExportMetricsServiceRequest, ExportMetricsServiceResponse>::default();
 
     let result = block_on_with_tasks(&exec, grpc.unary(request, path, codec));
 

@@ -88,59 +88,6 @@ use crate::transport::grpc::executor::NgxExecutor;
 use crate::transport::grpc::shim::SendRequestService;
 use crate::transport::hyper_http::{Connector, NgxConnector, ParsedEndpoint};
 
-// ── Prost codec — lifted from tests/grpc_smoke.rs ─────────────────────────────
-//
-// tonic 0.14 does not re-export a built-in ProstCodec, so we implement the
-// three traits inline.  This is identical to the codec the freestanding
-// smoke test uses; lifted here for the in-worker harness.
-
-use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
-use tonic::Status;
-
-struct ProstEncoder<M>(core::marker::PhantomData<M>);
-struct ProstDecoder<M>(core::marker::PhantomData<M>);
-
-impl<M> Encoder for ProstEncoder<M>
-where M: prost::Message + Default + Send + 'static,
-{
-    type Item = M;
-    type Error = Status;
-    fn encode(&mut self, item: M, dst: &mut EncodeBuf<'_>) -> Result<(), Status> {
-        item.encode(dst).map_err(|e| Status::internal(std::format!("{e}")))
-    }
-}
-
-impl<M> Decoder for ProstDecoder<M>
-where M: prost::Message + Default + Send + 'static,
-{
-    type Item = M;
-    type Error = Status;
-    fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<M>, Status> {
-        let bytes = bytes::Buf::copy_to_bytes(src, bytes::Buf::remaining(src));
-        let msg = M::decode(bytes).map_err(|e| Status::internal(std::format!("{e}")))?;
-        Ok(Some(msg))
-    }
-}
-
-struct ProstCodec<E, D>(core::marker::PhantomData<(E, D)>);
-
-impl<E, D> ProstCodec<E, D> {
-    fn new() -> Self { Self(core::marker::PhantomData) }
-}
-
-impl<E, D> Codec for ProstCodec<E, D>
-where
-    E: prost::Message + Default + Send + Sync + 'static,
-    D: prost::Message + Default + Send + Sync + 'static,
-{
-    type Encode = E;
-    type Decode = D;
-    type Encoder = ProstEncoder<E>;
-    type Decoder = ProstDecoder<D>;
-    fn encoder(&mut self) -> ProstEncoder<E> { ProstEncoder(core::marker::PhantomData) }
-    fn decoder(&mut self) -> ProstDecoder<D> { ProstDecoder(core::marker::PhantomData) }
-}
-
 // ── Test payload ──────────────────────────────────────────────────────────────
 
 /// Builds a minimal `ExportMetricsServiceRequest` with `service.name =
@@ -326,7 +273,7 @@ pub async fn fire_one_grpc_export(
     let path = PathAndQuery::from_static(
         "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
     );
-    let codec = ProstCodec::<ExportMetricsServiceRequest, ExportMetricsServiceResponse>::new();
+    let codec = tonic_prost::ProstCodec::<ExportMetricsServiceRequest, ExportMetricsServiceResponse>::default();
 
     ngx::ngx_log_debug!(log_ptr, "smoke: awaiting grpc.unary()");
     let _resp = grpc.unary(request, path, codec).await
