@@ -35,6 +35,11 @@
 //! proves this claim statistically.
 
 #![no_std]
+// Pull all `std` macros (format!, vec!, assert!, etc.) into global scope.
+// The crate is no_std but links to std, so this is safe — it only affects
+// name resolution, not the binary.  Required because generated tonic client
+// stubs use bare `format!` which is not in scope in a no_std crate.
+#[macro_use]
 extern crate std;
 
 use core::ptr;

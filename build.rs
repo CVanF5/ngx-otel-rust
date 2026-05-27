@@ -81,7 +81,7 @@ fn detect_stat_stub() -> bool {
         .unwrap_or(false)
 }
 
-/// Compile OpenTelemetry proto files with prost-build.
+/// Compile OpenTelemetry proto files with tonic-prost-build.
 fn compile_protos() {
     let proto_root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("proto");
 
@@ -92,15 +92,13 @@ fn compile_protos() {
         proto_root.join("opentelemetry/proto/collector/metrics/v1/metrics_service.proto"),
     ];
 
-    // Only compile if all proto files exist
-    let all_exist = protos.iter().all(|p| p.exists());
+    if protos.iter().all(|p| p.exists()) {
+        tonic_prost_build::configure()
+            .build_client(true)
+            .build_server(false)
+            .compile_protos(&protos, &[proto_root])
+            .expect("tonic-prost-build failed");
 
-    if all_exist {
-        prost_build::Config::new()
-            .compile_protos(&protos, &[&proto_root])
-            .expect("prost-build failed");
-
-        // Mark proto files for recompilation
         for proto in &protos {
             println!("cargo::rerun-if-changed={}", proto.display());
         }

@@ -28,14 +28,14 @@ nginx-sys = { path = "../ngx-rust/nginx-sys" }
 ngx = { path = "../ngx-rust", features = ["async", "std"] }
 openssl-sys = { version = "0.9.110", features = ["bindgen"] }
 pin-project-lite = "0.2.16"
-prost = "0.13"
+prost = "0.14"
 thiserror = { version = "2.0.12", default-features = false }
-tonic = { version = "0.14", default-features = false }
+tonic = { version = "0.14", default-features = false, features = ["codegen"] }
+tonic-prost = { version = "0.14", default-features = false }
 tower-service = "0.3"
 
 [build-dependencies]
-prost-build = "0.13"
-tonic-build = { version = "0.14", default-features = false }
+tonic-prost-build = { version = "0.14", default-features = false }
 
 [features]
 default = ["export-modules"]
