@@ -1,0 +1,31 @@
+# Dockerfile for the TSAN (ThreadSanitizer) test environment.
+# Used exclusively by the `tsan-test` Makefile target.
+#
+# Runs on Linux arm64 (the canonical TSAN target).  TSAN on macOS is
+# forbidden — do not attempt to build or run TSAN on aarch64-apple-darwin.
+#
+# The image is intentionally minimal: no ENTRYPOINT.  The `tsan-test`
+# Makefile target runs `build/tsan-run.sh` via `docker run ... bash`.
+#
+# Mount layout (all writable — configure writes to nginx source dir):
+#   /work/ngx-otel-rust  ← $(CURDIR)
+#   /work/nginx          ← ../nginx (sibling nginx source checkout)
+#   /work/ngx-rust       ← ../ngx-rust (sibling ngx-rust checkout)
+
+FROM debian:13-slim
+RUN apt-get update && apt-get install -y \
+    clang make curl pkg-config libssl-dev ca-certificates \
+    perl git netcat-openbsd lsof \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo
+ENV PATH=/usr/local/cargo/bin:$PATH
+
+# Install Rust stable (matching Cargo.toml rust-version = "1.81.0" minimum;
+# 1.95.0 is the current stable as of this file).  rust-src is required for
+# -Zbuild-std (used by build-tsan.mk to compile std with TSAN instrumentation).
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain 1.95.0 --profile minimal \
+        --component rust-src
+
+WORKDIR /work
