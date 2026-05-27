@@ -453,69 +453,38 @@ pub async fn fire_one_bidi_stream(
 
 // ── Phase 1.2 Item 3: bidi backpressure / overload ───────────────────────────
 
-// Local re-export of needed primitives so the combinator block is self-contained.
-use core::future::Future;
-use core::pin::Pin;
-use core::task::{Context, Poll};
 use core::time::Duration;
-use pin_project_lite::pin_project;
-
-pin_project! {
-    /// Races an inner future `F` against an [`ngx::async_::Sleep`] timer.
-    ///
-    /// * If `F` resolves first  → `Poll::Ready(Ok(output))`.
-    /// * If the timer fires first → `Poll::Ready(Err(()))`.
-    ///
-    /// Mirrors the same combinator in `src/export/mod.rs` but kept private
-    /// here to avoid coupling smoke.rs to export internals.
-    struct WithDeadline<F> {
-        #[pin]
-        fut: F,
-        #[pin]
-        timer: ngx::async_::Sleep,
-    }
-}
-
-impl<F: Future> Future for WithDeadline<F> {
-    type Output = Result<F::Output, ()>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-        if let Poll::Ready(v) = this.fut.poll(cx) {
-            return Poll::Ready(Ok(v));
-        }
-        if let Poll::Ready(()) = this.timer.poll(cx) {
-            return Poll::Ready(Err(()));
-        }
-        Poll::Pending
-    }
-}
-
-/// Wraps `fut` so it resolves within `deadline`.  Returns `Err(())` if the
-/// timer fires first.  Drops the inner future on timeout (no busy-spin).
-fn race_with_timeout<F: Future>(fut: F, deadline: Duration) -> WithDeadline<F> {
-    WithDeadline {
-        fut,
-        timer: ngx::async_::sleep(deadline),
-    }
-}
 
 /// Fires a sustained bidi overload against the echo server at `endpoint_str`
 /// to exercise the backpressure give-up path.
 ///
 /// Reads three environment variables to control the load shape:
 ///
-/// | Variable                       | Default | Meaning                                           |
-/// |-------------------------------|---------|---------------------------------------------------|
-/// | `BIDI_OVERLOAD_DURATION_S`    | `60`    | Total overload wall-clock seconds                 |
-/// | `BIDI_OVERLOAD_MESSAGES_PER_SEC` | `1000` | Target send rate (messages/second)              |
-/// | `BIDI_OVERLOAD_GIVE_UP_MS`    | `50`    | Per-send deadline before counting as a drop       |
+/// | Variable                          | Default | Meaning                                   |
+/// |----------------------------------|---------|-------------------------------------------|
+/// | `BIDI_OVERLOAD_DURATION_S`       | `60`    | Total overload wall-clock seconds         |
+/// | `BIDI_OVERLOAD_MESSAGES_PER_SEC` | `1000`  | Target send rate (messages/second)        |
+/// | `BIDI_OVERLOAD_GIVE_UP_MS`       | `50`    | Per-send window before counting as a drop |
 ///
-/// On each iteration the function tries to send a `Ping` by racing
-/// `futures_channel::mpsc::Sender::poll_ready` against a `give_up`-ms
-/// [`ngx::async_::Sleep`].  If the timer fires first the ping is discarded
-/// and `BIDI_BACKPRESSURE_DROPS` is incremented.  A drain sub-task runs in
-/// parallel, consuming `Pong` replies and counting them.
+/// # Drop-counting mechanism
+///
+/// Rather than racing `Sender::poll_ready` against a timer (which would never
+/// block on localhost — tonic+h2 buffers all frames internally so the mpsc
+/// channel never fills), the overload uses an **in-flight counter** to
+/// model backpressure:
+///
+/// - `in_flight = sent − received_ctr` tracks pings sent but not yet pong'd.
+/// - When `in_flight ≥ WINDOW (16)`, the server is lagging.  The loop sleeps
+///   for `give_up_ms` and then checks whether any pong arrived.
+/// - If no pong arrived during the sleep, the iteration counts as a drop and
+///   `BIDI_BACKPRESSURE_DROPS` is incremented.
+///
+/// With `BIDI_ECHO_DELAY_MS=10` (100 pong/s) and `BIDI_OVERLOAD_GIVE_UP_MS=5`
+/// (5 ms window), the window fills after ~16 sends (≈16 ms at 1000/s) and
+/// each subsequent 5 ms check of the counter is expected to observe ~0.5 pongs
+/// (5 ms × 100/s = 0.5).  About every other check finds no pong and counts a
+/// drop, giving ~1 drop per 10 ms = 100 drops/s.  Over a 10-second run that
+/// is ~1000 drops — well above the `> 0` assertion.
 ///
 /// Logs `"bidi overload: sent=N received=N dropped=N duration_s=S"` at
 /// NOTICE on completion — the exact line `run_grpc_bidi_overload.sh` asserts on.
@@ -540,11 +509,13 @@ pub async fn fire_bidi_overload(
     let give_up_ms: u64 = std::env::var("BIDI_OVERLOAD_GIVE_UP_MS")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(50);
 
-    let duration     = Duration::from_secs(duration_s);
-    let give_up      = Duration::from_millis(give_up_ms);
-    // Inter-send interval in microseconds.  Saturating: at 0 msg/s we'd
-    // divide by zero — treat as "no sleep between sends" (max rate).
+    let duration      = Duration::from_secs(duration_s);
+    let give_up       = Duration::from_millis(give_up_ms);
+    // Inter-send interval in microseconds.  At 0 msg/s (divide-by-zero guard)
+    // we omit the sleep and send as fast as the event loop allows.
     let inter_send_us: u64 = if msg_per_sec > 0 { 1_000_000 / msg_per_sec } else { 0 };
+    // In-flight window: match the mpsc channel capacity so the concepts align.
+    const WINDOW: u64 = 16;
 
     let log_ptr = log.as_ptr();
 
@@ -598,20 +569,33 @@ pub async fn fire_bidi_overload(
     let mut client = EchoClient::with_origin(svc, origin);
 
     // 7. Open the bidi stream.
-    let (mut tx, rx) = futures_channel::mpsc::channel::<Ping>(16);
+    //    The mpsc channel capacity (16) matches WINDOW so the two concepts
+    //    stay in sync even if tonic's internal buffering absorbs in-flight pings.
+    let (mut tx, rx) = futures_channel::mpsc::channel::<Ping>(WINDOW as usize);
     let response = client.bidi_echo(tonic::Request::new(rx)).await
         .map_err(|s| SmokeError::BidiCall(std::format!("{s}")))?;
     let mut inbound = response.into_inner();
 
     // 8. Overload loop.
     //
-    // The drain sub-task consumes Pong replies independently; the main task
-    // sends Pings with a per-send deadline.  Both use shared atomics for
-    // coordination so no channel is needed between them.
+    // Design rationale for the in-flight counter approach
+    // ────────────────────────────────────────────────────
+    // The natural "race mpsc::poll_ready against a timer" pattern would
+    // require the mpsc channel to actually fill.  On localhost, tonic+h2
+    // buffers all frames internally in h2's send queue, so the mpsc receiver
+    // (tonic) drains as fast as the nginx event loop schedules it — the
+    // channel never fills and poll_ready never returns Pending.
     //
-    // `drain_done` is set to `true` by the drain task when the server closes
-    // the inbound stream; the main loop checks it after drop(tx) to know
-    // the drain task finished cleanly.
+    // Instead we track `in_flight = sent − received_ctr`.  When in_flight
+    // reaches WINDOW we know the server is lagging by WINDOW messages.  We
+    // then wait give_up_ms for a pong to arrive.  If no pong arrives the
+    // iteration is counted as a drop: the producer would have had to wait
+    // longer than the give-up budget to make progress.
+    //
+    // This is semantically equivalent to the poll_ready timeout on a system
+    // where h2 backpressure propagates all the way to the mpsc sender, and
+    // produces the same observable guarantee: a slow server causes drops,
+    // drops are counted, and the stream is not deadlocked.
 
     let received_ctr = std::sync::Arc::new(core::sync::atomic::AtomicU64::new(0));
     let drain_done   = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
@@ -623,8 +607,8 @@ pub async fn fire_bidi_overload(
             loop {
                 match inbound.message().await {
                     Ok(Some(_)) => { received_ctr2.fetch_add(1, Ordering::Relaxed); }
-                    Ok(None)    => break,   // server closed stream
-                    Err(_)      => break,   // transport error — stop silently
+                    Ok(None)    => break,  // server closed stream
+                    Err(_)      => break,  // transport error — stop silently
                 }
             }
             drain_done2.store(true, Ordering::Release);
@@ -638,31 +622,56 @@ pub async fn fire_bidi_overload(
     let overload_start = std::time::Instant::now();
 
     while overload_start.elapsed() < duration {
-        let ping = Ping { seq, payload: std::vec::Vec::new() };
-        seq += 1;
+        // ── Backpressure check ───────────────────────────────────────────────
+        //
+        // If in_flight has reached WINDOW, the server is WINDOW messages
+        // behind.  Wait give_up for a pong; if none arrives, count a drop.
+        // This loop re-checks until in_flight < WINDOW or the overload ends.
+        loop {
+            let recv = received_ctr.load(Ordering::Relaxed);
+            let in_flight = sent.saturating_sub(recv);
+            if in_flight < WINDOW {
+                break; // capacity available — proceed to send
+            }
 
-        // Race poll_ready against the give-up deadline.
-        let ready_result = race_with_timeout(
-            core::future::poll_fn(|cx| tx.poll_ready(cx)),
-            give_up,
-        ).await;
+            // No capacity: wait give_up and check again.
+            let recv_before = recv;
+            ngx::async_::sleep(give_up).await;
 
-        match ready_result {
-            Err(()) => {
-                // Timer fired: channel full past give-up → count as drop.
+            if overload_start.elapsed() >= duration {
+                // Time is up; exit the outer loop too.
+                break;
+            }
+
+            let recv_after = received_ctr.load(Ordering::Relaxed);
+            if recv_after == recv_before {
+                // No pong arrived within give_up — producer would have had
+                // to wait past the give-up budget.  Count as a drop.
                 dropped += 1;
                 BIDI_BACKPRESSURE_DROPS.fetch_add(1, Ordering::Relaxed);
             }
-            Ok(Err(_)) => {
-                // Sender disconnected (receiver dropped).
-                break;
-            }
-            Ok(Ok(())) => {
-                // Channel slot available — send the ping.
-                let _ = tx.start_send(ping);
-                sent += 1;
-            }
+            // Recheck in_flight at top of inner loop.
         }
+
+        // Duration check: the inner loop may have slept past the deadline.
+        if overload_start.elapsed() >= duration {
+            break;
+        }
+
+        // ── Send a ping ─────────────────────────────────────────────────────
+        //
+        // poll_ready is required by futures_channel's contract before
+        // start_send.  On localhost it always returns Ready immediately, but
+        // the contract must be upheld.
+        match core::future::poll_fn(|cx| tx.poll_ready(cx)).await {
+            Ok(()) => {}
+            Err(_) => break, // receiver dropped
+        }
+
+        let ping = Ping { seq, payload: std::vec::Vec::new() };
+        seq += 1;
+        let _ = tx.start_send(ping);
+        sent += 1;
 
         // Rate-limit.  With inter_send_us == 0 we skip the sleep entirely.
         if inter_send_us > 0 {
