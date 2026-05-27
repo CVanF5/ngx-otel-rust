@@ -173,6 +173,14 @@ test-%: ## Test with the specified configuration.
 
 # ── Phase 1.2 Item 3 stress gates ───────────────────────────────────────────
 
+# Sub-item 3.2: Time::sleep() panic-path 1-hour watch loop.
+# Default LOOP_FOR=3600 for the formal gate; override to 60 for ad-hoc runs.
+
+.PHONY: timer-panic-watch
+
+timer-panic-watch: ## Sub-item 3.2: 1-hour Time::sleep panic watch
+	LOOP_FOR=$${LOOP_FOR:-3600} bash tests/bench/timer_panic_watch.sh
+
 # Sub-item 3.1: build nginx + module under ThreadSanitizer inside Docker and
 # run both gRPC smoke integration scripts.  Linux arm64 only.
 # Prerequisites on the host: Docker available; collector running (collector-up).
