@@ -15,12 +15,16 @@
 FROM debian:13-slim
 RUN apt-get update && apt-get install -y \
     clang make curl pkg-config libssl-dev libpcre2-dev zlib1g-dev \
+    protobuf-compiler \
     ca-certificates perl git netcat-openbsd lsof \
     && rm -rf /var/lib/apt/lists/*
-# libpcre2-dev: required by nginx's HTTP rewrite module (default-enabled).
-# zlib1g-dev:   required by nginx's HTTP gzip module (default-enabled).
-# Without these, auto/configure inside the container fails with
-# "the HTTP rewrite module requires the PCRE library".
+# libpcre2-dev:      required by nginx's HTTP rewrite module (default-enabled).
+# zlib1g-dev:        required by nginx's HTTP gzip module (default-enabled).
+# protobuf-compiler: provides /usr/bin/protoc, used by build.rs's three
+#                    tonic_prost_build::configure() calls (OTel + Echo protos).
+# Without these, the build fails inside the container with auto/configure
+# "HTTP rewrite module requires the PCRE library" or build.rs panic
+# "Could not find `protoc`".
 
 ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo
 ENV PATH=/usr/local/cargo/bin:$PATH
