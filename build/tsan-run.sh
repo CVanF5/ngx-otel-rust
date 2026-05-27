@@ -88,21 +88,33 @@ make -f "${PLAIN_OBJS}/Makefile" binary
 cd /work/ngx-otel-rust
 echo "[tsan-run] Step 2: OK — plain TSAN nginx at ${PLAIN_OBJS}/nginx"
 
-# ── Step 3: Export TSAN RUSTFLAGS for integration scripts ────────────────────
+# ── Step 3: Export TSAN env for integration scripts ──────────────────────────
 
-echo "[tsan-run] Step 3: Exporting TSAN RUSTFLAGS for integration scripts..."
-# The scripts hardcode MODULE_PATH to target/release/libngx_http_otel_module.so
-# and run `cargo build --release --features test-support` themselves.  Exporting
-# RUSTFLAGS here causes that cargo invocation to produce a TSAN-instrumented
-# cdylib at the expected path without any modification to the scripts.
+echo "[tsan-run] Step 3: Exporting TSAN env for integration scripts..."
+# The scripts run `cargo build --release --features test-support` themselves.
+# Three env vars steer that cargo invocation into producing a TSAN-instrumented
+# cdylib + stdlib without any change to the cargo command line:
 #
-# -Zexternal-clangrt: use the clang TSAN runtime already linked into the nginx
-# binary rather than a Rust-bundled copy.  Avoids duplicate runtime init.
-# -Zbuild-std is omitted: the scripts do not pass --target, so cargo builds for
-# the host triple and outputs to target/release/.  The standard library is not
-# re-compiled under TSAN; only the module's own code is instrumented.
+#   RUSTFLAGS                  TSAN flags applied to every Rust crate.
+#   -Zexternal-clangrt         use clang's TSAN runtime already linked into nginx
+#                              rather than a Rust-bundled copy (avoids duplicate
+#                              runtime init).
+#   CARGO_BUILD_TARGET         equivalent of `--target=<triple>`; cargo writes
+#                              output to target/<triple>/release/ when set.
+#   CARGO_UNSTABLE_BUILD_STD   equivalent of `-Zbuild-std=std,panic_abort`;
+#                              rebuilds stdlib under the same RUSTFLAGS so the
+#                              crate's `-Zsanitizer=thread` doesn't clash with
+#                              an un-instrumented host stdlib (rustc 1.95
+#                              rejects this ABI mismatch).  RUSTC_BOOTSTRAP=1
+#                              unlocks the unstable flag on a stable toolchain.
+#
+# Integration scripts gain a small CARGO_BUILD_TARGET-aware MODULE_PATH branch
+# so they find the cdylib at target/<triple>/release/ when set, and at the
+# original target/release/ when unset (non-TSAN runs unchanged).
 export RUSTFLAGS="-Cforce-frame-pointers=yes -Zsanitizer=thread -Zexternal-clangrt"
 export RUSTC_BOOTSTRAP=1
+export CARGO_BUILD_TARGET="$(rustc -vV | awk '/^host: / { print $2 }')"
+export CARGO_UNSTABLE_BUILD_STD="std,panic_abort"
 
 # Point integration scripts at the plain TSAN nginx.
 export NGINX_BINARY="${PLAIN_OBJS}/nginx"

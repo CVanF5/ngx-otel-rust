@@ -56,7 +56,14 @@ case "$(uname -s)" in
     Darwin) MODULE_EXT="dylib" ;;
     *)      MODULE_EXT="so"    ;;
 esac
-MODULE_PATH="${CRATE_DIR}/target/release/libngx_http_otel_module.${MODULE_EXT}"
+# When CARGO_BUILD_TARGET is set (e.g., the TSAN gate uses --target so cargo
+# can also -Zbuild-std), cargo writes its output to target/<triple>/release/
+# rather than target/release/.  Backwards-compatible: unset → original path.
+if [[ -n "${CARGO_BUILD_TARGET:-}" ]]; then
+    MODULE_PATH="${CRATE_DIR}/target/${CARGO_BUILD_TARGET}/release/libngx_http_otel_module.${MODULE_EXT}"
+else
+    MODULE_PATH="${CRATE_DIR}/target/release/libngx_http_otel_module.${MODULE_EXT}"
+fi
 
 SERVICE_NAME="ngx-otel-grpc-smoke"
 GRPC_ENDPOINT="http://127.0.0.1:4317"
@@ -113,7 +120,13 @@ info "Building bidi echo server example..."
     NGINX_BUILD_DIR="${NGINX_BUILD_DIR}" \
     cargo build --example bidi_echo_server 2>&1
 )
-ECHO_BINARY="${CRATE_DIR}/target/debug/examples/bidi_echo_server"
+# Same CARGO_BUILD_TARGET handling as MODULE_PATH above — cargo writes the
+# example to target/<triple>/debug/examples/ when --target is in effect.
+if [[ -n "${CARGO_BUILD_TARGET:-}" ]]; then
+    ECHO_BINARY="${CRATE_DIR}/target/${CARGO_BUILD_TARGET}/debug/examples/bidi_echo_server"
+else
+    ECHO_BINARY="${CRATE_DIR}/target/debug/examples/bidi_echo_server"
+fi
 if [[ ! -x "${ECHO_BINARY}" ]]; then
     echo "ERROR: bidi_echo_server binary not found at ${ECHO_BINARY}" >&2
     exit 1
