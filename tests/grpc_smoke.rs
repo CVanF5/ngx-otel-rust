@@ -46,8 +46,6 @@ use std::rc::Rc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::time::Duration;
 
-use http::uri::PathAndQuery;
-
 use ngx_http_otel_module::transport::grpc::shim::SendRequestService;
 use ngx_http_otel_module::transport::hyper_http::SpinTcpIo;
 
@@ -97,7 +95,8 @@ mod opentelemetry {
 }
 
 use opentelemetry::proto::collector::metrics::v1::{
-    ExportMetricsServiceRequest, ExportMetricsServiceResponse,
+    ExportMetricsServiceRequest,
+    metrics_service_client::MetricsServiceClient,
 };
 use opentelemetry::proto::common::v1::{
     any_value::Value as AnyValueInner, AnyValue, InstrumentationScope,
@@ -289,18 +288,14 @@ fn grpc_smoke_unary_export() {
             let _ = conn.await;
         }));
 
-    // 5. Build the tonic gRPC client over our shim.
+    // 5. Build the generated tonic gRPC client over our shim.
+    //    ready() + path + codec are encapsulated inside the generated export() method.
     let origin: http::Uri = "http://127.0.0.1:4317".parse().unwrap();
-    let mut grpc = tonic::client::Grpc::with_origin(SendRequestService::new(sender), origin);
+    let mut client = MetricsServiceClient::with_origin(SendRequestService::new(sender), origin);
 
     // 6. Issue a unary ExportMetrics call.
     let request = tonic::Request::new(build_export_request());
-    let path = PathAndQuery::from_static(
-        "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
-    );
-    let codec = tonic_prost::ProstCodec::<ExportMetricsServiceRequest, ExportMetricsServiceResponse>::default();
-
-    let result = block_on_with_tasks(&exec, grpc.unary(request, path, codec));
+    let result = block_on_with_tasks(&exec, client.export(request));
 
     // 7. Assert success.
     assert!(

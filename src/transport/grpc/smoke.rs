@@ -44,8 +44,8 @@
 //!                             │
 //!                             ├─ SendRequestService::new(SendRequest) // <- exercised
 //!                             │
-//!                             └─ tonic::client::Grpc::with_origin(svc, ...).
-//!                                   unary(req, path, codec).await
+//!                             └─ MetricsServiceClient::with_origin(svc, origin).
+//!                                   export(request).await
 //! ```
 //!
 //! When the worker is built with `--with-debug` (the canonical `make
@@ -68,11 +68,12 @@
 
 use core::ptr::NonNull;
 
-use http::uri::{PathAndQuery, Uri};
+use http::uri::Uri;
 use nginx_sys::ngx_log_t;
 
 use crate::encoder::opentelemetry::proto::collector::metrics::v1::{
-    ExportMetricsServiceRequest, ExportMetricsServiceResponse,
+    ExportMetricsServiceRequest,
+    metrics_service_client::MetricsServiceClient,
 };
 use crate::encoder::opentelemetry::proto::common::v1::{
     any_value::Value as AnyValueInner, AnyValue, InstrumentationScope,
@@ -257,28 +258,17 @@ pub async fn fire_one_grpc_export(
         let _ = conn.await;
     }).detach();
 
-    // 6. Build the tonic gRPC client over our SendRequestService shim.
-    let svc = SendRequestService::new(sender);
-    let mut grpc = tonic::client::Grpc::with_origin(svc, origin);
+    // 6. Build the generated tonic gRPC client over our SendRequestService shim.
+    //    ready() + path + codec are encapsulated inside the generated export() method.
+    let mut client = MetricsServiceClient::with_origin(SendRequestService::new(sender), origin);
 
-    // 7. Wait until the gRPC client is ready (poll_ready returns Ready/Ok).
-    //    Without this, `grpc.unary(...)` could return ChannelClosed if it
-    //    races the handshake completion at the dispatch layer.
-    ngx::ngx_log_debug!(log_ptr, "smoke: awaiting grpc.ready()");
-    grpc.ready().await
-        .map_err(|e| SmokeError::GrpcReady(std::format!("{e}")))?;
-
-    // 8. Issue the unary `Export(ExportMetricsServiceRequest)` call.
+    // 7. Issue the unary `Export(ExportMetricsServiceRequest)` call.
     let request = tonic::Request::new(build_export_request());
-    let path = PathAndQuery::from_static(
-        "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
-    );
-    let codec = tonic_prost::ProstCodec::<ExportMetricsServiceRequest, ExportMetricsServiceResponse>::default();
 
-    ngx::ngx_log_debug!(log_ptr, "smoke: awaiting grpc.unary()");
-    let _resp = grpc.unary(request, path, codec).await
+    ngx::ngx_log_debug!(log_ptr, "smoke: awaiting client.export()");
+    let _resp = client.export(request).await
         .map_err(|status| SmokeError::GrpcCall(std::format!("{status}")))?;
-    ngx::ngx_log_debug!(log_ptr, "smoke: grpc.unary() returned OK");
+    ngx::ngx_log_debug!(log_ptr, "smoke: client.export() returned OK");
 
     Ok(())
 }
