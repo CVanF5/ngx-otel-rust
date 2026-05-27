@@ -14,9 +14,13 @@
 
 FROM debian:13-slim
 RUN apt-get update && apt-get install -y \
-    clang make curl pkg-config libssl-dev ca-certificates \
-    perl git netcat-openbsd lsof \
+    clang make curl pkg-config libssl-dev libpcre2-dev zlib1g-dev \
+    ca-certificates perl git netcat-openbsd lsof \
     && rm -rf /var/lib/apt/lists/*
+# libpcre2-dev: required by nginx's HTTP rewrite module (default-enabled).
+# zlib1g-dev:   required by nginx's HTTP gzip module (default-enabled).
+# Without these, auto/configure inside the container fails with
+# "the HTTP rewrite module requires the PCRE library".
 
 ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo
 ENV PATH=/usr/local/cargo/bin:$PATH
