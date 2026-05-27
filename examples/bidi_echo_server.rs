@@ -10,6 +10,12 @@
 //! `run_grpc_bidi_smoke.sh` integration test as the in-process target for
 //! the bidi bridge exercise.
 //!
+//! Phase 1.2 Item 3 extension: the `BIDI_ECHO_DELAY_MS` environment variable
+//! introduces an artificial per-pong delay (default: 0 — no delay, byte-identical
+//! behaviour to Item 2).  The overload integration test sets this to 10ms to
+//! cap server throughput at ~100 msg/sec, creating a 10× rate mismatch against
+//! the client's 1 000 msg/sec target and driving the backpressure give-up path.
+//!
 //! This binary:
 //! - Uses Tokio (added as a dev-dependency; NEVER linked into the module dylib).
 //! - Is freestanding test infrastructure; it does NOT import from `src/`.
@@ -29,6 +35,7 @@ use ngx_otel_echo_v1::{
 };
 
 use std::pin::Pin;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
@@ -36,7 +43,11 @@ use tonic::{Request, Response, Status, Streaming};
 
 // ── Echo service implementation ───────────────────────────────────────────────
 
-struct EchoSvc;
+struct EchoSvc {
+    /// Per-pong artificial delay in milliseconds.  0 = no delay (default;
+    /// byte-identical behaviour to Item 2).  Set via `BIDI_ECHO_DELAY_MS`.
+    delay_ms: u64,
+}
 
 #[tonic::async_trait]
 impl Echo for EchoSvc {
@@ -47,6 +58,7 @@ impl Echo for EchoSvc {
         request: Request<Streaming<Ping>>,
     ) -> Result<Response<Self::BidiEchoStream>, Status> {
         let mut inbound = request.into_inner();
+        let delay_ms = self.delay_ms;
 
         // Channel capacity matches the 16-slot channel used on the client side
         // in fire_one_bidi_stream.  One buffer slot per in-flight ping is
@@ -59,6 +71,12 @@ impl Echo for EchoSvc {
             while let Some(item) = inbound.next().await {
                 match item {
                     Ok(ping) => {
+                        // Simulate a slow consumer when BIDI_ECHO_DELAY_MS > 0.
+                        // With delay_ms = 0 (default) the branch is never taken;
+                        // behaviour is byte-identical to the original Item 2 binary.
+                        if delay_ms > 0 {
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        }
                         let pong = Pong {
                             seq: ping.seq,
                             payload: ping.payload,
@@ -88,14 +106,23 @@ impl Echo for EchoSvc {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // BIDI_ECHO_DELAY_MS: artificial per-pong delay in milliseconds.
+    // Default 0 → no delay, byte-identical to the original Item 2 server.
+    // Set to a positive value (e.g. 10) to simulate a slow consumer for the
+    // Phase 1.2 Item 3 backpressure overload test.
+    let delay_ms: u64 = std::env::var("BIDI_ECHO_DELAY_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
     let bind_addr = std::env::var("BIDI_ECHO_BIND")
         .unwrap_or_else(|_| "127.0.0.1:4319".to_string());
     let addr: std::net::SocketAddr = bind_addr.parse()?;
 
-    println!("bidi echo server: listening on {addr}");
+    println!("bidi echo server: listening on {addr} (delay={delay_ms}ms)");
 
     tonic::transport::Server::builder()
-        .add_service(EchoServer::new(EchoSvc))
+        .add_service(EchoServer::new(EchoSvc { delay_ms }))
         .serve(addr)
         .await?;
 

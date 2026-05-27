@@ -450,3 +450,248 @@ pub async fn fire_one_bidi_stream(
 
     Ok(())
 }
+
+// ── Phase 1.2 Item 3: bidi backpressure / overload ───────────────────────────
+
+// Local re-export of needed primitives so the combinator block is self-contained.
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll};
+use core::time::Duration;
+use pin_project_lite::pin_project;
+
+pin_project! {
+    /// Races an inner future `F` against an [`ngx::async_::Sleep`] timer.
+    ///
+    /// * If `F` resolves first  → `Poll::Ready(Ok(output))`.
+    /// * If the timer fires first → `Poll::Ready(Err(()))`.
+    ///
+    /// Mirrors the same combinator in `src/export/mod.rs` but kept private
+    /// here to avoid coupling smoke.rs to export internals.
+    struct WithDeadline<F> {
+        #[pin]
+        fut: F,
+        #[pin]
+        timer: ngx::async_::Sleep,
+    }
+}
+
+impl<F: Future> Future for WithDeadline<F> {
+    type Output = Result<F::Output, ()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        if let Poll::Ready(v) = this.fut.poll(cx) {
+            return Poll::Ready(Ok(v));
+        }
+        if let Poll::Ready(()) = this.timer.poll(cx) {
+            return Poll::Ready(Err(()));
+        }
+        Poll::Pending
+    }
+}
+
+/// Wraps `fut` so it resolves within `deadline`.  Returns `Err(())` if the
+/// timer fires first.  Drops the inner future on timeout (no busy-spin).
+fn race_with_timeout<F: Future>(fut: F, deadline: Duration) -> WithDeadline<F> {
+    WithDeadline {
+        fut,
+        timer: ngx::async_::sleep(deadline),
+    }
+}
+
+/// Fires a sustained bidi overload against the echo server at `endpoint_str`
+/// to exercise the backpressure give-up path.
+///
+/// Reads three environment variables to control the load shape:
+///
+/// | Variable                       | Default | Meaning                                           |
+/// |-------------------------------|---------|---------------------------------------------------|
+/// | `BIDI_OVERLOAD_DURATION_S`    | `60`    | Total overload wall-clock seconds                 |
+/// | `BIDI_OVERLOAD_MESSAGES_PER_SEC` | `1000` | Target send rate (messages/second)              |
+/// | `BIDI_OVERLOAD_GIVE_UP_MS`    | `50`    | Per-send deadline before counting as a drop       |
+///
+/// On each iteration the function tries to send a `Ping` by racing
+/// `futures_channel::mpsc::Sender::poll_ready` against a `give_up`-ms
+/// [`ngx::async_::Sleep`].  If the timer fires first the ping is discarded
+/// and `BIDI_BACKPRESSURE_DROPS` is incremented.  A drain sub-task runs in
+/// parallel, consuming `Pong` replies and counting them.
+///
+/// Logs `"bidi overload: sent=N received=N dropped=N duration_s=S"` at
+/// NOTICE on completion — the exact line `run_grpc_bidi_overload.sh` asserts on.
+///
+/// Returns `Ok(())` on any clean finish (even zero successful sends).
+pub async fn fire_bidi_overload(
+    endpoint_str: &str,
+    log: core::ptr::NonNull<nginx_sys::ngx_log_t>,
+) -> Result<(), SmokeError> {
+    use crate::transport::grpc::echo_proto::ngx_otel_echo_v1::{
+        Ping,
+        echo_client::EchoClient,
+    };
+    use crate::export::BIDI_BACKPRESSURE_DROPS;
+    use core::sync::atomic::Ordering;
+
+    // ── Read overload parameters from environment ──────────────────────────
+    let duration_s: u64 = std::env::var("BIDI_OVERLOAD_DURATION_S")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(60);
+    let msg_per_sec: u64 = std::env::var("BIDI_OVERLOAD_MESSAGES_PER_SEC")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(1000);
+    let give_up_ms: u64 = std::env::var("BIDI_OVERLOAD_GIVE_UP_MS")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(50);
+
+    let duration     = Duration::from_secs(duration_s);
+    let give_up      = Duration::from_millis(give_up_ms);
+    // Inter-send interval in microseconds.  Saturating: at 0 msg/s we'd
+    // divide by zero — treat as "no sleep between sends" (max rate).
+    let inter_send_us: u64 = if msg_per_sec > 0 { 1_000_000 / msg_per_sec } else { 0 };
+
+    let log_ptr = log.as_ptr();
+
+    ngx::ngx_log_error!(
+        nginx_sys::NGX_LOG_NOTICE,
+        log_ptr,
+        "bidi overload: starting (duration={}s rate={}msg/s give_up={}ms)",
+        duration_s, msg_per_sec, give_up_ms
+    );
+
+    // Steps 1-5: identical pipeline to fire_one_bidi_stream.
+
+    // 1. Parse endpoint.
+    let endpoint = crate::transport::hyper_http::ParsedEndpoint::parse(endpoint_str)
+        .map_err(|e| SmokeError::InvalidEndpoint(std::format!("{e:?}")))?;
+
+    // 2. Build origin URI.
+    let origin_str = match &endpoint {
+        crate::transport::hyper_http::ParsedEndpoint::Http { host, port, .. } => {
+            std::format!("http://{host}:{port}")
+        }
+        crate::transport::hyper_http::ParsedEndpoint::Unix { .. } => {
+            return Err(SmokeError::InvalidEndpoint(std::string::String::from(
+                "unix sockets unsupported for bidi overload (use http://host:port)",
+            )));
+        }
+    };
+    let origin: http::uri::Uri = origin_str.parse()
+        .map_err(|e: http::uri::InvalidUri| SmokeError::InvalidOrigin(std::format!("{e}")))?;
+
+    // 3. Connect.
+    let connector = crate::transport::hyper_http::NgxConnector::new(log);
+    let io = connector.connect(&endpoint).await
+        .map_err(|e| SmokeError::Connect(std::format!("{e:?}")))?;
+
+    // 4. HTTP/2 handshake.
+    let handshake_fut = hyper::client::conn::http2::handshake::<
+        _,
+        _,
+        tonic::body::Body,
+    >(crate::transport::grpc::executor::NgxExecutor, io);
+
+    let (sender, conn) = handshake_fut.await
+        .map_err(|e| SmokeError::Handshake(std::format!("{e}")))?;
+
+    // 5. Drive Connection on the nginx event loop.
+    ngx::async_::spawn(async move { let _ = conn.await; }).detach();
+
+    // 6. Build the EchoClient.
+    let svc = crate::transport::grpc::shim::SendRequestService::new(sender);
+    let mut client = EchoClient::with_origin(svc, origin);
+
+    // 7. Open the bidi stream.
+    let (mut tx, rx) = futures_channel::mpsc::channel::<Ping>(16);
+    let response = client.bidi_echo(tonic::Request::new(rx)).await
+        .map_err(|s| SmokeError::BidiCall(std::format!("{s}")))?;
+    let mut inbound = response.into_inner();
+
+    // 8. Overload loop.
+    //
+    // The drain sub-task consumes Pong replies independently; the main task
+    // sends Pings with a per-send deadline.  Both use shared atomics for
+    // coordination so no channel is needed between them.
+    //
+    // `drain_done` is set to `true` by the drain task when the server closes
+    // the inbound stream; the main loop checks it after drop(tx) to know
+    // the drain task finished cleanly.
+
+    let received_ctr = std::sync::Arc::new(core::sync::atomic::AtomicU64::new(0));
+    let drain_done   = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+
+    {
+        let received_ctr2 = std::sync::Arc::clone(&received_ctr);
+        let drain_done2   = std::sync::Arc::clone(&drain_done);
+        ngx::async_::spawn(async move {
+            loop {
+                match inbound.message().await {
+                    Ok(Some(_)) => { received_ctr2.fetch_add(1, Ordering::Relaxed); }
+                    Ok(None)    => break,   // server closed stream
+                    Err(_)      => break,   // transport error — stop silently
+                }
+            }
+            drain_done2.store(true, Ordering::Release);
+        }).detach();
+    }
+
+    let mut seq: u64     = 0;
+    let mut sent: u64    = 0;
+    let mut dropped: u64 = 0;
+
+    let overload_start = std::time::Instant::now();
+
+    while overload_start.elapsed() < duration {
+        let ping = Ping { seq, payload: std::vec::Vec::new() };
+        seq += 1;
+
+        // Race poll_ready against the give-up deadline.
+        let ready_result = race_with_timeout(
+            core::future::poll_fn(|cx| tx.poll_ready(cx)),
+            give_up,
+        ).await;
+
+        match ready_result {
+            Err(()) => {
+                // Timer fired: channel full past give-up → count as drop.
+                dropped += 1;
+                BIDI_BACKPRESSURE_DROPS.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(Err(_)) => {
+                // Sender disconnected (receiver dropped).
+                break;
+            }
+            Ok(Ok(())) => {
+                // Channel slot available — send the ping.
+                let _ = tx.start_send(ping);
+                sent += 1;
+            }
+        }
+
+        // Rate-limit.  With inter_send_us == 0 we skip the sleep entirely.
+        if inter_send_us > 0 {
+            ngx::async_::sleep(Duration::from_micros(inter_send_us)).await;
+        }
+    }
+
+    // Close the send-half so the echo server and drain task see stream end.
+    drop(tx);
+
+    // Wait up to 5 s for the drain sub-task to finish.
+    let drain_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !drain_done.load(Ordering::Acquire) {
+        if std::time::Instant::now() >= drain_deadline {
+            break;
+        }
+        ngx::async_::sleep(Duration::from_millis(50)).await;
+    }
+
+    let received = received_ctr.load(Ordering::Acquire);
+    let elapsed_s = overload_start.elapsed().as_secs();
+
+    // This exact line is what run_grpc_bidi_overload.sh asserts on.
+    ngx::ngx_log_error!(
+        nginx_sys::NGX_LOG_NOTICE,
+        log_ptr,
+        "bidi overload: sent={} received={} dropped={} duration_s={}",
+        sent, received, dropped, elapsed_s
+    );
+
+    Ok(())
+}

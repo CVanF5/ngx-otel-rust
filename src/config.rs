@@ -111,6 +111,14 @@ pub struct MainConfig {
     /// `NgxConnIo`.  Parsed in all builds; acted on only with
     /// `test-support`.
     pub bidi_smoke_endpoint: ngx_str_t,
+    /// `otel_grpc_bidi_overload_endpoint <url>` — TEST-ONLY trigger for the
+    /// Phase 1.2 Item 3 backpressure / livelock integration test.  Parallel
+    /// to `bidi_smoke_endpoint` (Item 2).  When set (and built with
+    /// `test-support`), Worker 0's `init_process` fires a sustained bidi
+    /// overload against the echo server, exercising the give-up path and
+    /// incrementing `BIDI_BACKPRESSURE_DROPS`.  Parsed in all builds; acted
+    /// on only with `test-support`.
+    pub bidi_overload_endpoint: ngx_str_t,
     /// The registered shared memory zone (set during postconfiguration).
     pub shm_zone: *mut nginx_sys::ngx_shm_zone_t,
 }
@@ -130,6 +138,7 @@ impl Default for MainConfig {
             high_cardinality_attrs: std::vec::Vec::new(),
             grpc_smoke_endpoint: ngx_str_t::default(),
             bidi_smoke_endpoint: ngx_str_t::default(),
+            bidi_overload_endpoint: ngx_str_t::default(),
             shm_zone: ptr::null_mut(),
         }
     }
@@ -457,7 +466,7 @@ extern "C" fn cmd_exporter_block_handler(
 /* ─────────────────────────── top-level commands ────────────────────────────── */
 
 /// Number of top-level commands + 1 (terminator).
-const NCMDS: usize = 12;
+const NCMDS: usize = 13;
 
 pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; NCMDS] = [
     // otel_exporter { endpoint ...; trusted_certificate ...; }
@@ -563,6 +572,18 @@ pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; NCMDS] = [
         set: Some(cmd_add_high_cardinality_attr),
         conf: NGX_HTTP_MAIN_CONF_OFFSET,
         offset: 0,
+        post: ptr::null_mut(),
+    },
+    // otel_grpc_bidi_overload_endpoint <url>;  TEST-ONLY (Phase 1.2 Item 3
+    // backpressure livelock integration test; see src/transport/grpc/smoke.rs).
+    // Parsed in all builds but only acted on when the `test-support`
+    // feature is enabled.
+    ngx_command_t {
+        name: ngx_string!("otel_grpc_bidi_overload_endpoint"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(nginx_sys::ngx_conf_set_str_slot),
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+        offset: mem::offset_of!(MainConfig, bidi_overload_endpoint),
         post: ptr::null_mut(),
     },
     // terminator

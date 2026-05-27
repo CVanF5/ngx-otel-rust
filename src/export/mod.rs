@@ -70,6 +70,14 @@ pub static DROPPED_RECORDS: AtomicU64 = AtomicU64::new(0);
 /// Cumulative count of transport send failures since worker startup.
 pub static SEND_FAILURES: AtomicU64 = AtomicU64::new(0);
 
+/// Cumulative count of bidi outbound messages dropped because the outbound
+/// channel's `poll_ready` was `Pending` past the give-up deadline.  Indicates
+/// backpressure pushed back on the producer.  Bidi overload path only — not
+/// on the production OTLP/HTTP export loop.  Exposed as
+/// `ngx_otel.bidi_backpressure_drops` self-metric so the overload integration
+/// test can verify the counter is non-zero via the collector's metrics.json.
+pub static BIDI_BACKPRESSURE_DROPS: AtomicU64 = AtomicU64::new(0);
+
 /// Unix epoch nanoseconds when this worker's export loop started.
 ///
 /// Written once by [`export_loop`] immediately after computing `worker_start_ns`.
@@ -121,6 +129,7 @@ impl MetricSource for SelfMetricsSource {
         let failures = SEND_FAILURES.load(Ordering::Acquire) as i64;
         let interval_ms = self.interval_ms as i64;
 
+        let backpressure_drops = BIDI_BACKPRESSURE_DROPS.load(Ordering::Acquire) as i64;
         std::vec![
             monotonic_sum_metric(
                 "ngx_otel.dropped_records",
@@ -135,6 +144,14 @@ impl MetricSource for SelfMetricsSource {
                 "Cumulative export send failures since worker startup",
                 "failures",
                 failures,
+                self.start_time_unix_nano,
+                now,
+            ),
+            monotonic_sum_metric(
+                "ngx_otel.bidi_backpressure_drops",
+                "Bidi outbound messages dropped due to channel backpressure",
+                "messages",
+                backpressure_drops,
                 self.start_time_unix_nano,
                 now,
             ),
@@ -844,19 +861,21 @@ mod tests {
         );
     }
 
-    /// SelfMetricsSource must produce exactly 3 metrics with the right names.
+    /// SelfMetricsSource must produce exactly 4 metrics with the right names.
+    /// (Updated in Phase 1.2 Item 3 to include ngx_otel.bidi_backpressure_drops.)
     #[test]
-    fn self_metrics_source_produces_three_metrics() {
+    fn self_metrics_source_produces_four_metrics() {
         let src = SelfMetricsSource {
             interval_ms: 10_000,
             start_time_unix_nano: 1_700_000_000_000_000_000,
         };
         let metrics = src.collect();
-        assert_eq!(metrics.len(), 3, "SelfMetricsSource must emit 3 metrics");
+        assert_eq!(metrics.len(), 4, "SelfMetricsSource must emit 4 metrics");
 
         let names: std::vec::Vec<&str> = metrics.iter().map(|m| m.name.as_str()).collect();
         assert!(names.contains(&"ngx_otel.dropped_records"));
         assert!(names.contains(&"ngx_otel.send_failures"));
+        assert!(names.contains(&"ngx_otel.bidi_backpressure_drops"));
         assert!(names.contains(&"ngx_otel.export_interval"));
     }
 }

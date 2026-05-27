@@ -355,6 +355,81 @@ extern "C" fn ngx_otel_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
         }
     }
 
+    // ── Phase 1.2 Item 3: bidi backpressure overload ─────────────────────────
+    //
+    // Only compiled when the `test-support` feature is enabled.  When set,
+    // and the `otel_grpc_bidi_overload_endpoint` directive carries a non-empty
+    // value, fire a sustained bidi overload from Worker 0 against the echo
+    // server to exercise the give-up / backpressure path.  Increments the
+    // `BIDI_BACKPRESSURE_DROPS` counter for each send that exceeded the
+    // give-up deadline.  Result is logged at NOTICE; the integration test in
+    // `run_grpc_bidi_overload.sh` greps for the summary line and asserts
+    // dropped > 0 and received > 0.
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        if !amcf.bidi_overload_endpoint.is_empty() {
+            let endpoint_bytes = amcf.bidi_overload_endpoint.as_bytes();
+            if let Ok(endpoint_str) = core::str::from_utf8(endpoint_bytes) {
+                let endpoint_owned = std::string::String::from(endpoint_str);
+                let log_nn = match core::ptr::NonNull::new(log) {
+                    Some(p) => p,
+                    None => {
+                        ngx::ngx_log_error!(
+                            nginx_sys::NGX_LOG_ERR,
+                            log,
+                            "bidi overload: null log pointer; skipping"
+                        );
+                        return Status::NGX_OK.into();
+                    }
+                };
+
+                ngx::ngx_log_error!(
+                    nginx_sys::NGX_LOG_NOTICE,
+                    log,
+                    "bidi overload: queueing overload task (endpoint={})",
+                    endpoint_owned
+                );
+
+                let overload_task = ngx::async_::spawn(async move {
+                    let result = crate::transport::grpc::smoke::fire_bidi_overload(
+                        &endpoint_owned,
+                        log_nn,
+                    ).await;
+                    let log_ptr = log_nn.as_ptr();
+                    match result {
+                        Ok(()) => {
+                            // fire_bidi_overload logs the summary line at NOTICE
+                            // internally.  No additional log needed here.
+                        }
+                        Err(e) => {
+                            ngx::ngx_log_error!(
+                                nginx_sys::NGX_LOG_ERR,
+                                log_ptr,
+                                "bidi overload: failed: {}",
+                                e
+                            );
+                        }
+                    }
+                });
+
+                if pool.allocate(overload_task).is_null() {
+                    ngx::ngx_log_error!(
+                        nginx_sys::NGX_LOG_ERR,
+                        log,
+                        "bidi overload: pool allocation for overload task failed"
+                    );
+                    // Non-fatal: the task is already running.
+                }
+            } else {
+                ngx::ngx_log_error!(
+                    nginx_sys::NGX_LOG_ERR,
+                    log,
+                    "bidi overload: otel_grpc_bidi_overload_endpoint is not valid UTF-8; skipping"
+                );
+            }
+        }
+    }
+
     Status::NGX_OK.into()
 }
 
