@@ -101,8 +101,14 @@ echo "[tsan-run] Step 2: OK — plain TSAN nginx at ${PLAIN_OBJS}/nginx"
 # (upstream code, not module-under-test).  Pre-build it without TSAN now, then
 # the script picks it up via the ECHO_BINARY env override.
 echo "[tsan-run] Step 2.5: Pre-building bidi_echo_server example (no TSAN)..."
+# nginx-sys is transitively required (its bindings live in the crate's build
+# graph even though the example itself uses no nginx APIs).  Point at the
+# plain TSAN nginx headers — bindgen only reads ngx_auto_config.h, doesn't
+# link.
 (
     cd /work/ngx-otel-rust
+    NGINX_SOURCE_DIR=/work/nginx \
+    NGINX_BUILD_DIR="${PLAIN_OBJS}" \
     cargo build --example bidi_echo_server
 )
 export ECHO_BINARY=/work/ngx-otel-rust/target/debug/examples/bidi_echo_server
