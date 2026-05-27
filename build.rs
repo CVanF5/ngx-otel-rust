@@ -85,22 +85,61 @@ fn detect_stat_stub() -> bool {
 fn compile_protos() {
     let proto_root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("proto");
 
-    let protos = [
+    let otel_protos = [
         proto_root.join("opentelemetry/proto/common/v1/common.proto"),
         proto_root.join("opentelemetry/proto/resource/v1/resource.proto"),
         proto_root.join("opentelemetry/proto/metrics/v1/metrics.proto"),
         proto_root.join("opentelemetry/proto/collector/metrics/v1/metrics_service.proto"),
     ];
 
-    if protos.iter().all(|p| p.exists()) {
+    if otel_protos.iter().all(|p| p.exists()) {
         tonic_prost_build::configure()
             .build_client(true)
             .build_server(false)
-            .compile_protos(&protos, &[proto_root])
-            .expect("tonic-prost-build failed");
+            .compile_protos(&otel_protos, &[proto_root.clone()])
+            .expect("tonic-prost-build failed for OTel protos");
 
-        for proto in &protos {
+        for proto in &otel_protos {
             println!("cargo::rerun-if-changed={}", proto.display());
         }
+    }
+
+    // Phase 1.2 Item 2: compile the local echo proto used for bidi smoke
+    // testing.  This proto is a throwaway local definition; Phase 5 will
+    // replace it with OTAP's arrow_service.proto.
+    //
+    // Two separate compilations are required because the main library is
+    // no_std, and the tonic-generated server stub uses bare `Box::pin` which
+    // is not in scope in a no_std context (tonic::codegen::* doesn't re-export
+    // Box).  The example binary (bidi_echo_server.rs) is a full-std Rust
+    // binary, so it can safely include the server+client version.
+    //
+    // - Client-only version → OUT_DIR/ngx.otel.echo.v1.rs
+    //   Used from src/transport/grpc/echo_proto.rs (no_std-safe).
+    //
+    // - Server+client version → OUT_DIR/echo_server_gen/ngx.otel.echo.v1.rs
+    //   Used from examples/bidi_echo_server.rs (full-std, dev-only binary).
+    let echo_proto = proto_root.join("echo/v1/echo.proto");
+    if echo_proto.exists() {
+        let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+
+        // Client-only: no_std-safe, used by the library.
+        tonic_prost_build::configure()
+            .build_client(true)
+            .build_server(false)
+            .compile_protos(&[echo_proto.clone()], &[proto_root.clone()])
+            .expect("tonic-prost-build failed for echo client");
+
+        // Server+client: used by examples/bidi_echo_server.rs only.
+        let echo_server_out = out_dir.join("echo_server_gen");
+        std::fs::create_dir_all(&echo_server_out).expect("create echo_server_gen dir");
+        tonic_prost_build::configure()
+            .build_client(true)
+            .build_server(true)
+            .out_dir(&echo_server_out)
+            .compile_protos(&[echo_proto.clone()], &[proto_root])
+            .expect("tonic-prost-build failed for echo server");
+
+        println!("cargo::rerun-if-changed={}", echo_proto.display());
     }
 }
