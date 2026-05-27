@@ -276,6 +276,85 @@ extern "C" fn ngx_otel_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
         }
     }
 
+    // ── Phase 1.2 Item 2: bidi gRPC viability harness ───────────────────────
+    //
+    // Only compiled when the `test-support` feature is enabled.  When set,
+    // and the `otel_grpc_bidi_smoke_endpoint` directive carries a non-empty
+    // value, fire one bidi `Echo.BidiEcho` call from Worker 0 via the same
+    // `NgxExecutor` + `SendRequestService` + `NgxConnIo` stack as Item 1,
+    // against the stand-alone `examples/bidi_echo_server` process.  Proves
+    // the send-half and receive-half are independently pollable without
+    // deadlock or livelock on the nginx event loop.  Result is logged at
+    // NOTICE; the integration test in `run_grpc_bidi_smoke.sh` greps for
+    // the success line.
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        if !amcf.bidi_smoke_endpoint.is_empty() {
+            let endpoint_bytes = amcf.bidi_smoke_endpoint.as_bytes();
+            if let Ok(endpoint_str) = core::str::from_utf8(endpoint_bytes) {
+                let endpoint_owned = std::string::String::from(endpoint_str);
+                let log_nn = match core::ptr::NonNull::new(log) {
+                    Some(p) => p,
+                    None => {
+                        ngx::ngx_log_error!(
+                            nginx_sys::NGX_LOG_ERR,
+                            log,
+                            "bidi smoke: null log pointer; skipping"
+                        );
+                        return Status::NGX_OK.into();
+                    }
+                };
+
+                ngx::ngx_log_error!(
+                    nginx_sys::NGX_LOG_NOTICE,
+                    log,
+                    "bidi smoke: firing one bidi stream (endpoint={})",
+                    endpoint_owned
+                );
+
+                let bidi_task = ngx::async_::spawn(async move {
+                    let result = crate::transport::grpc::smoke::fire_one_bidi_stream(
+                        &endpoint_owned,
+                        log_nn,
+                    ).await;
+                    let log_ptr = log_nn.as_ptr();
+                    match result {
+                        Ok(()) => {
+                            // fire_one_bidi_stream already logs the
+                            // "bidi complete" line at NOTICE inside the
+                            // function.  No additional log needed here.
+                        }
+                        Err(e) => {
+                            // This exact pattern is what run_grpc_bidi_smoke.sh
+                            // asserts must appear zero times.
+                            ngx::ngx_log_error!(
+                                nginx_sys::NGX_LOG_ERR,
+                                log_ptr,
+                                "bidi smoke: bidi failed: {}",
+                                e
+                            );
+                        }
+                    }
+                });
+
+                if pool.allocate(bidi_task).is_null() {
+                    ngx::ngx_log_error!(
+                        nginx_sys::NGX_LOG_ERR,
+                        log,
+                        "bidi smoke: pool allocation for bidi task failed"
+                    );
+                    // Non-fatal: the task is already running.
+                }
+            } else {
+                ngx::ngx_log_error!(
+                    nginx_sys::NGX_LOG_ERR,
+                    log,
+                    "bidi smoke: otel_grpc_bidi_smoke_endpoint is not valid UTF-8; skipping"
+                );
+            }
+        }
+    }
+
     Status::NGX_OK.into()
 }
 

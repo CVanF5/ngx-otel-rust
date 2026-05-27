@@ -141,9 +141,9 @@ fn build_export_request() -> ExportMetricsServiceRequest {
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
-/// Errors from [`fire_one_grpc_export`].  All variants log the underlying
-/// cause as a string; we don't need structured error handling for a one-shot
-/// viability harness.
+/// Errors from [`fire_one_grpc_export`] and [`fire_one_bidi_stream`].
+/// All variants log the underlying cause as a string; we don't need
+/// structured error handling for a one-shot viability harness.
 #[derive(Debug)]
 pub enum SmokeError {
     InvalidEndpoint(std::string::String),
@@ -152,6 +152,10 @@ pub enum SmokeError {
     InvalidOrigin(std::string::String),
     GrpcReady(std::string::String),
     GrpcCall(std::string::String),
+    /// A bidi gRPC call step failed (Phase 1.2 Item 2).
+    BidiCall(std::string::String),
+    /// Sent/received ping counts diverged (Phase 1.2 Item 2).
+    BidiSendMismatch { sent: u64, received: u64 },
 }
 
 impl core::fmt::Display for SmokeError {
@@ -163,6 +167,10 @@ impl core::fmt::Display for SmokeError {
             Self::InvalidOrigin(s)   => write!(f, "invalid origin uri: {s}"),
             Self::GrpcReady(s)       => write!(f, "grpc ready: {s}"),
             Self::GrpcCall(s)        => write!(f, "grpc unary call: {s}"),
+            Self::BidiCall(s)        => write!(f, "bidi call: {s}"),
+            Self::BidiSendMismatch { sent, received } => {
+                write!(f, "bidi send/receive mismatch: sent={sent} received={received}")
+            }
         }
     }
 }
@@ -269,6 +277,176 @@ pub async fn fire_one_grpc_export(
     let _resp = client.export(request).await
         .map_err(|status| SmokeError::GrpcCall(std::format!("{status}")))?;
     ngx::ngx_log_debug!(log_ptr, "smoke: client.export() returned OK");
+
+    Ok(())
+}
+
+// ── Phase 1.2 Item 2: bidi smoke ─────────────────────────────────────────────
+
+/// Async send-one helper for `futures_channel::mpsc::Sender<T>`.
+///
+/// Equivalent to `SinkExt::send` (which requires `futures-util`) but
+/// implemented directly against the channel's `poll_ready` + `start_send`
+/// API, so we don't need `futures-util` as a top-level production dep.
+async fn mpsc_send_one(
+    tx: &mut futures_channel::mpsc::Sender<crate::transport::grpc::echo_proto::ngx_otel_echo_v1::Ping>,
+    msg: crate::transport::grpc::echo_proto::ngx_otel_echo_v1::Ping,
+) -> Result<(), SmokeError> {
+    core::future::poll_fn(|cx| tx.poll_ready(cx)).await
+        .map_err(|e| SmokeError::BidiCall(std::format!("send channel closed: {e}")))?;
+    tx.start_send(msg)
+        .map_err(|e| SmokeError::BidiCall(std::format!("start_send: {e}")))
+}
+
+/// Fires exactly one bidi gRPC `BidiEcho` call against the echo server at
+/// `endpoint_str` (e.g. `http://127.0.0.1:4319`).  Exercises the send-half
+/// and receive-half **asymmetrically** to prove they are independently
+/// pollable without deadlock, livelock, or a Tokio runtime.
+///
+/// The asymmetric drain sequence (Phase A: send 3 + drain 3; Phase B: send 7
+/// + drain 7; Phase C: close + confirm stream end) is the mechanical contract
+/// Phase 1.2 Item 2 establishes.  If the bridge serializes send and receive,
+/// Phase A-drain hangs — the function reports that via `BidiCall`.
+///
+/// On success logs `"bidi smoke: bidi complete (sent=10, received=10)"` at
+/// NOTICE — the exact string `run_grpc_bidi_smoke.sh` asserts on.
+pub async fn fire_one_bidi_stream(
+    endpoint_str: &str,
+    log: core::ptr::NonNull<nginx_sys::ngx_log_t>,
+) -> Result<(), SmokeError> {
+    use crate::transport::grpc::echo_proto::ngx_otel_echo_v1::{
+        Ping,
+        echo_client::EchoClient,
+    };
+
+    // Steps 1-5 are identical to fire_one_grpc_export (same pipeline shape).
+    // Factor into a shared helper if duplication becomes problematic; for now
+    // the copy is intentional — the bidi and unary functions share no state.
+
+    // 1. Parse the endpoint string.
+    let endpoint = crate::transport::hyper_http::ParsedEndpoint::parse(endpoint_str)
+        .map_err(|e| SmokeError::InvalidEndpoint(std::format!("{e:?}")))?;
+
+    // 2. Build the origin URI for `with_origin`.
+    let origin_str = match &endpoint {
+        crate::transport::hyper_http::ParsedEndpoint::Http { host, port, .. } => {
+            std::format!("http://{host}:{port}")
+        }
+        crate::transport::hyper_http::ParsedEndpoint::Unix { .. } => {
+            return Err(SmokeError::InvalidEndpoint(std::string::String::from(
+                "unix sockets unsupported for bidi smoke (use http://host:port)",
+            )));
+        }
+    };
+    let origin: http::uri::Uri = origin_str.parse()
+        .map_err(|e: http::uri::InvalidUri| SmokeError::InvalidOrigin(std::format!("{e}")))?;
+
+    let log_ptr = log.as_ptr();
+
+    // 3. Connect via the production NgxConnector.
+    let connector = crate::transport::hyper_http::NgxConnector::new(log);
+    let io = connector.connect(&endpoint).await
+        .map_err(|e| SmokeError::Connect(std::format!("{e:?}")))?;
+
+    // 4. HTTP/2 handshake.
+    let handshake_fut = hyper::client::conn::http2::handshake::<
+        _,
+        _,
+        tonic::body::Body,
+    >(crate::transport::grpc::executor::NgxExecutor, io);
+
+    ngx::ngx_log_debug!(log_ptr, "bidi smoke: awaiting h2 handshake");
+    let (sender, conn) = handshake_fut.await
+        .map_err(|e| SmokeError::Handshake(std::format!("{e}")))?;
+    ngx::ngx_log_debug!(log_ptr, "bidi smoke: h2 handshake completed");
+
+    // 5. Drive the Connection on the NGINX event loop.
+    ngx::async_::spawn(async move {
+        let _ = conn.await;
+    }).detach();
+
+    // 6. Build the generated EchoClient over our SendRequestService shim.
+    let svc = SendRequestService::new(sender);
+    let mut client = EchoClient::with_origin(svc, origin);
+
+    // 7. Build the outbound channel.  Capacity 16 matches the example server.
+    //    futures_channel::mpsc::Receiver<Ping> implements Stream<Item=Ping>
+    //    and therefore IntoStreamingRequest<Message=Ping>.
+    let (mut tx, rx) = futures_channel::mpsc::channel::<Ping>(16);
+
+    // Issue the bidi call.  rx (the Receiver) is consumed into the request
+    // stream here; tx remains as the send-half.
+    let response = client.bidi_echo(tonic::Request::new(rx)).await
+        .map_err(|status| SmokeError::BidiCall(std::format!("{status}")))?;
+    let mut inbound = response.into_inner();
+
+    // 8. Asymmetric drain exercise.
+    //
+    //    The bridge is correct if send and receive are independently pollable.
+    //    If the bridge serializes them, Phase A-drain will hang waiting for
+    //    the server to respond but the server is waiting for more pings.
+
+    // Phase A: send 3 pings then drain 3 pongs.
+    let mut sent: u64 = 0;
+    let mut received: u64 = 0;
+
+    for seq in 0u64..3 {
+        mpsc_send_one(&mut tx, Ping { seq, payload: std::vec::Vec::new() }).await?;
+        sent += 1;
+    }
+    ngx::ngx_log_debug!(log_ptr, "bidi smoke: Phase A sent (sent=3)");
+
+    while received < 3 {
+        let _pong = inbound.message().await
+            .map_err(|s| SmokeError::BidiCall(std::format!("Phase A drain: {s}")))?
+            .ok_or_else(|| SmokeError::BidiCall(
+                std::string::String::from("Phase A drain: stream ended early")
+            ))?;
+        received += 1;
+    }
+    ngx::ngx_log_debug!(log_ptr, "bidi smoke: Phase A drained (received=3)");
+
+    // Phase B: send 7 more pings then drain until total received == 10.
+    for seq in 3u64..10 {
+        mpsc_send_one(&mut tx, Ping { seq, payload: std::vec::Vec::new() }).await?;
+        sent += 1;
+    }
+    ngx::ngx_log_debug!(log_ptr, "bidi smoke: Phase B sent (sent=10)");
+
+    while received < 10 {
+        let _pong = inbound.message().await
+            .map_err(|s| SmokeError::BidiCall(std::format!("Phase B drain: {s}")))?
+            .ok_or_else(|| SmokeError::BidiCall(
+                std::string::String::from("Phase B drain: stream ended early")
+            ))?;
+        received += 1;
+    }
+    ngx::ngx_log_debug!(log_ptr, "bidi smoke: Phase B drained (received=10)");
+
+    // Phase C: close the send-half.  The server should see stream end and
+    // close its response stream too.
+    drop(tx);
+
+    let final_msg = inbound.message().await
+        .map_err(|s| SmokeError::BidiCall(std::format!("Phase C close: {s}")))?;
+    if final_msg.is_some() {
+        return Err(SmokeError::BidiCall(std::string::String::from(
+            "Phase C: expected stream end after tx drop, got another pong",
+        )));
+    }
+    ngx::ngx_log_debug!(log_ptr, "bidi smoke: Phase C stream end confirmed");
+
+    // Verify counts.
+    if sent != 10 || received != 10 {
+        return Err(SmokeError::BidiSendMismatch { sent, received });
+    }
+
+    // This exact line is what run_grpc_bidi_smoke.sh asserts on.
+    ngx::ngx_log_error!(
+        nginx_sys::NGX_LOG_NOTICE,
+        log_ptr,
+        "bidi smoke: bidi complete (sent=10, received=10)"
+    );
 
     Ok(())
 }

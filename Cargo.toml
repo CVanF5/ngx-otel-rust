@@ -14,6 +14,10 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 bytes = "1.10.1"
+# futures-channel: provides mpsc channel for fire_one_bidi_stream's outbound
+# stream.  Already present transitively via tonic/h2; listed here so
+# `futures_channel` is accessible as a first-class module path in smoke.rs.
+futures-channel = "0.3"
 http = "1.4.0"
 http-body = "1.0.1"
 http-body-util = "0.1.3"
