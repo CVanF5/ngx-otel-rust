@@ -42,6 +42,18 @@ impl HttpRequestHandler for LogPhaseHandler {
             None => return Status::NGX_OK,
         };
 
+        // Phase 1.3.3 scaffold: prove the hot-path read is zero-cost.
+        // One Relaxed atomic load on control_shm.flags per request.
+        // The loaded value is intentionally discarded; Phase 5 will use
+        // it for dynamic-reconfig fast-path checks (sampling rate, dropped
+        // attributes, etc.). This load is inside the is_configured() gate
+        // (we returned above if amcf.main_conf returned None, i.e., the
+        // module is disabled) so module-loaded-but-disabled stays zero-cost.
+        // TODO(phase-5): act on the loaded flags value.
+        if let Some(ctrl) = amcf.control_shm_ptr() {
+            let _ = unsafe { (*ctrl).flags.load(Ordering::Relaxed) };
+        }
+
         // Obtain base address of the shm zone.
         let base = match amcf.shm_base() {
             Some(b) => b,
