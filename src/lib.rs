@@ -54,6 +54,7 @@ use ngx::http::{HttpModule, HttpModuleMainConf, add_phase_handler};
 mod config;
 pub mod data_model;
 pub mod encoder;
+pub(crate) mod exporter;
 mod export;
 mod metric_source;
 mod shm;
