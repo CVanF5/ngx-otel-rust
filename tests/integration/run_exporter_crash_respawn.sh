@@ -11,15 +11,25 @@
 #   3. PID #2 != PID #1.
 #   4. error.log contains "otel exporter: cycle entered" at least twice
 #      (once for original spawn, once for respawn).
-#   5. After SIGQUIT shutdown, no exporter remains.
-#   6. Script is idempotent — running it twice in a row both pass.
+#   5. ngx_otel.dropped_records > 0 in metrics.json (proposal §3 bounded-loss
+#      gate): nginx is started BEFORE the collector so Worker 0's export loop
+#      immediately gets ECONNREFUSED and fills its retry buffer (retry_depth=4).
+#      After 5+ failed intervals (5s) DROPPED_RECORDS accumulates; the
+#      collector is then started so the SAME Worker 0 exports the drops.
+#   6. After SIGQUIT shutdown, no exporter remains.
+#   7. Script is idempotent — running it twice in a row both pass.
 #
-# Known constraint (documented inline): if the exporter ever exits with
-# status 2, nginx disables respawn (ngx_process.c:551-557). The exporter
-# cycle must never call exit(2) on a recoverable error.
+# Known constraint: if the exporter ever exits with status 2, nginx disables
+# respawn (ngx_process.c:551-557).  The exporter cycle must never call
+# exit(2) on a recoverable error.
+#
+# Collector requirement: the test ensures the OTel collector is running
+# AFTER the drop-accumulation window, not before.  nginx connects to
+# 127.0.0.1:4318 from the start; ECONNREFUSED (instant) fills the retry
+# queue quickly.  Once the collector starts, the same Worker 0 process
+# retries and exports with dropped_records > 0.
 #
 # Prerequisites: NGINX_BINARY set or auto-detected from objs-release/nginx.
-# No collector required (export failures during the crash window are accepted).
 #
 # Exit codes: 0 = all assertions passed, 1 = preflight failed, 2 = assertion failed.
 
@@ -133,7 +143,20 @@ sed \
     -e "s|@PREFIX@|${PREFIX}|g" \
     "${CONF_TEMPLATE}" > "${PREFIX}/nginx.conf"
 
-info "Starting nginx..."
+# Stop the collector so port 4318 is unreachable when nginx starts.
+# This guarantees Worker 0's export loop gets ECONNREFUSED immediately.
+# The collector is restarted after the failure window (below).
+if command -v docker >/dev/null 2>&1; then
+    info "Stopping collector to create export-failure window..."
+    ( cd "${CRATE_DIR}/test-harness" && docker compose stop 2>/dev/null ) || true
+    # Brief wait for port to release.
+    sleep 1
+fi
+
+# Record nginx start time so we can measure from it.
+NGINX_START_S="$(date +%s)"
+
+info "Starting nginx (collector stopped — drop window begins)..."
 "${NGINX_BINARY}" -p "${PREFIX}" -c "${PREFIX}/nginx.conf" &
 NGINX_PID=$!
 sleep 1
@@ -149,8 +172,9 @@ if [[ -z "${EXP_PID_1}" ]]; then
 fi
 pass "Initial exporter PID = ${EXP_PID_1}"
 
-# Drive a brief HTTP load while we kill the exporter (optional — verifies
-# nginx keeps serving requests during the respawn window).
+# Drive a brief HTTP load while we kill the exporter (verifies nginx keeps
+# serving requests during the respawn window, and generates metric data points
+# in the producer's ring buffer — "bump-and-defer" records in flight).
 # NOTE: track CURL_PIDS so we can wait on them specifically (not nginx).
 CURL_PIDS=()
 for _ in $(seq 1 20); do
@@ -177,21 +201,106 @@ if [[ -z "${EXP_PID_2}" ]]; then
 fi
 pass "Respawned exporter PID = ${EXP_PID_2} (was ${EXP_PID_1})"
 
-# Wait only for curl jobs (not nginx) — with a short deadline so the test
-# doesn't hang if any curl is slow.
+# Wait only for curl jobs (not nginx).
 for cpid in "${CURL_PIDS[@]}"; do
     wait "${cpid}" 2>/dev/null || true
 done
 
+# ── Wait for the drop-accumulation window ─────────────────────────────────────
+#
+# Worker 0 attempts to export every otel_metric_interval=1s.  Each attempt gets
+# ECONNREFUSED immediately (nothing listening on 4318).  With retry_depth=4,
+# the retry buffer fills after 4 intervals and starts evicting oldest entries
+# at interval 5+.  We need at least 5s from nginx start for the first drop;
+# wait until T+7s (= 6-7 drop events, ~2-3 batches evicted).
+NOW_S="$(date +%s)"
+ELAPSED=$(( NOW_S - NGINX_START_S ))
+DROP_WINDOW_END=$(( NGINX_START_S + 7 ))
+REMAINING=$(( DROP_WINDOW_END - NOW_S ))
+if (( REMAINING > 0 )); then
+    info "Waiting ${REMAINING}s more for retry buffer overflow (${ELAPSED}s elapsed from nginx start)..."
+    sleep "${REMAINING}"
+fi
+
+# ── Now start the collector so Worker 0 can export the accumulated drops ──────
+info "Starting collector so Worker 0 can export dropped_records..."
+
+# Snapshot metrics.json before we start collecting — ensures we only look at
+# payloads emitted during this test.
+PRE_SIZE=0
+if [[ -f "${METRICS_LOG}" ]]; then
+    PRE_SIZE=$(wc -c < "${METRICS_LOG}")
+fi
+info "metrics.json pre-size: ${PRE_SIZE} bytes"
+
+ensure_collector_running
+
+# Give Worker 0 time to retry (2 export intervals = 2s) and send the payload.
+info "Waiting for Worker 0 to export to collector..."
+sleep 3
+
 # Assertion 4: error.log contains "cycle entered" at least twice.
-sleep 1  # Give the new exporter time to log its startup line.
 CYCLE_ENTERED_COUNT="$(grep -c "otel exporter: cycle entered" "${PREFIX}/logs/error.log" 2>/dev/null || true)"
 if (( CYCLE_ENTERED_COUNT < 2 )); then
     fail "error.log contains 'otel exporter: cycle entered' only ${CYCLE_ENTERED_COUNT} time(s); expected >= 2"
 fi
 pass "error.log contains 'otel exporter: cycle entered' ${CYCLE_ENTERED_COUNT} time(s) (>= 2)"
 
-# Assertion 5: clean shutdown leaves no exporter.
+# Assertion 5: dropped_records > 0 in metrics.json delta (proposal §3 gate).
+#
+# The retry buffer overflow increments DROPPED_RECORDS in Worker 0's process.
+# Once the collector is available, the next successful export includes
+# ngx_otel.dropped_records = N > 0 in the self-metrics payload.
+#
+# This is the load-bearing claim from proposal §3: "exporter restart on crash
+# works with bounded telemetry loss" — measured by the dropped_records metric
+# reaching the collector, not just by log lines.
+NEW_CONTENT=""
+if [[ -f "${METRICS_LOG}" ]]; then
+    POST_SIZE=$(wc -c < "${METRICS_LOG}")
+    if (( POST_SIZE > PRE_SIZE )); then
+        NEW_CONTENT=$(tail -c "+$(( PRE_SIZE + 1 ))" "${METRICS_LOG}")
+    fi
+fi
+
+DROPPED_VALUE=0
+if [[ -n "${NEW_CONTENT}" ]]; then
+    DROPPED_VALUE="$(echo "${NEW_CONTENT}" \
+        | python3 -c "
+import sys, json
+max_dropped = 0
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        d = json.loads(line)
+    except Exception:
+        continue
+    for rm in d.get('resourceMetrics', []):
+        for sm in rm.get('scopeMetrics', []):
+            for m in sm.get('metrics', []):
+                if m.get('name') == 'ngx_otel.dropped_records':
+                    for pt in m.get('sum', {}).get('dataPoints', []):
+                        v = int(pt.get('asInt', 0))
+                        if v > max_dropped:
+                            max_dropped = v
+print(max_dropped)
+" 2>/dev/null || echo "0")"
+fi
+
+if (( DROPPED_VALUE > 0 )); then
+    pass "ngx_otel.dropped_records = ${DROPPED_VALUE} > 0 (proposal §3 bounded-loss gate)"
+else
+    fail "ngx_otel.dropped_records not > 0 in metrics.json delta (got ${DROPPED_VALUE:-0}).
+       Expected retry buffer (depth=4) to overflow after 5+ failed 1s-interval exports.
+       New metrics.json content (first 3 lines):
+$(echo "${NEW_CONTENT}" | head -3 || echo "(no new content)")
+       send_failures in error.log:
+$(grep -aE 'send failed|retry buffer full|retry send failed' "${PREFIX}/logs/error.log" | head -5 || echo "(none)")"
+fi
+
+# Assertion 6: clean shutdown leaves no exporter.
 info "Sending SIGQUIT to master PID ${NGINX_PID}..."
 kill -SIGQUIT "${NGINX_PID}"
 wait_for 10 "exporter to exit after SIGQUIT" \
