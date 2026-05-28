@@ -85,8 +85,18 @@ wait_for() {
     fail "Timed out waiting for: ${desc}"
 }
 
-# Return the PID of the otel exporter child (first match).
-# Field-anchored awk avoids self-match false positives.
+# Return the PID of the otel exporter child of a specific master PID.
+# Using ppid filter ensures we don't pick up stale exporters from previous
+# test runs that haven't been fully reaped yet.
+exporter_pid_of() {
+    local master_pid=$1
+    ps -eo pid,ppid,args 2>/dev/null \
+        | awk -v mpid="${master_pid}" \
+            '$2 == mpid && $3 == "nginx:" && $4 == "otel" && $5 == "exporter" {print $1}' \
+        | head -1
+}
+
+# Fallback: any otel exporter (not parent-filtered).
 exporter_pid() {
     ps -eo pid,args 2>/dev/null \
         | awk '$2 == "nginx:" && $3 == "otel" && $4 == "exporter" {print $1}' \
@@ -165,10 +175,12 @@ if ! kill -0 "${NGINX_PID}" 2>/dev/null; then
     fail "nginx exited immediately"
 fi
 
-# Assertion 1: one exporter appears.
-EXP_PID_1="$(exporter_pid)"
+# Assertion 1: one exporter appears (child of OUR master).
+# Use parent-filtered lookup to avoid picking up stale exporters from
+# previous test runs that haven't been fully reaped yet.
+EXP_PID_1="$(exporter_pid_of "${NGINX_PID}")"
 if [[ -z "${EXP_PID_1}" ]]; then
-    fail "No 'nginx: otel exporter' process found after start"
+    fail "No 'nginx: otel exporter' process (child of master ${NGINX_PID}) found after start"
 fi
 pass "Initial exporter PID = ${EXP_PID_1}"
 
@@ -196,13 +208,15 @@ info "Sending nginx -s reload (SIGHUP)..."
 
 # Wait for a NEW exporter (PID #2 != PID #1) to appear within 5s.
 # Both old and new exporters may be running during the overlap window.
-# We need to find a PID that is DIFFERENT from the original one.
+# We need to find a PID that is DIFFERENT from the original one, and
+# is still a child of OUR master (not a stale process from a previous run).
 SIGHUP_S="$(date +%s)"
 EXP_PID_2=""
 DEADLINE=$(( $(date +%s) + 5 ))
 while (( $(date +%s) < DEADLINE )); do
-    CANDIDATE=$(ps -eo pid,args 2>/dev/null \
-        | awk '$2 == "nginx:" && $3 == "otel" && $4 == "exporter" {print $1}' \
+    CANDIDATE=$(ps -eo pid,ppid,args 2>/dev/null \
+        | awk -v mpid="${NGINX_PID}" \
+            '$2 == mpid && $3 == "nginx:" && $4 == "otel" && $5 == "exporter" {print $1}' \
         | grep -v "^${EXP_PID_1}$" | head -1)
     if [[ -n "${CANDIDATE}" ]]; then
         EXP_PID_2="${CANDIDATE}"
