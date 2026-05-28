@@ -174,6 +174,9 @@ sleep 1.5
 if ! kill -0 "${NGINX_PID}" 2>/dev/null; then
     fail "nginx exited immediately"
 fi
+info "nginx master PID: ${NGINX_PID}"
+info "All otel exporter processes at startup:"
+ps -eo pid,ppid,args 2>/dev/null | awk '$3 == "nginx:" && $4 == "otel" && $5 == "exporter" {print "  pid="$1" ppid="$2}' || true
 
 # Assertion 1: one exporter appears (child of OUR master).
 # Use parent-filtered lookup to avoid picking up stale exporters from
