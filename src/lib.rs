@@ -48,8 +48,11 @@ use nginx_sys::{
     ngx_conf_t, ngx_cycle_t, ngx_http_module_t, ngx_int_t, ngx_module_t, ngx_uint_t,
     NGX_HTTP_MODULE,
 };
-use ngx::core::{Pool, Status};
+use ngx::core::Status;
 use ngx::http::{HttpModule, HttpModuleMainConf, add_phase_handler};
+// Pool is only needed for the test-support gRPC smoke harnesses in init_process.
+#[cfg(any(test, feature = "test-support"))]
+use ngx::core::Pool;
 
 mod config;
 pub mod data_model;
@@ -235,71 +238,27 @@ impl HttpModule for HttpOtelModule {
 
 /// Called by NGINX once per worker process after the process has forked.
 ///
-/// Only Worker 0 (or single-process mode) bootstraps the export task.
-/// All other workers log a debug line and return immediately.
+/// Phase 1.3.2: workers are no longer the owner of the export task.
+/// The `nginx: otel exporter` process (spawned in `ngx_otel_init_module`)
+/// owns the export task starting from Phase 1.3.2.2.
 ///
-/// Item 5 verification: grep `error.log` for "spawning export task" — exactly
-/// one match must appear across all workers.
-extern "C" fn ngx_otel_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
-    // Determine the calling process type and worker index.
-    let process_type = unsafe { nginx_sys::ngx_process } as u32;
-    let worker_num = unsafe { nginx_sys::ngx_worker };
-    let log = unsafe { (*cycle).log };
-
-    // Worker 0 and single-process mode spawn the export task.
-    // All other workers return early.
-    let is_designated = matches!(
-        (process_type, worker_num as u32),
-        (nginx_sys::NGX_PROCESS_WORKER, 0) | (nginx_sys::NGX_PROCESS_SINGLE, _)
-    );
-
-    if !is_designated {
-        ngx::ngx_log_error!(
-            nginx_sys::NGX_LOG_DEBUG,
-            log,
-            "otel init_process: worker {}, no export task",
-            worker_num
-        );
-        return Status::NGX_OK.into();
-    }
-
-    // Retrieve the main HTTP config for this cycle.
-    let cycle_ref = unsafe { &mut *cycle };
-    let Some(amcf) = HttpOtelModule::main_conf(cycle_ref) else {
-        return Status::NGX_OK.into();
-    };
-
-    if !amcf.is_configured() {
-        ngx::ngx_log_error!(
-            nginx_sys::NGX_LOG_DEBUG,
-            log,
-            "otel init_process: not configured, no export task"
-        );
-        return Status::NGX_OK.into();
-    }
-
-    // Item 5: this exact string is grepped by the integration test.
-    ngx::ngx_log_error!(
-        nginx_sys::NGX_LOG_NOTICE,
-        log,
-        "otel init_process: worker 0 spawning export task (endpoint={})",
-        amcf.exporter.endpoint
-    );
-
-    // Spawn the export loop on the NGINX event loop.
-    let task = ngx::async_::spawn(export::export_loop(amcf));
-
-    // Move the task handle into the cycle pool so it is dropped (and the
-    // task is cancelled) when the cycle is destroyed at worker exit.
-    let pool = unsafe { Pool::from_ngx_pool((*cycle).pool) };
-    if pool.allocate(task).is_null() {
-        ngx::ngx_log_error!(
-            nginx_sys::NGX_LOG_ERR,
-            log,
-            "otel init_process: pool allocation for export task failed"
-        );
-        return Status::NGX_ERROR.into();
-    }
+/// Q3 RESOLVED: callback kept registered (not `None`) for Phase 2.
+/// Phase 2 (logs) will populate this with per-worker LogProducer
+/// initialisation — one ring writer per worker.
+///
+/// The `#[cfg(any(test, feature = "test-support"))]` gRPC smoke harnesses
+/// remain on Worker 0 for the Phase 1.2 gRPC integration tests. They do
+/// not run in production builds (no allocation, no task spawn).
+extern "C" fn ngx_otel_init_process(_cycle: *mut ngx_cycle_t) -> ngx_int_t {
+    // Q3 RESOLVED: callback kept registered (not None) for Phase 2.
+    // Phase 1.3: the exporter owns the export task. Workers do
+    // nothing here. Phase 2 (logs) will populate this with
+    // per-worker LogProducer initialisation (one ring writer per
+    // worker).
+    //
+    // Existing #[cfg(test-support)] smoke harnesses still run on
+    // Worker(0) for the gRPC bidi tests. Their cfg-gating means
+    // production builds are completely empty here.
 
     // ── Phase 1.2 Item 1: in-worker gRPC viability harness ──────────────────
     //
@@ -312,223 +271,232 @@ extern "C" fn ngx_otel_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
     // `tests/integration/run_grpc_smoke.sh` greps for the success line.
     #[cfg(any(test, feature = "test-support"))]
     {
-        if !amcf.grpc_smoke_endpoint.is_empty() {
-            let endpoint_bytes = amcf.grpc_smoke_endpoint.as_bytes();
-            if let Ok(endpoint_str) = core::str::from_utf8(endpoint_bytes) {
-                let endpoint_owned = std::string::String::from(endpoint_str);
-                let log_nn = match core::ptr::NonNull::new(log) {
-                    Some(p) => p,
-                    None => {
+        let cycle = _cycle;
+        let process_type = unsafe { nginx_sys::ngx_process } as u32;
+        let worker_num = unsafe { nginx_sys::ngx_worker };
+        let log = unsafe { (*cycle).log };
+        let is_designated = matches!(
+            (process_type, worker_num as u32),
+            (nginx_sys::NGX_PROCESS_WORKER, 0) | (nginx_sys::NGX_PROCESS_SINGLE, _)
+        );
+        if is_designated {
+            let cycle_ref = unsafe { &mut *cycle };
+            if let Some(amcf) = HttpOtelModule::main_conf(cycle_ref) {
+                let pool = unsafe { Pool::from_ngx_pool((*cycle).pool) };
+
+                if !amcf.grpc_smoke_endpoint.is_empty() {
+                    let endpoint_bytes = amcf.grpc_smoke_endpoint.as_bytes();
+                    if let Ok(endpoint_str) = core::str::from_utf8(endpoint_bytes) {
+                        let endpoint_owned = std::string::String::from(endpoint_str);
+                        let log_nn = match core::ptr::NonNull::new(log) {
+                            Some(p) => p,
+                            None => {
+                                ngx::ngx_log_error!(
+                                    nginx_sys::NGX_LOG_ERR,
+                                    log,
+                                    "grpc smoke: null log pointer; skipping"
+                                );
+                                return Status::NGX_OK.into();
+                            }
+                        };
+
+                        ngx::ngx_log_error!(
+                            nginx_sys::NGX_LOG_NOTICE,
+                            log,
+                            "grpc smoke: firing one unary OTLP/gRPC export (endpoint={})",
+                            endpoint_owned
+                        );
+
+                        let smoke_task = ngx::async_::spawn(async move {
+                            let result = crate::transport::grpc::smoke::fire_one_grpc_export(
+                                &endpoint_owned,
+                                log_nn,
+                            ).await;
+                            let log_ptr = log_nn.as_ptr();
+                            match result {
+                                Ok(()) => {
+                                    // This exact line is what `run_grpc_smoke.sh` asserts on.
+                                    ngx::ngx_log_error!(
+                                        nginx_sys::NGX_LOG_NOTICE,
+                                        log_ptr,
+                                        "grpc smoke: export complete"
+                                    );
+                                }
+                                Err(e) => {
+                                    ngx::ngx_log_error!(
+                                        nginx_sys::NGX_LOG_ERR,
+                                        log_ptr,
+                                        "grpc smoke: export failed: {}",
+                                        e
+                                    );
+                                }
+                            }
+                        });
+
+                        if pool.allocate(smoke_task).is_null() {
+                            ngx::ngx_log_error!(
+                                nginx_sys::NGX_LOG_ERR,
+                                log,
+                                "grpc smoke: pool allocation for smoke task failed"
+                            );
+                            // Non-fatal.
+                        }
+                    } else {
                         ngx::ngx_log_error!(
                             nginx_sys::NGX_LOG_ERR,
                             log,
-                            "grpc smoke: null log pointer; skipping"
+                            "grpc smoke: otel_grpc_smoke_endpoint is not valid UTF-8; skipping"
                         );
-                        return Status::NGX_OK.into();
                     }
-                };
+                }
 
-                ngx::ngx_log_error!(
-                    nginx_sys::NGX_LOG_NOTICE,
-                    log,
-                    "grpc smoke: firing one unary OTLP/gRPC export (endpoint={})",
-                    endpoint_owned
-                );
+                // ── Phase 1.2 Item 2: bidi gRPC viability harness ───────────────────
+                //
+                // Only compiled when the `test-support` feature is enabled.  When set,
+                // and the `otel_grpc_bidi_smoke_endpoint` directive carries a non-empty
+                // value, fire one bidi `Echo.BidiEcho` call from Worker 0 via the same
+                // `NgxExecutor` + `SendRequestService` + `NgxConnIo` stack as Item 1,
+                // against the stand-alone `examples/bidi_echo_server` process.  Proves
+                // the send-half and receive-half are independently pollable without
+                // deadlock or livelock on the nginx event loop.  Result is logged at
+                // NOTICE; the integration test in `run_grpc_bidi_smoke.sh` greps for
+                // the success line.
+                if !amcf.bidi_smoke_endpoint.is_empty() {
+                    let endpoint_bytes = amcf.bidi_smoke_endpoint.as_bytes();
+                    if let Ok(endpoint_str) = core::str::from_utf8(endpoint_bytes) {
+                        let endpoint_owned = std::string::String::from(endpoint_str);
+                        let log_nn = match core::ptr::NonNull::new(log) {
+                            Some(p) => p,
+                            None => {
+                                ngx::ngx_log_error!(
+                                    nginx_sys::NGX_LOG_ERR,
+                                    log,
+                                    "bidi smoke: null log pointer; skipping"
+                                );
+                                return Status::NGX_OK.into();
+                            }
+                        };
 
-                let smoke_task = ngx::async_::spawn(async move {
-                    let result = crate::transport::grpc::smoke::fire_one_grpc_export(
-                        &endpoint_owned,
-                        log_nn,
-                    ).await;
-                    let log_ptr = log_nn.as_ptr();
-                    match result {
-                        Ok(()) => {
-                            // This exact line is what `run_grpc_smoke.sh` asserts on.
-                            ngx::ngx_log_error!(
-                                nginx_sys::NGX_LOG_NOTICE,
-                                log_ptr,
-                                "grpc smoke: export complete"
-                            );
-                        }
-                        Err(e) => {
+                        ngx::ngx_log_error!(
+                            nginx_sys::NGX_LOG_NOTICE,
+                            log,
+                            "bidi smoke: firing one bidi stream (endpoint={})",
+                            endpoint_owned
+                        );
+
+                        let bidi_task = ngx::async_::spawn(async move {
+                            let result = crate::transport::grpc::smoke::fire_one_bidi_stream(
+                                &endpoint_owned,
+                                log_nn,
+                            ).await;
+                            let log_ptr = log_nn.as_ptr();
+                            match result {
+                                Ok(()) => {
+                                    // fire_one_bidi_stream already logs the
+                                    // "bidi complete" line at NOTICE inside the
+                                    // function.  No additional log needed here.
+                                }
+                                Err(e) => {
+                                    // This exact pattern is what run_grpc_bidi_smoke.sh
+                                    // asserts must appear zero times.
+                                    ngx::ngx_log_error!(
+                                        nginx_sys::NGX_LOG_ERR,
+                                        log_ptr,
+                                        "bidi smoke: bidi failed: {}",
+                                        e
+                                    );
+                                }
+                            }
+                        });
+
+                        if pool.allocate(bidi_task).is_null() {
                             ngx::ngx_log_error!(
                                 nginx_sys::NGX_LOG_ERR,
-                                log_ptr,
-                                "grpc smoke: export failed: {}",
-                                e
+                                log,
+                                "bidi smoke: pool allocation for bidi task failed"
                             );
+                            // Non-fatal: the task is already running.
                         }
-                    }
-                });
-
-                if pool.allocate(smoke_task).is_null() {
-                    ngx::ngx_log_error!(
-                        nginx_sys::NGX_LOG_ERR,
-                        log,
-                        "grpc smoke: pool allocation for smoke task failed"
-                    );
-                    // Non-fatal: the export task above is already running.
-                }
-            } else {
-                ngx::ngx_log_error!(
-                    nginx_sys::NGX_LOG_ERR,
-                    log,
-                    "grpc smoke: otel_grpc_smoke_endpoint is not valid UTF-8; skipping"
-                );
-            }
-        }
-    }
-
-    // ── Phase 1.2 Item 2: bidi gRPC viability harness ───────────────────────
-    //
-    // Only compiled when the `test-support` feature is enabled.  When set,
-    // and the `otel_grpc_bidi_smoke_endpoint` directive carries a non-empty
-    // value, fire one bidi `Echo.BidiEcho` call from Worker 0 via the same
-    // `NgxExecutor` + `SendRequestService` + `NgxConnIo` stack as Item 1,
-    // against the stand-alone `examples/bidi_echo_server` process.  Proves
-    // the send-half and receive-half are independently pollable without
-    // deadlock or livelock on the nginx event loop.  Result is logged at
-    // NOTICE; the integration test in `run_grpc_bidi_smoke.sh` greps for
-    // the success line.
-    #[cfg(any(test, feature = "test-support"))]
-    {
-        if !amcf.bidi_smoke_endpoint.is_empty() {
-            let endpoint_bytes = amcf.bidi_smoke_endpoint.as_bytes();
-            if let Ok(endpoint_str) = core::str::from_utf8(endpoint_bytes) {
-                let endpoint_owned = std::string::String::from(endpoint_str);
-                let log_nn = match core::ptr::NonNull::new(log) {
-                    Some(p) => p,
-                    None => {
+                    } else {
                         ngx::ngx_log_error!(
                             nginx_sys::NGX_LOG_ERR,
                             log,
-                            "bidi smoke: null log pointer; skipping"
+                            "bidi smoke: otel_grpc_bidi_smoke_endpoint is not valid UTF-8; skipping"
                         );
-                        return Status::NGX_OK.into();
                     }
-                };
+                }
 
-                ngx::ngx_log_error!(
-                    nginx_sys::NGX_LOG_NOTICE,
-                    log,
-                    "bidi smoke: firing one bidi stream (endpoint={})",
-                    endpoint_owned
-                );
+                // ── Phase 1.2 Item 3: bidi backpressure overload ─────────────────────
+                //
+                // Only compiled when the `test-support` feature is enabled.  When set,
+                // and the `otel_grpc_bidi_overload_endpoint` directive carries a non-empty
+                // value, fire a sustained bidi overload from Worker 0 against the echo
+                // server to exercise the give-up / backpressure path.  Increments the
+                // `BIDI_BACKPRESSURE_DROPS` counter for each send that exceeded the
+                // give-up deadline.  Result is logged at NOTICE; the integration test in
+                // `run_grpc_bidi_overload.sh` greps for the summary line and asserts
+                // dropped > 0 and received > 0.
+                if !amcf.bidi_overload_endpoint.is_empty() {
+                    let endpoint_bytes = amcf.bidi_overload_endpoint.as_bytes();
+                    if let Ok(endpoint_str) = core::str::from_utf8(endpoint_bytes) {
+                        let endpoint_owned = std::string::String::from(endpoint_str);
+                        let log_nn = match core::ptr::NonNull::new(log) {
+                            Some(p) => p,
+                            None => {
+                                ngx::ngx_log_error!(
+                                    nginx_sys::NGX_LOG_ERR,
+                                    log,
+                                    "bidi overload: null log pointer; skipping"
+                                );
+                                return Status::NGX_OK.into();
+                            }
+                        };
 
-                let bidi_task = ngx::async_::spawn(async move {
-                    let result = crate::transport::grpc::smoke::fire_one_bidi_stream(
-                        &endpoint_owned,
-                        log_nn,
-                    ).await;
-                    let log_ptr = log_nn.as_ptr();
-                    match result {
-                        Ok(()) => {
-                            // fire_one_bidi_stream already logs the
-                            // "bidi complete" line at NOTICE inside the
-                            // function.  No additional log needed here.
-                        }
-                        Err(e) => {
-                            // This exact pattern is what run_grpc_bidi_smoke.sh
-                            // asserts must appear zero times.
+                        ngx::ngx_log_error!(
+                            nginx_sys::NGX_LOG_NOTICE,
+                            log,
+                            "bidi overload: queueing overload task (endpoint={})",
+                            endpoint_owned
+                        );
+
+                        let overload_task = ngx::async_::spawn(async move {
+                            let result = crate::transport::grpc::smoke::fire_bidi_overload(
+                                &endpoint_owned,
+                                log_nn,
+                            ).await;
+                            let log_ptr = log_nn.as_ptr();
+                            match result {
+                                Ok(()) => {
+                                    // fire_bidi_overload logs the summary line at NOTICE
+                                    // internally.  No additional log needed here.
+                                }
+                                Err(e) => {
+                                    ngx::ngx_log_error!(
+                                        nginx_sys::NGX_LOG_ERR,
+                                        log_ptr,
+                                        "bidi overload: failed: {}",
+                                        e
+                                    );
+                                }
+                            }
+                        });
+
+                        if pool.allocate(overload_task).is_null() {
                             ngx::ngx_log_error!(
                                 nginx_sys::NGX_LOG_ERR,
-                                log_ptr,
-                                "bidi smoke: bidi failed: {}",
-                                e
+                                log,
+                                "bidi overload: pool allocation for overload task failed"
                             );
+                            // Non-fatal: the task is already running.
                         }
-                    }
-                });
-
-                if pool.allocate(bidi_task).is_null() {
-                    ngx::ngx_log_error!(
-                        nginx_sys::NGX_LOG_ERR,
-                        log,
-                        "bidi smoke: pool allocation for bidi task failed"
-                    );
-                    // Non-fatal: the task is already running.
-                }
-            } else {
-                ngx::ngx_log_error!(
-                    nginx_sys::NGX_LOG_ERR,
-                    log,
-                    "bidi smoke: otel_grpc_bidi_smoke_endpoint is not valid UTF-8; skipping"
-                );
-            }
-        }
-    }
-
-    // ── Phase 1.2 Item 3: bidi backpressure overload ─────────────────────────
-    //
-    // Only compiled when the `test-support` feature is enabled.  When set,
-    // and the `otel_grpc_bidi_overload_endpoint` directive carries a non-empty
-    // value, fire a sustained bidi overload from Worker 0 against the echo
-    // server to exercise the give-up / backpressure path.  Increments the
-    // `BIDI_BACKPRESSURE_DROPS` counter for each send that exceeded the
-    // give-up deadline.  Result is logged at NOTICE; the integration test in
-    // `run_grpc_bidi_overload.sh` greps for the summary line and asserts
-    // dropped > 0 and received > 0.
-    #[cfg(any(test, feature = "test-support"))]
-    {
-        if !amcf.bidi_overload_endpoint.is_empty() {
-            let endpoint_bytes = amcf.bidi_overload_endpoint.as_bytes();
-            if let Ok(endpoint_str) = core::str::from_utf8(endpoint_bytes) {
-                let endpoint_owned = std::string::String::from(endpoint_str);
-                let log_nn = match core::ptr::NonNull::new(log) {
-                    Some(p) => p,
-                    None => {
+                    } else {
                         ngx::ngx_log_error!(
                             nginx_sys::NGX_LOG_ERR,
                             log,
-                            "bidi overload: null log pointer; skipping"
+                            "bidi overload: otel_grpc_bidi_overload_endpoint is not valid UTF-8; skipping"
                         );
-                        return Status::NGX_OK.into();
                     }
-                };
-
-                ngx::ngx_log_error!(
-                    nginx_sys::NGX_LOG_NOTICE,
-                    log,
-                    "bidi overload: queueing overload task (endpoint={})",
-                    endpoint_owned
-                );
-
-                let overload_task = ngx::async_::spawn(async move {
-                    let result = crate::transport::grpc::smoke::fire_bidi_overload(
-                        &endpoint_owned,
-                        log_nn,
-                    ).await;
-                    let log_ptr = log_nn.as_ptr();
-                    match result {
-                        Ok(()) => {
-                            // fire_bidi_overload logs the summary line at NOTICE
-                            // internally.  No additional log needed here.
-                        }
-                        Err(e) => {
-                            ngx::ngx_log_error!(
-                                nginx_sys::NGX_LOG_ERR,
-                                log_ptr,
-                                "bidi overload: failed: {}",
-                                e
-                            );
-                        }
-                    }
-                });
-
-                if pool.allocate(overload_task).is_null() {
-                    ngx::ngx_log_error!(
-                        nginx_sys::NGX_LOG_ERR,
-                        log,
-                        "bidi overload: pool allocation for overload task failed"
-                    );
-                    // Non-fatal: the task is already running.
                 }
-            } else {
-                ngx::ngx_log_error!(
-                    nginx_sys::NGX_LOG_ERR,
-                    log,
-                    "bidi overload: otel_grpc_bidi_overload_endpoint is not valid UTF-8; skipping"
-                );
             }
         }
     }
@@ -541,39 +509,20 @@ extern "C" fn ngx_otel_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
 /// Called by NGINX when the worker process is exiting (SIGQUIT, SIGHUP-induced
 /// shutdown, or natural exit).
 ///
-/// Performs a synchronous final flush via [`export::exit_process_flush`] to
-/// close the Phase 1.1 graceful-drain limitation: the async drain in
-/// `graceful_drain` may not fire when SIGQUIT arrives while the export loop is
-/// between intervals (asleep on a cancelable timer).  This callback fires
-/// unconditionally and sends one final batch via the sync HTTP client before
-/// the worker exits.
+/// Phase 1.3.2: workers no longer own the export state. The sync
+/// `exit_process_flush` call has been removed. The exporter's graceful_drain
+/// (called on its `ngx_quit` path) handles the final flush.
 ///
-/// Only runs for Worker 0 or single-process mode — the designated worker that
-/// holds the export state.  Other workers return immediately.
-unsafe extern "C" fn ngx_otel_exit_process(cycle: *mut ngx_cycle_t) {
-    let process_type = unsafe { nginx_sys::ngx_process } as u32;
-    let worker_num = unsafe { nginx_sys::ngx_worker };
-
-    let is_designated = matches!(
-        (process_type, worker_num as u32),
-        (nginx_sys::NGX_PROCESS_WORKER, 0) | (nginx_sys::NGX_PROCESS_SINGLE, _)
-    );
-
-    if !is_designated {
-        return;
-    }
-
-    // Retrieve the main HTTP config for this cycle.
-    let cycle_ref = unsafe { &mut *cycle };
-    let Some(amcf) = HttpOtelModule::main_conf(cycle_ref) else {
-        return;
-    };
-
-    if !amcf.is_configured() {
-        return;
-    }
-
-    export::exit_process_flush(amcf);
+/// Q3 RESOLVED: callback kept registered (not `None`) for Phase 2.
+/// Phase 2 (logs) will populate this with producer-side final flush —
+/// drain the worker's local log buffer into the shared ring before exit
+/// so the exporter picks up the tail records.
+unsafe extern "C" fn ngx_otel_exit_process(_cycle: *mut ngx_cycle_t) {
+    // Q3 RESOLVED: callback kept registered (not None) for Phase 2.
+    // Phase 1.3: the exporter's cycle owns the final drain.
+    // Phase 2 (logs) will populate this with producer-side final
+    // flush — drain the worker's local log buffer into the shared
+    // ring before exit so the exporter picks up the tail records.
 }
 
 /// Test-only stubs for nginx symbols referenced (but never called) in our code.

@@ -87,6 +87,11 @@ pub static BIDI_BACKPRESSURE_DROPS: AtomicU64 = AtomicU64::new(0);
 ///
 /// Process-global static: each forked worker inherits a zeroed copy and
 /// sets its own value independently. No cross-process coordination needed.
+// Phase 1.3.2: repurposed — now the exporter's start time (not a worker's).
+// The variable name is intentionally unchanged; a hygiene-only rename is
+// deferred to a separate commit after Phase 1.3 closes.
+// Sub-item 2 (exporter cycle) reads this to anchor the export epoch.
+#[allow(dead_code)]
 pub static WORKER_START_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Wall-clock budget for the graceful drain on `ngx_exiting`. Each send attempt
@@ -734,6 +739,10 @@ fn gauge_metric(name: &str, desc: &str, unit: &str, value: i64, time_ns: u64) ->
 /// # Called from
 /// `ngx_otel_exit_process` in `src/lib.rs`, gated on Worker 0 / single-process
 /// mode.  Do not call from other contexts.
+// Phase 1.3.2: no longer called from ngx_otel_exit_process (workers are no-ops).
+// Kept as a callable helper for the exporter's graceful_drain path; Sub-item 2
+// wires it up. Phase 2 (logs) may also use it from the producer side.
+#[allow(dead_code)]
 pub fn exit_process_flush(amcf: &MainConfig) {
     let log = ngx::log::ngx_cycle_log();
 
