@@ -259,6 +259,10 @@ sleep 5
 # 15s to accommodate scheduling delays on slow VMs and heavy load.
 
 info "Waiting for old exporter (PID ${EXP_PID_1}) to exit..."
+# Immediate check: by 5s after SIGHUP, old exporter should have exited.
+# Check error.log for drain evidence right now.
+info "Error.log ngx_quit events for old exporter (at 5s mark):"
+grep "ngx_quit\|drain" "${PREFIX}/logs/error.log" 2>/dev/null | grep "${EXP_PID_1}#" | head -5 || true
 OLD_EXITED=0
 DEADLINE=$(( $(date +%s) + 15 ))
 while (( $(date +%s) < DEADLINE )); do
