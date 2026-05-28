@@ -1,21 +1,24 @@
 #!/usr/bin/env bash
 # tests/integration/run_reload.sh — Step 10 SIGHUP reload integration test
 #
-# Sends a SIGHUP to nginx, verifies a clean worker-generation transition, and
+# Phase 1.3.2: the otel exporter process (not Worker 0) owns the export task.
+#
+# Sends a SIGHUP to nginx, verifies a clean exporter-generation transition, and
 # asserts that:
-#   1. Exactly 2 "spawning export task" lines appear in error.log
-#      (one per worker generation; no double-spawn within a generation).
-#   2. At least 2 "exit_process: sync flush" lines appear (one per exiting
-#      Worker 0 generation — pre-reload and post-reload).
+#   1. Exactly 2 "export loop started" lines appear in error.log
+#      (one per exporter generation across the reload cycle).
+#   2. At least 2 "graceful drain complete" lines appear (§6.3 race RESOLVED —
+#      the exporter is not a worker and is not subject to ngx_event_no_timers_left).
 #   3. "otel: SIGHUP reload detected" appears exactly once (from Item 1's
 #      postconfiguration hook in the master).
-#   4. metrics.json shows ≥ 2 unique startTimeUnixNano values for
-#      ngx_otel.dropped_records (start_time advances on each new worker
+#   4. metrics.json shows service.name from the new exporter in new content.
+#   5. metrics.json shows ≥ 2 unique startTimeUnixNano values for
+#      ngx_otel.dropped_records (start_time advances on each new exporter
 #      generation, per the proposal §6 design call).
-#   5. For every ngx_otel.dropped_records data point, timeUnixNano >=
+#   6. For every ngx_otel.dropped_records data point, timeUnixNano >=
 #      startTimeUnixNano (cumulative semantics are honest across reload;
 #      a backend computing rates by diffing same-stream samples will not
-#      see a spurious decrement when worker generations rotate).
+#      see a spurious decrement when exporter generations rotate).
 #
 # Prerequisites
 # ─────────────
@@ -262,28 +265,29 @@ fi
 
 info "Running assertions..."
 
-# 1. Exactly 2 "spawning export task" lines (one per worker generation).
-# Worker 0 of generation 1 spawns on initial startup; Worker 0 of generation 2
-# spawns after the reload.  No other workers spawn the task.
-SPAWN_COUNT=$(grep -c "spawning export task" "${PREFIX}/logs/error.log" 2>/dev/null) || SPAWN_COUNT=0
+# 1. Exactly 2 "export loop started" lines (one per exporter generation).
+# Phase 1.3.2: the export task runs in the otel exporter process, not Worker 0.
+# One exporter per nginx generation → 2 export loop starts across a reload cycle.
+SPAWN_COUNT=$(grep -c "export loop started" "${PREFIX}/logs/error.log" 2>/dev/null) || SPAWN_COUNT=0
 if [[ "${SPAWN_COUNT}" -eq 2 ]]; then
-    pass "error.log: exactly 2 'spawning export task' lines (one per worker generation)"
+    pass "error.log: exactly 2 'export loop started' lines (one per exporter generation)"
 else
-    fail "error.log: expected 2 'spawning export task' lines, got ${SPAWN_COUNT}.
+    fail "error.log: expected 2 'export loop started' lines, got ${SPAWN_COUNT}.
        Relevant lines:
-$(grep 'spawning export task\|init_process' "${PREFIX}/logs/error.log" | head -20)"
+$(grep 'export loop started\|otel exporter\|otel export' "${PREFIX}/logs/error.log" | head -20)"
 fi
 
-# 2. At least 2 "exit_process: sync flush" lines.
-# Generation-1 Worker 0 fires on SIGQUIT from reload; generation-2 Worker 0
-# fires on SIGQUIT from quit.
-FLUSH_COUNT=$(grep -c "exit_process: sync flush" "${PREFIX}/logs/error.log" 2>/dev/null) || FLUSH_COUNT=0
+# 2. At least 2 "graceful drain complete" lines.
+# Phase 1.3.2: each exporter runs a graceful drain on ngx_quit (§6.3 race RESOLVED).
+# Drain complete from generation-1 exporter (SIGHUP quit) + generation-2 (final quit).
+FLUSH_COUNT=$(grep -c "graceful drain complete" "${PREFIX}/logs/error.log" 2>/dev/null) || FLUSH_COUNT=0
 if [[ "${FLUSH_COUNT}" -ge 2 ]]; then
-    pass "error.log: ${FLUSH_COUNT} 'exit_process: sync flush' lines (≥ 2 expected)"
+    pass "error.log: ${FLUSH_COUNT} 'graceful drain complete' lines (≥ 2 expected)"
 else
-    fail "error.log: expected ≥ 2 'exit_process: sync flush' lines, got ${FLUSH_COUNT}.
+    fail "error.log: expected ≥ 2 'graceful drain complete' lines, got ${FLUSH_COUNT}.
+       Note: §6.3 RESOLVED — the exporter is not subject to ngx_event_no_timers_left.
        Relevant lines:
-$(grep 'exit_process' "${PREFIX}/logs/error.log" | head -20)"
+$(grep 'graceful drain\|ngx_quit' "${PREFIX}/logs/error.log" | head -20)"
 fi
 
 # 3. "otel: SIGHUP reload detected" appears exactly once.
@@ -298,8 +302,12 @@ $(grep 'SIGHUP\|reload detected' "${PREFIX}/logs/error.log" | head -10)"
 fi
 
 # 4. metrics.json: service.name appears in new content.
-if echo "${NEW_CONTENT}" | grep -q "${SERVICE_NAME}"; then
-    pass "metrics.json: service.name = ${SERVICE_NAME} present"
+# Note: grep -q (used historically) can fail with set -o pipefail on large
+# NEW_CONTENT (SIGPIPE from echo when grep exits early after the first match).
+# grep -c reads all stdin so the pipe drains cleanly.
+SVC_COUNT=$(echo "${NEW_CONTENT}" | grep -c "${SERVICE_NAME}" 2>/dev/null || echo 0)
+if [[ "${SVC_COUNT:-0}" -ge 1 ]]; then
+    pass "metrics.json: service.name = ${SERVICE_NAME} present (${SVC_COUNT} lines)"
 else
     fail "metrics.json: service.name '${SERVICE_NAME}' not found in new content."
 fi

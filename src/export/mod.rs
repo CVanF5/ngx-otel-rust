@@ -3,46 +3,40 @@
 // This source code is licensed under the Apache License, Version 2.0 license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! Step 9: Designated-worker export loop.
+//! Phase 1.3.2: Export loop relocated from Worker 0 to the `nginx: otel exporter` process.
 //!
-//! [`export_loop`] runs **only on Worker 0**, spawned from `ngx_otel_init_process`.
-//! It:
+//! [`export_loop`] runs inside the **exporter process**, spawned by
+//! `otel_exporter_cycle` in `src/exporter/mod.rs`. It:
 //!   1. Sleeps for the configured `otel_metric_interval`.
 //!   2. Collects metrics from all configured [`MetricSource`]s.
+//!      (shm rings written by workers, mapped via fork-shared pages)
 //!   3. Encodes via [`OtlpHttpEncoder`].
 //!   4. Ships via [`HyperHttpTransport<NgxConnector>`] (production transport only;
 //!      [`SpinConnector`] is test-only and never used here).
 //!   5. On send failure: enqueues bytes in a bounded retry buffer; drops the
 //!      oldest entry when the buffer is full.
-//!   6. On `ngx_exiting`: flushes the retry buffer and sends one final batch,
-//!      then returns cleanly so NGINX can finish shutting down.
+//!   6. On `ngx_quit`: flushes the retry buffer and sends one final batch,
+//!      then sets [`EXPORT_LOOP_DONE`] and returns cleanly.
 //!   7. On `ngx_terminate`: returns immediately without any drain.
 //!
-//! # Step 10 note
-//! `MainConfig` is captured at spawn time (worker 0 startup).  On SIGHUP
-//! reload NGINX creates a new cycle and a new config; the export loop is
-//! restarted naturally in each new worker generation by `init_process`.
+//! # Phase 1.3.2 note
+//! `MainConfig` is captured at spawn time (exporter startup). On SIGHUP
+//! reload nginx creates a new exporter process with a new cycle and config.
+//! The new exporter spawns its own `export_loop` task.
 //! `MainConfig::old_config` provides the hook for Phase 1.2 cross-cycle
 //! state transfer (TLS connection reuse, etc.).
 //!
-//! The documented Phase 1.1 graceful-drain limitation (SIGQUIT during sleep)
-//! is closed in Step 10 by the `exit_process` callback in `src/lib.rs`,
-//! which calls [`exit_process_flush`].  See [`graceful_drain`] for details.
-//!
-//! # Documented Phase 1.1 limitation — graceful drain on SIGQUIT
-//! When SIGQUIT arrives while the loop is between intervals (asleep), the
-//! drain may not fire: ngx-rust's `Sleep` registers a cancelable nginx timer,
-//! and nginx's worker exit logic does not wait for cancelable timers. The
-//! drain fires reliably only when SIGQUIT arrives during the active part of
-//! the loop body. See [`graceful_drain`] for the full diagnosis.
-//!
-//! **This limitation is closed in Step 10**: the `exit_process` callback in
-//! `src/lib.rs` calls [`exit_process_flush`], which performs a synchronous
-//! final send that fires unconditionally when the worker exits.
+//! # Phase 1.1 / 1.2 graceful-drain limitation — RESOLVED in Phase 1.3
+//! The documented SIGQUIT-during-sleep limitation (see [`graceful_drain`])
+//! is **resolved** in Phase 1.3.2: the exporter is not a worker and is not
+//! subject to `ngx_event_no_timers_left`. Cancelable timers fire normally
+//! when the exporter exits on `ngx_quit`, so the chunked sleep reliably
+//! detects shutdown and runs the drain. The `exit_process` flush path
+//! (formerly in `src/lib.rs`) is no longer needed on the worker side.
 
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::task::{Context, Poll};
 use core::time::Duration;
 use std::collections::VecDeque;
@@ -94,12 +88,20 @@ pub static BIDI_BACKPRESSURE_DROPS: AtomicU64 = AtomicU64::new(0);
 #[allow(dead_code)]
 pub static WORKER_START_NS: AtomicU64 = AtomicU64::new(0);
 
-/// Wall-clock budget for the graceful drain on `ngx_exiting`. Each send attempt
+/// Set to `true` by [`export_loop`] just before it returns after a graceful
+/// drain on `ngx_quit`. The exporter cycle polls this flag in its `ngx_quit`
+/// branch to know when the drain has completed and it is safe to exit.
+///
+/// Phase 1.3.2: process-global; the exporter process is single-instance so
+/// there is exactly one export_loop per process lifetime.
+pub(crate) static EXPORT_LOOP_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Wall-clock budget for the graceful drain on `ngx_quit`. Each send attempt
 /// inside the drain is capped at this duration so a dead collector cannot
-/// stall worker shutdown.
+/// stall exporter shutdown.
 const GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET: Duration = Duration::from_secs(2);
 
-/// Maximum slice of the export interval that may pass between `ngx_exiting`
+/// Maximum slice of the export interval that may pass between `ngx_quit`
 /// polls. Chunked sleep ensures shutdown is responsive even with a long
 /// configured `otel_metric_interval` — we never wait more than this between
 /// shutdown checks. The cost is one extra timer wake per chunk; negligible.
@@ -173,10 +175,18 @@ impl MetricSource for SelfMetricsSource {
 
 // ── Main export loop ─────────────────────────────────────────────────────────
 
-/// Async export loop — spawned by `ngx_otel_init_process` on Worker 0 only.
+/// Async export loop — spawned by `otel_exporter_cycle` inside the exporter process.
+///
+/// Phase 1.3.2: runs in the `nginx: otel exporter` process, not Worker 0.
+/// The shm rings (written by worker bumps) are read across the fork boundary
+/// via the same mapped pages — fork-shared memory is coherent for atomic reads.
 ///
 /// Takes `&'static MainConfig` because the loop task outlives the spawn call;
-/// NGINX allocates MainConfig from the cycle pool which has worker lifetime.
+/// NGINX allocates MainConfig from the cycle pool which has exporter lifetime.
+///
+/// When `ngx_quit` is detected, runs [`graceful_drain`], sets
+/// [`EXPORT_LOOP_DONE`], and returns. The exporter cycle polls
+/// `EXPORT_LOOP_DONE` before calling `process::exit`.
 pub async fn export_loop(amcf: &'static MainConfig) {
     let log = ngx::log::ngx_cycle_log();
 
@@ -256,21 +266,26 @@ pub async fn export_loop(amcf: &'static MainConfig) {
         }
 
         // ── Check for graceful SIGQUIT ────────────────────────────────────
-        if unsafe { nginx_sys::ngx_exiting } != 0 {
+        // Phase 1.3.2: poll ngx_quit (not ngx_exiting). The exporter is not a
+        // worker; master signals it to quit via ngx_quit on the channel handler
+        // path (SIGQUIT → master → NGX_CMD_QUIT → ngx_quit). ngx_exiting is a
+        // worker-specific flag set by the worker's SIGQUIT handler.
+        if unsafe { nginx_sys::ngx_quit } != 0 {
             ngx::ngx_log_error!(
                 NGX_LOG_NOTICE,
                 log.as_ptr(),
-                "otel export: ngx_exiting set, starting graceful drain"
+                "otel export: ngx_quit set, starting graceful drain"
             );
             graceful_drain(&mut transport, &mut retry_queue, &encoder, amcf, worker_start_ns).await;
+            EXPORT_LOOP_DONE.store(true, Ordering::Release);
             return;
         }
 
         // ── Chunked sleep for the configured export interval ──────────────────
-        // We must check ngx_exiting at least every SHUTDOWN_POLL_INTERVAL so
-        // that SIGQUIT during a long sleep doesn't cause the worker to exit
-        // before our drain runs. The Task's only chance to drain is while the
-        // event loop is still polling it.
+        // We must check ngx_quit at least every SHUTDOWN_POLL_INTERVAL so that
+        // SIGQUIT during a long sleep doesn't delay the drain significantly.
+        // Phase 1.3.2: unlike workers, the exporter is not subject to
+        // ngx_event_no_timers_left, so cancelable timers fire reliably on quit.
         let interval = Duration::from_millis(amcf.interval_ms());
         let mut slept = Duration::ZERO;
         let mut shutdown_during_sleep = ShutdownKind::None;
@@ -282,7 +297,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                 shutdown_during_sleep = ShutdownKind::Terminate;
                 break;
             }
-            if unsafe { nginx_sys::ngx_exiting } != 0 {
+            if unsafe { nginx_sys::ngx_quit } != 0 {
                 shutdown_during_sleep = ShutdownKind::Exiting;
                 break;
             }
@@ -295,14 +310,15 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             return;
         }
         if matches!(shutdown_during_sleep, ShutdownKind::Exiting)
-            || unsafe { nginx_sys::ngx_exiting } != 0
+            || unsafe { nginx_sys::ngx_quit } != 0
         {
             ngx::ngx_log_error!(
                 NGX_LOG_NOTICE,
                 log.as_ptr(),
-                "otel export: ngx_exiting set during sleep, starting graceful drain"
+                "otel export: ngx_quit set during sleep, starting graceful drain"
             );
             graceful_drain(&mut transport, &mut retry_queue, &encoder, amcf, worker_start_ns).await;
+            EXPORT_LOOP_DONE.store(true, Ordering::Release);
             return;
         }
 
@@ -373,43 +389,51 @@ pub async fn export_loop(amcf: &'static MainConfig) {
 
 // ── Graceful drain ────────────────────────────────────────────────────────────
 
-/// Called when `ngx_exiting` is detected from inside [`export_loop`].
+/// Called when `ngx_quit` is detected from inside [`export_loop`].
+///
+/// Phase 1.3.2: runs on the **exporter's** `ngx_quit` path, not a worker's
+/// `ngx_exiting` path. The exporter receives SIGQUIT via master's channel
+/// write (`NGX_CMD_QUIT` → `ngx_quit`).
 ///
 /// Best-effort: attempt to flush the retry queue (one send per queued batch)
 /// and then send one final freshly-collected batch. Each send is wrapped in a
 /// short wall-clock budget ([`GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET`]) so that an
-/// unreachable collector cannot stall worker shutdown.
+/// unreachable collector cannot stall exporter shutdown.
 ///
 /// # Lifetime safety
 ///
-/// `ngx_exiting` only marks the worker as draining — the event loop is still
-/// running, the cycle pool is still live, and our spawned task is still being
-/// polled. The same primitives are used unguarded by `nginx-acme`'s
-/// `ngx_http_acme_main_loop` (see `nginx-acme/src/lib.rs:194-206`). The Task
-/// handle is dropped at cycle-pool teardown, which happens *after* this
-/// function returns. Awaiting `transport.send()` here is safe.
+/// `ngx_quit` only marks the process as quitting — the event loop is still
+/// running (the exporter cycle continues calling `ngx_process_events_and_timers`
+/// until `EXPORT_LOOP_DONE` is set), the cycle pool is still live, and our
+/// spawned task is still being polled. The Task handle is dropped at cycle-pool
+/// teardown, which happens *after* this function returns. Awaiting
+/// `transport.send()` here is safe.
 ///
-/// # Documented limitation — drain may not fire on SIGQUIT during sleep
+/// # Documented Phase 1.1 limitation — RESOLVED in Phase 1.3
+///
+/// (Historical context retained; this section no longer describes a limitation.)
 ///
 /// `ngx_event_no_timers_left()` returns `NGX_OK` (worker may exit) when the
 /// only pending timers are `cancelable`. The ngx-rust SDK marks every
 /// [`ngx::async_::sleep`] timer as cancelable
 /// (`ngx-rust/src/async_/sleep.rs:94: ev.set_cancelable(1)`), so when SIGQUIT
-/// arrives while [`export_loop`] is between intervals, nginx treats the worker
-/// as idle and exits before our timer fires. Our task is then dropped from
-/// the cycle pool without running this drain.
+/// arrived while Worker 0's [`export_loop`] was between intervals, nginx would
+/// treat the worker as idle and exit before the timer fired.
 ///
-/// Mitigation: the export loop chunks its sleep into
-/// [`SHUTDOWN_POLL_INTERVAL`] slices, narrowing the window but not closing
-/// it. The drain DOES fire reliably when SIGQUIT arrives during the active
-/// part of the loop body (collect/encode/send/retry).
+/// **RESOLVED in Phase 1.3.2**: the exporter is not a worker and is not
+/// subject to `ngx_event_no_timers_left`. When SIGQUIT arrives while the
+/// exporter is between intervals, nginx's event loop does NOT cancel the
+/// sleep timer — it fires normally, the export loop detects `ngx_quit`, and
+/// runs this drain. The chunked sleep ([`SHUTDOWN_POLL_INTERVAL`]) caps
+/// detection latency at 250 ms.
 ///
-/// **This limitation is closed in Step 10** by the `exit_process` callback
-/// in `src/lib.rs`, which calls [`exit_process_flush`]. That callback fires
-/// unconditionally when the worker exits — bypassing the cancelable-timer
-/// race entirely. Both paths may fire when SIGQUIT arrives during the active
-/// part of the loop body; the worst case is a duplicate batch at the
-/// collector, which it deduplicates via timestamps.
+/// On Phase 1.3 builds, `exit_process_flush` is a dead-code helper (Phase 2
+/// may resurrect it). The exporter cycle waits for [`EXPORT_LOOP_DONE`]
+/// before calling `process::exit`, ensuring the drain always completes.
+///
+/// Q2 RESOLVED — option (a): old exporter races workers on SIGHUP. Dedup
+/// via `time_unix_nano` on the collector side (cumulative-counter model).
+/// Phase 2 (logs) reopens this when log-drain semantics force ordered handoff.
 async fn graceful_drain(
     transport: &mut HyperHttpTransport<NgxConnector>,
     retry_queue: &mut VecDeque<(std::vec::Vec<u8>, u64)>,

@@ -5,7 +5,8 @@
 # sends HTTP traffic, waits for a metrics flush, then checks that:
 #   1. metrics.json contains entries with service.name = ngx-otel-step9-integration
 #   2. At least one histogram data point for http.server.request.duration arrived
-#   3. error.log contains exactly one "spawning export task" line (Worker 0 only)
+#   3. error.log contains exactly one "export loop started" line (exporter process only)
+#      Phase 1.3.2: the export task runs in the otel exporter process, not Worker 0.
 #
 # Prerequisites
 # ─────────────
@@ -138,7 +139,7 @@ info "metrics.json pre-size: ${PRE_SIZE} bytes"
 info "Starting nginx (worker_processes 4)..."
 # Note: error_log is already set in nginx.conf; do NOT pass -g "error_log ..."
 # here as that would create a second log target and double every line, causing
-# the "exactly 1 spawning export task" assertion to fail.
+# the "exactly 1 export loop started" assertion to fail.
 "${NGINX_BINARY}" \
     -p "${PREFIX}" \
     -c "${PREFIX}/nginx.conf" &
@@ -218,33 +219,35 @@ else
     FAILED=1
 fi
 
-# 3. Exactly one "spawning export task" in error.log (Worker 0 only)
-SPAWN_COUNT=$(grep -c "spawning export task" "${PREFIX}/logs/error.log" 2>/dev/null) || SPAWN_COUNT=0
+# 3. Exactly one "export loop started" in error.log (otel exporter process only)
+# Phase 1.3.2: the export task is spawned inside the otel exporter process, not
+# Worker 0. The "otel export: export loop started" line is logged once per
+# exporter cycle, confirming the async task is running in the correct process.
+# (Previously this checked for "spawning export task" on Worker 0.)
+SPAWN_COUNT=$(grep -c "export loop started" "${PREFIX}/logs/error.log" 2>/dev/null) || SPAWN_COUNT=0
 if [[ "${SPAWN_COUNT}" -eq 1 ]]; then
-    pass "error.log contains exactly 1 'spawning export task' line (Worker 0 only)"
+    pass "error.log contains exactly 1 'export loop started' line (otel exporter process)"
 else
-    fail "error.log contains ${SPAWN_COUNT} 'spawning export task' lines (expected 1).
+    fail "error.log contains ${SPAWN_COUNT} 'export loop started' lines (expected 1).
        Relevant lines:
-$(grep "spawning export task\|init_process" "${PREFIX}/logs/error.log" | head -20)"
+$(grep "export loop started\|otel exporter\|otel export" "${PREFIX}/logs/error.log" | head -20)"
     FAILED=1
 fi
 
-# 4. Conditional graceful-drain integrity check.
+# 4. Graceful-drain integrity check.
 #
-# Background: when SIGQUIT arrives while the export loop is between intervals
-# (asleep on a cancelable ngx-rust timer), nginx exits before the loop wakes
-# and the drain never fires. This is a documented Phase 1.1 limitation (see
-# src/export/mod.rs::graceful_drain). So we CANNOT assert the drain runs
-# unconditionally — the SIGQUIT-vs-sleep race makes that flaky.
+# Phase 1.3.2: the §6.3 SIGQUIT-during-sleep race is RESOLVED. The exporter is
+# not a worker and is not subject to ngx_event_no_timers_left. The drain fires
+# reliably when ngx_quit is set. The exporter cycle waits for EXPORT_LOOP_DONE
+# before calling process::exit, so the drain always completes.
 #
-# What we CAN assert: if the drain started, it must also complete. A regression
-# where the drain begins but hangs (e.g., budget logic broken, transport future
-# never resolves) would leave a "graceful drain starting" line with no matching
+# We assert the drain must complete if it started. A regression where the drain
+# begins but hangs would leave a "graceful drain starting" line with no matching
 # "graceful drain complete" line — that we want to catch.
 DRAIN_START=$(grep -c "graceful drain starting" "${PREFIX}/logs/error.log" 2>/dev/null) || DRAIN_START=0
 DRAIN_END=$(grep -c "graceful drain complete" "${PREFIX}/logs/error.log" 2>/dev/null) || DRAIN_END=0
 if [[ "${DRAIN_START}" -eq 0 ]]; then
-    info "Note: graceful drain did not fire this run (SIGQUIT landed during sleep — documented limitation)."
+    info "Note: graceful drain did not fire this run (exporter may have been SIGTERM'd)."
 elif [[ "${DRAIN_START}" -eq "${DRAIN_END}" ]]; then
     pass "graceful drain integrity: ${DRAIN_START} start(s), ${DRAIN_END} complete(s)"
 else

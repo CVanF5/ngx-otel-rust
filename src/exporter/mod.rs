@@ -3,15 +3,17 @@
 // This source code is licensed under the Apache License, Version 2.0 license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! Exporter process lifecycle — Phase 1.3.1.
+//! Exporter process lifecycle — Phase 1.3.2.
 //!
 //! This module provides the `nginx: otel exporter` child process, spawned by
 //! master via the `init_module` hook in `src/lib.rs`. The exporter handles
 //! master channel signals (QUIT / TERMINATE / REOPEN), drops privileges to the
-//! configured nginx user, and runs the nginx event loop.
+//! configured nginx user, runs the nginx event loop, and now (Phase 1.3.2)
+//! owns the async export task spawned via [`ngx::async_::spawn`].
 //!
-//! Phase 1.3.2 will relocate the async export task here; for now (1.3.1)
-//! this is lifecycle-only.
+//! Workers are bump-and-defer only — no event loop work, no allocation, no
+//! sockets on the cold path. The collector connection originates exclusively
+//! from the exporter PID.
 
 pub(crate) mod channel;
 
@@ -19,6 +21,11 @@ use core::ffi::c_void;
 use core::mem;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
+
+use ngx::core::Pool;
+use ngx::http::HttpModuleMainConf;
+
+use crate::HttpOtelModule;
 
 /// Process-local flag set by `otel_exporter_cycle` immediately after fork.
 ///
@@ -196,18 +203,27 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
         //     fully initialised.
         nginx_sys::ngx_setproctitle(c"otel exporter".as_ptr().cast_mut());
 
+        // 11. Spawn the async export task. The task lives for the process
+        //     lifetime; allocating it on the exporter's pool keeps it pinned
+        //     until the cycle tears down. The task reads the shm rings written
+        //     by workers via fork-shared pages (PHASE_1_3_RESEARCH.md §4.1).
+        //     Sub-item 2 (Phase 1.3.2): this is the new owner of the export loop.
+        let amcf = HttpOtelModule::main_conf(&mut *cycle)
+            .expect("exporter cycle: missing otel main conf");
+        let task = ngx::async_::spawn(crate::export::export_loop(amcf));
+        let pool = Pool::from_ngx_pool((*cycle).pool);
+        let _ = pool.allocate(task);
+
         ngx::ngx_log_error!(
             nginx_sys::NGX_LOG_NOTICE, (*cycle).log,
-            "otel exporter: cycle entered, pid={}, parent={}",
-            nginx_sys::ngx_pid, nginx_sys::ngx_parent
+            "otel exporter: cycle entered, pid={}, parent={}, endpoint={}",
+            nginx_sys::ngx_pid, nginx_sys::ngx_parent, amcf.exporter.endpoint
         );
 
-        // 11. Main event loop. Polls ngx_terminate / ngx_quit / ngx_reopen
-        //     exactly as ngx_cache_manager_process_cycle does. Phase 1.3.2
-        //     will add the async export task spawn and a graceful drain on
-        //     ngx_quit before the exit; the loop structure is designed to
-        //     accommodate that addition cleanly (the ngx_quit arm is a
-        //     separate branch, not a fall-through from ngx_terminate).
+        // 12. Main event loop. Polls ngx_terminate / ngx_quit / ngx_reopen
+        //     exactly as ngx_cache_manager_process_cycle does.
+        //     On ngx_quit: wait for the export task's graceful drain to complete
+        //     (signalled via EXPORT_LOOP_DONE) before exiting.
         loop {
             if nginx_sys::ngx_terminate != 0 {
                 ngx::ngx_log_error!(
@@ -217,14 +233,32 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
                 std::process::exit(0);
             }
             if nginx_sys::ngx_quit != 0 {
+                // Keep driving the event loop until the export task completes
+                // its graceful drain and sets EXPORT_LOOP_DONE, or until a
+                // hard deadline is reached.
+                //
+                // §6.3 RESOLVED: the exporter is not a worker and is not subject
+                // to ngx_event_no_timers_left. Cancelable sleep timers fire
+                // normally, so the export loop detects ngx_quit within at most
+                // SHUTDOWN_POLL_INTERVAL (250 ms) and runs graceful_drain.
+                //
+                // Q2 RESOLVED — option (a): on SIGHUP the old exporter races
+                // workers. Dedup via time_unix_nano (cumulative-counter model).
+                // Phase 2 (logs) reopens this when log-drain semantics force
+                // ordered handoff.
+                let drain_deadline = std::time::Instant::now()
+                    + std::time::Duration::from_secs(15);
+                while !crate::export::EXPORT_LOOP_DONE.load(Ordering::Acquire)
+                    && std::time::Instant::now() < drain_deadline
+                {
+                    nginx_sys::ngx_process_events_and_timers(cycle);
+                }
+                let drained = crate::export::EXPORT_LOOP_DONE.load(Ordering::Relaxed);
                 ngx::ngx_log_error!(
                     nginx_sys::NGX_LOG_NOTICE, (*cycle).log,
-                    "otel exporter: ngx_quit, exit"
+                    "otel exporter: ngx_quit, drain_done={}, exit",
+                    drained
                 );
-                // TODO(phase-1.3.2): add graceful_drain(amcf).await here,
-                // keeping the event loop alive until the drain completes.
-                // The drain races workers (Q2 RESOLVED — option a); the
-                // dedup is via time_unix_nano on the collector side.
                 std::process::exit(0);
             }
             if nginx_sys::ngx_reopen != 0 {
