@@ -203,10 +203,20 @@ sleep 5
 
 # ─── Send SIGHUP ──────────────────────────────────────────────────────────────
 
-info "Sending nginx -s reload (SIGHUP)..."
+info "Sending SIGHUP to master (PID ${NGINX_PID})..."
 # Use direct kill -HUP to ensure the signal goes to exactly our master process.
-# 'nginx -s reload' reads the pid file; this guarantees we target our master.
 kill -HUP "${NGINX_PID}" 2>/dev/null || true
+# Verify master received SIGHUP (should see "reconfiguring" within 2s)
+sleep 0.5
+if grep -q "reconfiguring" "${PREFIX}/logs/error.log" 2>/dev/null; then
+    info "SIGHUP confirmed: master is reconfiguring"
+else
+    info "WARNING: no 'reconfiguring' in error.log after 0.5s; checking again..."
+    sleep 1.5
+    grep -q "reconfiguring" "${PREFIX}/logs/error.log" 2>/dev/null \
+        && info "Delayed reconfigure detected" \
+        || fail "Master (${NGINX_PID}) did not process SIGHUP: error.log has no 'reconfiguring' line"
+fi
 
 # Wait for a NEW exporter (PID #2 != PID #1) to appear within 5s.
 # Both old and new exporters may be running during the overlap window.
