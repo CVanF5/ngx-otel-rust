@@ -121,10 +121,29 @@ unsafe impl HttpModuleMainConf for HttpOtelModule {
 ///
 /// See `PHASE_1_3_RESEARCH.md` §2.7–2.9, §5.2 and Q4 for design decisions.
 extern "C" fn ngx_otel_init_module(cycle: *mut nginx_sys::ngx_cycle_t) -> nginx_sys::ngx_int_t {
-    // Only fork from master. In single-process mode the single process IS
-    // the exporter+worker; we skip the fork entirely there.
-    // Safety: ngx_process is a process-global nginx variable.
-    if unsafe { nginx_sys::ngx_process } as u32 != nginx_sys::NGX_PROCESS_MASTER {
+    // Fork only when running in master-process mode. Two call sites:
+    //
+    // 1. Initial start: ngx_process = NGX_PROCESS_SINGLE at this point
+    //    (nginx.c:339 sets MASTER *after* ngx_init_cycle returns; our hook
+    //    fires during ngx_init_cycle:649). Allow SINGLE here.
+    //
+    // 2. SIGHUP reload: ngx_process = NGX_PROCESS_MASTER. Allow MASTER.
+    //
+    // Skip all worker/helper/signaller contexts (they should never call
+    // ngx_init_cycle, but the check is cheap and defensive).
+    //
+    // Note: unlike cache_manager (spawned from ngx_master_process_cycle
+    // where MASTER is already set), we use init_module which fires earlier.
+    let process = unsafe { nginx_sys::ngx_process } as u32;
+    if process != nginx_sys::NGX_PROCESS_MASTER && process != nginx_sys::NGX_PROCESS_SINGLE {
+        return Status::NGX_OK.into();
+    }
+
+    // Don't spawn an exporter during `nginx -t` (config-test mode). In test
+    // mode ngx_init_cycle is called just for syntax validation; spawning a
+    // child here would leak it as an orphan when the master exits after the
+    // test.
+    if unsafe { nginx_sys::ngx_test_config } != 0 {
         return Status::NGX_OK.into();
     }
 
@@ -632,6 +651,9 @@ mod nginx_test_stubs {
 
     #[no_mangle]
     pub static mut ngx_parent: nginx_sys::ngx_pid_t = 0;
+
+    #[no_mangle]
+    pub static mut ngx_test_config: nginx_sys::ngx_uint_t = 0;
 
     // Exporter cycle helpers: accept-mutex flag, channel fd, process table.
     #[no_mangle]

@@ -6,17 +6,18 @@
 //! Exporter process lifecycle — Phase 1.3.1.
 //!
 //! This module provides the `nginx: otel exporter` child process, spawned by
-//! master via the `init_module` hook in `src/lib.rs`. The exporter runs the
-//! export loop (Phase 1.3.2), handles master channel signals
-//! (QUIT / TERMINATE / REOPEN), and drops privileges to the configured nginx
-//! user.
+//! master via the `init_module` hook in `src/lib.rs`. The exporter handles
+//! master channel signals (QUIT / TERMINATE / REOPEN), drops privileges to the
+//! configured nginx user, and runs the nginx event loop.
 //!
-//! Sub-item 1 (this file, initial pass): `NgxProcess::Exporter` helper +
-//! `IS_OTEL_EXPORTER` flag. Sub-items 2–5 add the channel handler, the
-//! `init_module` callback, the full cycle body, and the crash-respawn test.
+//! Phase 1.3.2 will relocate the async export task here; for now (1.3.1)
+//! this is lifecycle-only.
 
 pub(crate) mod channel;
 
+use core::ffi::c_void;
+use core::mem;
+use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Process-local flag set by `otel_exporter_cycle` immediately after fork.
@@ -72,31 +73,310 @@ pub(crate) fn ngx_process() -> NgxProcess {
     }
 }
 
-/// Exporter cycle entry point.
+// ── Exporter cycle entry point ────────────────────────────────────────────────
+
+/// Exporter cycle entry point — called from `ngx_spawn_process` via the
+/// `ngx_spawn_proc_pt` function pointer registered in `ngx_otel_init_module`.
 ///
-/// **Sub-item 3 stub:** logs and exits immediately. Sub-item 4 replaces this
-/// with the full body (signal installation, channel-event registration,
-/// privilege drop, event loop). The stub is used here solely so Sub-item 3
-/// can be compiled and the syntax/config test can be run without starting a
-/// tight respawn loop.
+/// Sequence mirrors `ngx_cache_manager_process_cycle`
+/// (`nginx/src/os/unix/ngx_process_cycle.c:1088-1136`) with the addition of
+/// signal-handler installation (needed at initial start because `init_module`
+/// fires before `ngx_init_signals` in master — see §2.8 of the research doc).
+///
+/// # Sequencing constraints (order is load-bearing)
+/// 1. `ngx_init_signals` BEFORE `sigprocmask` clears the mask.
+/// 2. `close_sibling_channels` BEFORE `ngx_add_channel_event` (close
+///    FDs we don't own; keep `ngx_channel` = our channel[1]).
+/// 3. `drop_privileges_and_chdir` AFTER `ngx_add_channel_event` (safer to
+///    register before dropping).
+/// 4. `ngx_setproctitle` last, just before entering the loop.
 ///
 /// # Safety
 ///
-/// This is an FFI callback (`ngx_spawn_proc_pt`). All dereferences are inside
-/// `unsafe` blocks.
+/// This is an FFI callback (`ngx_spawn_proc_pt`). `cycle` is guaranteed
+/// non-null by nginx. All nginx-global dereferences are inside `unsafe`.
 pub(crate) unsafe extern "C" fn otel_exporter_cycle(
     cycle: *mut nginx_sys::ngx_cycle_t,
-    _data: *mut core::ffi::c_void,
+    _data: *mut c_void,
 ) {
     unsafe {
+        // 0. Update ngx_cycle to point to the new cycle. At the time of fork,
+        //    the master's ngx_cycle still points to the previous init cycle
+        //    (nginx.c:335 sets it AFTER ngx_init_cycle returns, but our hook
+        //    fires during ngx_init_cycle:649). Updating it here ensures that
+        //    ngx_get_connection (and friends) read the correct connection_n.
+        nginx_sys::ngx_cycle = cycle;
+
+        // 1. Identify as exporter: set the nginx process-type global and our
+        //    own process-local flag. This lets ngx_process() return Exporter
+        //    rather than Helper for this process.
+        nginx_sys::ngx_process = nginx_sys::NGX_PROCESS_HELPER as nginx_sys::ngx_uint_t;
+        IS_OTEL_EXPORTER.store(true, Ordering::Relaxed);
+
+        // 2. Install signal handlers. This call is idempotent on the SIGHUP
+        //    path (signals are already installed in master). It is REQUIRED at
+        //    initial start: init_module fires before ngx_init_signals in master
+        //    (nginx.c:293 vs :345), so the forked child inherits SIG_DFL.
+        //    See PHASE_1_3_RESEARCH.md §2.8.
+        let _ = nginx_sys::ngx_init_signals((*cycle).log);
+
+        // 3. Clear the blocked-signal mask inherited from master.
+        //    See ngx_worker_process_init:881-886.
+        let mut empty: libc::sigset_t = mem::zeroed();
+        libc::sigemptyset(&mut empty);
+        libc::sigprocmask(libc::SIG_SETMASK, &empty, ptr::null_mut());
+
+        // 4. We don't accept connections. Close the listening sockets.
+        nginx_sys::ngx_close_listening_sockets(cycle);
+
+        // 5. Modest connection pool — same as cache_manager (line :1105).
+        (*cycle).connection_n = 512;
+
+        // 5a. Initialise the event system: call each module's init_process.
+        //     This must happen before ngx_add_channel_event because the event
+        //     module's init_process allocates cycle->connections/read_events/
+        //     write_events. Mirrors ngx_worker_process_init:891-898.
+        //
+        //     Our own module's init_process (ngx_otel_init_process) is safe:
+        //     it returns early because ngx_process = NGX_PROCESS_HELPER (not
+        //     WORKER or SINGLE), so it never spawns the export task here.
+        let mut i = 0usize;
+        let modules: *mut *mut nginx_sys::ngx_module_t = (*cycle).modules;
+        while !(*modules.add(i)).is_null() {
+            let m: *mut nginx_sys::ngx_module_t = *modules.add(i);
+            if let Some(init_process_fn) = (*m).init_process {
+                let rc = init_process_fn(cycle);
+                if rc == nginx_sys::NGX_ERROR as nginx_sys::ngx_int_t {
+                    ngx::ngx_log_error!(
+                        nginx_sys::NGX_LOG_EMERG, (*cycle).log,
+                        "otel exporter: module[{}] init_process returned NGX_ERROR", i
+                    );
+                    std::process::exit(2);
+                }
+            }
+            i += 1;
+        }
+
+        // 6. Close sibling channel FDs and our own channel[0] (the master
+        //    end). Mirrors ngx_worker_process_init:900-923.
+        close_sibling_channels(cycle);
+
+        // 7. Register our channel event handler on ngx_channel (our
+        //    channel[1]). This is how master sends QUIT/TERMINATE/REOPEN
+        //    commands to us. See PHASE_1_3_RESEARCH.md §2.4, §3.4.
+        let rc = nginx_sys::ngx_add_channel_event(
+            cycle,
+            nginx_sys::ngx_channel as nginx_sys::ngx_fd_t,
+            nginx_sys::NGX_READ_EVENT as nginx_sys::ngx_int_t,
+            Some(channel::otel_exporter_channel_handler),
+        );
+        if rc == nginx_sys::NGX_ERROR as nginx_sys::ngx_int_t {
+            // Fatal: if we can't receive channel commands, master can't signal
+            // us to quit. exit(2) disables respawn so we don't loop forever.
+            ngx::ngx_log_error!(
+                nginx_sys::NGX_LOG_EMERG, (*cycle).log,
+                "otel exporter: ngx_add_channel_event failed; aborting"
+            );
+            std::process::exit(2);
+        }
+
+        // 8. Drop privileges and chdir — parity with worker_process_init.
+        //    Must happen AFTER channel registration (see sequencing above).
+        drop_privileges_and_chdir(cycle);
+
+        // 9. No accept mutex — exporter doesn't accept HTTP connections.
+        nginx_sys::ngx_use_accept_mutex = 0;
+
+        // 10. Set the process title visible in `ps`. Do this last so that
+        //     "otel exporter" in ps is the signal that the exporter is
+        //     fully initialised.
+        nginx_sys::ngx_setproctitle(c"otel exporter".as_ptr().cast_mut());
+
         ngx::ngx_log_error!(
-            nginx_sys::NGX_LOG_NOTICE,
-            (*cycle).log,
-            "otel exporter: stub cycle entered, pid={}, exiting immediately",
-            nginx_sys::ngx_pid
+            nginx_sys::NGX_LOG_NOTICE, (*cycle).log,
+            "otel exporter: cycle entered, pid={}, parent={}",
+            nginx_sys::ngx_pid, nginx_sys::ngx_parent
+        );
+
+        // 11. Main event loop. Polls ngx_terminate / ngx_quit / ngx_reopen
+        //     exactly as ngx_cache_manager_process_cycle does. Phase 1.3.2
+        //     will add the async export task spawn and a graceful drain on
+        //     ngx_quit before the exit; the loop structure is designed to
+        //     accommodate that addition cleanly (the ngx_quit arm is a
+        //     separate branch, not a fall-through from ngx_terminate).
+        loop {
+            if nginx_sys::ngx_terminate != 0 {
+                ngx::ngx_log_error!(
+                    nginx_sys::NGX_LOG_NOTICE, (*cycle).log,
+                    "otel exporter: ngx_terminate, exit"
+                );
+                std::process::exit(0);
+            }
+            if nginx_sys::ngx_quit != 0 {
+                ngx::ngx_log_error!(
+                    nginx_sys::NGX_LOG_NOTICE, (*cycle).log,
+                    "otel exporter: ngx_quit, exit"
+                );
+                // TODO(phase-1.3.2): add graceful_drain(amcf).await here,
+                // keeping the event loop alive until the drain completes.
+                // The drain races workers (Q2 RESOLVED — option a); the
+                // dedup is via time_unix_nano on the collector side.
+                std::process::exit(0);
+            }
+            if nginx_sys::ngx_reopen != 0 {
+                nginx_sys::ngx_reopen = 0;
+                nginx_sys::ngx_reopen_files(cycle, -1i32 as nginx_sys::ngx_uid_t);
+                ngx::ngx_log_error!(
+                    nginx_sys::NGX_LOG_NOTICE, (*cycle).log,
+                    "otel exporter: reopening logs"
+                );
+            }
+            nginx_sys::ngx_process_events_and_timers(cycle);
+        }
+    }
+}
+
+// ── Lifecycle helpers ─────────────────────────────────────────────────────────
+
+/// Close sibling process channel FDs that this process should not own.
+///
+/// Transcribed from `ngx_worker_process_init:900-923`
+/// (`nginx/src/os/unix/ngx_process_cycle.c`). Iterates
+/// `ngx_processes[0..ngx_last_process]` and closes `channel[1]` for every
+/// slot that is not ours, then closes our own `channel[0]` (the master end —
+/// we only need `channel[1]` which nginx sets as `ngx_channel` before fork).
+///
+/// # Safety
+///
+/// Accesses nginx globals `ngx_processes`, `ngx_last_process`,
+/// `ngx_process_slot`. Called exclusively from `otel_exporter_cycle` while
+/// still in the single-thread forked child before any event loop is running.
+unsafe fn close_sibling_channels(cycle: *mut nginx_sys::ngx_cycle_t) {
+    let last = nginx_sys::ngx_last_process as usize;
+    let slot = nginx_sys::ngx_process_slot as usize;
+
+    for n in 0..last {
+        if n == slot {
+            continue; // skip our own slot
+        }
+        let pid = nginx_sys::ngx_processes[n].pid;
+        if pid == -1 {
+            continue; // empty slot
+        }
+        let ch1 = nginx_sys::ngx_processes[n].channel[1];
+        if ch1 == -1 {
+            continue; // no write end to close
+        }
+        if libc::close(ch1) == -1 {
+            ngx::ngx_log_error!(
+                nginx_sys::NGX_LOG_ALERT, (*cycle).log,
+                "otel exporter: close() channel[1] for slot {} (pid={}) failed",
+                n, pid
+            );
+        }
+    }
+
+    // Close our own channel[0] (the master's write end). We keep channel[1]
+    // (ngx_channel) — that's the fd we registered for channel events.
+    let ch0 = nginx_sys::ngx_processes[slot].channel[0];
+    if ch0 != -1 {
+        if libc::close(ch0) == -1 {
+            ngx::ngx_log_error!(
+                nginx_sys::NGX_LOG_ALERT, (*cycle).log,
+                "otel exporter: close() channel[0] for our slot failed"
+            );
+        }
+    }
+}
+
+/// Drop privileges to the configured nginx user and chdir to the working
+/// directory.
+///
+/// Implements the Q5-RESOLVED drop-privileges specification from
+/// `PHASE_1_3_RESEARCH.md`: `setgid` → `initgroups` → `setuid`, then
+/// `chdir`. Mirrors `ngx_worker_process_init:799-879`.
+///
+/// Skipped when `geteuid() != 0` (not running as root), mirroring the same
+/// guard in the C source (`ngx_worker_process_init:799`). On macOS developer
+/// machines this branch is always taken (user is not root); the exporter then
+/// runs as the developer's current user, which is not root — the privilege
+/// drop invariant is satisfied.
+///
+/// The `NGX_HAVE_CAPABILITIES` + `transparent` branch is intentionally
+/// omitted: the exporter does not proxy with transparent addresses.
+/// `TODO(phase-N):` if future requirements change, add it here.
+///
+/// `prctl(PR_SET_DUMPABLE)` is also omitted (nice-to-have for coredumps;
+/// not required for correctness — can be added later).
+///
+/// # Safety
+///
+/// Accesses `ngx_core_module` and dereferences `cycle->conf_ctx`. Called
+/// exclusively from `otel_exporter_cycle` in the forked child.
+unsafe fn drop_privileges_and_chdir(cycle: *mut nginx_sys::ngx_cycle_t) {
+    // Resolve ngx_core_conf_t via ngx_get_conf(cycle->conf_ctx, ngx_core_module).
+    // Same pattern as config.rs::register_shm_zone:292-305.
+    //
+    // conf_ctx is *mut *mut *mut *mut c_void; indexing by core_module.index
+    // gives the *mut *mut *mut c_void that points to ngx_core_conf_t.
+    let core_idx = nginx_sys::ngx_core_module.index as usize;
+    // Safety: conf_ctx is a valid array of pointers set by nginx at startup.
+    let raw_conf: *mut *mut *mut c_void = *(*cycle).conf_ctx.add(core_idx);
+    let ccf: *const nginx_sys::ngx_core_conf_t = raw_conf.cast();
+    if ccf.is_null() {
+        return;
+    }
+
+    // Only drop privileges when running as root — same guard as
+    // ngx_worker_process_init:799.  On macOS dev machines geteuid() != 0 so
+    // this branch is skipped; the exporter runs as the current user (not root).
+    if libc::geteuid() != 0 {
+        return;
+    }
+
+    // setgid MUST come before setuid (once setuid drops, setgid is locked).
+    if libc::setgid((*ccf).group as libc::gid_t) == -1 {
+        ngx::ngx_log_error!(
+            nginx_sys::NGX_LOG_EMERG, (*cycle).log,
+            "otel exporter: setgid({}) failed", (*ccf).group
+        );
+        // Fatal: exit(2) disables respawn — privilege-drop failure is
+        // unrecoverable (ngx_process.c:551-557).
+        std::process::exit(2);
+    }
+
+    // initgroups failure is non-fatal (mirrors nginx worker behaviour).
+    if libc::initgroups((*ccf).username, (*ccf).group as libc::c_int) == -1 {
+        ngx::ngx_log_error!(
+            nginx_sys::NGX_LOG_ALERT, (*cycle).log,
+            "otel exporter: initgroups() failed (non-fatal)"
         );
     }
-    std::process::exit(0);
+
+    // TODO(phase-N): skip NGX_HAVE_CAPABILITIES + transparent branch.
+    // The exporter does not proxy with transparent addresses today.
+
+    if libc::setuid((*ccf).user as libc::uid_t) == -1 {
+        ngx::ngx_log_error!(
+            nginx_sys::NGX_LOG_EMERG, (*cycle).log,
+            "otel exporter: setuid({}) failed", (*ccf).user
+        );
+        std::process::exit(2);
+    }
+
+    // TODO(phase-N): skip prctl(PR_SET_DUMPABLE) reset. Nice-to-have for
+    // coredumps after setuid; not required for correctness. Add here if
+    // production diagnostics demand it.
+
+    if (*ccf).working_directory.len > 0 {
+        if libc::chdir((*ccf).working_directory.data.cast()) == -1 {
+            ngx::ngx_log_error!(
+                nginx_sys::NGX_LOG_ALERT, (*cycle).log,
+                "otel exporter: chdir() failed"
+            );
+            std::process::exit(2);
+        }
+    }
 }
 
 #[cfg(test)]
