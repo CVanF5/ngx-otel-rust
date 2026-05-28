@@ -107,7 +107,7 @@ exporter_pid() {
 
 METRIC_INTERVAL_S=1
 SERVICE_NAME="ngx-otel-reload-overlap"
-NGINX_PORT=9201
+NGINX_PORT=9205  # unique port; other tests use 9200/9201/9202/9203/9204
 
 PREFIX="$(mktemp -d /tmp/ngx-otel-overlap.XXXXXX)"
 NGINX_PID=""
