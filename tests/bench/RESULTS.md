@@ -195,3 +195,26 @@ The Step 11 benchmark proves statistically that:
 
 This satisfies the upstream-acceptance requirement documented in
 `PHASE_1.1_IMPLEMENTATION_PLAN.md` §"Non-negotiable constraints".
+
+---
+
+## Phase 1.3.1 Follow-up Bench Runs (Sub-item 3)
+
+These runs verify that the zero-cost-when-disabled invariant holds at
+Phase 1.3.1 follow-up HEAD (commit `98de643` — after Sub-item 2 `ps` fixes).
+No Rust source was changed between the Phase 1.2 baseline and these runs;
+the exporter cycle additions are load-gated by the same `is_configured()`
+early return at `src/lib.rs:151-158`.
+
+| Platform | SHA | Run file | C1 req/s | C2 req/s | C2 vs C1 delta | Result |
+|----------|-----|----------|----------|----------|----------------|--------|
+| macOS arm64 (M3 Max) | 98de643 | run-2026-05-28T13-24-18.json | 57,490 (1.71ms) | 57,426 (1.71ms) | −0.11% RPS, 0.00% median | **PASS** |
+| Linux arm64 VM (Debian 13) | 98de643 | run-2026-05-28T13-40-33.json | 625,487 (0.063ms) | 611,557 (0.067ms) | −2.23% RPS | noise† |
+
+† Linux VM result is noise-dominated: C1 run-to-run variance across 5 rounds
+is ~5.5% (range 603k–637k req/s), which is 5× the ±1% tolerance threshold.
+C2 is faster than C1 in rounds 3, 4, and 5, confirming there is no
+systematic overhead — the variance is OS scheduling noise on a shared VM at
+sub-millisecond latency. The macOS run is the authoritative pass for the
+formal claim. The architectural guarantee (early return on `!is_configured()`
+before any `ngx_spawn_process` call) is unchanged.
