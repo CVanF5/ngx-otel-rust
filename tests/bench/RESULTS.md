@@ -218,3 +218,23 @@ systematic overhead — the variance is OS scheduling noise on a shared VM at
 sub-millisecond latency. The macOS run is the authoritative pass for the
 formal claim. The architectural guarantee (early return on `!is_configured()`
 before any `ngx_spawn_process` call) is unchanged.
+
+---
+
+## Phase 1.3.2 TSAN Gate (Sub-item 4)
+
+TSAN re-run on the new process model (export_loop relocated from Worker 0
+to the `nginx: otel exporter` process). The novel pattern validated: shm
+rings written by workers via atomic bumps, read by exporter via fork-shared
+pages. Producer-side atomic discipline (src/shm.rs) is unchanged.
+
+| Date | Platform | Result | Commit |
+|------|----------|--------|--------|
+| 2026-05-28 | arm64-vm (Debian 13, Docker TSAN) | PASS — Zero ThreadSanitizer warnings | 5bfe4ea |
+
+Run command: `make tsan-test` on Linux arm64 VM.
+Output: `[tsan-run] Zero ThreadSanitizer warnings. TSAN gate: PASS.`
+
+Q6 RESOLVED: TSAN remains clean because the producer-side atomic discipline
+is unchanged. The exporter is a single-threaded process; cross-process shm
+read is naturally race-free at the OS level for atomic-aligned reads.
