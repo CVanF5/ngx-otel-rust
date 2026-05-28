@@ -72,6 +72,33 @@ pub(crate) fn ngx_process() -> NgxProcess {
     }
 }
 
+/// Exporter cycle entry point.
+///
+/// **Sub-item 3 stub:** logs and exits immediately. Sub-item 4 replaces this
+/// with the full body (signal installation, channel-event registration,
+/// privilege drop, event loop). The stub is used here solely so Sub-item 3
+/// can be compiled and the syntax/config test can be run without starting a
+/// tight respawn loop.
+///
+/// # Safety
+///
+/// This is an FFI callback (`ngx_spawn_proc_pt`). All dereferences are inside
+/// `unsafe` blocks.
+pub(crate) unsafe extern "C" fn otel_exporter_cycle(
+    cycle: *mut nginx_sys::ngx_cycle_t,
+    _data: *mut core::ffi::c_void,
+) {
+    unsafe {
+        ngx::ngx_log_error!(
+            nginx_sys::NGX_LOG_NOTICE,
+            (*cycle).log,
+            "otel exporter: stub cycle entered, pid={}, exiting immediately",
+            nginx_sys::ngx_pid
+        );
+    }
+    std::process::exit(0);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

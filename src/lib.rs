@@ -88,7 +88,7 @@ pub static mut ngx_http_otel_module: ngx_module_t = ngx_module_t {
     type_: NGX_HTTP_MODULE as ngx_uint_t,
 
     init_master: None,
-    init_module: None,
+    init_module: Some(ngx_otel_init_module),
     init_process: Some(ngx_otel_init_process),
     init_thread: None,
     exit_thread: None,
@@ -100,6 +100,89 @@ pub static mut ngx_http_otel_module: ngx_module_t = ngx_module_t {
 
 unsafe impl HttpModuleMainConf for HttpOtelModule {
     type MainConf = config::MainConfig;
+}
+
+// ── init_module callback ──────────────────────────────────────────────────────
+
+/// Called by nginx from `ngx_init_modules` (via `ngx_init_cycle`) — once at
+/// initial start and again on each SIGHUP reload.
+///
+/// Forks the `nginx: otel exporter` child process from master, gated on
+/// `MainConfig::is_configured()`. Uses `NGX_PROCESS_RESPAWN` for initial
+/// start (auto-respawn on crash) and `NGX_PROCESS_JUST_RESPAWN` for SIGHUP
+/// reloads (skipped on the first signal fan-out so old+new exporter coexist
+/// briefly — same pattern as `ngx_start_cache_manager_processes`).
+///
+/// Timing note: at initial start this fires *before* `ngx_init_signals` in
+/// the master, so the forked child inherits SIG_DFL handlers. The child calls
+/// `nginx_sys::ngx_init_signals` immediately after fork to fix this.
+/// On SIGHUP this hook fires inside `ngx_master_process_cycle` where signals
+/// are already installed — the child inherits them correctly.
+///
+/// See `PHASE_1_3_RESEARCH.md` §2.7–2.9, §5.2 and Q4 for design decisions.
+extern "C" fn ngx_otel_init_module(cycle: *mut nginx_sys::ngx_cycle_t) -> nginx_sys::ngx_int_t {
+    // Only fork from master. In single-process mode the single process IS
+    // the exporter+worker; we skip the fork entirely there.
+    // Safety: ngx_process is a process-global nginx variable.
+    if unsafe { nginx_sys::ngx_process } as u32 != nginx_sys::NGX_PROCESS_MASTER {
+        return Status::NGX_OK.into();
+    }
+
+    let cycle_ref = unsafe { &mut *cycle };
+    let Some(amcf) = HttpOtelModule::main_conf(cycle_ref) else {
+        return Status::NGX_OK.into();
+    };
+    if !amcf.is_configured() {
+        // Zero-cost gate: module loaded but no otel_exporter block → no fork,
+        // no proctitle child, no background activity.
+        return Status::NGX_OK.into();
+    }
+
+    // Detect SIGHUP reload via old_cycle: non-NULL on reload, NULL at initial
+    // start. Same pattern as nginx-acme's postconfiguration `old_cycle` check
+    // and `config.rs::postconfiguration:214-220`.
+    // Safety: old_cycle is a pointer field; null-ness check is safe.
+    let is_reload = unsafe { !(*cycle).old_cycle.is_null() };
+    let respawn_flag: nginx_sys::ngx_int_t = if is_reload {
+        // JUST_RESPAWN: new exporter is skipped on master's first signal
+        // fan-out so old+new coexist during the ~100ms overlap window.
+        nginx_sys::NGX_PROCESS_JUST_RESPAWN as nginx_sys::ngx_int_t
+    } else {
+        // RESPAWN: master auto-respawns on crash (ngx_reap_children:593-616).
+        nginx_sys::NGX_PROCESS_RESPAWN as nginx_sys::ngx_int_t
+    };
+
+    // Q4 RESOLVED: pass NULL as `data`. The exporter cycle resolves MainConfig
+    // from `cycle` via HttpOtelModule::main_conf(cycle) — same path the current
+    // export_loop uses. Mirrors cache_manager which uses `data` only for the
+    // small ngx_cache_manager_ctx_t dispatch struct, never for config.
+    let pid = unsafe {
+        nginx_sys::ngx_spawn_process(
+            cycle,
+            Some(exporter::otel_exporter_cycle),
+            core::ptr::null_mut(),
+            c"otel exporter".as_ptr().cast_mut(),
+            respawn_flag,
+        )
+    };
+
+    if pid == nginx_sys::NGX_INVALID_PID as nginx_sys::ngx_pid_t {
+        ngx::ngx_log_error!(
+            nginx_sys::NGX_LOG_ERR,
+            cycle_ref.log,
+            "otel: failed to spawn exporter process"
+        );
+        return Status::NGX_ERROR.into();
+    }
+
+    ngx::ngx_log_error!(
+        nginx_sys::NGX_LOG_NOTICE,
+        cycle_ref.log,
+        "otel: spawned exporter process, pid={}, reload={}",
+        pid,
+        is_reload
+    );
+    Status::NGX_OK.into()
 }
 
 impl HttpModule for HttpOtelModule {
@@ -539,6 +622,39 @@ mod nginx_test_stubs {
 
     #[no_mangle]
     pub static mut ngx_exiting: nginx_sys::ngx_uint_t = 0;
+
+    // nginx process identity globals used by the exporter cycle and
+    // init_module.  These are data symbols resolved eagerly by dyld on macOS;
+    // they must be stubbed even if the code paths that access them are never
+    // exercised in unit tests.
+    #[no_mangle]
+    pub static mut ngx_pid: nginx_sys::ngx_pid_t = 0;
+
+    #[no_mangle]
+    pub static mut ngx_parent: nginx_sys::ngx_pid_t = 0;
+
+    // Exporter cycle helpers: accept-mutex flag, channel fd, process table.
+    #[no_mangle]
+    pub static mut ngx_use_accept_mutex: nginx_sys::ngx_uint_t = 0;
+
+    // ngx_channel is the per-process channel[1] fd set by ngx_spawn_process.
+    #[no_mangle]
+    pub static mut ngx_channel: nginx_sys::ngx_socket_t = -1;
+
+    // Process table used by close_sibling_channels.
+    #[no_mangle]
+    pub static mut ngx_last_process: nginx_sys::ngx_int_t = 0;
+
+    #[no_mangle]
+    pub static mut ngx_process_slot: nginx_sys::ngx_int_t = 0;
+
+    // ngx_processes array — zeroed; pid = 0, channel = [0,0] in the stub.
+    // close_sibling_channels iterates 0..ngx_last_process (=0), so it never
+    // touches this array in tests.
+    #[no_mangle]
+    pub static mut ngx_processes: [nginx_sys::ngx_process_t; 1024] = {
+        unsafe { core::mem::zeroed() }
+    };
 
     // nginx global cycle pointer (used by ngx::log::ngx_cycle_log).
     #[no_mangle]
