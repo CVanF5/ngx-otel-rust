@@ -106,9 +106,18 @@ wait_for() {
 #   why the old `comm` pattern worked there but silently failed on Linux.
 #   `args` (POSIX) returns the full argv joined, so it captures argv[0]
 #   rewrites on both platforms.
+#
+# WHY field-anchored awk ($2=="nginx:" && $3=="otel" && $4=="exporter"):
+#   The regex /nginx: otel exporter/ self-matches: the awk process appears in
+#   ps -eo args with its own script containing "nginx: otel exporter", causing
+#   exporter_pid() to return the awk PID even when no nginx exporter is running.
+#   Field-anchored equality ($2, $3, $4) only matches lines where the second
+#   whitespace-delimited field is exactly "nginx:" — the awk process has $2="awk"
+#   or similar, not "nginx:". No self-match; no false positives from grep/ugrep
+#   processes that may appear in the process list with this pattern in their args.
 exporter_pid() {
     ps -eo pid,args 2>/dev/null \
-        | awk '/nginx: otel exporter/{print $1}' \
+        | awk '$2 == "nginx:" && $3 == "otel" && $4 == "exporter" {print $1}' \
         | head -1
 }
 
@@ -231,8 +240,12 @@ fi
 pass "New exporter PID = ${NEW_EXP_PID} (was ${EXP_PID_INITIAL})"
 
 # Wait for the old exporter to exit and confirm exactly one exporter remains.
+# Use field-anchored awk (same logic as exporter_pid) to avoid grep self-match:
+# `grep -c "nginx: otel exporter"` would count the grep process itself, whose
+# args contain the pattern string, producing false positives.
 sleep 2
-EXPORTER_COUNT="$(ps -eo args 2>/dev/null | grep -c "nginx: otel exporter" || true)"
+EXPORTER_COUNT="$(ps -eo pid,args 2>/dev/null \
+    | awk '$2 == "nginx:" && $3 == "otel" && $4 == "exporter" {c++} END{print c+0}')"
 if [[ "${EXPORTER_COUNT}" -ne 1 ]]; then
     fail "Expected exactly 1 exporter after SIGHUP reload, found ${EXPORTER_COUNT}"
 fi
