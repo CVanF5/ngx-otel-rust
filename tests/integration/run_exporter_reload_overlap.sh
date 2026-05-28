@@ -201,10 +201,9 @@ sleep 5
 # ─── Send SIGHUP ──────────────────────────────────────────────────────────────
 
 info "Sending nginx -s reload (SIGHUP)..."
-"${NGINX_BINARY}" \
-    -p "${PREFIX}" \
-    -c "${PREFIX}/nginx.conf" \
-    -s reload 2>/dev/null || true
+# Use direct kill -HUP to ensure the signal goes to exactly our master process.
+# 'nginx -s reload' reads the pid file; this guarantees we target our master.
+kill -HUP "${NGINX_PID}" 2>/dev/null || true
 
 # Wait for a NEW exporter (PID #2 != PID #1) to appear within 5s.
 # Both old and new exporters may be running during the overlap window.
