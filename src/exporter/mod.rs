@@ -164,10 +164,14 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
         // 7. Register our channel event handler on ngx_channel (our
         //    channel[1]). This is how master sends QUIT/TERMINATE/REOPEN
         //    commands to us. See PHASE_1_3_RESEARCH.md §2.4, §3.4.
+        // Use NGX_RS_READ_EVENT (ngx-rust wrapper.h helper) rather than
+        // nginx_sys::NGX_READ_EVENT directly — the latter is a parenthesised
+        // compound #define on Linux epoll and bindgen does not lift it.
+        // See ngx-rust commit on wrapper.h for the rationale.
         let rc = nginx_sys::ngx_add_channel_event(
             cycle,
             nginx_sys::ngx_channel as nginx_sys::ngx_fd_t,
-            nginx_sys::NGX_READ_EVENT as nginx_sys::ngx_int_t,
+            nginx_sys::NGX_RS_READ_EVENT as nginx_sys::ngx_int_t,
             Some(channel::otel_exporter_channel_handler),
         );
         if rc == nginx_sys::NGX_ERROR as nginx_sys::ngx_int_t {
@@ -346,7 +350,14 @@ unsafe fn drop_privileges_and_chdir(cycle: *mut nginx_sys::ngx_cycle_t) {
     }
 
     // initgroups failure is non-fatal (mirrors nginx worker behaviour).
-    if libc::initgroups((*ccf).username, (*ccf).group as libc::c_int) == -1 {
+    // libc::initgroups takes c_int on macOS/BSD but gid_t (u32) on Linux —
+    // see libc 0.2 platform shims. Cast through a per-platform alias so the
+    // call compiles cleanly on both arms.
+    #[cfg(target_os = "linux")]
+    let initgroups_gid = (*ccf).group as libc::gid_t;
+    #[cfg(not(target_os = "linux"))]
+    let initgroups_gid = (*ccf).group as libc::c_int;
+    if libc::initgroups((*ccf).username, initgroups_gid) == -1 {
         ngx::ngx_log_error!(
             nginx_sys::NGX_LOG_ALERT, (*cycle).log,
             "otel exporter: initgroups() failed (non-fatal)"
