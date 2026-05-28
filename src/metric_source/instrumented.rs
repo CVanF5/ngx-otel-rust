@@ -192,15 +192,34 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
         // TODO(fix3b): Per OTel semconv, http.server.request.duration should be
         // broken down by {http.request.method, http.response.status_code,
         // network.protocol.version}. Doing this with per-request attributes
-        // requires one histogram slot per {method × status_class} combination
-        // in WorkerSlots (multi-dimensional shm histogram). The current design
-        // has a single aggregated histogram; add the per-combination slots in a
-        // follow-on architectural pass (requires shm layout change + migration).
+        // requires one histogram slot per {method × status_class × protocol}
+        // combination in WorkerSlots (multi-dimensional shm histogram). The
+        // current design has a single aggregated histogram; the multi-dim
+        // slots arrive in a follow-on architectural pass (requires shm layout
+        // change + migration).
+        //
+        // Cardinality discipline (proposal §6.4 "Producer-side cardinality
+        // discipline"): when the multi-dim slots land, the attribute keys MUST
+        // be a closed Rust enum drawn from the OTel HTTP semantic conventions
+        // ONLY. The bounded set is:
+        //   - http.request.method        (~7 values; WithinU8 for the OTAP
+        //                                  classifier)
+        //   - http.response.status_code  (~30 values, or 5 status classes;
+        //                                  WithinU8 either way)
+        //   - network.protocol.version   (H1/H2/H3; WithinU8)
+        //
+        // No free-form String keys; no raw url.path, no client.address, no
+        // user_agent.original on data points by default. Unbounded attribute
+        // values would defeat the OTAP collector-side classifier's dictionary
+        // encoding (concatenate.rs::estimate_cardinality → GreaterThanU16,
+        // plain column on the wire) and explode per-point bytes on the wire.
+        // High-cardinality attributes stay opt-in-only behind the explicit
+        // directives specified in proposal §3 Phase 1.1.
         //
         // The status class totals (s1xx–s5xx) are available for reference but
         // are not emitted as separate metrics: per OTel semconv the status
         // breakdown belongs as an attribute on the duration histogram, not as
-        // standalone counters. They will be wired in once the multi-dimensional
+        // standalone counters. They will be wired in once the multi-dim
         // histogram slots exist.
         let _ = (s1xx, s2xx, s3xx, s4xx, s5xx);
 
