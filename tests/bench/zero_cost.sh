@@ -141,14 +141,14 @@ if [[ ! -f "${MODULE_PATH}" ]]; then
 fi
 
 # Record build time for mtime verification.
-MODULE_MTIME="$(stat -f "%m" "${MODULE_PATH}" 2>/dev/null || stat -c "%Y" "${MODULE_PATH}")"
+MODULE_MTIME="$(date -r "${MODULE_PATH}" +%s)"
 info "Module built: ${MODULE_PATH} (mtime=${MODULE_MTIME})"
 
 # Verify mtime is newer than every source file (only if we just built).
 if [[ "${SKIP_BUILD}" != "1" ]]; then
     STALE_SRC=""
     while IFS= read -r -d '' src_file; do
-        src_mtime="$(stat -f "%m" "${src_file}" 2>/dev/null || stat -c "%Y" "${src_file}")"
+        src_mtime="$(date -r "${src_file}" +%s)"
         if (( src_mtime > MODULE_MTIME )); then
             STALE_SRC="${src_file}"
             break
@@ -198,7 +198,7 @@ sandbox_setup() {
     conf_module_path="$(grep "^load_module" "${prefix}/nginx.conf" | awk '{print $2}' | tr -d ';' || true)"
     if [[ -n "${conf_module_path}" ]]; then
         local conf_mtime
-        conf_mtime="$(stat -f "%m" "${conf_module_path}" 2>/dev/null || stat -c "%Y" "${conf_module_path}")"
+        conf_mtime="$(date -r "${conf_module_path}" +%s)"
         if [[ "${conf_mtime}" != "${MODULE_MTIME}" ]]; then
             echo "ERROR: dylib mtime drifted during the run for sandbox ${name}: ${conf_module_path} mtime=${conf_mtime}, expected ${MODULE_MTIME} (was the dylib rebuilt mid-run?)" >&2
             exit 1
