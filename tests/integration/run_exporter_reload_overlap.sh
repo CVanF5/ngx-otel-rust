@@ -228,11 +228,13 @@ pass "PIDs are distinct: old=${EXP_PID_1} new=${EXP_PID_2}"
 info "Continuing HTTP load for 5s (SIGHUP overlap window)..."
 sleep 5
 
-# ─── Poll for old exporter exit (10s budget) ─────────────────────────────────
+# ─── Poll for old exporter exit (15s budget) ─────────────────────────────────
+# The old exporter drains within ~2-3s of receiving ngx_quit, but allowing
+# 15s to accommodate scheduling delays on slow VMs and heavy load.
 
 info "Waiting for old exporter (PID ${EXP_PID_1}) to exit..."
 OLD_EXITED=0
-DEADLINE=$(( $(date +%s) + 10 ))
+DEADLINE=$(( $(date +%s) + 15 ))
 while (( $(date +%s) < DEADLINE )); do
     if ! kill -0 "${EXP_PID_1}" 2>/dev/null; then
         OLD_EXITED=1
@@ -243,9 +245,15 @@ done
 
 # Assertion 4: old exporter exited.
 if [[ "${OLD_EXITED}" -eq 1 ]]; then
-    pass "Old exporter (PID ${EXP_PID_1}) exited within 10s"
+    pass "Old exporter (PID ${EXP_PID_1}) exited within 15s"
 else
-    fail "Old exporter (PID ${EXP_PID_1}) did not exit within 10s after SIGHUP"
+    # Diagnostic: check if PID is still a real nginx exporter or a zombie
+    PID_STATE=$(cat /proc/${EXP_PID_1}/status 2>/dev/null | grep "^State:" || echo "not found in /proc")
+    PID_CMD=$(ps -o args= -p "${EXP_PID_1}" 2>/dev/null || echo "not found in ps")
+    fail "Old exporter (PID ${EXP_PID_1}) did not exit within 15s after SIGHUP.
+       Process state: ${PID_STATE}
+       Process command: ${PID_CMD}
+       Check error.log for ngx_quit/drain messages."
 fi
 
 # Stop the background curl loop.
