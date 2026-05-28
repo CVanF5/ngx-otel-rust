@@ -95,9 +95,20 @@ wait_for() {
 }
 
 # Return the PID of the otel exporter child (first match).
+#
+# WHY ps -eo pid,args (not pid,comm):
+#   Linux `comm` reads /proc/PID/comm, which holds the 15-byte TASK_COMM_LEN
+#   kernel name set by exec or prctl(PR_SET_NAME) — NOT by argv[0] rewrites.
+#   nginx's ngx_setproctitle() rewrites argv[0] in-place; it never calls
+#   prctl(PR_SET_NAME), so /proc/PID/comm always shows the original exec name
+#   ("nginx"), losing the "nginx: otel exporter" title entirely on Linux.
+#   macOS ps(1) happens to surface argv[0] via its own comm column, which is
+#   why the old `comm` pattern worked there but silently failed on Linux.
+#   `args` (POSIX) returns the full argv joined, so it captures argv[0]
+#   rewrites on both platforms.
 exporter_pid() {
-    ps -eo pid,comm 2>/dev/null \
-        | awk '/otel exporter/{print $1}' \
+    ps -eo pid,args 2>/dev/null \
+        | awk '/nginx: otel exporter/{print $1}' \
         | head -1
 }
 
@@ -168,7 +179,8 @@ fi
 pass "Exporter PID = ${EXP_PID_INITIAL}"
 
 # Privilege check: exporter must NOT run as root.
-EXP_USER="$(ps -eo pid,user,comm 2>/dev/null \
+# Use pid,user,args (not pid,user,comm) — see exporter_pid() comment above.
+EXP_USER="$(ps -eo pid,user,args 2>/dev/null \
     | awk -v pid="${EXP_PID_INITIAL}" '$1==pid{print $2}' | head -1)"
 if [[ "${EXP_USER}" == "root" ]]; then
     fail "Exporter is running as root (expected non-root user '${EXP_USER}')"
@@ -220,7 +232,7 @@ pass "New exporter PID = ${NEW_EXP_PID} (was ${EXP_PID_INITIAL})"
 
 # Wait for the old exporter to exit and confirm exactly one exporter remains.
 sleep 2
-EXPORTER_COUNT="$(ps -eo comm 2>/dev/null | grep -c "otel exporter" || true)"
+EXPORTER_COUNT="$(ps -eo args 2>/dev/null | grep -c "nginx: otel exporter" || true)"
 if [[ "${EXPORTER_COUNT}" -ne 1 ]]; then
     fail "Expected exactly 1 exporter after SIGHUP reload, found ${EXPORTER_COUNT}"
 fi

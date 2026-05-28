@@ -85,9 +85,21 @@ wait_for() {
     fail "Timed out waiting for: ${desc}"
 }
 
+# Return the PID of the otel exporter child (first match).
+#
+# WHY ps -eo pid,args (not pid,comm):
+#   Linux `comm` reads /proc/PID/comm, which holds the 15-byte TASK_COMM_LEN
+#   kernel name set by exec or prctl(PR_SET_NAME) — NOT by argv[0] rewrites.
+#   nginx's ngx_setproctitle() rewrites argv[0] in-place; it never calls
+#   prctl(PR_SET_NAME), so /proc/PID/comm always shows the original exec name
+#   ("nginx"), losing the "nginx: otel exporter" title entirely on Linux.
+#   macOS ps(1) happens to surface argv[0] via its own comm column, which is
+#   why the old `comm` pattern worked there but silently failed on Linux.
+#   `args` (POSIX) returns the full argv joined, so it captures argv[0]
+#   rewrites on both platforms.
 exporter_pid() {
-    ps -eo pid,comm 2>/dev/null \
-        | awk '/otel exporter/{print $1}' \
+    ps -eo pid,args 2>/dev/null \
+        | awk '/nginx: otel exporter/{print $1}' \
         | head -1
 }
 
