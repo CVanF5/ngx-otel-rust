@@ -15,6 +15,8 @@
 //! `IS_OTEL_EXPORTER` flag. Sub-items 2–5 add the channel handler, the
 //! `init_module` callback, the full cycle body, and the crash-respawn test.
 
+pub(crate) mod channel;
+
 use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Process-local flag set by `otel_exporter_cycle` immediately after fork.

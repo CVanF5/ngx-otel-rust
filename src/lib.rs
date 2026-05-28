@@ -527,9 +527,15 @@ mod nginx_test_stubs {
     #[no_mangle]
     pub static mut ngx_process: nginx_sys::ngx_uint_t = nginx_sys::NGX_PROCESS_SINGLE as nginx_sys::ngx_uint_t;
 
-    // nginx shutdown flags accessed by the export loop.
+    // nginx shutdown flags accessed by the export loop and the channel handler.
     #[no_mangle]
     pub static mut ngx_terminate: core::ffi::c_int = 0;
+
+    #[no_mangle]
+    pub static mut ngx_quit: core::ffi::c_int = 0;
+
+    #[no_mangle]
+    pub static mut ngx_reopen: core::ffi::c_int = 0;
 
     #[no_mangle]
     pub static mut ngx_exiting: nginx_sys::ngx_uint_t = 0;
