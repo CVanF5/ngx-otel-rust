@@ -174,9 +174,6 @@ sleep 1.5
 if ! kill -0 "${NGINX_PID}" 2>/dev/null; then
     fail "nginx exited immediately"
 fi
-info "nginx master PID: ${NGINX_PID}"
-info "All otel exporter processes at startup:"
-ps -eo pid,ppid,args 2>/dev/null | awk '$3 == "nginx:" && $4 == "otel" && $5 == "exporter" {print "  pid="$1" ppid="$2}' || true
 
 # Assertion 1: one exporter appears (child of OUR master).
 # Use parent-filtered lookup to avoid picking up stale exporters from
@@ -259,13 +256,9 @@ sleep 5
 # 15s to accommodate scheduling delays on slow VMs and heavy load.
 
 info "Waiting for old exporter (PID ${EXP_PID_1}) to exit..."
-# Immediate check: by 5s after SIGHUP, old exporter should have exited.
-# Check error.log for drain evidence right now.
-info "Error.log size: $(wc -c < "${PREFIX}/logs/error.log" 2>/dev/null || echo 'not found') bytes"
-info "Error.log ngx_quit/child events (last 20 lines of signal processing):"
-grep "ngx_quit\|drain\|child: 0" "${PREFIX}/logs/error.log" 2>/dev/null | grep -v "^2026.*#.*#" | tail -20 || true
+# Check error.log for drain evidence at the 5s mark.
 info "Error.log for old exporter PID ${EXP_PID_1}:"
-grep "${EXP_PID_1}#" "${PREFIX}/logs/error.log" 2>/dev/null | tail -5 || true
+grep "${EXP_PID_1}#" "${PREFIX}/logs/error.log" 2>/dev/null | grep -E "ngx_quit|drain" | tail -3 || true
 OLD_EXITED=0
 DEADLINE=$(( $(date +%s) + 15 ))
 while (( $(date +%s) < DEADLINE )); do
