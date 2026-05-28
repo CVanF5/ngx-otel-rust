@@ -16,6 +16,7 @@
 //! from the exporter PID.
 
 pub(crate) mod channel;
+pub(crate) mod control_shm;
 
 use core::ffi::c_void;
 use core::mem;

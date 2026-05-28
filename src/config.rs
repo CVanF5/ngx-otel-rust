@@ -121,6 +121,11 @@ pub struct MainConfig {
     pub bidi_overload_endpoint: ngx_str_t,
     /// The registered shared memory zone (set during postconfiguration).
     pub shm_zone: *mut nginx_sys::ngx_shm_zone_t,
+    /// The registered control-plane shared memory zone (set during
+    /// postconfiguration alongside `shm_zone`). Used by the exporter for
+    /// the liveness heartbeat and by workers for the hot-path placeholder
+    /// load (Phase 1.3.3). Phase 5 wires the bidi control channel to it.
+    pub control_shm_zone: *mut nginx_sys::ngx_shm_zone_t,
 }
 
 impl Default for MainConfig {
@@ -140,6 +145,7 @@ impl Default for MainConfig {
             bidi_smoke_endpoint: ngx_str_t::default(),
             bidi_overload_endpoint: ngx_str_t::default(),
             shm_zone: ptr::null_mut(),
+            control_shm_zone: ptr::null_mut(),
         }
     }
 }
@@ -274,8 +280,14 @@ impl MainConfig {
             return Err(Status::NGX_ERROR);
         }
 
-        // Register the shared memory zone.
+        // Register the metrics shared memory zone.
         self.register_shm_zone(cf, module)?;
+
+        // Register the control-plane shared memory zone (Phase 1.3.3).
+        // This zone holds the ControlShm heartbeat counter and the
+        // Phase 5 flag word. Registered alongside the metrics zone so
+        // both are mapped before workers fork.
+        self.register_control_shm_zone(cf, module)?;
 
         Ok(())
     }
@@ -345,6 +357,43 @@ impl MainConfig {
         Ok(())
     }
 
+    /// Register the control-plane shared memory zone with nginx.
+    ///
+    /// Mirrors [`register_shm_zone`] but uses a fixed size
+    /// (`ControlShm::ZONE_SIZE`) and the control-zone init callback.
+    /// Stores the resulting `*mut ngx_shm_zone_t` on
+    /// `MainConfig::control_shm_zone`.
+    fn register_control_shm_zone(
+        &mut self,
+        cf: *mut ngx_conf_t,
+        module: *mut ngx_module_t,
+    ) -> Result<(), Status> {
+        let mut zone_name = ngx::ngx_string!("ngx_http_otel_control_zone");
+        let zone_size = crate::exporter::control_shm::ControlShm::ZONE_SIZE;
+
+        let Some(zone) =
+            (unsafe { shm::register_zone(cf, &mut zone_name, zone_size, module) })
+        else {
+            unsafe {
+                ngx_conf_log_error!(
+                    NGX_LOG_EMERG,
+                    &mut *cf,
+                    "otel: failed to register control shared memory zone"
+                );
+            }
+            return Err(Status::NGX_ERROR);
+        };
+
+        unsafe {
+            (*zone).init =
+                Some(crate::exporter::control_shm::control_shm_zone_init);
+            (*zone).data = ptr::from_mut(self).cast();
+        }
+
+        self.control_shm_zone = zone;
+        Ok(())
+    }
+
     /// Returns the base address of our WorkerSlots data within the shared memory zone.
     ///
     /// This is `shm.addr + data_offset()` — past the nginx slab-pool header that
@@ -361,6 +410,38 @@ impl MainConfig {
             return None;
         }
         Some(unsafe { addr.cast::<u8>().add(crate::shm::data_offset()) })
+    }
+
+    /// Returns a pointer to the `ControlShm` data in the control zone.
+    ///
+    /// The `ControlShm` struct lives at `data_offset()` bytes past
+    /// `shm.addr` (after the slab-pool header nginx writes at zone start).
+    ///
+    /// Returns `None` if either:
+    /// - `control_shm_zone` is null (not registered — module not
+    ///   configured, or `otel_exporter` block absent), OR
+    /// - `control_shm_zone.shm.addr` is null (declared but not yet
+    ///   mapped — window between `ngx_shared_memory_add` and
+    ///   `ngx_init_zone`).
+    ///
+    /// # Hot-path note (Sub-item 2)
+    /// Workers call this from `LogPhaseHandler` on every request. The
+    /// `None`-returning path (module disabled) is a null pointer check,
+    /// which is a single branch — zero allocations, zero syscalls.
+    pub fn control_shm_ptr(
+        &self,
+    ) -> Option<*const crate::exporter::control_shm::ControlShm> {
+        let zone = unsafe { self.control_shm_zone.as_ref()? };
+        let addr = zone.shm.addr;
+        if addr.is_null() {
+            return None;
+        }
+        let offset = crate::shm::data_offset();
+        Some(unsafe {
+            addr.cast::<u8>()
+                .add(offset)
+                .cast::<crate::exporter::control_shm::ControlShm>()
+        })
     }
 }
 

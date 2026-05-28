@@ -322,6 +322,16 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             return;
         }
 
+        // ── Control-shm heartbeat (Phase 1.3.3 Sub-item 1) ──────────────────
+        // Bump version once per drain cycle as a liveness heartbeat.
+        // Phase 5 will reuse this increment after applying a reconfig to
+        // signal delivery convergence to the collector.
+        // TODO(phase-5): also write reconfig payload from control channel
+        // into control_shm.flags before/after this bump.
+        if let Some(ctrl) = amcf.control_shm_ptr() {
+            unsafe { (*ctrl).version.fetch_add(1, Ordering::Relaxed) };
+        }
+
         // ── Drain retry queue before collecting fresh data ────────────────
         // Stop draining as soon as a send fails — transport may still be down.
         let mut queue_snapshot = core::mem::take(&mut retry_queue);
