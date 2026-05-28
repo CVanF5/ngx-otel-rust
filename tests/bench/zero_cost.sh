@@ -311,9 +311,9 @@ parse_wrk_output() {
             return
         fi
         case "${unit}" in
-            us) echo "scale=4; ${num} / 1000" | bc ;;
+            us) python3 -c "print(round(${num}/1000.0,4))" ;;
             ms) echo "${num}" ;;
-            s)  echo "scale=4; ${num} * 1000" | bc ;;
+            s)  python3 -c "print(round(${num}*1000.0,4))" ;;
             *)  echo "0" ;;
         esac
     }
