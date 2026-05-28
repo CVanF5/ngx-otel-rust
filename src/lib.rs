@@ -796,4 +796,81 @@ mod nginx_test_stubs {
     ) -> *mut core::ffi::c_char {
         core::ptr::null_mut()
     }
+
+    // ── Phase 1.3.1 stubs — exporter cycle / channel handler ─────────────────
+    //
+    // On macOS, flat-namespace dynamic linking resolves these at runtime.
+    // On Linux (ELF), all referenced symbols must be resolved at link time
+    // even for the test binary.  These stubs are never called by unit tests;
+    // they only need to exist so the linker is satisfied.
+
+    #[no_mangle]
+    pub unsafe extern "C" fn ngx_spawn_process(
+        _cycle: *mut nginx_sys::ngx_cycle_t,
+        _proc_: nginx_sys::ngx_spawn_proc_pt,
+        _data: *mut c_void,
+        _name: *mut core::ffi::c_char,
+        _respawn: nginx_sys::ngx_int_t,
+    ) -> nginx_sys::ngx_pid_t {
+        -1
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn ngx_init_signals(
+        _log: *mut nginx_sys::ngx_log_t,
+    ) -> nginx_sys::ngx_int_t {
+        0
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn ngx_read_channel(
+        _s: nginx_sys::ngx_socket_t,
+        _ch: *mut nginx_sys::ngx_channel_t,
+        _size: usize,
+        _log: *mut nginx_sys::ngx_log_t,
+    ) -> nginx_sys::ngx_int_t {
+        nginx_sys::NGX_ERROR as nginx_sys::ngx_int_t
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn ngx_add_channel_event(
+        _cycle: *mut nginx_sys::ngx_cycle_t,
+        _fd: nginx_sys::ngx_fd_t,
+        _event: nginx_sys::ngx_int_t,
+        _handler: nginx_sys::ngx_event_handler_pt,
+    ) -> nginx_sys::ngx_int_t {
+        nginx_sys::NGX_ERROR as nginx_sys::ngx_int_t
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn ngx_setproctitle(
+        _title: *mut core::ffi::c_char,
+    ) {
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn ngx_process_events_and_timers(
+        _cycle: *mut nginx_sys::ngx_cycle_t,
+    ) {
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn ngx_reopen_files(
+        _cycle: *mut nginx_sys::ngx_cycle_t,
+        _user: nginx_sys::ngx_uid_t,
+    ) {
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn ngx_close_listening_sockets(
+        _cycle: *mut nginx_sys::ngx_cycle_t,
+    ) {
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn ngx_close_channel(
+        _fd: *mut nginx_sys::ngx_fd_t,
+        _log: *mut nginx_sys::ngx_log_t,
+    ) {
+    }
 }
