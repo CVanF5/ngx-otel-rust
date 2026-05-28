@@ -546,130 +546,170 @@ extern "C" fn cmd_exporter_block_handler(
 
 /* ─────────────────────────── top-level commands ────────────────────────────── */
 
-/// Number of top-level commands + 1 (terminator).
-const NCMDS: usize = 13;
+// Production build: 12 commands + 1 terminator.
+// test-support build: 12 commands + otel_status_endpoint + 1 terminator.
+// Two separate definitions so the string "otel_status_endpoint" is absent
+// from production .so files (verified by grep on objs-release/).
 
-pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; NCMDS] = [
-    // otel_exporter { endpoint ...; trusted_certificate ...; }
-    ngx_command_t {
-        name: ngx_string!("otel_exporter"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_NOARGS | NGX_CONF_BLOCK) as ngx_uint_t,
-        set: Some(cmd_set_exporter_block),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+/// Shared production commands (indices 0–11 in both builds).
+macro_rules! production_commands {
+    () => {
+        [
+            // otel_exporter { endpoint ...; trusted_certificate ...; }
+            ngx_command_t {
+                name: ngx_string!("otel_exporter"),
+                type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_NOARGS | NGX_CONF_BLOCK) as ngx_uint_t,
+                set: Some(cmd_set_exporter_block),
+                conf: NGX_HTTP_MAIN_CONF_OFFSET,
+                offset: 0,
+                post: ptr::null_mut(),
+            },
+            // otel_service_name <name>;
+            ngx_command_t {
+                name: ngx_string!("otel_service_name"),
+                type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+                set: Some(nginx_sys::ngx_conf_set_str_slot),
+                conf: NGX_HTTP_MAIN_CONF_OFFSET,
+                offset: mem::offset_of!(MainConfig, service_name),
+                post: ptr::null_mut(),
+            },
+            // otel_resource_attr <key> <value>;
+            ngx_command_t {
+                name: ngx_string!("otel_resource_attr"),
+                type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE2) as ngx_uint_t,
+                set: Some(cmd_add_resource_attr),
+                conf: NGX_HTTP_MAIN_CONF_OFFSET,
+                offset: 0,
+                post: ptr::null_mut(),
+            },
+            // otel_exporter_header <name> <value>;
+            ngx_command_t {
+                name: ngx_string!("otel_exporter_header"),
+                type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE2) as ngx_uint_t,
+                set: Some(cmd_add_exporter_header),
+                conf: NGX_HTTP_MAIN_CONF_OFFSET,
+                offset: 0,
+                post: ptr::null_mut(),
+            },
+            // otel_metric_interval <duration>;
+            ngx_command_t {
+                name: ngx_string!("otel_metric_interval"),
+                type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+                set: Some(cmd_set_metric_interval),
+                conf: NGX_HTTP_MAIN_CONF_OFFSET,
+                offset: 0,
+                post: ptr::null_mut(),
+            },
+            // otel_metric_batch_size <count>;
+            ngx_command_t {
+                name: ngx_string!("otel_metric_batch_size"),
+                type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+                set: Some(cmd_set_metric_batch_size),
+                conf: NGX_HTTP_MAIN_CONF_OFFSET,
+                offset: 0,
+                post: ptr::null_mut(),
+            },
+            // otel_metric_zone <name> <size>;
+            ngx_command_t {
+                name: ngx_string!("otel_metric_zone"),
+                type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE2) as ngx_uint_t,
+                set: Some(cmd_set_metric_zone),
+                conf: NGX_HTTP_MAIN_CONF_OFFSET,
+                offset: 0,
+                post: ptr::null_mut(),
+            },
+            // otel_metric_status_code_class on | off;
+            ngx_command_t {
+                name: ngx_string!("otel_metric_status_code_class"),
+                type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_FLAG) as ngx_uint_t,
+                set: Some(nginx_sys::ngx_conf_set_flag_slot),
+                conf: NGX_HTTP_MAIN_CONF_OFFSET,
+                offset: mem::offset_of!(MainConfig, status_code_class),
+                post: ptr::null_mut(),
+            },
+            // otel_grpc_smoke_endpoint <url>;  TEST-ONLY (Phase 1.2 Item 1).
+            // Parsed in all builds but only acted on with test-support feature.
+            ngx_command_t {
+                name: ngx_string!("otel_grpc_smoke_endpoint"),
+                type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+                set: Some(nginx_sys::ngx_conf_set_str_slot),
+                conf: NGX_HTTP_MAIN_CONF_OFFSET,
+                offset: mem::offset_of!(MainConfig, grpc_smoke_endpoint),
+                post: ptr::null_mut(),
+            },
+            // otel_grpc_bidi_smoke_endpoint <url>;  TEST-ONLY (Phase 1.2 Item 2).
+            ngx_command_t {
+                name: ngx_string!("otel_grpc_bidi_smoke_endpoint"),
+                type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+                set: Some(nginx_sys::ngx_conf_set_str_slot),
+                conf: NGX_HTTP_MAIN_CONF_OFFSET,
+                offset: mem::offset_of!(MainConfig, bidi_smoke_endpoint),
+                post: ptr::null_mut(),
+            },
+            // otel_metric_high_cardinality_attr <attr>;
+            ngx_command_t {
+                name: ngx_string!("otel_metric_high_cardinality_attr"),
+                type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+                set: Some(cmd_add_high_cardinality_attr),
+                conf: NGX_HTTP_MAIN_CONF_OFFSET,
+                offset: 0,
+                post: ptr::null_mut(),
+            },
+            // otel_grpc_bidi_overload_endpoint <url>;  TEST-ONLY (Phase 1.2 Item 3).
+            ngx_command_t {
+                name: ngx_string!("otel_grpc_bidi_overload_endpoint"),
+                type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+                set: Some(nginx_sys::ngx_conf_set_str_slot),
+                conf: NGX_HTTP_MAIN_CONF_OFFSET,
+                offset: mem::offset_of!(MainConfig, bidi_overload_endpoint),
+                post: ptr::null_mut(),
+            },
+        ]
+    };
+}
+
+/// Production build: 12 production commands + terminator.
+#[cfg(not(any(test, feature = "test-support")))]
+pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 13] = {
+    let mut cmds = [ngx_command_t::empty(); 13];
+    let prod = production_commands!();
+    let mut i = 0;
+    while i < 12 {
+        cmds[i] = prod[i];
+        i += 1;
+    }
+    // cmds[12] stays empty() — terminator
+    cmds
+};
+
+/// test-support build: 12 production commands + otel_status_endpoint + terminator.
+///
+/// `otel_status_endpoint;` is a location-level directive (no args) that registers
+/// a content handler returning `control_shm.version` as plain text. Used by the
+/// heartbeat integration test to read the exporter's liveness counter without
+/// process-level introspection. Absent from production builds (verified by grep
+/// on `objs-release/ngx_http_otel_module.so`).
+#[cfg(any(test, feature = "test-support"))]
+pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 14] = {
+    let mut cmds = [ngx_command_t::empty(); 14];
+    let prod = production_commands!();
+    let mut i = 0;
+    while i < 12 {
+        cmds[i] = prod[i];
+        i += 1;
+    }
+    // Index 12: otel_status_endpoint (test-support only).
+    cmds[12] = ngx_command_t {
+        name: ngx_string!("otel_status_endpoint"),
+        type_: (nginx_sys::NGX_HTTP_LOC_CONF | NGX_CONF_NOARGS) as ngx_uint_t,
+        set: Some(cmd_set_otel_status_endpoint),
+        conf: 0,
         offset: 0,
         post: ptr::null_mut(),
-    },
-    // otel_service_name <name>;
-    ngx_command_t {
-        name: ngx_string!("otel_service_name"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-        set: Some(nginx_sys::ngx_conf_set_str_slot),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
-        offset: mem::offset_of!(MainConfig, service_name),
-        post: ptr::null_mut(),
-    },
-    // otel_resource_attr <key> <value>;
-    ngx_command_t {
-        name: ngx_string!("otel_resource_attr"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE2) as ngx_uint_t,
-        set: Some(cmd_add_resource_attr),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
-        offset: 0,
-        post: ptr::null_mut(),
-    },
-    // otel_exporter_header <name> <value>;
-    ngx_command_t {
-        name: ngx_string!("otel_exporter_header"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE2) as ngx_uint_t,
-        set: Some(cmd_add_exporter_header),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
-        offset: 0,
-        post: ptr::null_mut(),
-    },
-    // otel_metric_interval <duration>;
-    ngx_command_t {
-        name: ngx_string!("otel_metric_interval"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-        set: Some(cmd_set_metric_interval),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
-        offset: 0,
-        post: ptr::null_mut(),
-    },
-    // otel_metric_batch_size <count>;
-    ngx_command_t {
-        name: ngx_string!("otel_metric_batch_size"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-        set: Some(cmd_set_metric_batch_size),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
-        offset: 0,
-        post: ptr::null_mut(),
-    },
-    // otel_metric_zone <name> <size>;
-    ngx_command_t {
-        name: ngx_string!("otel_metric_zone"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE2) as ngx_uint_t,
-        set: Some(cmd_set_metric_zone),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
-        offset: 0,
-        post: ptr::null_mut(),
-    },
-    // otel_metric_status_code_class on | off;
-    ngx_command_t {
-        name: ngx_string!("otel_metric_status_code_class"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_FLAG) as ngx_uint_t,
-        set: Some(nginx_sys::ngx_conf_set_flag_slot),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
-        offset: mem::offset_of!(MainConfig, status_code_class),
-        post: ptr::null_mut(),
-    },
-    // otel_grpc_smoke_endpoint <url>;  TEST-ONLY (Phase 1.2 Item 1
-    // in-worker gRPC viability harness; see src/transport/grpc/smoke.rs).
-    // Parsed in all builds but only acted on when the `test-support`
-    // feature is enabled.
-    ngx_command_t {
-        name: ngx_string!("otel_grpc_smoke_endpoint"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-        set: Some(nginx_sys::ngx_conf_set_str_slot),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
-        offset: mem::offset_of!(MainConfig, grpc_smoke_endpoint),
-        post: ptr::null_mut(),
-    },
-    // otel_grpc_bidi_smoke_endpoint <url>;  TEST-ONLY (Phase 1.2 Item 2
-    // bidi gRPC viability harness; see src/transport/grpc/smoke.rs).
-    // Parallel to otel_grpc_smoke_endpoint.  Parsed in all builds but
-    // only acted on when the `test-support` feature is enabled.
-    ngx_command_t {
-        name: ngx_string!("otel_grpc_bidi_smoke_endpoint"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-        set: Some(nginx_sys::ngx_conf_set_str_slot),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
-        offset: mem::offset_of!(MainConfig, bidi_smoke_endpoint),
-        post: ptr::null_mut(),
-    },
-    // otel_metric_high_cardinality_attr <attr>;
-    ngx_command_t {
-        name: ngx_string!("otel_metric_high_cardinality_attr"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-        set: Some(cmd_add_high_cardinality_attr),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
-        offset: 0,
-        post: ptr::null_mut(),
-    },
-    // otel_grpc_bidi_overload_endpoint <url>;  TEST-ONLY (Phase 1.2 Item 3
-    // backpressure livelock integration test; see src/transport/grpc/smoke.rs).
-    // Parsed in all builds but only acted on when the `test-support`
-    // feature is enabled.
-    ngx_command_t {
-        name: ngx_string!("otel_grpc_bidi_overload_endpoint"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-        set: Some(nginx_sys::ngx_conf_set_str_slot),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
-        offset: mem::offset_of!(MainConfig, bidi_overload_endpoint),
-        post: ptr::null_mut(),
-    },
-    // terminator
-    ngx_command_t::empty(),
-];
+    };
+    // cmds[13] stays empty() — terminator.
+    cmds
+};
 
 /* ─────────────────────────── command handlers ──────────────────────────────── */
 
@@ -841,6 +881,41 @@ extern "C" fn cmd_add_high_cardinality_attr(
     }
 
     amcf.high_cardinality_attrs.push(attr);
+    NGX_CONF_OK
+}
+
+/// Directive callback for `otel_status_endpoint;` (location-level, no args).
+///
+/// Sets the content handler for the location to
+/// [`crate::otel_status_content_handler`], which returns the current
+/// `control_shm.version` as plain text. Used by the heartbeat
+/// integration test to read the exporter liveness counter.
+///
+/// **Only compiled in test-support builds. The string "otel_status_endpoint"
+/// does NOT appear in production `.so` files.**
+#[cfg(any(test, feature = "test-support"))]
+extern "C" fn cmd_set_otel_status_endpoint(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    _conf: *mut c_void,
+) -> *mut c_char {
+    use ngx::http::{HttpModuleLocationConf, NgxHttpCoreModule};
+
+    let cf_ref = unsafe { &*cf };
+    let clcf = match NgxHttpCoreModule::location_conf_mut(cf_ref) {
+        Some(c) => c,
+        None => {
+            unsafe {
+                ngx_conf_log_error!(
+                    NGX_LOG_EMERG,
+                    &mut *cf,
+                    "otel_status_endpoint: failed to get core location conf"
+                );
+            }
+            return NGX_CONF_ERROR;
+        }
+    };
+    clcf.handler = Some(crate::otel_status_content_handler);
     NGX_CONF_OK
 }
 

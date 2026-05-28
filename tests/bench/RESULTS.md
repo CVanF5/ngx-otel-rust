@@ -238,3 +238,28 @@ Output: `[tsan-run] Zero ThreadSanitizer warnings. TSAN gate: PASS.`
 Q6 RESOLVED: TSAN remains clean because the producer-side atomic discipline
 is unchanged. The exporter is a single-threaded process; cross-process shm
 read is naturally race-free at the OS level for atomic-aligned reads.
+
+---
+
+## Phase 1.3.3 Sub-item 2 Zero-Cost Bench (hot-path Relaxed load)
+
+These runs verify that the one Relaxed atomic load added to `LogPhaseHandler`
+in Phase 1.3.3 Sub-item 2 (`control_shm.flags`) is structurally zero-cost —
+≤ +1% C3 overhead vs C1 on both platforms.
+
+**Sub-item 2 commit:** `31c79dd` — adds `flags.load(Relaxed)` in LogPhaseHandler.
+
+| Platform | SHA | Run file | C1 req/s | C3 req/s | C3 vs C1 delta | Result |
+|----------|-----|----------|----------|----------|----------------|--------|
+| macOS arm64 (M3 Max) | 31c79dd | run-2026-05-28T18-30-57.json | 56,714 (1.73ms) | 56,647 (1.73ms) | 0.00% median, −0.12% RPS | **PASS** ✓ |
+| Linux arm64 VM (Debian 13) | 31c79dd | run-2026-05-28T19-51-39.json | 605,246 (0.067ms) | 598,240 (0.066ms) | −1.49% median†, −1.16% RPS | noise† |
+
+† Linux VM is noise-dominated: C1 run-to-run variance = 11.94% (vs ±1% gate),
+identical to prior Linux bench runs. C3 median is 0.001ms FASTER than C1 —
+not measurable overhead. C2 also shows C2 −4.48% faster than C1, confirming
+all differences are scheduling noise, not hot-path cost. The one Relaxed load
+reads a word on a cache-resident page (4 KiB control zone, no contention from
+writers in Phase 1.3.3); the structural argument is that it cannot add
+measurable overhead. macOS arm64 is the authoritative PASS.
+
+**Sub-item 2 gate: PASS on macOS arm64. Linux arm64 is noise-dominated (documented).**

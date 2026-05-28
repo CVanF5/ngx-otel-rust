@@ -537,6 +537,83 @@ unsafe extern "C" fn ngx_otel_exit_process(_cycle: *mut ngx_cycle_t) {
     // ring before exit so the exporter picks up the tail records.
 }
 
+// ── otel_status_endpoint content handler ─────────────────────────────────────
+
+/// Content handler for `otel_status_endpoint;` (Phase 1.3.3 Sub-item 3).
+///
+/// Returns the current `control_shm.version` as a decimal plain-text response.
+/// Registered by `cmd_set_otel_status_endpoint` when `otel_status_endpoint;`
+/// appears in a location block in test-support builds.
+///
+/// **Gated on `#[cfg(any(test, feature = "test-support"))]`.** Production
+/// builds do not carry this handler or the directive that triggers it. Verified
+/// by `grep -q "otel_status_endpoint" objs-release/ngx_http_otel_module.so`.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) unsafe extern "C" fn otel_status_content_handler(
+    r: *mut nginx_sys::ngx_http_request_t,
+) -> nginx_sys::ngx_int_t {
+    use core::sync::atomic::Ordering;
+    use ngx::core::{Buffer, Pool};
+    use ngx::http::HttpModuleMainConf as _;
+
+    // Read control_shm version via the request's module conf (one Relaxed load).
+    // ngx_http_request_t implements HttpModuleConfExt, so main_conf() works directly.
+    let version = if let Some(r_ref) = unsafe { r.as_ref() } {
+        if let Some(amcf) = HttpOtelModule::main_conf(r_ref) {
+            amcf.control_shm_ptr()
+                .map(|ctrl| unsafe { (*ctrl).version.load(Ordering::Relaxed) })
+                .unwrap_or(0)
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
+    // Format as "version\n".
+    let body = std::format!("{}\n", version);
+    let body_len = body.len();
+
+    // Set response headers.
+    let headers_out = unsafe { &mut (*r).headers_out };
+    headers_out.status = 200;
+    headers_out.content_length_n = body_len as nginx_sys::off_t;
+    // Content-Type: text/plain (static string; pointer valid for process lifetime).
+    static CONTENT_TYPE_BYTES: &[u8] = b"text/plain";
+    headers_out.content_type.len = CONTENT_TYPE_BYTES.len();
+    headers_out.content_type.data = CONTENT_TYPE_BYTES.as_ptr() as *mut _;
+    headers_out.content_type_len = CONTENT_TYPE_BYTES.len();
+
+    // Send response header.
+    let rc = unsafe { nginx_sys::ngx_http_send_header(r) };
+    if rc == nginx_sys::NGX_ERROR as nginx_sys::ngx_int_t {
+        return rc;
+    }
+    // HEAD requests need no body.
+    if unsafe { (*r).header_only() } != 0 {
+        return nginx_sys::NGX_OK as nginx_sys::ngx_int_t;
+    }
+
+    // Allocate body buffer from request pool.
+    let pool = unsafe { Pool::from_ngx_pool((*r).pool) };
+    let Some(mut buf) = pool.create_buffer_from_str(&body) else {
+        return nginx_sys::NGX_HTTP_INTERNAL_SERVER_ERROR as nginx_sys::ngx_int_t;
+    };
+    buf.set_last_buf(true);
+    buf.set_last_in_chain(true);
+
+    // Wrap in an output chain and send.
+    let chain_ptr = pool.calloc_type::<nginx_sys::ngx_chain_t>();
+    if chain_ptr.is_null() {
+        return nginx_sys::NGX_HTTP_INTERNAL_SERVER_ERROR as nginx_sys::ngx_int_t;
+    }
+    unsafe {
+        (*chain_ptr).buf = buf.as_ngx_buf_mut();
+        (*chain_ptr).next = core::ptr::null_mut();
+    }
+    unsafe { nginx_sys::ngx_http_output_filter(r, chain_ptr) }
+}
+
 /// Test-only stubs for nginx symbols referenced (but never called) in our code.
 /// On macOS, flat-namespace dynamic linking resolves all external symbols at
 /// process startup; without these stubs the test binary won't start.
@@ -760,6 +837,43 @@ mod nginx_test_stubs {
     // nginx http module descriptor (used by ngx core internally).
     #[no_mangle]
     pub static mut ngx_http_module: nginx_sys::ngx_module_t = nginx_sys::ngx_module_t::default();
+
+    // ── Phase 1.3.3 stubs — otel_status_endpoint content handler ─────────────
+    //
+    // Referenced in the #[cfg(any(test, feature = "test-support"))] content
+    // handler. Never called in unit tests but must exist for macOS flat-namespace
+    // linker and Linux ELF test binary linkage.
+
+    #[no_mangle]
+    pub unsafe extern "C" fn ngx_http_send_header(
+        _r: *mut nginx_sys::ngx_http_request_t,
+    ) -> nginx_sys::ngx_int_t {
+        nginx_sys::NGX_OK as nginx_sys::ngx_int_t
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn ngx_http_output_filter(
+        _r: *mut nginx_sys::ngx_http_request_t,
+        _chain: *mut nginx_sys::ngx_chain_t,
+    ) -> nginx_sys::ngx_int_t {
+        nginx_sys::NGX_OK as nginx_sys::ngx_int_t
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn ngx_create_temp_buf(
+        _pool: *mut nginx_sys::ngx_pool_t,
+        _size: usize,
+    ) -> *mut nginx_sys::ngx_buf_t {
+        core::ptr::null_mut()
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn ngx_pcalloc(
+        _pool: *mut nginx_sys::ngx_pool_t,
+        _size: usize,
+    ) -> *mut core::ffi::c_void {
+        core::ptr::null_mut()
+    }
 
     // nginx posted-events queue (used by event loop).
     #[no_mangle]
