@@ -160,14 +160,26 @@ extern "C" fn ngx_otel_init_module(cycle: *mut nginx_sys::ngx_cycle_t) -> nginx_
         return Status::NGX_OK.into();
     }
 
-    // Detect SIGHUP reload via old_cycle: non-NULL on reload, NULL at initial
-    // start. Same pattern as nginx-acme's postconfiguration `old_cycle` check
-    // and `config.rs::postconfiguration:214-220`.
-    // Safety: old_cycle is a pointer field; null-ness check is safe.
-    let is_reload = unsafe { !(*cycle).old_cycle.is_null() };
+    // Detect SIGHUP reload via old_cycle->conf_ctx: the cycle passed to
+    // ngx_init_cycle is NULL only at very first start (it's the zero-initialized
+    // init_cycle struct; conf_ctx == NULL marks it). On SIGHUP, old_cycle is the
+    // fully-initialized current cycle (conf_ctx != NULL).
+    //
+    // IMPORTANT: Checking `old_cycle != NULL` alone is WRONG. At initial start,
+    // ngx_init_cycle is called as ngx_init_cycle(&init_cycle) where
+    // init_cycle is zeroed, so new_cycle->old_cycle = &init_cycle (NOT null).
+    // The distinguishing factor is conf_ctx: NULL in the zero-init cycle,
+    // non-NULL in a fully-configured running cycle.
+    // See nginx/src/core/ngx_cycle.c and the ngx_is_init_cycle() macro.
+    let is_reload = unsafe {
+        let old = (*cycle).old_cycle;
+        !old.is_null() && !(*old).conf_ctx.is_null()
+    };
     let respawn_flag: nginx_sys::ngx_int_t = if is_reload {
         // JUST_RESPAWN: new exporter is skipped on master's first signal
         // fan-out so old+new coexist during the ~100ms overlap window.
+        // The old exporter receives NGX_CMD_QUIT via ngx_signal_worker_processes
+        // and exits after its graceful drain.
         nginx_sys::NGX_PROCESS_JUST_RESPAWN as nginx_sys::ngx_int_t
     } else {
         // RESPAWN: master auto-respawns on crash (ngx_reap_children:593-616).
