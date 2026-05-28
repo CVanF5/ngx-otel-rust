@@ -261,8 +261,11 @@ sleep 5
 info "Waiting for old exporter (PID ${EXP_PID_1}) to exit..."
 # Immediate check: by 5s after SIGHUP, old exporter should have exited.
 # Check error.log for drain evidence right now.
-info "Error.log ngx_quit events for old exporter (at 5s mark):"
-grep "ngx_quit\|drain" "${PREFIX}/logs/error.log" 2>/dev/null | grep "${EXP_PID_1}#" | head -5 || true
+info "Error.log size: $(wc -c < "${PREFIX}/logs/error.log" 2>/dev/null || echo 'not found') bytes"
+info "Error.log ngx_quit/child events (last 20 lines of signal processing):"
+grep "ngx_quit\|drain\|child: 0" "${PREFIX}/logs/error.log" 2>/dev/null | grep -v "^2026.*#.*#" | tail -20 || true
+info "Error.log for old exporter PID ${EXP_PID_1}:"
+grep "${EXP_PID_1}#" "${PREFIX}/logs/error.log" 2>/dev/null | tail -5 || true
 OLD_EXITED=0
 DEADLINE=$(( $(date +%s) + 15 ))
 while (( $(date +%s) < DEADLINE )); do
