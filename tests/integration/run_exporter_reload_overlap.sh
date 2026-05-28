@@ -393,17 +393,9 @@ if [[ -z "${MAX_GAP_NS}" ]] || [[ "${MAX_GAP_NS}" -eq 0 ]]; then
 elif (( MAX_GAP_NS <= INTERVAL_NS )); then
     pass "No gap > 2 × interval in timeline (max gap = ${MAX_GAP_NS} ns)"
 else
-    # Report but don't hard-fail; gaps can legitimately appear at collector
-    # batch boundaries. Only fail if the gap is > 5s (clearly broken).
-    HARD_LIMIT_NS=$(( METRIC_INTERVAL_S * 5 * 1000000000 ))
-    if (( MAX_GAP_NS > HARD_LIMIT_NS )); then
-        fail "Gap of ${MAX_GAP_NS} ns exceeds hard limit ${HARD_LIMIT_NS} ns (5 × interval).
-       The SIGHUP overlap handoff lost more than 5 consecutive intervals.
+    fail "Gap of ${MAX_GAP_NS} ns exceeds 2 × interval limit ${INTERVAL_NS} ns (${METRIC_INTERVAL_S}s × 2).
+       The SIGHUP overlap handoff lost more than 2 consecutive intervals.
        Check error.log for both exporter drains and timing."
-    else
-        info "Note: gap ${MAX_GAP_NS} ns > 2 × interval but ≤ 5 × interval. Soft warning only."
-        pass "Timeline gap within tolerable range (${MAX_GAP_NS} ns ≤ ${HARD_LIMIT_NS} ns)"
-    fi
 fi
 
 # Also verify service.name is present (basic sanity check).
