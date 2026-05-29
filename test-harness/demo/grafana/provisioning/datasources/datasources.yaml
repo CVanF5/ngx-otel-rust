@@ -1,0 +1,35 @@
+# Grafana datasource provisioning for the ngx-otel-rust demo.
+#
+# Prometheus is live today. Loki (logs, Phase 2) and Tempo (traces, future)
+# are pre-provisioned so the dashboards/explore views are ready the moment
+# those compose profiles are enabled — until then they simply report
+# "unreachable" if queried, which is harmless.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      httpMethod: POST
+      # Match the collector exporter scrape cadence for sane $__rate_interval.
+      timeInterval: 5s
+
+  # ── FUTURE: logs (Phase 2). Brought online by `--profile logs`. ────────
+  - name: Loki
+    uid: loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    isDefault: false
+
+  # ── FUTURE: traces. Brought online by `--profile traces`. ──────────────
+  - name: Tempo
+    uid: tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    isDefault: false

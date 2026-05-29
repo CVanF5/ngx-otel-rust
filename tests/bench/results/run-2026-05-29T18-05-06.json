@@ -1,0 +1,9 @@
+[
+  {
+    "config": "c2",
+    "round": 1,
+    "median_ms": 1.75,
+    "p99_ms": 2.49,
+    "req_per_sec": 56552.63,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  4 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     1.77ms  344.20us  15.66ms   97.08%\n    Req/Sec    14.21k   759.18    15.72k    90.08%\n  Latency Distribution\n     50%    1.75ms\n     75%    1.77ms\n     90%    1.80ms\n     99%    2.49ms\n  1696650 requests in 30.00s, 242.70MB read\nRequests/sec:  56552.63\nTransfer/sec:      8.09MB\n"
+  }

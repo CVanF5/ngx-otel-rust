@@ -1,0 +1,33 @@
+[
+  {
+    "config": "c3",
+    "round": 1,
+    "median_ms": 1.75,
+    "p99_ms": 2.22,
+    "req_per_sec": 57120.99,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  4 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     1.75ms  289.66us  13.63ms   96.62%\n    Req/Sec    14.35k   814.54    16.13k    79.49%\n  Latency Distribution\n     50%    1.75ms\n     75%    1.77ms\n     90%    1.81ms\n     99%    2.22ms\n  1719466 requests in 30.10s, 245.96MB read\nRequests/sec:  57120.99\nTransfer/sec:      8.17MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 1,
+    "median_ms": 1.75,
+    "p99_ms": 2.38,
+    "req_per_sec": 56515.34,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  4 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     1.77ms  312.14us  15.53ms   96.49%\n    Req/Sec    14.20k   721.11    15.17k    89.70%\n  Latency Distribution\n     50%    1.75ms\n     75%    1.77ms\n     90%    1.80ms\n     99%    2.38ms\n  1701158 requests in 30.10s, 243.34MB read\nRequests/sec:  56515.34\nTransfer/sec:      8.08MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 1,
+    "median_ms": 1.75,
+    "p99_ms": 2.46,
+    "req_per_sec": 56596.13,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  4 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     1.77ms  304.05us  13.21ms   96.49%\n    Req/Sec    14.22k   764.16    15.54k    89.37%\n  Latency Distribution\n     50%    1.75ms\n     75%    1.77ms\n     90%    1.80ms\n     99%    2.46ms\n  1703580 requests in 30.10s, 243.69MB read\nRequests/sec:  56596.13\nTransfer/sec:      8.10MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 2,
+    "median_ms": 1.74,
+    "p99_ms": 2.32,
+    "req_per_sec": 57101.28,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  4 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency     1.75ms  311.50us  12.00ms   95.39%\n    Req/Sec    14.36k     0.89k   19.23k    80.05%\n  Latency Distribution\n     50%    1.74ms\n     75%    1.77ms\n     90%    1.81ms\n     99%    2.32ms\n  1718771 requests in 30.10s, 245.86MB read\nRequests/sec:  57101.28\nTransfer/sec:      8.17MB\n"
+  }

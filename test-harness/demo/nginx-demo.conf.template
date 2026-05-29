@@ -1,0 +1,68 @@
+# nginx-demo.conf.template — demo server for the Grafana visualisation stack.
+#
+# run-demo.sh substitutes:
+#   @MODULE_PATH@  — absolute path to the built module (.so / .dylib)
+#   @PREFIX@       — absolute path to the per-run sandbox prefix
+#
+# Shape:
+#   :9400  front server, instrumented + exporting OTLP to the demo collector
+#     /          -> 200 directly (exercises request/response body-size hists)
+#     /api/*     -> proxy_pass to the local backend upstream (exercises the
+#                   http.server.upstream.* metrics)
+#     /big       -> larger response body (fills higher byte-size buckets)
+#   :9401  backend upstream (plain nginx server block; the proxy target)
+
+daemon off;
+master_process on;
+worker_processes 4;
+error_log @PREFIX@/logs/error.log notice;
+pid       @PREFIX@/logs/nginx.pid;
+
+load_module @MODULE_PATH@;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    otel_exporter {
+        endpoint http://127.0.0.1:14318/v1/metrics;
+    }
+    otel_service_name ngx-otel-rust-demo;
+    otel_metric_interval 2s;
+
+    # Backend the front server proxies to (populates upstream.* metrics).
+    upstream demo_backend {
+        server 127.0.0.1:9401;
+        keepalive 16;
+    }
+
+    # ── Front (instrumented) server ───────────────────────────────────────
+    server {
+        listen 127.0.0.1:9400;
+
+        location / {
+            return 200 "ngx-otel-rust demo: ok\n";
+        }
+
+        location /big {
+            # Larger body to spread the response-body-size histogram into
+            # higher buckets. (~1 KiB of filler.)
+            return 200 "BIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIGBIG\n";
+        }
+
+        location /api/ {
+            proxy_pass http://demo_backend/;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+        }
+    }
+
+    # ── Backend upstream ──────────────────────────────────────────────────
+    server {
+        listen 127.0.0.1:9401;
+        location / {
+            return 200 "backend response\n";
+        }
+    }
+}

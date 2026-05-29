@@ -1,0 +1,94 @@
+# docker-compose.demo.yml — Grafana visualisation stack for ngx-otel-rust.
+#
+# Standalone from the test harness (test-harness/docker-compose.yml): it
+# uses its own container names and OFFSET host ports (143xx/19090/3000) so
+# it never collides with the test collector on 4317/4318 or anything else
+# already bound on the dev box.
+#
+# nginx runs on the HOST (it loads the host-built module .so) and ships
+# OTLP/HTTP to 127.0.0.1:14318 — see demo/run-demo.sh and nginx-demo.conf.
+#
+# Profiles:
+#   (default)   collector + prometheus + grafana  → metrics, available today
+#   logs        adds loki                          → Phase 2 (logs)
+#   traces      adds tempo                         → future (traces)
+#
+#   docker compose -f docker-compose.demo.yml up -d                  # metrics
+#   docker compose -f docker-compose.demo.yml --profile logs up -d   # + loki
+#
+# Grafana: http://localhost:3000  (anonymous, Admin role — demo only)
+
+name: ngx-otel-demo
+
+services:
+  collector:
+    image: otel/opentelemetry-collector-contrib:0.152.0
+    container_name: ngx-otel-demo-collector
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector-demo.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "127.0.0.1:14318:4318"   # OTLP/HTTP  (point nginx here)
+      - "127.0.0.1:14317:4317"   # OTLP/gRPC
+      - "127.0.0.1:18889:8889"   # Prometheus scrape endpoint (debug/curl)
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    container_name: ngx-otel-demo-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=6h
+      - --web.enable-lifecycle
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "127.0.0.1:19090:9090"
+    depends_on:
+      - collector
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: ngx-otel-demo-grafana
+    environment:
+      # Demo-only: no login wall.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_USERS_DEFAULT_THEME: "dark"
+      # Land straight on the ngx-otel-rust dashboard.
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: "/var/lib/grafana/dashboards/ngx-otel-rust-overview.json"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  # ── FUTURE: logs (Phase 2) — `--profile logs` ─────────────────────────
+  # Loki 3.x ingests OTLP logs natively at /otlp/v1/logs; the collector's
+  # otlphttp/loki exporter ships straight to it (no Promtail). The Grafana
+  # Loki datasource is already provisioned and points here.
+  loki:
+    image: grafana/loki:3.3.2
+    container_name: ngx-otel-demo-loki
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    ports:
+      - "127.0.0.1:13100:3100"
+    profiles: ["logs"]
+    restart: unless-stopped
+
+  # ── FUTURE: traces — `--profile traces` ───────────────────────────────
+  tempo:
+    image: grafana/tempo:2.7.0
+    container_name: ngx-otel-demo-tempo
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ./tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+    ports:
+      - "127.0.0.1:13200:3200"
+    profiles: ["traces"]
+    restart: unless-stopped

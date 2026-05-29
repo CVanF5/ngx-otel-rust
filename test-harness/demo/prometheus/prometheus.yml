@@ -1,0 +1,10 @@
+# Prometheus scrape config for the ngx-otel-rust demo.
+# Scrapes the OTel collector's Prometheus exporter inside the compose network.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: otel-collector
+    static_configs:
+      - targets: ["collector:8889"]

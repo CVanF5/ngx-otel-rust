@@ -1,0 +1,87 @@
+# otel-collector-demo.yaml — collector config for the Grafana demo stack.
+#
+# Superset of test-harness/otel-collector-config.yaml: keeps the debug
+# exporter (so you can still tail raw OTLP), drops the file exporter (the
+# demo doesn't assert on metrics.json), and ADDS a Prometheus exporter
+# that Grafana visualises via a Prometheus datasource.
+#
+# Metric-shape notes specific to ngx-otel-rust (see demo/README.md §"How
+# the metrics map"):
+#   * The module emits *every* metric as an OTLP Histogram — including the
+#     stub_status counters/gauges, which are single-bucket histograms
+#     (count=1, sum=value). Per-request metrics use CUMULATIVE temporality
+#     with a fixed start_time_unix_nano anchored to the exporter start.
+#   * `add_metric_suffixes: false` keeps Prometheus names a predictable
+#     dotted→underscore mapping (e.g. http.server.request.duration ->
+#     http_server_request_duration) with NO unit/type suffix, so the
+#     provisioned dashboard queries are stable.
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  batch:
+    timeout: 1s
+    send_batch_size: 1024
+
+exporters:
+  # Raw OTLP dump in the collector logs — handy when demoing the pipeline.
+  debug:
+    verbosity: normal
+
+  # Scraped by the Prometheus container at collector:8889/metrics.
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    # Predictable metric names: http.server.request.duration ->
+    # http_server_request_duration{,_bucket,_sum,_count}. No unit suffixes.
+    add_metric_suffixes: false
+    # Promote resource attributes (service.name, etc.) to series labels so
+    # the dashboard can filter by service_name.
+    resource_to_telemetry_conversion:
+      enabled: true
+    # Sample at scrape time (NOT the OTLP datapoint timestamp). The exporter
+    # accumulates the module's deltas into a monotonic counter; stamping at
+    # scrape time keeps rate()/histogram_quantile() well-behaved.
+    send_timestamps: false
+    metric_expiration: 5m
+
+  # ── FUTURE: logs (Phase 2) ────────────────────────────────────────────
+  # When the module starts emitting OTLP logs, ship them straight to Loki's
+  # native OTLP endpoint — no Promtail, no format translation. Enable the
+  # `logs` compose profile (brings up the loki service) and uncomment the
+  # exporter + logs pipeline below.
+  # otlphttp/loki:
+  #   logs_endpoint: http://loki:3100/otlp/v1/logs
+  #   tls:
+  #     insecure: true
+
+  # ── FUTURE: traces ────────────────────────────────────────────────────
+  # otlp/tempo:
+  #   endpoint: tempo:4317
+  #   tls:
+  #     insecure: true
+
+service:
+  telemetry:
+    logs:
+      level: info
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [prometheus, debug]
+    # ── FUTURE: uncomment when Phase 2 logs land (compose `logs` profile) ──
+    # logs:
+    #   receivers: [otlp]
+    #   processors: [batch]
+    #   exporters: [otlphttp/loki, debug]
+    # ── FUTURE: traces ────────────────────────────────────────────────────
+    # traces:
+    #   receivers: [otlp]
+    #   processors: [batch]
+    #   exporters: [otlp/tempo, debug]

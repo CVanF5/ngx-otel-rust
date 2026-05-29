@@ -1,0 +1,14 @@
+# Load any dashboard JSON under /var/lib/grafana/dashboards.
+apiVersion: 1
+
+providers:
+  - name: ngx-otel-rust
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    editable: true
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
