@@ -71,9 +71,17 @@ impl HttpRequestHandler for LogPhaseHandler {
         let r = request.as_ref();
 
         // ── request duration in milliseconds ──────────────────────────────
-        // duration_ms = ngx_current_msec - r->start_msec
-        let duration_ms: u64 = unsafe {
-            (nginx_sys::ngx_current_msec as u64).saturating_sub(r.start_msec as u64)
+        // Mirror avr-module/src/ngx_http_avr_data_sources.c:12-15 (get_request_time)
+        // and nginx/src/http/ngx_http_variables.c:2284 ($request_time idiom):
+        //   ms = (tp->sec - r->start_sec) * 1000 + (tp->msec - r->start_msec)
+        // r->start_msec is the millisecond *fraction* of the start second (0–999),
+        // not a full epoch timestamp — the previous code subtracted the wrong clock.
+        let duration_ms: u64 = {
+            let tp = nginx_sys::ngx_timeofday(); // safe: returns &'static ngx_time_t
+            // time_t = c_long (i64 on 64-bit), ngx_uint_t/ngx_msec_t = usize.
+            let ms: i64 = (tp.sec as i64 - r.start_sec as i64) * 1000
+                + (tp.msec as i64 - r.start_msec as i64);
+            ms.max(0) as u64
         };
         slot.request_duration_ms.record(duration_ms, &DURATION_BOUNDS_MS);
 
