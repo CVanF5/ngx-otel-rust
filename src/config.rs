@@ -45,6 +45,20 @@ const DEFAULT_BATCH_SIZE: u64 = 100;
 /// See the spec-inconsistency note on that method.
 const DEFAULT_RETRY_BUFFER_DEPTH: usize = 4;
 
+/// Selects the OTLP wire transport for metric export.
+///
+/// Corresponds to the `otel_metric_protocol` directive:
+/// - `otlp_http` (default): OTLP/HTTP over HTTP/1.1 (`POST /v1/metrics`).
+/// - `otlp_grpc`:           OTLP/gRPC over HTTP/2 (`MetricsService.Export`).
+/// - `arrow` is reserved for Phase 5 and is rejected at config parse time.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MetricProtocol {
+    /// OTLP/HTTP protobuf — the default.  Uses `HyperHttpTransport`.
+    OtlpHttp,
+    /// OTLP/gRPC — new in this phase.  Uses `GrpcTransport`.
+    OtlpGrpc,
+}
+
 /// Per-worker key-value pair stored in NGINX pool memory.
 /// Both key and value are ngx_str_t slices into the configuration file buffer.
 #[derive(Clone, Copy, Debug)]
@@ -119,6 +133,10 @@ pub struct MainConfig {
     /// incrementing `BIDI_BACKPRESSURE_DROPS`.  Parsed in all builds; acted
     /// on only with `test-support`.
     pub bidi_overload_endpoint: ngx_str_t,
+    /// `otel_metric_protocol otlp_http | otlp_grpc;` — selects the export
+    /// transport.  `None` means the directive was not set; treated as
+    /// `OtlpHttp` (default) by [`metric_protocol`].
+    pub metric_protocol: Option<MetricProtocol>,
     /// The registered shared memory zone (set during postconfiguration).
     pub shm_zone: *mut nginx_sys::ngx_shm_zone_t,
     /// The registered control-plane shared memory zone (set during
@@ -144,6 +162,7 @@ impl Default for MainConfig {
             grpc_smoke_endpoint: ngx_str_t::default(),
             bidi_smoke_endpoint: ngx_str_t::default(),
             bidi_overload_endpoint: ngx_str_t::default(),
+            metric_protocol: None,
             shm_zone: ptr::null_mut(),
             control_shm_zone: ptr::null_mut(),
         }
@@ -196,6 +215,13 @@ impl MainConfig {
     /// Whether HTTP status code class bucketing is enabled (default: true).
     pub fn status_code_class_enabled(&self) -> bool {
         self.status_code_class != 0 // UNSET_FLAG or 1 → true; explicit 0 → false
+    }
+
+    /// Effective metric export protocol.  Returns `OtlpHttp` when the
+    /// `otel_metric_protocol` directive was not set (preserves existing
+    /// byte-identical behaviour for HTTP).
+    pub fn metric_protocol(&self) -> MetricProtocol {
+        self.metric_protocol.unwrap_or(MetricProtocol::OtlpHttp)
     }
 
     /// Obtain the main config from the previous NGINX cycle (used for SIGHUP reload).
@@ -664,25 +690,37 @@ macro_rules! production_commands {
                 offset: mem::offset_of!(MainConfig, bidi_overload_endpoint),
                 post: ptr::null_mut(),
             },
+            // otel_metric_protocol otlp_http | otlp_grpc;
+            // Selects the OTLP wire transport.  Default: otlp_http (byte-identical
+            // to the pre-existing behaviour when the directive is absent).
+            // "arrow" is rejected with a "not yet implemented (Phase 5)" message.
+            ngx_command_t {
+                name: ngx_string!("otel_metric_protocol"),
+                type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+                set: Some(cmd_set_metric_protocol),
+                conf: NGX_HTTP_MAIN_CONF_OFFSET,
+                offset: 0,
+                post: ptr::null_mut(),
+            },
         ]
     };
 }
 
-/// Production build: 12 production commands + terminator.
+/// Production build: 13 production commands + terminator.
 #[cfg(not(any(test, feature = "test-support")))]
-pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 13] = {
-    let mut cmds = [ngx_command_t::empty(); 13];
+pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 14] = {
+    let mut cmds = [ngx_command_t::empty(); 14];
     let prod = production_commands!();
     let mut i = 0;
-    while i < 12 {
+    while i < 13 {
         cmds[i] = prod[i];
         i += 1;
     }
-    // cmds[12] stays empty() — terminator
+    // cmds[13] stays empty() — terminator
     cmds
 };
 
-/// test-support build: 12 production commands + otel_status_endpoint + terminator.
+/// test-support build: 13 production commands + otel_status_endpoint + terminator.
 ///
 /// `otel_status_endpoint;` is a location-level directive (no args) that registers
 /// a content handler returning `control_shm.version` as plain text. Used by the
@@ -690,16 +728,16 @@ pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 13] = {
 /// process-level introspection. Absent from production builds (verified by grep
 /// on `objs-release/ngx_http_otel_module.so`).
 #[cfg(any(test, feature = "test-support"))]
-pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 14] = {
-    let mut cmds = [ngx_command_t::empty(); 14];
+pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 15] = {
+    let mut cmds = [ngx_command_t::empty(); 15];
     let prod = production_commands!();
     let mut i = 0;
-    while i < 12 {
+    while i < 13 {
         cmds[i] = prod[i];
         i += 1;
     }
-    // Index 12: otel_status_endpoint (test-support only).
-    cmds[12] = ngx_command_t {
+    // Index 13: otel_status_endpoint (test-support only).
+    cmds[13] = ngx_command_t {
         name: ngx_string!("otel_status_endpoint"),
         type_: (nginx_sys::NGX_HTTP_LOC_CONF | NGX_CONF_NOARGS) as ngx_uint_t,
         set: Some(cmd_set_otel_status_endpoint),
@@ -707,7 +745,7 @@ pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 14] = {
         offset: 0,
         post: ptr::null_mut(),
     };
-    // cmds[13] stays empty() — terminator.
+    // cmds[14] stays empty() — terminator.
     cmds
 };
 
@@ -882,6 +920,53 @@ extern "C" fn cmd_add_high_cardinality_attr(
 
     amcf.high_cardinality_attrs.push(attr);
     NGX_CONF_OK
+}
+
+/// Directive callback for `otel_metric_protocol otlp_http | otlp_grpc;`.
+///
+/// Accepts `otlp_http` and `otlp_grpc`.  Rejects `arrow` with a
+/// "not yet implemented (Phase 5)" message.  Rejects any other value with
+/// an "unknown value" message listing the valid choices.
+extern "C" fn cmd_set_metric_protocol(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    let amcf = unsafe { conf.cast::<MainConfig>().as_mut().expect("main config") };
+
+    if amcf.metric_protocol.is_some() {
+        return c"is duplicate".as_ptr().cast_mut();
+    }
+
+    let args = unsafe { cf_args(cf) };
+    let value = args[1].as_bytes();
+
+    if value == b"otlp_http" {
+        amcf.metric_protocol = Some(MetricProtocol::OtlpHttp);
+        NGX_CONF_OK
+    } else if value == b"otlp_grpc" {
+        amcf.metric_protocol = Some(MetricProtocol::OtlpGrpc);
+        NGX_CONF_OK
+    } else if value == b"arrow" {
+        unsafe {
+            ngx_conf_log_error!(
+                NGX_LOG_EMERG,
+                &mut *cf,
+                "otel_metric_protocol: \"arrow\" is not yet implemented (Phase 5)"
+            );
+        }
+        NGX_CONF_ERROR
+    } else {
+        unsafe {
+            ngx_conf_log_error!(
+                NGX_LOG_EMERG,
+                &mut *cf,
+                "otel_metric_protocol: unknown value \"{}\"; valid values: otlp_http, otlp_grpc",
+                args[1]
+            );
+        }
+        NGX_CONF_ERROR
+    }
 }
 
 /// Directive callback for `otel_status_endpoint;` (location-level, no args).

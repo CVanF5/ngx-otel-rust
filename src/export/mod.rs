@@ -44,7 +44,7 @@ use std::collections::VecDeque;
 use nginx_sys::{NGX_LOG_ERR, NGX_LOG_NOTICE};
 use pin_project_lite::pin_project;
 
-use crate::config::MainConfig;
+use crate::config::{MainConfig, MetricProtocol};
 use crate::data_model::{
     AggregationTemporality, AnyValue, Batch, GaugeData, KeyValue, Metric, MetricData,
     NumberDataPoint, NumberValue, Resource, Scope, SumData,
@@ -54,7 +54,7 @@ use crate::metric_source::MetricSource;
 use crate::metric_source::instrumented::InstrumentedSource;
 use crate::metric_source::stub_status::StubStatusSource;
 use crate::transport::hyper_http::NgxConnector;
-use crate::transport::{HyperHttpTransport, Transport};
+use crate::transport::{GrpcTransport, HyperHttpTransport, Transport};
 
 // ── Self-metric atomics ──────────────────────────────────────────────────────
 
@@ -106,6 +106,37 @@ const GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET: Duration = Duration::from_secs(2);
 /// configured `otel_metric_interval` — we never wait more than this between
 /// shutdown checks. The cost is one extra timer wake per chunk; negligible.
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Selects between the HTTP and gRPC production transports.
+///
+/// Built once in [`export_loop`] from `amcf.metric_protocol()` and threaded
+/// through [`graceful_drain`].  An enum avoids `dyn Transport` and keeps
+/// `send` monomorphic (both variants are cold-path anyway — the export
+/// loop runs in a dedicated process that is not on the hot request path).
+///
+/// # Exit-time flush note
+///
+/// The synchronous `exit_process_flush` path (HTTP-only) is intentionally
+/// NOT mirrored for gRPC: building a blocking one-shot h2 stack after the
+/// async runtime has been torn down is fragile.  For `otlp_grpc`, the
+/// in-loop async [`graceful_drain`] (which runs while the event loop is
+/// still alive) provides the final flush.  This is safe because the
+/// exporter process stays alive until `EXPORT_LOOP_DONE` is set (set by
+/// `graceful_drain` after it completes), so `graceful_drain` always runs
+/// before `process::exit`.
+enum ExportTransport {
+    Http(HyperHttpTransport<NgxConnector>),
+    Grpc(GrpcTransport<NgxConnector>),
+}
+
+impl Transport for ExportTransport {
+    async fn send(&mut self, bytes: std::vec::Vec<u8>) -> Result<(), crate::transport::TransportError> {
+        match self {
+            Self::Http(t) => t.send(bytes).await,
+            Self::Grpc(t) => t.send(bytes).await,
+        }
+    }
+}
 
 /// Why the chunked sleep terminated early, if it did.
 #[derive(Copy, Clone)]
@@ -215,19 +246,39 @@ pub async fn export_loop(amcf: &'static MainConfig) {
         .collect();
 
     // ── Construct production transport (NgxConnector; NEVER SpinConnector) ─
-    let mut transport =
-        match HyperHttpTransport::<NgxConnector>::with_ngx_log(endpoint_str, headers, log) {
-            Ok(t) => t,
-            Err(e) => {
-                ngx::ngx_log_error!(
-                    NGX_LOG_ERR,
-                    log.as_ptr(),
-                    "otel export: failed to create transport: {}",
-                    e
-                );
-                return;
+    //
+    // Transport selected by `otel_metric_protocol` (default: otlp_http).
+    // For gRPC the connection is lazy (deferred to first send).
+    let mut transport = match amcf.metric_protocol() {
+        MetricProtocol::OtlpHttp => {
+            match HyperHttpTransport::<NgxConnector>::with_ngx_log(endpoint_str, headers, log) {
+                Ok(t) => ExportTransport::Http(t),
+                Err(e) => {
+                    ngx::ngx_log_error!(
+                        NGX_LOG_ERR,
+                        log.as_ptr(),
+                        "otel export: failed to create HTTP transport: {}",
+                        e
+                    );
+                    return;
+                }
             }
-        };
+        }
+        MetricProtocol::OtlpGrpc => {
+            match GrpcTransport::<NgxConnector>::with_ngx_log(endpoint_str, log) {
+                Ok(t) => ExportTransport::Grpc(t),
+                Err(e) => {
+                    ngx::ngx_log_error!(
+                        NGX_LOG_ERR,
+                        log.as_ptr(),
+                        "otel export: failed to create gRPC transport: {}",
+                        e
+                    );
+                    return;
+                }
+            }
+        }
+    };
 
     let encoder = OtlpHttpEncoder;
 
@@ -245,11 +296,16 @@ pub async fn export_loop(amcf: &'static MainConfig) {
     let retry_buffer_depth = amcf.retry_buffer_depth();
     let mut retry_queue: VecDeque<(std::vec::Vec<u8>, u64)> = VecDeque::new();
 
+    let protocol_str = match amcf.metric_protocol() {
+        MetricProtocol::OtlpHttp => "otlp_http",
+        MetricProtocol::OtlpGrpc => "otlp_grpc",
+    };
     ngx::ngx_log_error!(
         NGX_LOG_NOTICE,
         log.as_ptr(),
-        "otel export: export loop started, endpoint={}, interval={}ms, retry_depth={}",
+        "otel export: export loop started, endpoint={}, protocol={}, interval={}ms, retry_depth={}",
         endpoint_str,
+        protocol_str,
         amcf.interval_ms(),
         retry_buffer_depth
     );
@@ -445,7 +501,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
 /// via `time_unix_nano` on the collector side (cumulative-counter model).
 /// Phase 2 (logs) reopens this when log-drain semantics force ordered handoff.
 async fn graceful_drain(
-    transport: &mut HyperHttpTransport<NgxConnector>,
+    transport: &mut ExportTransport,
     retry_queue: &mut VecDeque<(std::vec::Vec<u8>, u64)>,
     encoder: &OtlpHttpEncoder,
     amcf: &'static MainConfig,
