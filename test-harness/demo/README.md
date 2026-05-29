@@ -6,9 +6,13 @@ pre-wired (but dormant) **Loki** (logs) and **Tempo** (traces) paths for
 Phase 2 and beyond.
 
 ```
- nginx + module (host)  --OTLP/HTTP-->  collector  --/metrics scrape-->  Prometheus  -->  Grafana
-        :9400                            :14318                            :19090            :3000
+ nginx + module (host)  --OTLP/gRPC-->  collector  --/metrics scrape-->  Prometheus  -->  Grafana
+        :9400                            :14317                            :19090            :3000
 ```
+
+The demo ships **OTLP/gRPC** (`otel_metric_protocol otlp_grpc;`) to the
+collector's gRPC receiver at host port **14317**.  (The previous OTLP/HTTP
+path on `:14318` is still available but no longer used by the demo.)
 
 Everything binds `127.0.0.1` only and uses **offset ports** so it never
 collides with the test-harness collector (`4317/4318`).
@@ -33,7 +37,8 @@ the dashboard.
 | Grafana | http://localhost:3000 |
 | Prometheus | http://localhost:19090 |
 | Collector Prometheus endpoint | http://localhost:18889/metrics |
-| Collector OTLP/HTTP (nginx target) | http://127.0.0.1:14318 |
+| Collector OTLP/gRPC (nginx target) | http://127.0.0.1:14317 |
+| Collector OTLP/HTTP (still available) | http://127.0.0.1:14318 |
 | nginx front server | http://127.0.0.1:9400/ (also `/big`, `/api/`) |
 
 ## Files

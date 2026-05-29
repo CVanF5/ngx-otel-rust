@@ -26,10 +26,15 @@ events {
 
 http {
     otel_exporter {
-        endpoint http://127.0.0.1:14318/v1/metrics;
+        # gRPC receiver: http://host:port (no /v1/metrics path).
+        # The demo stack's collector listens on gRPC at host port 14317.
+        endpoint http://127.0.0.1:14317;
     }
     otel_service_name ngx-otel-rust-demo;
     otel_metric_interval 2s;
+    # Ship OTLP/gRPC to the collector (Phase 2 grpc_transport).
+    # Default is otlp_http; this directive promotes the demo to gRPC.
+    otel_metric_protocol otlp_grpc;
 
     # Backend the front server proxies to (populates upstream.* metrics).
     upstream demo_backend {
