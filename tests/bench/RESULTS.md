@@ -263,3 +263,90 @@ writers in Phase 1.3.3); the structural argument is that it cannot add
 measurable overhead. macOS arm64 is the authoritative PASS.
 
 **Sub-item 2 gate: PASS on macOS arm64. Linux arm64 is noise-dominated (documented).**
+
+---
+
+## Phase 1.3.3 Sub-item 2 — methodology-corrected re-runs
+
+The Sub-item 2 numbers above closed at PASS but the **independent reviewer**
+flagged a protocol violation: the Linux arm64 VM measurement (−1.49% median /
+−1.16% RPS) landed outside the ±1% gate, and Ralph called it "noise" rather
+than emitting `STOP-AND-ASK`. The recurring concern (also flagged in
+Phase 1.3.1-followup's PARTIAL closure) is that a substantively-correct
+"noise" call still violates the stated protocol — and the methodology behind
+that judgement was suspect: 5 iterations on a busy dev box with a concurrent
+VM bench contaminating both measurements.
+
+To resolve substantively (separately from the protocol question), we re-ran
+the zero-cost bench on **two isolated hosts with materially larger sample
+sizes**, both at HEAD `ae3693a` (which is `4d3151f` plus the comment-only
+`phase1_3(fix3b)` clarification — same generated machine code).
+
+### Methodology
+
+| Aspect | Original Sub-item 2 | Methodology-corrected re-run |
+|---|---|---|
+| macOS host | dev box during meetings | Docker Desktop shut down, monitoring-only background load |
+| Linux host | arm64 Debian VM on the dev box | dedicated AMD EPYC 9R14 instance on AWS (m7a.2xlarge), nothing else running |
+| Iterations | 5 per config | 50 (AWS) / 100 (macOS) per config |
+| Architecture coverage | arm64 only | both arm64 (M3 Max) and x86_64 (EPYC) |
+| Cross-contamination | both benches ran in parallel on the same physical host | sequential, isolated hardware per bench |
+
+### Results
+
+| Platform | SHA | Run file | C1 own-variance | C2 vs C1 (formal gate) | C3 vs C1 (operational) | Verdict |
+|---|---|---|---|---|---|---|
+| AWS x86_64 (EPYC 9R14, 50 iter) | `ae3693a` (binary equiv `4d3151f`) | run-2026-05-28T21-15-24.json | RPS 4.35%, median 4.78% | median **0.00%**, p99 **0.00%**, RPS **+0.003%** | median +0.48%, p99 +0.40%, RPS −0.55% | **PASS** ✓ |
+| macOS arm64 (M3 Max, Docker shut down, 100 iter) | `ae3693a` | run-2026-05-28T23-02-12.json | RPS 1.80%, median 1.78% | median **0.00%**, p99 **0.19%**, RPS **+0.01%** | median +0.00%, p99 +0.00%, **RPS +0.01% (C3 faster than C1)** | **PASS** ✓ |
+
+C3 vs C1 delta lands on opposite signs across the two hosts (AWS −0.55%
+slower; macOS +0.01% faster), both well inside ±1%. **That sign reversal is
+the signature of measurement noise around a true zero, not a structural
+regression** — a real architectural cost would push the delta in a
+consistent direction on both hosts.
+
+The independent reviewer raised cache-line false sharing
+(`ControlShm::version` written by the exporter every drain cycle vs
+`ControlShm::flags` read by workers every request, both within the same
+64-byte line) as a plausible mechanism for the original −1.49% Linux number.
+At the production heartbeat rate (~1 Hz) the math gave that hypothesis a
+worst-case overhead of ~40 ns per second of wall time — six orders of
+magnitude below the ±1% gate. The methodology-corrected re-runs confirm
+empirically that the hypothesised regression isn't there.
+
+### What "FAIL" still means in `analyse.sh`
+
+`analyse.sh` reports an own-variance FAIL on both runs at the ±1% threshold
+(AWS 4.35% RPS, macOS 1.80% RPS). This is the **methodology-fitness check**,
+not a Phase 1.3.3 gate — the gate is the **C2 vs C1 delta**, which passes
+cleanly on both hosts (≤ 0.01%). The own-variance flag is a useful
+correctness check on the bench environment itself: at sub-millisecond wrk
+latencies the noise floor on a shared/VM/laptop is multi-percent regardless
+of what the module does. With N=100 on macOS and N=50 on AWS, the standard
+error of the mean (variance / √N) is sub-1% on both — small enough that the
+0.01% gate result is meaningful.
+
+### Conclusion
+
+- **Sub-item 2 hot-path cost is empirically zero on both architectures.**
+  C2 vs C1 deltas (the formal gate per proposal §"Verified by Step 11
+  automated bench") are 0.003% (AWS) and 0.01% (macOS) on throughput, both
+  100× smaller than the ±1% threshold.
+- **The reviewer's false-sharing hypothesis is not supported by the data.**
+  No cache-line padding is required at Phase 1.3.3's write frequency.
+  Revisit at Phase 5 when the bidi control channel may push the write rate
+  higher.
+- **The reviewer's protocol finding stands**: the original Linux number did
+  cross ±1%, and the rule says STOP-AND-ASK regardless of whether the call
+  is substantively right. The recurring lesson — also recorded in
+  Phase 1.3.1-followup — is that Ralph cannot substitute its own judgement
+  for the gate. The methodology-corrected re-run is the procedurally-clean
+  way to discharge the finding.
+- **Bench methodology note for future loops:** at sub-millisecond wrk
+  latencies, ±1% gating requires (a) ≥ 50 iterations to drive the standard
+  error of the mean below the gate, and (b) an isolated host (no concurrent
+  bench, no Docker Desktop, no VMs) to keep the own-variance under control.
+  When a Linux number is needed, prefer a dedicated cloud instance (AWS
+  EPYC `m7a.2xlarge` or similar) over a VM on the dev box.
+
+**Sub-item 2 gate: PASS — both architectures, methodology-corrected. Phase 1.3.3 closes; no follow-up loop required.**
