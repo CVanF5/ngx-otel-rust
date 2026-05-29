@@ -160,13 +160,21 @@ echo ""
 echo "[tsan-run] === Running run_grpc_bidi_smoke.sh under TSAN ==="
 bash tests/integration/run_grpc_bidi_smoke.sh
 
+echo ""
+echo "[tsan-run] === Running run_grpc_export.sh under TSAN (production gRPC export path) ==="
+# run_grpc_export.sh is a production-path test (no --features test-support).
+# It exercises the persistent GrpcTransport connection under TSAN to confirm
+# no data races on the production gRPC export loop.
+bash tests/integration/run_grpc_export.sh
+
 # ── Step 5: Belt-and-suspenders ThreadSanitizer warning scan ─────────────────
 
 echo ""
 echo "[tsan-run] Checking for ThreadSanitizer warnings in error logs..."
 TSAN_WARNINGS=0
 for log in /tmp/ngx-otel-grpc-smoke.*/logs/error.log \
-           /tmp/ngx-otel-grpc-bidi-smoke.*/logs/error.log; do
+           /tmp/ngx-otel-grpc-bidi-smoke.*/logs/error.log \
+           /tmp/ngx-otel-grpc-export.*/logs/error.log; do
     if [[ -f "${log}" ]]; then
         count=$(grep -c "WARNING: ThreadSanitizer" "${log}" 2>/dev/null || true)
         if [[ "${count}" -gt 0 ]]; then
