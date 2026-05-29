@@ -61,4 +61,5 @@ pub trait Transport: Send {
     async fn send(&mut self, bytes: std::vec::Vec<u8>) -> Result<(), TransportError>;
 }
 
+pub use grpc::transport::GrpcTransport;
 pub use hyper_http::HyperHttpTransport;

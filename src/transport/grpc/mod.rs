@@ -26,6 +26,7 @@
 
 pub mod executor;
 pub mod shim;
+pub mod transport;
 
 // Generated protobuf types for the local Echo bidi-streaming service.
 // Phase 1.2 Item 2 mechanical exercise; not gated on test-support because the
