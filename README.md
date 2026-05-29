@@ -5,6 +5,10 @@ OpenTelemetry signals to an OTel collector.  Designed for migration to
 OTAP (OpenTelemetry Protocol with Apache Arrow) — the columnar evolution
 of OTLP — in a later phase.
 
+The metrics it emits are defined in **[`METRIC_MODEL.md`](METRIC_MODEL.md)**
+(OTel-semantic-conventions format) — the producer-side contract, modelled
+on the F5 AVR nginx module (`avr-module/`) with OTel-semconv names/units.
+
 [NGINX]: https://nginx.org/
 [`ngx-rust`]: https://github.com/nginx/ngx-rust
 
