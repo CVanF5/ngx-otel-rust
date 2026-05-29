@@ -234,10 +234,10 @@ mod tests {
                 description: "HTTP server request duration".into(),
                 unit: "ms".into(),
                 data: MetricData::Histogram(HistogramData {
-                    aggregation_temporality: AggregationTemporality::Delta,
+                    aggregation_temporality: AggregationTemporality::Cumulative,
                     data_points: std::vec![HistogramDataPoint {
                         attributes: std::vec![],
-                        start_time_unix_nano: 0,
+                        start_time_unix_nano: 1_699_999_990_000_000_000,
                         time_unix_nano: 1_700_000_000_000_000_000,
                         count: 42,
                         sum: 1234.5,
@@ -290,7 +290,7 @@ mod tests {
         };
         assert_eq!(
             hist.aggregation_temporality,
-            metrics_proto::AggregationTemporality::Delta as i32
+            metrics_proto::AggregationTemporality::Cumulative as i32
         );
         assert_eq!(hist.data_points.len(), 1);
         let dp = &hist.data_points[0];
@@ -298,6 +298,7 @@ mod tests {
         assert_eq!(dp.sum, Some(1234.5));
         assert_eq!(dp.bucket_counts, std::vec![1u64, 2, 5, 10, 24]);
         assert_eq!(dp.explicit_bounds, std::vec![5.0f64, 10.0, 25.0, 50.0]);
+        assert_eq!(dp.start_time_unix_nano, 1_699_999_990_000_000_000);
         assert_eq!(dp.time_unix_nano, 1_700_000_000_000_000_000);
     }
 }

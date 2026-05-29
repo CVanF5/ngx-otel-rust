@@ -651,7 +651,7 @@ fn collect_all_sources(amcf: &MainConfig, worker_start_ns: u64) -> Batch {
             let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
             (avail / core::mem::size_of::<crate::shm::WorkerSlots>()).max(1)
         };
-        metrics.extend(InstrumentedSource { base, n_workers }.collect());
+        metrics.extend(InstrumentedSource { base, n_workers, start_time_unix_nano: worker_start_ns }.collect());
     }
 
     // 3. Self-metrics (dropped_records, send_failures, export_interval).

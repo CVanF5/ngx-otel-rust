@@ -134,6 +134,12 @@ pub struct InstrumentedSource {
     pub base: *mut u8,
     /// Number of workers whose slots are in the zone.
     pub n_workers: usize,
+    /// Unix epoch nanoseconds when the exporter (and therefore these
+    /// cumulative windows) started. Used as `start_time_unix_nano` on all
+    /// histogram datapoints so downstream Prometheus/OTAP consumers can
+    /// anchor cumulative rate windows correctly.  Must equal the value
+    /// used by [`crate::export::SelfMetricsSource`].
+    pub start_time_unix_nano: u64,
 }
 
 // Safety: InstrumentedSource is only used on Worker 0's export loop.
@@ -144,6 +150,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
     fn collect(&self) -> std::vec::Vec<crate::data_model::Metric> {
         use crate::data_model::AggregationTemporality;
 
+        let start = self.start_time_unix_nano;
         let now = now_unix_nano();
 
         // Aggregate all workers.
@@ -231,6 +238,11 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
         // histogram slots exist.
         let _ = (s1xx, s2xx, s3xx, s4xx, s5xx);
 
+        // All histograms are cumulative running totals (snapshot() reads the
+        // shm counters without resetting them). Emit as Cumulative with a
+        // fixed start_time_unix_nano anchored to the exporter start, matching
+        // the stub_status discipline. This removes the need for the collector-
+        // side transform/fix_temporality workaround.
         std::vec![
             // ── request metrics ───────────────────────────────────────────
             hist_metric(
@@ -239,8 +251,9 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                 "ms",
                 dur,
                 dur_bounds.clone(),
+                start,
                 now,
-                AggregationTemporality::Delta,
+                AggregationTemporality::Cumulative,
             ),
             hist_metric(
                 "http.server.request.body.size",
@@ -248,8 +261,9 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                 "By",
                 req_bytes,
                 byte_bounds.clone(),
+                start,
                 now,
-                AggregationTemporality::Delta,
+                AggregationTemporality::Cumulative,
             ),
             hist_metric(
                 "http.server.response.body.size",
@@ -257,8 +271,9 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                 "By",
                 resp_bytes,
                 byte_bounds.clone(),
+                start,
                 now,
-                AggregationTemporality::Delta,
+                AggregationTemporality::Cumulative,
             ),
             // ── upstream timings ──────────────────────────────────────────
             hist_metric(
@@ -267,8 +282,9 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                 "ms",
                 up_resp,
                 dur_bounds.clone(),
+                start,
                 now,
-                AggregationTemporality::Delta,
+                AggregationTemporality::Cumulative,
             ),
             hist_metric(
                 "http.server.upstream.header.duration",
@@ -276,8 +292,9 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                 "ms",
                 up_hdr,
                 dur_bounds.clone(),
+                start,
                 now,
-                AggregationTemporality::Delta,
+                AggregationTemporality::Cumulative,
             ),
             hist_metric(
                 "http.server.upstream.connect.duration",
@@ -285,8 +302,9 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                 "ms",
                 up_conn,
                 dur_bounds.clone(),
+                start,
                 now,
-                AggregationTemporality::Delta,
+                AggregationTemporality::Cumulative,
             ),
             hist_metric(
                 "http.server.upstream.bytes.received",
@@ -294,8 +312,9 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                 "By",
                 up_bytes,
                 byte_bounds.clone(),
+                start,
                 now,
-                AggregationTemporality::Delta,
+                AggregationTemporality::Cumulative,
             ),
             hist_metric(
                 "http.server.upstream.bytes.sent",
@@ -303,8 +322,9 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                 "By",
                 up_bytes_sent,
                 byte_bounds.clone(),
+                start,
                 now,
-                AggregationTemporality::Delta,
+                AggregationTemporality::Cumulative,
             ),
         ]
     }
@@ -332,6 +352,7 @@ fn hist_metric<const N: usize>(
     unit: &str,
     data: ([u64; N], u64, u64),
     bounds: std::vec::Vec<f64>,
+    start_time_ns: u64,
     time_ns: u64,
     temporality: crate::data_model::AggregationTemporality,
 ) -> crate::data_model::Metric {
@@ -344,7 +365,7 @@ fn hist_metric<const N: usize>(
             aggregation_temporality: temporality,
             data_points: std::vec![HistogramDataPoint {
                 attributes: std::vec![],
-                start_time_unix_nano: 0,
+                start_time_unix_nano: start_time_ns,
                 time_unix_nano: time_ns,
                 count: data.2,
                 sum: data.1 as f64,
