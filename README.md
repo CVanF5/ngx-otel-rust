@@ -14,43 +14,52 @@ on the F5 AVR nginx module (`avr-module/`) with OTel-semconv names/units.
 
 ## Status
 
-**Phase 1.1 (OTLP/HTTP metrics) is in active development; pre-PR.**
+**Phases 1.1–1.3 complete (OTLP/HTTP + OTLP/gRPC metrics from a dedicated
+exporter process); pre-upstream-PR.**  Phase 2 (logs) is in design.
 
 What works today:
 
 - Per-worker shm counter slots written from a Log-phase handler — no
-  allocations, no locks, no syscalls on the request path.
-- Worker-0-only async export loop driving hyper-on-`ngx-rust` HTTP/1
-  (no Tokio runtime).
+  allocations, no locks, no syscalls on the request path.  The handler's
+  only branch is a single `Relaxed` atomic load on the control-shm flags
+  word (a Phase 5 dynamic-reconfig placeholder; the value is discarded
+  today).
+- A dedicated `nginx: otel exporter` child process owns the entire cold
+  path — the async export loop driving hyper-on-`ngx-rust` (no Tokio
+  runtime).  Workers hold zero collector sockets; they bump shm counters
+  and defer.
+- Two production export transports, selected by `otel_metric_protocol`:
+  **OTLP/HTTP** over HTTP/1.1 (`otlp_http`, the default) and **OTLP/gRPC**
+  unary over HTTP/2 (`otlp_grpc`).
 - Stub-status equivalents (`nginx.connections.*`, `nginx.requests.total`)
   plus a histogram set inspired by F5 AVR
   (`http.server.request.duration`, request/response body size, upstream
-  timings, upstream byte counts).
+  timings, upstream byte counts).  Full model in
+  [`METRIC_MODEL.md`](METRIC_MODEL.md).
 - OTLP protobuf encoding with vendored proto files; collector receives
-  the expected Sum / Gauge / Histogram shapes.
-- Graceful drain on `nginx -s quit` via async + `exit_process`
-  synchronous flush (closes the cancelable-timer race during sleep).
-  Supports `http://` and `unix:` endpoints; `https://` deferred to
-  Phase 1.2.
-- SIGHUP reload safety (`old_config()` accessor, clean worker-generation
-  transition, endpoint-change supported).
-- Zero-cost-when-disabled invariant verified statistically:
-  `< 0.5%` delta on median latency / p99 / throughput vs a no-module
-  baseline at ~56,500 req/s on a dev laptop.  Production-shape numbers
-  pending Step 12 on representative hardware.
+  the expected Sum / Gauge / Histogram shapes with correct Cumulative
+  temporality.
+- Graceful drain on `nginx -s quit`, a crash-respawn supervisor for the
+  exporter process, and SIGHUP reload safety (`old_config()` accessor,
+  clean worker-generation transition; endpoint and protocol changes
+  supported).  A control-shm heartbeat tracks exporter liveness.
+- `http://` and `unix:` endpoints.  `https://` / TLS is not yet
+  implemented (see [Limitations](#limitations)) and is deferred to a
+  later phase.
+- Zero-cost-when-disabled invariant verified statistically: ≤ 0.01%
+  throughput delta (module-loaded-but-disabled vs no-module baseline)
+  on isolated AWS EPYC and macOS arm64 hosts.  See
+  `tests/bench/RESULTS.md`.
 
-What's pending in Phase 1.1:
+Validated by a **24-hour soak** on a dedicated AWS EPYC 9R14 instance
+(2026-05-29 → 30): 45.2 billion requests at ~523k req/s sustained
+(p99 200µs), bounded memory growth, and a live collector-downtime
+injection in which nginx kept serving (HTTP 200 throughout), the
+`ngx_otel.send_failures` / `ngx_otel.dropped_records` self-metrics
+accounted every drop, and export recovered cleanly on collector restart.
 
-- Step 12 stress + acceptance test suite — 10-minute sustained load
-  with bounded memory growth, collector-downtime injection via
-  `docker stop` (drops accounted via `ngx_otel.dropped_records`
-  self-metric), a 24-hour soak harness, and a sweep of the Phase 1.1
-  acceptance criteria.  Tracked in F5-internal development notes;
-  not on this repo's roadmap until after Phase B (Test::Nginx
-  migration) lands.
-
-Phase 1.2 onward (logs, traces, NGINX Plus, OTAP) is out of scope here.
-See the Confluence proposal (link below) for the full phase plan.
+Phase 2 onward (logs, traces, NGINX Plus, OTAP) is out of scope for this
+README.  See the Confluence proposal (link below) for the full phase plan.
 
 ## Architecture
 
@@ -60,7 +69,7 @@ flowchart LR
 
     subgraph workers["NGINX worker processes"]
         direction TB
-        W0["Worker 0<br/>(designated)"]
+        W0[Worker 0]
         W1[Worker 1]
         WN[Worker N]
     end
@@ -72,11 +81,12 @@ flowchart LR
         SN[("Slot N")]
     end
 
-    subgraph loop["Async export loop on Worker 0<br/>(every otel_metric_interval)"]
+    subgraph exporter["nginx: otel exporter process<br/>(cold path; every otel_metric_interval)"]
         direction LR
-        Src["MetricSource"] --> Enc["Encoder<br/>OTLP protobuf"] --> Tx["Transport<br/>hyper on NgxConnIo"]
+        Src["MetricSource"] --> Enc["Encoder<br/>OTLP protobuf"] --> Tx["Transport<br/>HTTP/1 or gRPC/h2"]
     end
 
+    Ctl[("Control shm<br/>flags + heartbeat")]
     NS[("ngx_stat_*<br/>atomics")]
     Coll[("OTel<br/>Collector")]
 
@@ -88,28 +98,36 @@ flowchart LR
     W1 -->|"Log-phase<br/>atomic +="| S1
     WN -->|"Log-phase<br/>atomic +="| SN
 
+    W0 -.flags load.-> Ctl
+    Ctl -.heartbeat.-> exporter
+
     S0 -.read.-> Src
     S1 -.read.-> Src
     SN -.read.-> Src
     NS -.read.-> Src
 
-    Tx -->|"HTTP/1.1 POST<br/>/v1/metrics"| Coll
+    Tx -->|"OTLP/HTTP POST /v1/metrics<br/>or OTLP/gRPC Export"| Coll
 ```
 
 Per-worker shm counter slots for instrumented metrics; atomic increments
 from a Log-phase handler write to the worker's own slot only (no
-cross-worker cache traffic).  Worker 0 runs the only export loop —
-async, driven by `ngx-rust`'s single-threaded executor — which reads
-slots plus NGINX core's `ngx_stat_*` atomics, encodes via OTLP protobuf,
-and sends via [hyper] 1.x driven on a `NgxConnIo` adapter that wraps
-`ngx_peer_connection_t` and uses NGINX's event handlers for I/O
-readiness wakeup (no spinning, no blocking).  Three trait boundaries —
+cross-worker cache traffic).  A **dedicated `nginx: otel exporter` child
+process** owns the entire cold path — an async export loop driven by
+`ngx-rust`'s single-threaded executor that reads the worker slots plus
+NGINX core's `ngx_stat_*` atomics, encodes via OTLP protobuf, and sends
+either over [hyper] 1.x HTTP/1 or over OTLP/gRPC on HTTP/2 — both driven
+on a `NgxConnIo` adapter that wraps `ngx_peer_connection_t` and uses
+NGINX's event handlers for I/O readiness wakeup (no spinning, no
+blocking).  Workers never open a collector connection.  A small control
+shm carries a liveness heartbeat plus a flags word the workers load on
+the request path (one `Relaxed` atomic read — the sole hot-path branch,
+reserved for Phase 5 dynamic reconfiguration).  Three trait boundaries —
 `MetricSource`, `Encoder`, `Transport` — keep an eventual OTAP /
 columnar migration a swap, not a rewrite.
 
 When `otel_exporter` is not configured the Log-phase handler is not
-registered and the export task is not spawned — no work runs on the
-request path, no background task runs in any worker.  This is the
+registered and the exporter process is not spawned — no work runs on the
+request path, no background process runs.  This is the
 "zero-cost-when-disabled" invariant the module's upstream-acceptance
 case rests on.
 
@@ -122,7 +140,8 @@ case rests on.
 - NGINX sources, 1.22.0 or later (1.26.x recommended).
 - Regular NGINX build dependencies: C compiler, `make`, PCRE2, Zlib.
 - System-wide installation of OpenSSL 1.1.1 or later.
-- Rust toolchain (1.81.0 or later).
+- Rust toolchain (1.85.0 or later — the `ngx-rust` dependency is
+  edition 2024 / MSRV 1.85).
 - `pkg-config` or `pkgconf`.
 - `libclang` for rust-bindgen (used by `nginx-sys` and `openssl-sys` to
   parse C headers at build time).
@@ -253,10 +272,11 @@ load_module modules/ngx_http_otel_module.so;
 
 http {
     otel_exporter {
-        endpoint http://127.0.0.1:4318/v1/metrics;
-        # endpoint unix:/run/otel-collector.sock;     # also supported
-        # trusted_certificate /etc/ssl/ca.pem;        # Phase 1.2 (TLS)
+        endpoint http://127.0.0.1:4317;              # OTLP/gRPC collector
+        # endpoint http://127.0.0.1:4318/v1/metrics; # OTLP/HTTP (the default protocol)
+        # endpoint unix:/run/otel-collector.sock;    # Unix sockets also supported
     }
+    otel_metric_protocol otlp_grpc;         # otlp_http (default) | otlp_grpc
     otel_service_name my-nginx;
     otel_resource_attr deployment.environment production;
     otel_exporter_header authorization "Bearer ...";
@@ -276,10 +296,13 @@ http {
 Notes:
 
 - The module imposes **zero per-request cost when `otel_exporter` is
-  not configured**.  Verified statistically via the Step 11 benchmark
+  not configured**.  Verified statistically via the zero-cost benchmark
   harness (see `tests/bench/RESULTS.md`).
-- The export loop runs only on Worker 0; other workers serve traffic
-  and bump shm counters but spawn no background work.
+- `otel_metric_protocol` selects the export wire protocol: `otlp_http`
+  (default, OTLP/HTTP over HTTP/1.1) or `otlp_grpc` (OTLP/gRPC unary over
+  HTTP/2).  The example above uses gRPC; omit the directive for HTTP.
+- All export work runs in the dedicated `nginx: otel exporter` process;
+  workers serve traffic and bump shm counters only.
 - Counters reset on `nginx -s reload`; downstream collectors handle
   continuity via OTLP's `start_time_unix_nano`.
 
@@ -287,27 +310,36 @@ Notes:
 
 ```sh
 make check       # rustfmt + clippy (zero warnings required)
-make unittest    # cargo test --lib (currently 14 tests)
-make test        # bash integration scripts: run.sh, run_reload.sh, run_endpoint_change.sh
+make unittest    # cargo test --lib (currently 22 tests)
+make test        # bash integration scripts (see below)
 make all         # build + check + test
 ```
 
-`make test` requires a running OTel collector on `127.0.0.1:4318`.
-The integration scripts assert against metrics that arrive at the
-collector, so any OTLP/HTTP receiver will work.  In development the
-project uses an `otel/opentelemetry-collector-contrib:0.152.0` Docker
-container with HTTP receiver + debug + file exporters.
+`make test` requires a running OTel collector on `127.0.0.1:4318`
+(OTLP/HTTP) and `127.0.0.1:4317` (OTLP/gRPC).  The integration scripts
+assert against metrics that arrive at the collector, so any OTLP
+receiver will work.  In development the project uses an
+`otel/opentelemetry-collector-contrib:0.152.0` Docker container with
+HTTP + gRPC receivers and debug + file exporters.
 
 Direct bash invocation (for debugging a specific test):
 
 ```sh
 export NGINX_SOURCE_DIR=/path/to/nginx \
        NGINX_BUILD_DIR=/path/to/nginx/objs
-bash tests/integration/run.sh                  # Step 9: metrics arrive end-to-end
-bash tests/integration/run_reload.sh           # Step 10: SIGHUP reload + counter-reset
-bash tests/integration/run_endpoint_change.sh  # Step 10: endpoint change across reload
-bash tests/bench/zero_cost.sh                  # Step 11: zero-cost-when-disabled (~10 min)
-bash tests/bench/analyse.sh                    # Re-derive Step 11 tolerance check from JSON
+bash tests/integration/run.sh                        # metrics arrive end-to-end (OTLP/HTTP)
+bash tests/integration/run_reload.sh                 # SIGHUP reload + counter-reset
+bash tests/integration/run_endpoint_change.sh        # endpoint change across reload
+bash tests/integration/run_grpc_smoke.sh             # unary gRPC viability
+bash tests/integration/run_grpc_bidi_smoke.sh        # bidi gRPC viability
+bash tests/integration/run_grpc_bidi_overload.sh     # bidi backpressure
+bash tests/integration/run_grpc_export.sh            # production OTLP/gRPC export path
+bash tests/integration/run_exporter_lifecycle.sh     # exporter process spawn/lifecycle
+bash tests/integration/run_exporter_crash_respawn.sh # exporter crash + respawn + dropped_records
+bash tests/integration/run_exporter_reload_overlap.sh # SIGHUP exporter overlap
+bash tests/integration/run_exporter_heartbeat.sh     # control-shm heartbeat (needs test-support)
+bash tests/bench/zero_cost.sh                        # zero-cost-when-disabled (~10 min)
+bash tests/bench/analyse.sh                          # re-derive tolerance check from JSON
 ```
 
 The bash integration scripts are due to be ported to Perl
@@ -354,34 +386,40 @@ ngx-otel-rust/
 │   ├── data_model/        # OTel-abstract types (Histogram / Sum / Gauge variants)
 │   ├── metric_source/     # MetricSource trait + StubStatusSource + InstrumentedSource
 │   ├── encoder/           # Encoder trait + OTLP/HTTP protobuf encoder
-│   ├── transport/         # Transport trait + hyper_http.rs (async) + sync_http.rs
-│   │                      # (synchronous exit_process flush)
-│   └── export/            # designated-worker export loop, graceful drain, retry buffer,
+│   ├── transport/         # Transport trait; hyper_http.rs (OTLP/HTTP async),
+│   │                      # sync_http.rs (exit_process flush), grpc/ (OTLP/gRPC unary
+│   │                      # production transport + bidi smoke harnesses on a
+│   │                      # runtime-less h2 executor)
+│   ├── exporter/          # dedicated "nginx: otel exporter" process: control_shm
+│   │                      # (flags + heartbeat), worker->exporter channel, supervisor
+│   └── export/            # export loop, graceful drain, retry buffer,
 │                          # SelfMetricsSource (dropped_records, send_failures, export_interval)
 ├── tests/
 │   ├── transport_integration.rs  # async transport integration test (test-support feature)
 │   ├── transport_errors.rs       # error-path coverage
-│   ├── integration/              # end-to-end bash scripts (Step 9 + 10; pending Test::Nginx port)
+│   ├── integration/              # end-to-end bash scripts (pending Test::Nginx port)
 │   │   ├── nginx.conf
-│   │   ├── run.sh                # Step 9 baseline: metrics arrive end-to-end
-│   │   ├── run_reload.sh         # Step 10: SIGHUP reload, exit_process flush, counter-reset
-│   │   └── run_endpoint_change.sh # Step 10: endpoint swap across reload
+│   │   ├── run.sh                # baseline: metrics arrive end-to-end
+│   │   ├── run_reload.sh         # SIGHUP reload, exit_process flush, counter-reset
+│   │   ├── run_endpoint_change.sh # endpoint swap across reload
+│   │   ├── run_grpc_*.sh         # gRPC smoke / bidi / overload + production export
+│   │   └── run_exporter_*.sh     # exporter lifecycle, crash-respawn, reload-overlap, heartbeat
 │   └── bench/
 │       ├── nginx_c1.conf         # no module loaded
 │       ├── nginx_c2.conf         # module loaded, no exporter (zero-cost case)
 │       ├── nginx_c3.conf         # module loaded + exporter configured
-│       ├── zero_cost.sh          # Step 11: wrk benchmark harness, randomised iteration order
+│       ├── zero_cost.sh          # zero-cost wrk benchmark harness, randomised iteration order
 │       ├── analyse.sh            # tolerance assertion against committed JSON results
-│       └── RESULTS.md            # Step 11 results document (laptop sanity check)
+│       └── RESULTS.md            # zero-cost + soak results (isolated AWS EPYC + macOS arm64)
 └── ...
 ```
 
 ## Limitations
 
-- **HTTPS endpoints fall back to async drain only** when the
-  `exit_process` synchronous flush would otherwise fire.  TLS for the
-  sync path is deferred to Phase 1.2 where it shares implementation
-  with the TLS work gRPC requires.
+- **HTTPS / TLS is not yet implemented.**  `https://` endpoints are
+  rejected at config parse (`http://` and `unix:` only); both the
+  OTLP/HTTP and OTLP/gRPC transports run over plaintext (h2c for gRPC).
+  TLS is deferred to a later phase.
 - **Hot path is single-process-per-worker**; per-histogram attribute
   populations are reserved for a later iteration that needs
   multi-dimensional shm.
