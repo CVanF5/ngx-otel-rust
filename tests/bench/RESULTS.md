@@ -350,3 +350,116 @@ error of the mean (variance / √N) is sub-1% on both — small enough that the
   EPYC `m7a.2xlarge` or similar) over a VM on the dev box.
 
 **Sub-item 2 gate: PASS — both architectures, methodology-corrected. Phase 1.3.3 closes; no follow-up loop required.**
+
+---
+
+## Step 12 — 24-hour production soak (HTTP + gRPC)
+
+Production characterisation on a dedicated AWS EPYC 9R14 instance
+(`m7a.2xlarge`, x86_64, Debian 13, 16 vCPU / 30 GiB) — the isolated-host
+methodology mandated above. `objs-release/nginx` + the `target/release`
+cdylib, `worker_processes 4`, trivial `return 200` location, `access_log
+off`, `otel_metric_interval 10s`; OTel collector (`otelcol-contrib`, OTLP
+gRPC :4317 + HTTP :4318) co-resident. 24h `wrk -t4 -c100`. Each soak injected
+a collector-downtime event at +12h (Action 4): SIGKILL the collector, 60s
+down, restart — asserting nginx keeps serving and the exporter recovers with
+all drops accounted.
+
+| Run | Date | Protocol | Requests | Throughput | p50 / p99 | Exporter RSS | wrk exit |
+|---|---|---|---|---|---|---|---|
+| HTTP | 2026-05-29→30 | OTLP/HTTP | 45.24 B | 523,624 req/s | 90µs / 200µs | flat ~3.9 MB | 0 |
+| gRPC | 2026-05-30→31 | OTLP/gRPC (h2c) | 44.78 B | 518,279 req/s | 92µs / 202µs | flat ~3.9 MB | 0 |
+
+Both runs: bounded memory (exporter RSS flat across 24h after early warmup;
+nginx master/workers flat — no leak), loadavg steady ~7.9, clean graceful
+drain on `nginx -s quit` (`graceful drain complete`, final batch flushed).
+gRPC throughput is ~1% below HTTP, within run-to-run variance — the transport
+difference is entirely cold-path in the exporter process; workers only bump
+shm regardless of protocol.
+
+### Action 4 — collector-downtime recovery
+
+| Run | Drops during 60s outage | send_failures | Recovery |
+|---|---|---|---|
+| HTTP | `dropped_records` 57 | 13 | clean — export resumed on restart |
+| gRPC | `dropped_records` 38 | 11 | clean — **retry buffer drained on reconnect**, then resumed |
+
+The gRPC case additionally validates the h2 long-lived-connection path: on
+collector SIGKILL the in-flight RPC failed distinctly (`Service was not
+ready: channel closed`), reconnect attempts during downtime returned
+`Connection refused`, the bounded retry buffer shed 19 pts/cycle (all
+accounted in `ngx_otel.dropped_records`), and on restart the exporter
+established a **fresh** h2 connection (new ephemeral local port) and flushed
+the queued retry batches before resuming steady export — full recovery within
+one 10s cycle. `bidi_backpressure_drops` stayed 0 throughout.
+
+**Step 12 PASS for both transports.**
+
+> **`access_log off` here is a benchmark/soak measurement choice** (keeps log
+> I/O out of the measured request path), **not a product default**. Phase 2
+> (logs over OTLP) consumes nginx access logs as its telemetry source and
+> will require `access_log` *enabled* — do not propagate this setting into
+> Phase 2 configs.
+
+---
+
+## Metrics-correctness loop — dedicated-cloud zero-cost gate (N=50)
+
+Closes the one outstanding item of the metrics-correctness loop: its Linux
+zero-cost gate on dedicated cloud hardware (per the methodology note above,
+the cloud run — not a dev-box VM — is the real gate). The only hot-path
+change in that loop was the `ngx_timeofday()` duration fix (`9e2138e`) — a
+cached deref + integer math.
+
+Same EPYC `m7a.2xlarge` host, N=50, `access_log off` in all three bench
+configs (`nginx_c{1,2,3}.conf`). Run file: `run-2026-05-31T19-31-59.json`.
+
+| Config | median | p99 | req/s |
+|---|---|---|---|
+| C1 (no module) | 0.091 ms | 0.200 ms | 524,483 |
+| C2 (loaded, disabled) | 0.091 ms | 0.200 ms | 523,198 |
+| C3 (loaded + exporter) | 0.091 ms | 0.201 ms | 524,375 |
+
+| Check | Result |
+|---|---|
+| **C2 vs C1 — zero-cost gate** | median **0.00%**, p99 **0.00%**, RPS **0.25%** — **PASS** |
+| C3 vs C1 — operational (informational) | median +0.00%, p99 +0.50%, RPS −0.02% |
+| C1 own-variance — methodology-fitness | median 3.30%, RPS 3.06% — over the 3% bar (artifact, see below) |
+
+**The zero-cost gate passes flat** — C2 is indistinguishable from C1, an
+order of magnitude below the host's own jitter.
+
+### The `access_log off` fix and the residual own-variance "FAIL"
+
+A first N=50 run (`run-2026-05-30T09-32-51.json`) passed the C2-vs-C1 gate
+(0.00–0.40%) but failed C1 own-variance at 3.83%/3.65%. Root cause: the bench
+configs left `access_log` on, so each 30s run wrote ~0.7–1.5 GB of access.log
+to the tmpfs sandbox — injecting memory-bandwidth/cache jitter into sub-100µs
+latency measurements. Disabling `access_log` cut median latency 0.209 → 0.091
+ms and raised throughput 465k → 524k (the log I/O was a larger cost than the
+module itself) — that is the run tabled above.
+
+The residual own-variance FAIL (3.30% / 3.06%) is a **metric artifact, not
+machine instability**, and re-running will not lower it:
+
+- `analyse.sh` computes variance as **peak-to-peak range ÷ median**
+  (`(max − min) / median`, `analyse.sh:155`) — maximally sensitive to a
+  single outlier and to timer quantization.
+- **Latency 3.30% is µs-quantization.** At a 91µs median, wrk reports whole
+  µs, so all 50 C1 medians land on 89/90/91/92µs; 89→92 is mechanically 3.3%
+  (±1.5µs of resolution), not jitter.
+- **Throughput 3.06% is one fast outlier.** Dropping the single fastest of 50
+  C1 runs (534,709 vs next 529,962 req/s) gives 2.15% → PASS; the p10–p90
+  band is just 1.4% (520,678–528,190 req/s).
+
+As with the Phase 1.3.3 methodology-corrected re-runs, the own-variance check
+is a **methodology-fitness flag, not the gate**. The gate (C2 vs C1) passes at
+0.00–0.25%, far below the noise.
+
+**Future tooling note:** `analyse.sh`'s stability check should use a robust
+dispersion measure (CV or IQR) and/or a µs floor instead of peak-to-peak
+range — at sub-100µs medians the range metric is dominated by quantization
+and single outliers. Tracked as a bench-tooling refinement, independent of
+this gate.
+
+**Metrics-correctness loop: zero-cost gate PASS (dedicated cloud, N=50). Loop closed.**
