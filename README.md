@@ -282,7 +282,7 @@ http {
     otel_exporter_header authorization "Bearer ...";
     otel_metric_interval 10s;
     otel_metric_zone otel_metrics 1m;
-    otel_metric_status_code_class on;       # default; emits http.response.status_code.class
+    otel_metric_status_code_class on;       # accepted (default on); class emission deferred to Phase 2 — see Limitations
 
     # Opt-in high-cardinality attributes (off by default for series safety):
     # otel_metric_high_cardinality_attr url.path;
@@ -423,6 +423,12 @@ ngx-otel-rust/
 - **Hot path is single-process-per-worker**; per-histogram attribute
   populations are reserved for a later iteration that needs
   multi-dimensional shm.
+- **`otel_metric_status_code_class` is accepted but not yet emitting.**  The
+  directive parses and defaults on, and the hot path buckets responses into
+  1xx–5xx classes, but `http.response.status_code.class` is not emitted yet.
+  Deferred to Phase 2 (the `fix3b` plan: emit it as a bounded, semconv-aligned
+  attribute on the duration histogram once per-data-point attributes +
+  multi-dimensional shm land).
 - **Tokio appears in `Cargo.lock`** transitively via hyper 1.x.  It is
   present at the type level but never instantiated at runtime — the
   module's "no Tokio" rule reads as "no Tokio runtime use".  See the
