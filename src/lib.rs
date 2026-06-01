@@ -49,7 +49,7 @@ use nginx_sys::{
     NGX_HTTP_MODULE,
 };
 use ngx::core::Status;
-use ngx::http::{HttpModule, HttpModuleMainConf, add_phase_handler};
+use ngx::http::{add_phase_handler, HttpModule, HttpModuleMainConf};
 // Pool is only needed for the test-support gRPC smoke harnesses in init_process.
 #[cfg(any(test, feature = "test-support"))]
 use ngx::core::Pool;
@@ -57,8 +57,8 @@ use ngx::core::Pool;
 mod config;
 pub mod data_model;
 pub mod encoder;
-pub(crate) mod exporter;
 mod export;
+pub(crate) mod exporter;
 mod metric_source;
 mod shm;
 pub mod transport;
@@ -234,12 +234,10 @@ impl HttpModule for HttpOtelModule {
         }
 
         // Step 6: register log-phase handler only when exporter is configured.
-        if amcf.is_configured() {
-            if add_phase_handler::<metric_source::instrumented::LogPhaseHandler>(cf_ref)
-                .is_err()
-            {
-                return Status::NGX_ERROR.into();
-            }
+        if amcf.is_configured()
+            && add_phase_handler::<metric_source::instrumented::LogPhaseHandler>(cf_ref).is_err()
+        {
+            return Status::NGX_ERROR.into();
         }
 
         Status::NGX_OK.into()
@@ -323,7 +321,8 @@ extern "C" fn ngx_otel_init_process(_cycle: *mut ngx_cycle_t) -> ngx_int_t {
                             let result = crate::transport::grpc::smoke::fire_one_grpc_export(
                                 &endpoint_owned,
                                 log_nn,
-                            ).await;
+                            )
+                            .await;
                             let log_ptr = log_nn.as_ptr();
                             match result {
                                 Ok(()) => {
@@ -400,7 +399,8 @@ extern "C" fn ngx_otel_init_process(_cycle: *mut ngx_cycle_t) -> ngx_int_t {
                             let result = crate::transport::grpc::smoke::fire_one_bidi_stream(
                                 &endpoint_owned,
                                 log_nn,
-                            ).await;
+                            )
+                            .await;
                             let log_ptr = log_nn.as_ptr();
                             match result {
                                 Ok(()) => {
@@ -475,7 +475,8 @@ extern "C" fn ngx_otel_init_process(_cycle: *mut ngx_cycle_t) -> ngx_int_t {
                             let result = crate::transport::grpc::smoke::fire_bidi_overload(
                                 &endpoint_owned,
                                 log_nn,
-                            ).await;
+                            )
+                            .await;
                             let log_ptr = log_nn.as_ptr();
                             match result {
                                 Ok(()) => {
@@ -665,7 +666,8 @@ mod nginx_test_stubs {
 
     // nginx process-type globals accessed by ngx_otel_init_process.
     #[no_mangle]
-    pub static mut ngx_process: nginx_sys::ngx_uint_t = nginx_sys::NGX_PROCESS_SINGLE as nginx_sys::ngx_uint_t;
+    pub static mut ngx_process: nginx_sys::ngx_uint_t =
+        nginx_sys::NGX_PROCESS_SINGLE as nginx_sys::ngx_uint_t;
 
     // nginx shutdown flags accessed by the export loop and the channel handler.
     #[no_mangle]
@@ -712,9 +714,7 @@ mod nginx_test_stubs {
     // close_sibling_channels iterates 0..ngx_last_process (=0), so it never
     // touches this array in tests.
     #[no_mangle]
-    pub static mut ngx_processes: [nginx_sys::ngx_process_t; 1024] = {
-        unsafe { core::mem::zeroed() }
-    };
+    pub static mut ngx_processes: [nginx_sys::ngx_process_t; 1024] = unsafe { core::mem::zeroed() };
 
     // nginx global cycle pointer (used by ngx::log::ngx_cycle_log).
     #[no_mangle]
@@ -729,7 +729,7 @@ mod nginx_test_stubs {
         ($name:ident) => {
             #[no_mangle]
             pub static mut $name: *mut nginx_sys::ngx_atomic_t =
-                unsafe { core::ptr::addr_of_mut!(STUB_STAT_ZERO) };
+                core::ptr::addr_of_mut!(STUB_STAT_ZERO);
         };
     }
 
@@ -747,9 +747,7 @@ mod nginx_test_stubs {
 
     // nginx array API used by register_log_handler.
     #[no_mangle]
-    pub unsafe extern "C" fn ngx_array_push(
-        _a: *mut nginx_sys::ngx_array_t,
-    ) -> *mut c_void {
+    pub unsafe extern "C" fn ngx_array_push(_a: *mut nginx_sys::ngx_array_t) -> *mut c_void {
         core::ptr::null_mut()
     }
 
@@ -827,12 +825,11 @@ mod nginx_test_stubs {
 
     // nginx event timer rbtree (global static used by ngx_add_timer / ngx_del_timer).
     #[no_mangle]
-    pub static mut ngx_event_timer_rbtree: nginx_sys::ngx_rbtree_t =
-        nginx_sys::ngx_rbtree_t {
-            root: core::ptr::null_mut(),
-            sentinel: core::ptr::null_mut(),
-            insert: None,
-        };
+    pub static mut ngx_event_timer_rbtree: nginx_sys::ngx_rbtree_t = nginx_sys::ngx_rbtree_t {
+        root: core::ptr::null_mut(),
+        sentinel: core::ptr::null_mut(),
+        insert: None,
+    };
 
     // nginx http module descriptor (used by ngx core internally).
     #[no_mangle]
@@ -878,10 +875,7 @@ mod nginx_test_stubs {
     // nginx posted-events queue (used by event loop).
     #[no_mangle]
     pub static mut ngx_posted_next_events: nginx_sys::ngx_queue_t =
-        nginx_sys::ngx_queue_t {
-            prev: core::ptr::null_mut(),
-            next: core::ptr::null_mut(),
-        };
+        nginx_sys::ngx_queue_t { prev: core::ptr::null_mut(), next: core::ptr::null_mut() };
 
     // nginx pool cleanup API (used by ngx::core::Pool).
     #[no_mangle]
@@ -969,16 +963,10 @@ mod nginx_test_stubs {
     }
 
     #[no_mangle]
-    pub unsafe extern "C" fn ngx_setproctitle(
-        _title: *mut core::ffi::c_char,
-    ) {
-    }
+    pub unsafe extern "C" fn ngx_setproctitle(_title: *mut core::ffi::c_char) {}
 
     #[no_mangle]
-    pub unsafe extern "C" fn ngx_process_events_and_timers(
-        _cycle: *mut nginx_sys::ngx_cycle_t,
-    ) {
-    }
+    pub unsafe extern "C" fn ngx_process_events_and_timers(_cycle: *mut nginx_sys::ngx_cycle_t) {}
 
     #[no_mangle]
     pub unsafe extern "C" fn ngx_reopen_files(
@@ -988,10 +976,7 @@ mod nginx_test_stubs {
     }
 
     #[no_mangle]
-    pub unsafe extern "C" fn ngx_close_listening_sockets(
-        _cycle: *mut nginx_sys::ngx_cycle_t,
-    ) {
-    }
+    pub unsafe extern "C" fn ngx_close_listening_sockets(_cycle: *mut nginx_sys::ngx_cycle_t) {}
 
     #[no_mangle]
     pub unsafe extern "C" fn ngx_close_channel(

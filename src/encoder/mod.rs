@@ -20,30 +20,28 @@ use crate::data_model::{AggregationTemporality, AnyValue, Batch, MetricData, Num
 /// resolve correctly.  `pub(crate)` so other in-crate modules (e.g. the
 /// gRPC smoke harness in `transport::grpc::smoke`) can use the same prost
 /// types without duplicating the `include!` hierarchy.
+///
+/// Lints are broadly allowed on this module: it is prost/tonic-generated
+/// code, regenerated on every build, with type naming and doc formatting
+/// fixed by the OpenTelemetry `.proto` spec.  It is deliberately excluded
+/// from this crate's lint gate (the one outer `#[allow]` covers all nested
+/// `include!`s, since lint levels are lexically scoped).
+#[allow(clippy::all, clippy::pedantic, clippy::nursery, dead_code, rustdoc::all)]
 pub(crate) mod opentelemetry {
     pub mod proto {
         pub mod common {
             pub mod v1 {
-                include!(concat!(
-                    env!("OUT_DIR"),
-                    "/opentelemetry.proto.common.v1.rs"
-                ));
+                include!(concat!(env!("OUT_DIR"), "/opentelemetry.proto.common.v1.rs"));
             }
         }
         pub mod resource {
             pub mod v1 {
-                include!(concat!(
-                    env!("OUT_DIR"),
-                    "/opentelemetry.proto.resource.v1.rs"
-                ));
+                include!(concat!(env!("OUT_DIR"), "/opentelemetry.proto.resource.v1.rs"));
             }
         }
         pub mod metrics {
             pub mod v1 {
-                include!(concat!(
-                    env!("OUT_DIR"),
-                    "/opentelemetry.proto.metrics.v1.rs"
-                ));
+                include!(concat!(env!("OUT_DIR"), "/opentelemetry.proto.metrics.v1.rs"));
             }
         }
         pub mod collector {
@@ -117,10 +115,7 @@ impl Encoder for OtlpHttpEncoder {
 // ── Conversion helpers ───────────────────────────────────────────────────────
 
 fn convert_kv(kv: &crate::data_model::KeyValue) -> common::KeyValue {
-    common::KeyValue {
-        key: kv.key.clone(),
-        value: Some(convert_any_value(&kv.value)),
-    }
+    common::KeyValue { key: kv.key.clone(), value: Some(convert_any_value(&kv.value)) }
 }
 
 fn convert_any_value(v: &AnyValue) -> common::AnyValue {
@@ -209,13 +204,13 @@ fn convert_hdp(dp: &crate::data_model::HistogramDataPoint) -> metrics_proto::His
 
 #[cfg(test)]
 mod tests {
+    use super::collector::ExportMetricsServiceRequest;
+    use super::metrics_proto;
     use super::*;
     use crate::data_model::{
         AggregationTemporality, AnyValue, Batch, HistogramData, HistogramDataPoint, KeyValue,
         Metric, MetricData, Resource, Scope,
     };
-    use super::collector::ExportMetricsServiceRequest;
-    use super::metrics_proto;
 
     fn make_batch() -> Batch {
         Batch {
@@ -225,10 +220,7 @@ mod tests {
                     value: AnyValue::String("test-nginx".into()),
                 }],
             },
-            scope: Scope {
-                name: "ngx-otel-rust".into(),
-                version: "0.1.0".into(),
-            },
+            scope: Scope { name: "ngx-otel-rust".into(), version: "0.1.0".into() },
             metrics: std::vec![Metric {
                 name: "http.server.request.duration".into(),
                 description: "HTTP server request duration".into(),

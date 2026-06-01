@@ -92,7 +92,7 @@ where
     /// Sends the request via the underlying `SendRequest` handle.
     fn call(&mut self, req: http::Request<B>) -> Self::Future {
         let fut = self.inner.send_request(req);
-        Box::pin(async move { fut.await })
+        Box::pin(fut)
     }
 }
 
@@ -145,8 +145,9 @@ mod tests {
             SendRequestService<B>: tonic::client::GrpcService<B>,
         {
             // If this function body compiles the type constraints are satisfied.
-            let _type_check: fn(SendRequestService<B>) -> tonic::client::Grpc<SendRequestService<B>> =
-                |svc| tonic::client::Grpc::new(svc);
+            let _type_check: fn(
+                SendRequestService<B>,
+            ) -> tonic::client::Grpc<SendRequestService<B>> = |svc| tonic::client::Grpc::new(svc);
         }
 
         grpc_new_accepts_shim::<Body>();

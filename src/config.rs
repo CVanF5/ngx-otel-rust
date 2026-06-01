@@ -213,6 +213,13 @@ impl MainConfig {
     }
 
     /// Whether HTTP status code class bucketing is enabled (default: true).
+    ///
+    /// Currently unused: the status-class breakdown is bucketed in the hot
+    /// path but not yet emitted (see `TODO(fix3b)` in
+    /// `metric_source/instrumented.rs`). Emission is deferred to Phase 2,
+    /// when per-data-point attributes + multi-dimensional shm land — at which
+    /// point this accessor gates the emission.
+    #[allow(dead_code)]
     pub fn status_code_class_enabled(&self) -> bool {
         self.status_code_class != 0 // UNSET_FLAG or 1 → true; explicit 0 → false
     }
@@ -291,9 +298,8 @@ impl MainConfig {
 
         // Validate endpoint scheme.
         let ep = self.exporter.endpoint.as_bytes();
-        let valid_scheme = ep.starts_with(b"unix:")
-            || ep.starts_with(b"http://")
-            || ep.starts_with(b"https://");
+        let valid_scheme =
+            ep.starts_with(b"unix:") || ep.starts_with(b"http://") || ep.starts_with(b"https://");
 
         if !valid_scheme {
             unsafe {
@@ -329,11 +335,10 @@ impl MainConfig {
         // is a void* pointing to ngx_core_conf_t (typed as void*** in the binding).
         let n_workers: usize = unsafe {
             let cycle = (*cf).cycle.as_ref().ok_or(Status::NGX_ERROR)?;
-            let core_idx = nginx_sys::ngx_core_module.index as usize;
+            let core_idx = nginx_sys::ngx_core_module.index;
             // conf_ctx is *mut *mut *mut *mut c_void; indexing gives *mut *mut *mut c_void.
             // The BIT value of that pointer IS the ngx_core_conf_t*.
-            let raw_conf: *mut *mut *mut core::ffi::c_void =
-                *cycle.conf_ctx.add(core_idx);
+            let raw_conf: *mut *mut *mut core::ffi::c_void = *cycle.conf_ctx.add(core_idx);
             let core_conf: *const nginx_sys::ngx_core_conf_t = raw_conf.cast();
             if core_conf.is_null() {
                 1 // fallback
@@ -347,18 +352,12 @@ impl MainConfig {
 
         // Choose a zone name: use the configured name or default.
         let default_name = ngx::ngx_string!("ngx_http_otel_zone");
-        let mut zone_name: ngx_str_t = if self.zone_name.is_empty() {
-            default_name
-        } else {
-            self.zone_name
-        };
+        let mut zone_name: ngx_str_t =
+            if self.zone_name.is_empty() { default_name } else { self.zone_name };
 
         // Apply the larger of required size and explicitly configured size.
-        let zone_size = if self.zone_size > 0 {
-            self.zone_size.max(required_size)
-        } else {
-            required_size
-        };
+        let zone_size =
+            if self.zone_size > 0 { self.zone_size.max(required_size) } else { required_size };
 
         // Register the zone.
         let Some(zone) = (unsafe { shm::register_zone(cf, &mut zone_name, zone_size, module) })
@@ -397,8 +396,7 @@ impl MainConfig {
         let mut zone_name = ngx::ngx_string!("ngx_http_otel_control_zone");
         let zone_size = crate::exporter::control_shm::ControlShm::ZONE_SIZE;
 
-        let Some(zone) =
-            (unsafe { shm::register_zone(cf, &mut zone_name, zone_size, module) })
+        let Some(zone) = (unsafe { shm::register_zone(cf, &mut zone_name, zone_size, module) })
         else {
             unsafe {
                 ngx_conf_log_error!(
@@ -411,8 +409,7 @@ impl MainConfig {
         };
 
         unsafe {
-            (*zone).init =
-                Some(crate::exporter::control_shm::control_shm_zone_init);
+            (*zone).init = Some(crate::exporter::control_shm::control_shm_zone_init);
             (*zone).data = ptr::from_mut(self).cast();
         }
 
@@ -454,9 +451,7 @@ impl MainConfig {
     /// Workers call this from `LogPhaseHandler` on every request. The
     /// `None`-returning path (module disabled) is a null pointer check,
     /// which is a single branch — zero allocations, zero syscalls.
-    pub fn control_shm_ptr(
-        &self,
-    ) -> Option<*const crate::exporter::control_shm::ControlShm> {
+    pub fn control_shm_ptr(&self) -> Option<*const crate::exporter::control_shm::ControlShm> {
         let zone = unsafe { self.control_shm_zone.as_ref()? };
         let addr = zone.shm.addr;
         if addr.is_null() {
@@ -464,9 +459,7 @@ impl MainConfig {
         }
         let offset = crate::shm::data_offset();
         Some(unsafe {
-            addr.cast::<u8>()
-                .add(offset)
-                .cast::<crate::exporter::control_shm::ControlShm>()
+            addr.cast::<u8>().add(offset).cast::<crate::exporter::control_shm::ControlShm>()
         })
     }
 }
@@ -760,11 +753,7 @@ extern "C" fn cmd_set_exporter_block(
 
     if amcf.exporter.is_set() {
         unsafe {
-            ngx_conf_log_error!(
-                NGX_LOG_EMERG,
-                &mut *cf,
-                "\"otel_exporter\" is duplicate"
-            );
+            ngx_conf_log_error!(NGX_LOG_EMERG, &mut *cf, "\"otel_exporter\" is duplicate");
         }
         return NGX_CONF_ERROR;
     }

@@ -10,9 +10,7 @@
 
 use core::sync::atomic::Ordering;
 
-use crate::data_model::{
-    AggregationTemporality, HistogramData, Metric, MetricData,
-};
+use crate::data_model::{AggregationTemporality, HistogramData, Metric, MetricData};
 use crate::metric_source::MetricSource;
 
 /// A `MetricSource` that reads NGINX's internal connection/request counters.
@@ -93,8 +91,8 @@ impl MetricSource for StubStatusSource {
 #[cfg(ngx_feature = "stat_stub")]
 unsafe fn read_stats() -> (u64, u64, u64, u64, u64, u64, u64) {
     use nginx_sys::{
-        ngx_stat_accepted, ngx_stat_active, ngx_stat_handled, ngx_stat_reading,
-        ngx_stat_requests, ngx_stat_waiting, ngx_stat_writing,
+        ngx_stat_accepted, ngx_stat_active, ngx_stat_handled, ngx_stat_reading, ngx_stat_requests,
+        ngx_stat_waiting, ngx_stat_writing,
     };
 
     macro_rules! load {
@@ -104,10 +102,7 @@ unsafe fn read_stats() -> (u64, u64, u64, u64, u64, u64, u64) {
             // TODO(portability): ngx_atomic_t is c_ulong-wide. This alias is correct
             // on 64-bit Linux/macOS where c_ulong == u64, but breaks on 32-bit
             // platforms where c_ulong == u32. Revisit before declaring v1.0 portable.
-            unsafe {
-                (*(($ptr) as *const core::sync::atomic::AtomicU64))
-                    .load(Ordering::Acquire)
-            }
+            unsafe { (*(($ptr) as *const core::sync::atomic::AtomicU64)).load(Ordering::Acquire) }
         };
     }
 
@@ -136,10 +131,7 @@ fn now_unix_nano() -> u64 {
     // In nginx context we'd use ngx_timeofday(), but for Phase 1.1 std::time is fine
     // because this runs only on the export worker (not the request path).
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64
 }
 
 /// Build a cumulative-sum "counter" metric from a scalar value.
@@ -210,7 +202,10 @@ mod tests {
         // Each metric has exactly one data point (stub_status only emits histograms).
         for m in &metrics {
             let MetricData::Histogram(ref h) = m.data else {
-                panic!("stub_status must only emit histogram metrics; got non-histogram for {}", m.name);
+                panic!(
+                    "stub_status must only emit histogram metrics; got non-histogram for {}",
+                    m.name
+                );
             };
             assert_eq!(h.data_points.len(), 1, "metric {} has wrong #points", m.name);
         }

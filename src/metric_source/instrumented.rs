@@ -61,7 +61,7 @@ impl HttpRequestHandler for LogPhaseHandler {
         };
 
         // Determine current worker index (no syscall — nginx global).
-        let worker_id = unsafe { nginx_sys::ngx_worker as usize };
+        let worker_id = unsafe { nginx_sys::ngx_worker };
 
         // Get our slot. No allocation; pointer arithmetic only.
         // Safety: zone was sized for ≥ worker_id slots during postconfiguration.
@@ -78,9 +78,9 @@ impl HttpRequestHandler for LogPhaseHandler {
         // not a full epoch timestamp — the previous code subtracted the wrong clock.
         let duration_ms: u64 = {
             let tp = nginx_sys::ngx_timeofday(); // safe: returns &'static ngx_time_t
-            // time_t = c_long (i64 on 64-bit), ngx_uint_t/ngx_msec_t = usize.
-            let ms: i64 = (tp.sec as i64 - r.start_sec as i64) * 1000
-                + (tp.msec as i64 - r.start_msec as i64);
+                                                 // time_t = c_long (i64 on 64-bit), ngx_uint_t/ngx_msec_t = usize.
+            let ms: i64 =
+                (tp.sec as i64 - r.start_sec) * 1000 + (tp.msec as i64 - r.start_msec as i64);
             ms.max(0) as u64
         };
         slot.request_duration_ms.record(duration_ms, &DURATION_BOUNDS_MS);
@@ -91,7 +91,11 @@ impl HttpRequestHandler for LogPhaseHandler {
         // ── response bytes ────────────────────────────────────────────────
         let resp_bytes = {
             let conn = request.connection();
-            if conn.is_null() { 0u64 } else { unsafe { (*conn).sent as u64 } }
+            if conn.is_null() {
+                0u64
+            } else {
+                unsafe { (*conn).sent as u64 }
+            }
         };
         slot.response_body_bytes.record(resp_bytes, &BYTES_BOUNDS);
 
@@ -200,8 +204,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
 
         use crate::shm::{BYTES_BOUNDS, DURATION_BOUNDS_MS};
 
-        let dur_bounds: std::vec::Vec<f64> =
-            DURATION_BOUNDS_MS.iter().map(|&b| b as f64).collect();
+        let dur_bounds: std::vec::Vec<f64> = DURATION_BOUNDS_MS.iter().map(|&b| b as f64).collect();
         let byte_bounds: std::vec::Vec<f64> = BYTES_BOUNDS.iter().map(|&b| b as f64).collect();
 
         // TODO(fix3b): Per OTel semconv, http.server.request.duration should be
@@ -346,6 +349,9 @@ fn add_histogram<const N: usize>(
     acc.2 += count;
 }
 
+// Internal OTLP-histogram builder; the argument count mirrors the histogram's
+// own shape (name/desc/unit + data + bounds + start/now + temporality).
+#[allow(clippy::too_many_arguments)]
 fn hist_metric<const N: usize>(
     name: &str,
     desc: &str,
@@ -378,8 +384,5 @@ fn hist_metric<const N: usize>(
 
 fn now_unix_nano() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64
 }

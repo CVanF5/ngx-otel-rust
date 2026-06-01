@@ -30,8 +30,8 @@ pub mod ngx_otel_echo_v1 {
 }
 
 use ngx_otel_echo_v1::{
-    Ping, Pong,
     echo_server::{Echo, EchoServer},
+    Ping, Pong,
 };
 
 use std::pin::Pin;
@@ -51,7 +51,8 @@ struct EchoSvc {
 
 #[tonic::async_trait]
 impl Echo for EchoSvc {
-    type BidiEchoStream = Pin<Box<dyn tokio_stream::Stream<Item = Result<Pong, Status>> + Send + 'static>>;
+    type BidiEchoStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<Pong, Status>> + Send + 'static>>;
 
     async fn bidi_echo(
         &self,
@@ -77,10 +78,7 @@ impl Echo for EchoSvc {
                         if delay_ms > 0 {
                             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                         }
-                        let pong = Pong {
-                            seq: ping.seq,
-                            payload: ping.payload,
-                        };
+                        let pong = Pong { seq: ping.seq, payload: ping.payload };
                         if tx.send(Ok(pong)).await.is_err() {
                             // Receiver dropped (client gone); stop silently.
                             break;
@@ -110,13 +108,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Default 0 → no delay, byte-identical to the original Item 2 server.
     // Set to a positive value (e.g. 10) to simulate a slow consumer for the
     // Phase 1.2 Item 3 backpressure overload test.
-    let delay_ms: u64 = std::env::var("BIDI_ECHO_DELAY_MS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    let delay_ms: u64 =
+        std::env::var("BIDI_ECHO_DELAY_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
 
-    let bind_addr = std::env::var("BIDI_ECHO_BIND")
-        .unwrap_or_else(|_| "127.0.0.1:4319".to_string());
+    let bind_addr =
+        std::env::var("BIDI_ECHO_BIND").unwrap_or_else(|_| "127.0.0.1:4319".to_string());
     let addr: std::net::SocketAddr = bind_addr.parse()?;
 
     println!("bidi echo server: listening on {addr} (delay={delay_ms}ms)");

@@ -72,12 +72,10 @@ use http::uri::Uri;
 use nginx_sys::ngx_log_t;
 
 use crate::encoder::opentelemetry::proto::collector::metrics::v1::{
-    ExportMetricsServiceRequest,
-    metrics_service_client::MetricsServiceClient,
+    metrics_service_client::MetricsServiceClient, ExportMetricsServiceRequest,
 };
 use crate::encoder::opentelemetry::proto::common::v1::{
-    any_value::Value as AnyValueInner, AnyValue, InstrumentationScope,
-    KeyValue as ProtoKeyValue,
+    any_value::Value as AnyValueInner, AnyValue, InstrumentationScope, KeyValue as ProtoKeyValue,
 };
 use crate::encoder::opentelemetry::proto::metrics::v1::{
     metric::Data as MetricDataInner, number_data_point::Value as NumberValue, Gauge, Metric,
@@ -102,9 +100,7 @@ fn build_export_request() -> ExportMetricsServiceRequest {
                 attributes: std::vec![ProtoKeyValue {
                     key: "service.name".into(),
                     value: Some(AnyValue {
-                        value: Some(AnyValueInner::StringValue(
-                            "ngx-otel-grpc-smoke".into(),
-                        )),
+                        value: Some(AnyValueInner::StringValue("ngx-otel-grpc-smoke".into(),)),
                     }),
                 }],
                 dropped_attributes_count: 0,
@@ -155,19 +151,22 @@ pub enum SmokeError {
     /// A bidi gRPC call step failed (Phase 1.2 Item 2).
     BidiCall(std::string::String),
     /// Sent/received ping counts diverged (Phase 1.2 Item 2).
-    BidiSendMismatch { sent: u64, received: u64 },
+    BidiSendMismatch {
+        sent: u64,
+        received: u64,
+    },
 }
 
 impl core::fmt::Display for SmokeError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::InvalidEndpoint(s) => write!(f, "invalid endpoint: {s}"),
-            Self::Connect(s)         => write!(f, "connect: {s}"),
-            Self::Handshake(s)       => write!(f, "h2 handshake: {s}"),
-            Self::InvalidOrigin(s)   => write!(f, "invalid origin uri: {s}"),
-            Self::GrpcReady(s)       => write!(f, "grpc ready: {s}"),
-            Self::GrpcCall(s)        => write!(f, "grpc unary call: {s}"),
-            Self::BidiCall(s)        => write!(f, "bidi call: {s}"),
+            Self::Connect(s) => write!(f, "connect: {s}"),
+            Self::Handshake(s) => write!(f, "h2 handshake: {s}"),
+            Self::InvalidOrigin(s) => write!(f, "invalid origin uri: {s}"),
+            Self::GrpcReady(s) => write!(f, "grpc ready: {s}"),
+            Self::GrpcCall(s) => write!(f, "grpc unary call: {s}"),
+            Self::BidiCall(s) => write!(f, "bidi call: {s}"),
             Self::BidiSendMismatch { sent, received } => {
                 write!(f, "bidi send/receive mismatch: sent={sent} received={received}")
             }
@@ -210,7 +209,8 @@ pub async fn fire_one_grpc_export(
             )));
         }
     };
-    let origin: Uri = origin_str.parse()
+    let origin: Uri = origin_str
+        .parse()
         .map_err(|e: http::uri::InvalidUri| SmokeError::InvalidOrigin(std::format!("{e}")))?;
 
     // 3. Connect via the production transport's NgxConnector.  This is the
@@ -219,7 +219,9 @@ pub async fn fire_one_grpc_export(
     //    `poll_read`/`poll_write` with C-handler-driven wakeups (no spin).
     let connector = NgxConnector::new(log);
     let log_ptr = log.as_ptr();
-    let io = connector.connect(&endpoint).await
+    let io = connector
+        .connect(&endpoint)
+        .await
         .map_err(|e| SmokeError::Connect(std::format!("{e:?}")))?;
 
     // 4. HTTP/2 handshake driven by NgxExecutor.  The handshake performs
@@ -248,15 +250,12 @@ pub async fn fire_one_grpc_export(
     //    the same Mutex — deadlock.  Patched `schedule()` always defers
     //    via `ngx_post_event`, matching what every other "custom executor
     //    for h2" (Tokio's LocalSet, async-executor) does by design.
-    let handshake_fut = hyper::client::conn::http2::handshake::<
-        _,
-        _,
-        tonic::body::Body,
-    >(NgxExecutor, io);
+    let handshake_fut =
+        hyper::client::conn::http2::handshake::<_, _, tonic::body::Body>(NgxExecutor, io);
 
     ngx::ngx_log_debug!(log_ptr, "smoke: awaiting h2 handshake");
-    let (sender, conn) = handshake_fut.await
-        .map_err(|e| SmokeError::Handshake(std::format!("{e}")))?;
+    let (sender, conn) =
+        handshake_fut.await.map_err(|e| SmokeError::Handshake(std::format!("{e}")))?;
     ngx::ngx_log_debug!(log_ptr, "smoke: h2 handshake completed");
 
     // 5. Drive `conn` (the request-stream dispatcher) on the NGINX event
@@ -264,7 +263,8 @@ pub async fn fire_one_grpc_export(
     //    Output (which only resolves when the connection closes).
     ngx::async_::spawn(async move {
         let _ = conn.await;
-    }).detach();
+    })
+    .detach();
 
     // 6. Build the generated tonic gRPC client over our SendRequestService shim.
     //    ready() + path + codec are encapsulated inside the generated export() method.
@@ -274,7 +274,9 @@ pub async fn fire_one_grpc_export(
     let request = tonic::Request::new(build_export_request());
 
     ngx::ngx_log_debug!(log_ptr, "smoke: awaiting client.export()");
-    let _resp = client.export(request).await
+    let _resp = client
+        .export(request)
+        .await
         .map_err(|status| SmokeError::GrpcCall(std::format!("{status}")))?;
     ngx::ngx_log_debug!(log_ptr, "smoke: client.export() returned OK");
 
@@ -289,13 +291,15 @@ pub async fn fire_one_grpc_export(
 /// implemented directly against the channel's `poll_ready` + `start_send`
 /// API, so we don't need `futures-util` as a top-level production dep.
 async fn mpsc_send_one(
-    tx: &mut futures_channel::mpsc::Sender<crate::transport::grpc::echo_proto::ngx_otel_echo_v1::Ping>,
+    tx: &mut futures_channel::mpsc::Sender<
+        crate::transport::grpc::echo_proto::ngx_otel_echo_v1::Ping,
+    >,
     msg: crate::transport::grpc::echo_proto::ngx_otel_echo_v1::Ping,
 ) -> Result<(), SmokeError> {
-    core::future::poll_fn(|cx| tx.poll_ready(cx)).await
+    core::future::poll_fn(|cx| tx.poll_ready(cx))
+        .await
         .map_err(|e| SmokeError::BidiCall(std::format!("send channel closed: {e}")))?;
-    tx.start_send(msg)
-        .map_err(|e| SmokeError::BidiCall(std::format!("start_send: {e}")))
+    tx.start_send(msg).map_err(|e| SmokeError::BidiCall(std::format!("start_send: {e}")))
 }
 
 /// Fires exactly one bidi gRPC `BidiEcho` call against the echo server at
@@ -303,8 +307,8 @@ async fn mpsc_send_one(
 /// and receive-half **asymmetrically** to prove they are independently
 /// pollable without deadlock, livelock, or a Tokio runtime.
 ///
-/// The asymmetric drain sequence (Phase A: send 3 + drain 3; Phase B: send 7
-/// + drain 7; Phase C: close + confirm stream end) is the mechanical contract
+/// The asymmetric drain sequence (Phase A: send 3, drain 3; Phase B: send 7,
+/// drain 7; Phase C: close then confirm stream end) is the mechanical contract
 /// Phase 1.2 Item 2 establishes.  If the bridge serializes send and receive,
 /// Phase A-drain hangs — the function reports that via `BidiCall`.
 ///
@@ -314,10 +318,7 @@ pub async fn fire_one_bidi_stream(
     endpoint_str: &str,
     log: core::ptr::NonNull<nginx_sys::ngx_log_t>,
 ) -> Result<(), SmokeError> {
-    use crate::transport::grpc::echo_proto::ngx_otel_echo_v1::{
-        Ping,
-        echo_client::EchoClient,
-    };
+    use crate::transport::grpc::echo_proto::ngx_otel_echo_v1::{echo_client::EchoClient, Ping};
 
     // Steps 1-5 are identical to fire_one_grpc_export (same pipeline shape).
     // Factor into a shared helper if duplication becomes problematic; for now
@@ -338,32 +339,35 @@ pub async fn fire_one_bidi_stream(
             )));
         }
     };
-    let origin: http::uri::Uri = origin_str.parse()
+    let origin: http::uri::Uri = origin_str
+        .parse()
         .map_err(|e: http::uri::InvalidUri| SmokeError::InvalidOrigin(std::format!("{e}")))?;
 
     let log_ptr = log.as_ptr();
 
     // 3. Connect via the production NgxConnector.
     let connector = crate::transport::hyper_http::NgxConnector::new(log);
-    let io = connector.connect(&endpoint).await
+    let io = connector
+        .connect(&endpoint)
+        .await
         .map_err(|e| SmokeError::Connect(std::format!("{e:?}")))?;
 
     // 4. HTTP/2 handshake.
-    let handshake_fut = hyper::client::conn::http2::handshake::<
-        _,
-        _,
-        tonic::body::Body,
-    >(crate::transport::grpc::executor::NgxExecutor, io);
+    let handshake_fut = hyper::client::conn::http2::handshake::<_, _, tonic::body::Body>(
+        crate::transport::grpc::executor::NgxExecutor,
+        io,
+    );
 
     ngx::ngx_log_debug!(log_ptr, "bidi smoke: awaiting h2 handshake");
-    let (sender, conn) = handshake_fut.await
-        .map_err(|e| SmokeError::Handshake(std::format!("{e}")))?;
+    let (sender, conn) =
+        handshake_fut.await.map_err(|e| SmokeError::Handshake(std::format!("{e}")))?;
     ngx::ngx_log_debug!(log_ptr, "bidi smoke: h2 handshake completed");
 
     // 5. Drive the Connection on the NGINX event loop.
     ngx::async_::spawn(async move {
         let _ = conn.await;
-    }).detach();
+    })
+    .detach();
 
     // 6. Build the generated EchoClient over our SendRequestService shim.
     let svc = SendRequestService::new(sender);
@@ -376,7 +380,9 @@ pub async fn fire_one_bidi_stream(
 
     // Issue the bidi call.  rx (the Receiver) is consumed into the request
     // stream here; tx remains as the send-half.
-    let response = client.bidi_echo(tonic::Request::new(rx)).await
+    let response = client
+        .bidi_echo(tonic::Request::new(rx))
+        .await
         .map_err(|status| SmokeError::BidiCall(std::format!("{status}")))?;
     let mut inbound = response.into_inner();
 
@@ -397,11 +403,13 @@ pub async fn fire_one_bidi_stream(
     ngx::ngx_log_debug!(log_ptr, "bidi smoke: Phase A sent (sent=3)");
 
     while received < 3 {
-        let _pong = inbound.message().await
+        let _pong = inbound
+            .message()
+            .await
             .map_err(|s| SmokeError::BidiCall(std::format!("Phase A drain: {s}")))?
-            .ok_or_else(|| SmokeError::BidiCall(
-                std::string::String::from("Phase A drain: stream ended early")
-            ))?;
+            .ok_or_else(|| {
+                SmokeError::BidiCall(std::string::String::from("Phase A drain: stream ended early"))
+            })?;
         received += 1;
     }
     ngx::ngx_log_debug!(log_ptr, "bidi smoke: Phase A drained (received=3)");
@@ -414,11 +422,13 @@ pub async fn fire_one_bidi_stream(
     ngx::ngx_log_debug!(log_ptr, "bidi smoke: Phase B sent (sent=10)");
 
     while received < 10 {
-        let _pong = inbound.message().await
+        let _pong = inbound
+            .message()
+            .await
             .map_err(|s| SmokeError::BidiCall(std::format!("Phase B drain: {s}")))?
-            .ok_or_else(|| SmokeError::BidiCall(
-                std::string::String::from("Phase B drain: stream ended early")
-            ))?;
+            .ok_or_else(|| {
+                SmokeError::BidiCall(std::string::String::from("Phase B drain: stream ended early"))
+            })?;
         received += 1;
     }
     ngx::ngx_log_debug!(log_ptr, "bidi smoke: Phase B drained (received=10)");
@@ -427,7 +437,9 @@ pub async fn fire_one_bidi_stream(
     // close its response stream too.
     drop(tx);
 
-    let final_msg = inbound.message().await
+    let final_msg = inbound
+        .message()
+        .await
         .map_err(|s| SmokeError::BidiCall(std::format!("Phase C close: {s}")))?;
     if final_msg.is_some() {
         return Err(SmokeError::BidiCall(std::string::String::from(
@@ -494,26 +506,25 @@ pub async fn fire_bidi_overload(
     endpoint_str: &str,
     log: core::ptr::NonNull<nginx_sys::ngx_log_t>,
 ) -> Result<(), SmokeError> {
-    use crate::transport::grpc::echo_proto::ngx_otel_echo_v1::{
-        Ping,
-        echo_client::EchoClient,
-    };
     use crate::export::BIDI_BACKPRESSURE_DROPS;
+    use crate::transport::grpc::echo_proto::ngx_otel_echo_v1::{echo_client::EchoClient, Ping};
     use core::sync::atomic::Ordering;
 
     // ── Read overload parameters from environment ──────────────────────────
-    let duration_s: u64 = std::env::var("BIDI_OVERLOAD_DURATION_S")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(60);
+    let duration_s: u64 =
+        std::env::var("BIDI_OVERLOAD_DURATION_S").ok().and_then(|s| s.parse().ok()).unwrap_or(60);
     let msg_per_sec: u64 = std::env::var("BIDI_OVERLOAD_MESSAGES_PER_SEC")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(1000);
-    let give_up_ms: u64 = std::env::var("BIDI_OVERLOAD_GIVE_UP_MS")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(50);
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1000);
+    let give_up_ms: u64 =
+        std::env::var("BIDI_OVERLOAD_GIVE_UP_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(50);
 
-    let duration      = Duration::from_secs(duration_s);
-    let give_up       = Duration::from_millis(give_up_ms);
+    let duration = Duration::from_secs(duration_s);
+    let give_up = Duration::from_millis(give_up_ms);
     // Inter-send interval in microseconds.  At 0 msg/s (divide-by-zero guard)
     // we omit the sleep and send as fast as the event loop allows.
-    let inter_send_us: u64 = if msg_per_sec > 0 { 1_000_000 / msg_per_sec } else { 0 };
+    let inter_send_us: u64 = 1_000_000u64.checked_div(msg_per_sec).unwrap_or(0);
     // In-flight window: match the mpsc channel capacity so the concepts align.
     const WINDOW: u64 = 16;
 
@@ -523,7 +534,9 @@ pub async fn fire_bidi_overload(
         nginx_sys::NGX_LOG_NOTICE,
         log_ptr,
         "bidi overload: starting (duration={}s rate={}msg/s give_up={}ms)",
-        duration_s, msg_per_sec, give_up_ms
+        duration_s,
+        msg_per_sec,
+        give_up_ms
     );
 
     // Steps 1-5: identical pipeline to fire_one_bidi_stream.
@@ -543,26 +556,31 @@ pub async fn fire_bidi_overload(
             )));
         }
     };
-    let origin: http::uri::Uri = origin_str.parse()
+    let origin: http::uri::Uri = origin_str
+        .parse()
         .map_err(|e: http::uri::InvalidUri| SmokeError::InvalidOrigin(std::format!("{e}")))?;
 
     // 3. Connect.
     let connector = crate::transport::hyper_http::NgxConnector::new(log);
-    let io = connector.connect(&endpoint).await
+    let io = connector
+        .connect(&endpoint)
+        .await
         .map_err(|e| SmokeError::Connect(std::format!("{e:?}")))?;
 
     // 4. HTTP/2 handshake.
-    let handshake_fut = hyper::client::conn::http2::handshake::<
-        _,
-        _,
-        tonic::body::Body,
-    >(crate::transport::grpc::executor::NgxExecutor, io);
+    let handshake_fut = hyper::client::conn::http2::handshake::<_, _, tonic::body::Body>(
+        crate::transport::grpc::executor::NgxExecutor,
+        io,
+    );
 
-    let (sender, conn) = handshake_fut.await
-        .map_err(|e| SmokeError::Handshake(std::format!("{e}")))?;
+    let (sender, conn) =
+        handshake_fut.await.map_err(|e| SmokeError::Handshake(std::format!("{e}")))?;
 
     // 5. Drive Connection on the nginx event loop.
-    ngx::async_::spawn(async move { let _ = conn.await; }).detach();
+    ngx::async_::spawn(async move {
+        let _ = conn.await;
+    })
+    .detach();
 
     // 6. Build the EchoClient.
     let svc = crate::transport::grpc::shim::SendRequestService::new(sender);
@@ -572,7 +590,9 @@ pub async fn fire_bidi_overload(
     //    The mpsc channel capacity (16) matches WINDOW so the two concepts
     //    stay in sync even if tonic's internal buffering absorbs in-flight pings.
     let (mut tx, rx) = futures_channel::mpsc::channel::<Ping>(WINDOW as usize);
-    let response = client.bidi_echo(tonic::Request::new(rx)).await
+    let response = client
+        .bidi_echo(tonic::Request::new(rx))
+        .await
         .map_err(|s| SmokeError::BidiCall(std::format!("{s}")))?;
     let mut inbound = response.into_inner();
 
@@ -598,25 +618,28 @@ pub async fn fire_bidi_overload(
     // drops are counted, and the stream is not deadlocked.
 
     let received_ctr = std::sync::Arc::new(core::sync::atomic::AtomicU64::new(0));
-    let drain_done   = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+    let drain_done = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
 
     {
         let received_ctr2 = std::sync::Arc::clone(&received_ctr);
-        let drain_done2   = std::sync::Arc::clone(&drain_done);
+        let drain_done2 = std::sync::Arc::clone(&drain_done);
         ngx::async_::spawn(async move {
             loop {
                 match inbound.message().await {
-                    Ok(Some(_)) => { received_ctr2.fetch_add(1, Ordering::Relaxed); }
-                    Ok(None)    => break,  // server closed stream
-                    Err(_)      => break,  // transport error — stop silently
+                    Ok(Some(_)) => {
+                        received_ctr2.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(None) => break, // server closed stream
+                    Err(_) => break,   // transport error — stop silently
                 }
             }
             drain_done2.store(true, Ordering::Release);
-        }).detach();
+        })
+        .detach();
     }
 
-    let mut seq: u64     = 0;
-    let mut sent: u64    = 0;
+    let mut seq: u64 = 0;
+    let mut sent: u64 = 0;
     let mut dropped: u64 = 0;
 
     let overload_start = std::time::Instant::now();
@@ -699,7 +722,10 @@ pub async fn fire_bidi_overload(
         nginx_sys::NGX_LOG_NOTICE,
         log_ptr,
         "bidi overload: sent={} received={} dropped={} duration_s={}",
-        sent, received, dropped, elapsed_s
+        sent,
+        received,
+        dropped,
+        elapsed_s
     );
 
     Ok(())

@@ -96,10 +96,7 @@ fn make_test_batch(service_name: &str) -> Batch {
                 value: AnyValue::String(service_name.to_string()),
             }],
         },
-        scope: Scope {
-            name: "ngx-otel-step8".to_string(),
-            version: "0.1.0".to_string(),
-        },
+        scope: Scope { name: "ngx-otel-step8".to_string(), version: "0.1.0".to_string() },
         metrics: vec![Metric {
             name: "test.http.server.request.duration".to_string(),
             description: "Step 8 integration test metric".to_string(),
@@ -148,27 +145,21 @@ fn send_otlp_to_live_collector() {
     // The collector may flush its JSON log synchronously (before sending the
     // HTTP 200 response), so we must snapshot the file size *before* the
     // network round-trip rather than after.
-    let pre_size = std::fs::metadata(METRICS_LOG_PATH)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let pre_size = std::fs::metadata(METRICS_LOG_PATH).map(|m| m.len()).unwrap_or(0);
 
     // ── Send via HyperHttpTransport ───────────────────────────────────────
-    let mut transport = HyperHttpTransport::new(COLLECTOR_ENDPOINT, vec![])
-        .expect("endpoint must parse");
+    let mut transport =
+        HyperHttpTransport::new(COLLECTOR_ENDPOINT, vec![]).expect("endpoint must parse");
 
     let result = block_on(transport.send(bytes));
-    assert!(
-        result.is_ok(),
-        "send must succeed against live collector: {:?}",
-        result.err()
-    );
+    assert!(result.is_ok(), "send must succeed against live collector: {:?}", result.err());
 
     // ── Verify the payload arrived in the collector log ───────────────────
     // Give the collector a moment to flush if it writes asynchronously.
     std::thread::sleep(std::time::Duration::from_millis(300));
 
-    let log_content = std::fs::read_to_string(METRICS_LOG_PATH)
-        .expect("metrics.json must be readable");
+    let log_content =
+        std::fs::read_to_string(METRICS_LOG_PATH).expect("metrics.json must be readable");
 
     // Only examine bytes appended after we sent the request.
     let new_content = if pre_size as usize <= log_content.len() {
@@ -194,8 +185,8 @@ fn send_twice_reconnects_cleanly() {
     let encoder = OtlpHttpEncoder;
     let bytes = encoder.encode(&batch);
 
-    let mut transport = HyperHttpTransport::new(COLLECTOR_ENDPOINT, vec![])
-        .expect("endpoint must parse");
+    let mut transport =
+        HyperHttpTransport::new(COLLECTOR_ENDPOINT, vec![]).expect("endpoint must parse");
 
     let first = block_on(transport.send(bytes.clone()));
     assert!(first.is_ok(), "first send must succeed: {:?}", first.err());
@@ -218,9 +209,5 @@ fn send_with_custom_headers() {
         HyperHttpTransport::new(COLLECTOR_ENDPOINT, headers).expect("endpoint must parse");
 
     let result = block_on(transport.send(bytes));
-    assert!(
-        result.is_ok(),
-        "send with custom headers must succeed: {:?}",
-        result.err()
-    );
+    assert!(result.is_ok(), "send with custom headers must succeed: {:?}", result.err());
 }

@@ -59,26 +59,17 @@ mod opentelemetry {
     pub mod proto {
         pub mod common {
             pub mod v1 {
-                include!(concat!(
-                    env!("OUT_DIR"),
-                    "/opentelemetry.proto.common.v1.rs"
-                ));
+                include!(concat!(env!("OUT_DIR"), "/opentelemetry.proto.common.v1.rs"));
             }
         }
         pub mod resource {
             pub mod v1 {
-                include!(concat!(
-                    env!("OUT_DIR"),
-                    "/opentelemetry.proto.resource.v1.rs"
-                ));
+                include!(concat!(env!("OUT_DIR"), "/opentelemetry.proto.resource.v1.rs"));
             }
         }
         pub mod metrics {
             pub mod v1 {
-                include!(concat!(
-                    env!("OUT_DIR"),
-                    "/opentelemetry.proto.metrics.v1.rs"
-                ));
+                include!(concat!(env!("OUT_DIR"), "/opentelemetry.proto.metrics.v1.rs"));
             }
         }
         pub mod collector {
@@ -95,12 +86,10 @@ mod opentelemetry {
 }
 
 use opentelemetry::proto::collector::metrics::v1::{
-    ExportMetricsServiceRequest,
-    metrics_service_client::MetricsServiceClient,
+    metrics_service_client::MetricsServiceClient, ExportMetricsServiceRequest,
 };
 use opentelemetry::proto::common::v1::{
-    any_value::Value as AnyValueInner, AnyValue, InstrumentationScope,
-    KeyValue as ProtoKeyValue,
+    any_value::Value as AnyValueInner, AnyValue, InstrumentationScope, KeyValue as ProtoKeyValue,
 };
 use opentelemetry::proto::metrics::v1::{
     metric::Data as MetricDataInner, number_data_point::Value as NumberValue, Gauge, Metric,
@@ -170,9 +159,7 @@ fn block_on_with_tasks<F: Future>(exec: &TaskQueueExecutor, fut: F) -> F::Output
 
     loop {
         // ① Move newly queued tasks into the running set.
-        exec.running
-            .borrow_mut()
-            .extend(exec.queue.borrow_mut().drain(..));
+        exec.running.borrow_mut().extend(exec.queue.borrow_mut().drain(..));
 
         // ② Take ownership of running tasks (avoids holding the RefCell borrow
         //    while tasks are polled, since polling may call execute() → borrow
@@ -193,9 +180,7 @@ fn block_on_with_tasks<F: Future>(exec: &TaskQueueExecutor, fut: F) -> F::Output
             Poll::Ready(val) => return val,
             Poll::Pending => {
                 // Drain tasks spawned by the main future before sleeping.
-                exec.running
-                    .borrow_mut()
-                    .extend(exec.queue.borrow_mut().drain(..));
+                exec.running.borrow_mut().extend(exec.queue.borrow_mut().drain(..));
                 std::thread::yield_now();
             }
         }
@@ -211,9 +196,7 @@ fn build_export_request() -> ExportMetricsServiceRequest {
                 attributes: vec![ProtoKeyValue {
                     key: "service.name".into(),
                     value: Some(AnyValue {
-                        value: Some(AnyValueInner::StringValue(
-                            "ngx-otel-grpc-smoke".into(),
-                        )),
+                        value: Some(AnyValueInner::StringValue("ngx-otel-grpc-smoke".into())),
                     }),
                 }],
                 dropped_attributes_count: 0,
@@ -270,23 +253,18 @@ fn grpc_smoke_unary_export() {
     //    The turbofish `::<_, _, tonic::body::Body>` is required because the
     //    body type `B` cannot be inferred from the handshake call alone — it
     //    is determined by what `SendRequest` will later be used for.
-    let handshake_fut = hyper::client::conn::http2::handshake::<
-        _,
-        _,
-        tonic::body::Body,
-    >(exec.clone(), io);
+    let handshake_fut =
+        hyper::client::conn::http2::handshake::<_, _, tonic::body::Body>(exec.clone(), io);
 
-    let (sender, conn) = block_on_with_tasks(&exec, handshake_fut)
-        .expect("HTTP/2 handshake failed");
+    let (sender, conn) =
+        block_on_with_tasks(&exec, handshake_fut).expect("HTTP/2 handshake failed");
 
     // 4. Drive the `Connection` (h2 client-task / request dispatcher) as a
     //    background task.  ConnTask (the TCP I/O driver) is already in
     //    exec.running from step 3.
-    exec.queue
-        .borrow_mut()
-        .push_back(Box::pin(async move {
-            let _ = conn.await;
-        }));
+    exec.queue.borrow_mut().push_back(Box::pin(async move {
+        let _ = conn.await;
+    }));
 
     // 5. Build the generated tonic gRPC client over our shim.
     //    ready() + path + codec are encapsulated inside the generated export() method.
@@ -298,9 +276,5 @@ fn grpc_smoke_unary_export() {
     let result = block_on_with_tasks(&exec, client.export(request));
 
     // 7. Assert success.
-    assert!(
-        result.is_ok(),
-        "gRPC unary call failed: {:?}",
-        result.err()
-    );
+    assert!(result.is_ok(), "gRPC unary call failed: {:?}", result.err());
 }

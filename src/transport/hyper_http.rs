@@ -62,9 +62,9 @@ use http_body_util::Full;
 use hyper::Request;
 use nginx_sys::{
     ngx_connection_t, ngx_create_pool, ngx_destroy_pool, ngx_event_connect_peer,
-    ngx_event_get_peer, ngx_event_t, ngx_handle_read_event, ngx_handle_write_event,
-    ngx_int_t, ngx_log_t, ngx_palloc, ngx_peer_connection_t, NGX_AGAIN, NGX_DEFAULT_POOL_SIZE,
-    NGX_ERROR, NGX_OK,
+    ngx_event_get_peer, ngx_event_t, ngx_handle_read_event, ngx_handle_write_event, ngx_int_t,
+    ngx_log_t, ngx_palloc, ngx_peer_connection_t, NGX_AGAIN, NGX_DEFAULT_POOL_SIZE, NGX_ERROR,
+    NGX_OK,
 };
 use ngx::core::Pool;
 
@@ -90,15 +90,8 @@ const SPIN_IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub(crate) enum ParsedEndpoint {
-    Http {
-        host: std::string::String,
-        port: u16,
-        path: std::string::String,
-    },
-    Unix {
-        socket_path: std::string::String,
-        http_path: std::string::String,
-    },
+    Http { host: std::string::String, port: u16, path: std::string::String },
+    Unix { socket_path: std::string::String, http_path: std::string::String },
 }
 
 impl ParsedEndpoint {
@@ -109,11 +102,7 @@ impl ParsedEndpoint {
                 None => (rest, std::string::String::from("/")),
             };
             let (host, port) = parse_authority(authority, 80);
-            Ok(ParsedEndpoint::Http {
-                host: std::string::String::from(host),
-                port,
-                path,
-            })
+            Ok(ParsedEndpoint::Http { host: std::string::String::from(host), port, path })
         } else if input.starts_with("https://") {
             Err(TransportError::TlsConfig {
                 cause: std::string::String::from(
@@ -196,11 +185,15 @@ impl OwnedNgxPool {
 
 impl Deref for OwnedNgxPool {
     type Target = Pool;
-    fn deref(&self) -> &Pool { &self.0 }
+    fn deref(&self) -> &Pool {
+        &self.0
+    }
 }
 
 impl DerefMut for OwnedNgxPool {
-    fn deref_mut(&mut self) -> &mut Pool { &mut self.0 }
+    fn deref_mut(&mut self) -> &mut Pool {
+        &mut self.0
+    }
 }
 
 impl Drop for OwnedNgxPool {
@@ -229,9 +222,9 @@ impl Drop for OwnedNgxPool {
 /// move.  Always use it behind a `Pin<Box<NgxConnIo>>`.
 pub struct NgxConnIo {
     pool: OwnedNgxPool,
-    pc:   ngx_peer_connection_t,
-    rev:  Option<Waker>,
-    wev:  Option<Waker>,
+    pc: ngx_peer_connection_t,
+    rev: Option<Waker>,
+    wev: Option<Waker>,
 }
 
 // SAFETY: Only used from NGINX's single-threaded worker event loop.
@@ -244,7 +237,7 @@ impl NgxConnIo {
 
         let mut pc: ngx_peer_connection_t = unsafe { core::mem::zeroed() };
         pc.get = Some(ngx_event_get_peer);
-        pc.log  = log.as_ptr();
+        pc.log = log.as_ptr();
 
         Ok(Self { pool, pc, rev: None, wev: None })
     }
@@ -276,18 +269,15 @@ impl NgxConnIo {
             }
 
             (*(*c).log).connection = (*c).number;
-            (*(*c).read ).handler  = Some(ngx_otel_conn_read_handler);
-            (*(*c).write).handler  = Some(ngx_otel_conn_write_handler);
+            (*(*c).read).handler = Some(ngx_otel_conn_read_handler);
+            (*(*c).write).handler = Some(ngx_otel_conn_write_handler);
         }
 
         rc
     }
 
     /// Async drive for the connection-establishment state machine.
-    fn poll_connect(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), io::Error>> {
+    fn poll_connect(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         // If already connected, check for timeout or other errors.
         if !self.pc.connection.is_null() {
             let c = self.pc.connection;
@@ -296,7 +286,7 @@ impl NgxConnIo {
                     nginx_sys::ngx_close_connection(c);
                     Err(io::ErrorKind::TimedOut.into())
                 } else {
-                    (*(*c).read ).handler = Some(ngx_otel_conn_read_handler);
+                    (*(*c).read).handler = Some(ngx_otel_conn_read_handler);
                     (*(*c).write).handler = Some(ngx_otel_conn_write_handler);
                     Ok(())
                 }
@@ -358,11 +348,7 @@ impl hyper::rt::Read for NgxConnIo {
         // Call the NGINX recv function pointer (fills MaybeUninit bytes).
         let uninit: &mut [MaybeUninit<u8>] = unsafe { buf.as_mut() };
         let n: isize = unsafe {
-            ((*c).recv.unwrap_unchecked())(
-                c,
-                uninit.as_mut_ptr().cast::<u8>(),
-                uninit.len(),
-            )
+            ((*c).recv.unwrap_unchecked())(c, uninit.as_mut_ptr().cast::<u8>(), uninit.len())
         };
 
         if n == NGX_ERROR as isize {
@@ -428,9 +414,8 @@ impl hyper::rt::Write for NgxConnIo {
         }
 
         let c = self.pc.connection;
-        let n: isize = unsafe {
-            ((*c).send.unwrap_unchecked())(c, buf.as_ptr().cast_mut(), buf.len())
-        };
+        let n: isize =
+            unsafe { ((*c).send.unwrap_unchecked())(c, buf.as_ptr().cast_mut(), buf.len()) };
 
         if n == NGX_AGAIN as isize {
             // Store waker; C handler fires wake() when fd is write-ready.
@@ -453,17 +438,11 @@ impl hyper::rt::Write for NgxConnIo {
         Poll::Ready(Err(io::ErrorKind::WriteZero.into()))
     }
 
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<Result<(), io::Error>> {
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<Result<(), io::Error>> {
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         self.get_mut().close();
         Poll::Ready(Ok(()))
     }
@@ -484,15 +463,11 @@ impl Drop for NgxConnIo {
 /// We wake the stored read-waker so the async task is rescheduled.
 unsafe extern "C" fn ngx_otel_conn_read_handler(ev: *mut ngx_event_t) {
     let c: *mut ngx_connection_t = unsafe { (*ev).data.cast() };
-    let this: *mut NgxConnIo    = unsafe { (*c).data.cast() };
+    let this: *mut NgxConnIo = unsafe { (*c).data.cast() };
     let waker_opt = unsafe { (*this).rev.take() };
     let rev_was_some = waker_opt.is_some();
     let log = unsafe { (*c).log };
-    ngx::ngx_log_debug!(
-        log,
-        "ngx_otel_conn_read_handler: rev_was_some={}",
-        rev_was_some
-    );
+    ngx::ngx_log_debug!(log, "ngx_otel_conn_read_handler: rev_was_some={}", rev_was_some);
     if let Some(waker) = waker_opt {
         waker.wake();
     }
@@ -502,15 +477,11 @@ unsafe extern "C" fn ngx_otel_conn_read_handler(ev: *mut ngx_event_t) {
 /// We wake the stored write-waker so the async task is rescheduled.
 unsafe extern "C" fn ngx_otel_conn_write_handler(ev: *mut ngx_event_t) {
     let c: *mut ngx_connection_t = unsafe { (*ev).data.cast() };
-    let this: *mut NgxConnIo    = unsafe { (*c).data.cast() };
+    let this: *mut NgxConnIo = unsafe { (*c).data.cast() };
     let waker_opt = unsafe { (*this).wev.take() };
     let wev_was_some = waker_opt.is_some();
     let log = unsafe { (*c).log };
-    ngx::ngx_log_debug!(
-        log,
-        "ngx_otel_conn_write_handler: wev_was_some={}",
-        wev_was_some
-    );
+    ngx::ngx_log_debug!(log, "ngx_otel_conn_write_handler: wev_was_some={}", wev_was_some);
     if let Some(waker) = waker_opt {
         waker.wake();
     } else {
@@ -553,12 +524,16 @@ impl hyper::rt::Read for SpinTcpIo {
     ) -> Poll<Result<(), io::Error>> {
         let uninit = unsafe { buf.as_mut() };
         let len = uninit.len();
-        if len == 0 { return Poll::Ready(Ok(())); }
-        let slice = unsafe {
-            core::slice::from_raw_parts_mut(uninit.as_mut_ptr().cast::<u8>(), len)
-        };
+        if len == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let slice =
+            unsafe { core::slice::from_raw_parts_mut(uninit.as_mut_ptr().cast::<u8>(), len) };
         match self.0.read(slice) {
-            Ok(n) => { unsafe { buf.advance(n) }; Poll::Ready(Ok(())) }
+            Ok(n) => {
+                unsafe { buf.advance(n) };
+                Poll::Ready(Ok(()))
+            }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 cx.waker().wake_by_ref(); // safe only in spin-loop executor
                 Poll::Pending
@@ -608,12 +583,16 @@ impl hyper::rt::Read for SpinUnixIo {
     ) -> Poll<Result<(), io::Error>> {
         let uninit = unsafe { buf.as_mut() };
         let len = uninit.len();
-        if len == 0 { return Poll::Ready(Ok(())); }
-        let slice = unsafe {
-            core::slice::from_raw_parts_mut(uninit.as_mut_ptr().cast::<u8>(), len)
-        };
+        if len == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let slice =
+            unsafe { core::slice::from_raw_parts_mut(uninit.as_mut_ptr().cast::<u8>(), len) };
         match self.0.read(slice) {
-            Ok(n) => { unsafe { buf.advance(n) }; Poll::Ready(Ok(())) }
+            Ok(n) => {
+                unsafe { buf.advance(n) };
+                Poll::Ready(Ok(()))
+            }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 cx.waker().wake_by_ref();
                 Poll::Pending
@@ -666,7 +645,7 @@ impl hyper::rt::Read for SpinIo {
         buf: hyper::rt::ReadBufCursor<'_>,
     ) -> Poll<Result<(), io::Error>> {
         match self.get_mut() {
-            SpinIo::Tcp(t)  => Pin::new(t).poll_read(cx, buf),
+            SpinIo::Tcp(t) => Pin::new(t).poll_read(cx, buf),
             SpinIo::Unix(u) => Pin::new(u).poll_read(cx, buf),
         }
     }
@@ -680,19 +659,19 @@ impl hyper::rt::Write for SpinIo {
         buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
         match self.get_mut() {
-            SpinIo::Tcp(t)  => Pin::new(t).poll_write(cx, buf),
+            SpinIo::Tcp(t) => Pin::new(t).poll_write(cx, buf),
             SpinIo::Unix(u) => Pin::new(u).poll_write(cx, buf),
         }
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         match self.get_mut() {
-            SpinIo::Tcp(t)  => Pin::new(t).poll_flush(cx),
+            SpinIo::Tcp(t) => Pin::new(t).poll_flush(cx),
             SpinIo::Unix(u) => Pin::new(u).poll_flush(cx),
         }
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         match self.get_mut() {
-            SpinIo::Tcp(t)  => Pin::new(t).poll_shutdown(cx),
+            SpinIo::Tcp(t) => Pin::new(t).poll_shutdown(cx),
             SpinIo::Unix(u) => Pin::new(u).poll_shutdown(cx),
         }
     }
@@ -739,22 +718,28 @@ impl Connector for SpinConnector {
                 let addr = std::format!("{}:{}", host, port);
                 let stream = TcpStream::connect(&addr)
                     .map_err(|e| TransportError::Connection { cause: e.to_string() })?;
-                stream.set_nonblocking(true)
+                stream
+                    .set_nonblocking(true)
                     .map_err(|e| TransportError::Connection { cause: e.to_string() })?;
-                stream.set_read_timeout(Some(SPIN_IO_TIMEOUT))
+                stream
+                    .set_read_timeout(Some(SPIN_IO_TIMEOUT))
                     .map_err(|e| TransportError::Connection { cause: e.to_string() })?;
-                stream.set_write_timeout(Some(SPIN_IO_TIMEOUT))
+                stream
+                    .set_write_timeout(Some(SPIN_IO_TIMEOUT))
                     .map_err(|e| TransportError::Connection { cause: e.to_string() })?;
                 Ok(SpinIo::Tcp(SpinTcpIo(stream)))
             }
             ParsedEndpoint::Unix { socket_path, .. } => {
                 let stream = UnixStream::connect(socket_path)
                     .map_err(|e| TransportError::Connection { cause: e.to_string() })?;
-                stream.set_nonblocking(true)
+                stream
+                    .set_nonblocking(true)
                     .map_err(|e| TransportError::Connection { cause: e.to_string() })?;
-                stream.set_read_timeout(Some(SPIN_IO_TIMEOUT))
+                stream
+                    .set_read_timeout(Some(SPIN_IO_TIMEOUT))
                     .map_err(|e| TransportError::Connection { cause: e.to_string() })?;
-                stream.set_write_timeout(Some(SPIN_IO_TIMEOUT))
+                stream
+                    .set_write_timeout(Some(SPIN_IO_TIMEOUT))
                     .map_err(|e| TransportError::Connection { cause: e.to_string() })?;
                 Ok(SpinIo::Unix(SpinUnixIo(stream)))
             }
@@ -814,9 +799,9 @@ impl Connector for NgxConnector {
                 {
                     let this = io.as_mut().get_mut();
                     this.pc.sockaddr = sockaddr_ptr;
-                    this.pc.socklen  =
+                    this.pc.socklen =
                         core::mem::size_of::<libc::sockaddr_in>() as nginx_sys::socklen_t;
-                    this.pc.name     = name_ptr;
+                    this.pc.name = name_ptr;
                 }
 
                 future::poll_fn(|cx| io.as_mut().poll_connect(cx))
@@ -860,9 +845,9 @@ fn build_pc_name(
     host: &str,
     port: u16,
 ) -> Result<*mut nginx_sys::ngx_str_t, TransportError> {
-    let s     = std::format!("{}:{}", host, port);
+    let s = std::format!("{}:{}", host, port);
     let bytes = s.as_bytes();
-    let len   = bytes.len();
+    let len = bytes.len();
 
     let data_ptr = unsafe { ngx_palloc(pool.as_ptr(), len) } as *mut u8;
     if data_ptr.is_null() {
@@ -872,16 +857,16 @@ fn build_pc_name(
     }
     unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), data_ptr, len) };
 
-    let name_ptr = unsafe {
-        ngx_palloc(pool.as_ptr(), core::mem::size_of::<nginx_sys::ngx_str_t>())
-    } as *mut nginx_sys::ngx_str_t;
+    let name_ptr =
+        unsafe { ngx_palloc(pool.as_ptr(), core::mem::size_of::<nginx_sys::ngx_str_t>()) }
+            as *mut nginx_sys::ngx_str_t;
     if name_ptr.is_null() {
         return Err(TransportError::Connection {
             cause: std::string::String::from("pool alloc for pc.name struct failed"),
         });
     }
     unsafe {
-        (*name_ptr).len  = len;
+        (*name_ptr).len = len;
         (*name_ptr).data = data_ptr;
     }
     Ok(name_ptr)
@@ -921,7 +906,7 @@ fn build_ipv4_sockaddr(
         core::ptr::write_bytes(ptr, 0u8, 1);
         let sa = &mut *ptr;
         sa.sin_family = libc::AF_INET as libc::sa_family_t;
-        sa.sin_port   = port.to_be();
+        sa.sin_port = port.to_be();
         // v4.octets() gives the four address bytes in network (big-endian) order.
         // `from_ne_bytes` reinterprets those bytes in the machine's native order
         // so that when the u32 is later read byte-by-byte by the kernel it sees
@@ -944,8 +929,8 @@ fn build_ipv4_sockaddr(
 /// - Step 9: `HyperHttpTransport<NgxConnector>` via
 ///   [`HyperHttpTransport::with_ngx_log`].
 pub struct HyperHttpTransport<C> {
-    endpoint:  ParsedEndpoint,
-    headers:   std::vec::Vec<(std::string::String, std::string::String)>,
+    endpoint: ParsedEndpoint,
+    headers: std::vec::Vec<(std::string::String, std::string::String)>,
     connector: C,
 }
 
@@ -953,7 +938,7 @@ pub struct HyperHttpTransport<C> {
 impl<C: core::fmt::Debug> core::fmt::Debug for HyperHttpTransport<C> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("HyperHttpTransport")
-            .field("endpoint",  &self.endpoint)
+            .field("endpoint", &self.endpoint)
             .field("connector", &self.connector)
             .finish()
     }
@@ -1013,8 +998,8 @@ impl HyperHttpTransport<NgxConnector> {
 impl<C: Connector> Transport for HyperHttpTransport<C> {
     async fn send(&mut self, bytes: std::vec::Vec<u8>) -> Result<(), TransportError> {
         let io = self.connector.connect(&self.endpoint).await?;
-        let authority  = self.endpoint.authority();
-        let http_path  = std::string::String::from(self.endpoint.http_path());
+        let authority = self.endpoint.authority();
+        let http_path = std::string::String::from(self.endpoint.http_path());
         http_post(io, &authority, &http_path, &self.headers, bytes).await
     }
 }
@@ -1063,31 +1048,25 @@ where
             hyper::header::CONTENT_LENGTH,
             body_len.to_string().parse().expect("numeric string"),
         );
-        hdrs.insert(
-            hyper::header::CONNECTION,
-            "close".parse().expect("static value"),
-        );
+        hdrs.insert(hyper::header::CONNECTION, "close".parse().expect("static value"));
         for (k, v) in extra_headers {
-            if let (Ok(name), Ok(val)) = (
-                k.parse::<hyper::header::HeaderName>(),
-                v.parse::<hyper::header::HeaderValue>(),
-            ) {
+            if let (Ok(name), Ok(val)) =
+                (k.parse::<hyper::header::HeaderName>(), v.parse::<hyper::header::HeaderValue>())
+            {
                 hdrs.insert(name, val);
             }
         }
     }
-    let req = builder
-        .body(full_body)
-        .map_err(|e| TransportError::Connection { cause: e.to_string() })?;
+    let req =
+        builder.body(full_body).map_err(|e| TransportError::Connection { cause: e.to_string() })?;
 
-    let (mut sender, conn) =
-        hyper::client::conn::http1::handshake::<IO, Full<Bytes>>(io)
-            .await
-            .map_err(|e| TransportError::Connection { cause: e.to_string() })?;
+    let (mut sender, conn) = hyper::client::conn::http1::handshake::<IO, Full<Bytes>>(io)
+        .await
+        .map_err(|e| TransportError::Connection { cause: e.to_string() })?;
 
     let resp_fut = sender.send_request(req);
 
-    let mut conn     = core::pin::pin!(conn);
+    let mut conn = core::pin::pin!(conn);
     let mut resp_fut = core::pin::pin!(resp_fut);
 
     let resp = future::poll_fn(|cx| {
@@ -1103,9 +1082,7 @@ where
     } else {
         Err(TransportError::HttpStatus {
             code: status.as_u16(),
-            message: std::string::String::from(
-                status.canonical_reason().unwrap_or("unknown"),
-            ),
+            message: std::string::String::from(status.canonical_reason().unwrap_or("unknown")),
         })
     }
 }

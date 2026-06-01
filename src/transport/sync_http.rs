@@ -108,8 +108,8 @@ pub fn sync_post(
 ) -> Result<(), SyncSendError> {
     // Parse the endpoint — reuses the same parser as HyperHttpTransport so
     // the two transports interpret the configuration string identically.
-    let endpoint = ParsedEndpoint::parse(endpoint_str)
-        .map_err(|_| SyncSendError::UnsupportedScheme)?;
+    let endpoint =
+        ParsedEndpoint::parse(endpoint_str).map_err(|_| SyncSendError::UnsupportedScheme)?;
 
     match endpoint {
         ParsedEndpoint::Http { host, port, path } => {
@@ -139,12 +139,8 @@ pub fn sync_post(
             // collector does not stall worker exit beyond the 500 ms budget.
             let mut stream = std::net::TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
                 .map_err(SyncSendError::Connect)?;
-            stream
-                .set_write_timeout(Some(WRITE_TIMEOUT))
-                .map_err(SyncSendError::Write)?;
-            stream
-                .set_read_timeout(Some(READ_TIMEOUT))
-                .map_err(SyncSendError::Read)?;
+            stream.set_write_timeout(Some(WRITE_TIMEOUT)).map_err(SyncSendError::Write)?;
+            stream.set_read_timeout(Some(READ_TIMEOUT)).map_err(SyncSendError::Read)?;
 
             send_request_and_read_response(&mut stream, &request)
         }
@@ -166,14 +162,9 @@ pub fn sync_post(
             // stall beyond 500 ms.  Such a deployment shape is exotic for a
             // local collector unix socket; if it does occur, the worker's
             // configured `worker_shutdown_timeout` is the outer backstop.
-            let mut stream = UnixStream::connect(&socket_path)
-                .map_err(SyncSendError::Connect)?;
-            stream
-                .set_write_timeout(Some(WRITE_TIMEOUT))
-                .map_err(SyncSendError::Write)?;
-            stream
-                .set_read_timeout(Some(READ_TIMEOUT))
-                .map_err(SyncSendError::Read)?;
+            let mut stream = UnixStream::connect(&socket_path).map_err(SyncSendError::Connect)?;
+            stream.set_write_timeout(Some(WRITE_TIMEOUT)).map_err(SyncSendError::Write)?;
+            stream.set_read_timeout(Some(READ_TIMEOUT)).map_err(SyncSendError::Read)?;
 
             send_request_and_read_response(&mut stream, &request)
         }
@@ -320,11 +311,7 @@ mod tests {
         let result = sync_post(&endpoint, &[], body);
         let request_bytes = server.join().expect("server thread panicked");
 
-        assert!(
-            result.is_ok(),
-            "sync_post over unix must succeed: {:?}",
-            result.err()
-        );
+        assert!(result.is_ok(), "sync_post over unix must succeed: {:?}", result.err());
 
         let raw = std::string::String::from_utf8_lossy(&request_bytes);
         assert!(

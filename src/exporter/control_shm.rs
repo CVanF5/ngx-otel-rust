@@ -118,23 +118,10 @@ mod tests {
         let ctrl = unsafe { &*buf.as_ptr().cast::<ControlShm>() };
 
         // Fresh-allocated buffer zeroed by vec! — simulating zone init.
-        assert_eq!(
-            ctrl.version.load(Ordering::Relaxed),
-            0,
-            "version must start at 0"
-        );
-        assert_eq!(
-            ctrl.flags.load(Ordering::Relaxed),
-            0,
-            "flags must start at 0"
-        );
+        assert_eq!(ctrl.version.load(Ordering::Relaxed), 0, "version must start at 0");
+        assert_eq!(ctrl.flags.load(Ordering::Relaxed), 0, "flags must start at 0");
         for (i, r) in ctrl._reserved.iter().enumerate() {
-            assert_eq!(
-                r.load(Ordering::Relaxed),
-                0,
-                "_reserved[{}] must start at 0",
-                i
-            );
+            assert_eq!(r.load(Ordering::Relaxed), 0, "_reserved[{}] must start at 0", i);
         }
 
         // Increment version once (simulates one exporter drain cycle).

@@ -1,0 +1,11 @@
+# Mirrors nginx/ngx-rust's rustfmt config (style only); edition tracks this
+# crate's Cargo.toml (2021) rather than upstream's 2024 until/unless we migrate.
+edition = "2021"
+max_width = 100
+use_small_heuristics = "Max"
+
+# unstable options (nightly rustfmt only):
+# comment_width = 100
+# group_imports = "StdExternalCrate"
+# format_strings = true
+# wrap_comments = true

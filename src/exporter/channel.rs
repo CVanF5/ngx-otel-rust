@@ -47,12 +47,7 @@ pub unsafe extern "C" fn otel_exporter_channel_handler(ev: *mut ngx_event_t) {
     loop {
         let mut ch: ngx_channel_t = unsafe { mem::zeroed() };
         let n: ngx_int_t = unsafe {
-            ngx_read_channel(
-                (*c).fd,
-                &mut ch as *mut _,
-                mem::size_of::<ngx_channel_t>(),
-                (*ev).log,
-            )
+            ngx_read_channel((*c).fd, &mut ch as *mut _, mem::size_of::<ngx_channel_t>(), (*ev).log)
         };
 
         if n == NGX_AGAIN as ngx_int_t {

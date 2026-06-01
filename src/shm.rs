@@ -124,6 +124,7 @@ impl WorkerSlots {
     ///
     /// # Safety
     /// The caller must ensure the memory at `ptr` is valid for a `WorkerSlots`.
+    #[cfg(test)] // only used by in-crate unit tests; production zeroes the zone via nginx
     pub unsafe fn init_at(ptr: *mut WorkerSlots) {
         unsafe { ptr::write_bytes(ptr, 0, 1) };
     }
@@ -175,7 +176,11 @@ pub unsafe fn register_zone(
     module: *mut nginx_sys::ngx_module_t,
 ) -> Option<*mut ngx_shm_zone_t> {
     let zone = unsafe { ngx_shared_memory_add(cf, name, size, module.cast()) };
-    if zone.is_null() { None } else { Some(zone) }
+    if zone.is_null() {
+        None
+    } else {
+        Some(zone)
+    }
 }
 
 /// Zone initialisation callback, called by nginx on each (re)start.

@@ -76,9 +76,7 @@ fn detect_stat_stub() -> bool {
     };
     let auto_config = build_dir.join("ngx_auto_config.h");
     println!("cargo::rerun-if-changed={}", auto_config.display());
-    std::fs::read_to_string(&auto_config)
-        .map(|s| s.contains("NGX_STAT_STUB"))
-        .unwrap_or(false)
+    std::fs::read_to_string(&auto_config).map(|s| s.contains("NGX_STAT_STUB")).unwrap_or(false)
 }
 
 /// Compile OpenTelemetry proto files with tonic-prost-build.
@@ -96,7 +94,7 @@ fn compile_protos() {
         tonic_prost_build::configure()
             .build_client(true)
             .build_server(false)
-            .compile_protos(&otel_protos, &[proto_root.clone()])
+            .compile_protos(&otel_protos, std::slice::from_ref(&proto_root))
             .expect("tonic-prost-build failed for OTel protos");
 
         for proto in &otel_protos {
@@ -127,7 +125,7 @@ fn compile_protos() {
         tonic_prost_build::configure()
             .build_client(true)
             .build_server(false)
-            .compile_protos(&[echo_proto.clone()], &[proto_root.clone()])
+            .compile_protos(std::slice::from_ref(&echo_proto), std::slice::from_ref(&proto_root))
             .expect("tonic-prost-build failed for echo client");
 
         // Server+client: used by examples/bidi_echo_server.rs only.
@@ -137,7 +135,7 @@ fn compile_protos() {
             .build_client(true)
             .build_server(true)
             .out_dir(&echo_server_out)
-            .compile_protos(&[echo_proto.clone()], &[proto_root])
+            .compile_protos(std::slice::from_ref(&echo_proto), &[proto_root])
             .expect("tonic-prost-build failed for echo server");
 
         println!("cargo::rerun-if-changed={}", echo_proto.display());

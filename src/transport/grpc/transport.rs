@@ -49,6 +49,12 @@ use crate::transport::{Transport, TransportError};
 /// Generic over the connector so tests can inject a `SpinConnector`-backed
 /// variant; the production path uses
 /// [`GrpcTransport::<NgxConnector>::with_ngx_log`].
+// `Connector` is intentionally crate-internal (its `connect` signature also
+// references the crate-internal `ParsedEndpoint`); this struct is `pub` only so
+// integration tests can construct it. Widening `Connector`/`ParsedEndpoint` to
+// `pub` would leak internals in a crate with no real public API (cdylib), so
+// allow the private-bound lint here and on the inherent impl below.
+#[allow(private_bounds)]
 pub struct GrpcTransport<C: Connector> {
     /// Parsed endpoint (host + port used by `connector.connect`).
     endpoint: ParsedEndpoint,
@@ -96,12 +102,10 @@ impl GrpcTransport<NgxConnector> {
     }
 }
 
+#[allow(private_bounds)] // see note on the struct above
 impl<C: Connector> GrpcTransport<C> {
     /// Generic constructor (used by `with_ngx_log` and may be used by tests).
-    pub(crate) fn with_connector(
-        endpoint_str: &str,
-        connector: C,
-    ) -> Result<Self, TransportError> {
+    pub(crate) fn with_connector(endpoint_str: &str, connector: C) -> Result<Self, TransportError> {
         let endpoint = ParsedEndpoint::parse(endpoint_str)?;
 
         // Build the origin URI: `http://host:port` (no path).
@@ -119,19 +123,14 @@ impl<C: Connector> GrpcTransport<C> {
             }
         };
 
-        let origin: Uri = origin_str
-            .parse()
-            .map_err(|_: http::uri::InvalidUri| TransportError::InvalidEndpoint {
+        let origin: Uri = origin_str.parse().map_err(|_: http::uri::InvalidUri| {
+            TransportError::InvalidEndpoint {
                 input: std::string::String::from(endpoint_str),
                 reason: "gRPC: could not parse http://host:port as a valid URI",
-            })?;
+            }
+        })?;
 
-        Ok(Self {
-            endpoint,
-            origin,
-            connector,
-            client: None,
-        })
+        Ok(Self { endpoint, origin, connector, client: None })
     }
 }
 
@@ -248,12 +247,8 @@ mod tests {
     #[test]
     fn grpc_transport_rejects_https_endpoint() {
         let log_ptr = core::ptr::NonNull::dangling();
-        let result =
-            GrpcTransport::<NgxConnector>::with_ngx_log("https://127.0.0.1:4317", log_ptr);
-        assert!(
-            result.is_err(),
-            "https:// endpoints must fail (TLS not implemented)"
-        );
+        let result = GrpcTransport::<NgxConnector>::with_ngx_log("https://127.0.0.1:4317", log_ptr);
+        assert!(result.is_err(), "https:// endpoints must fail (TLS not implemented)");
     }
 
     /// `GrpcTransport<NgxConnector>` must satisfy the `Transport + Send` bounds

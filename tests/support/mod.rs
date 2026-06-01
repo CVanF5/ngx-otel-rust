@@ -62,7 +62,8 @@ pub static mut ngx_current_msec: nginx_sys::ngx_msec_t = 0;
 
 // nginx process-type globals (referenced by ngx_otel_init_process).
 #[no_mangle]
-pub static mut ngx_process: nginx_sys::ngx_uint_t = nginx_sys::NGX_PROCESS_SINGLE as nginx_sys::ngx_uint_t;
+pub static mut ngx_process: nginx_sys::ngx_uint_t =
+    nginx_sys::NGX_PROCESS_SINGLE as nginx_sys::ngx_uint_t;
 
 // nginx shutdown flags (referenced by the export loop).
 #[no_mangle]
@@ -96,9 +97,7 @@ stat_ptr_stub!(ngx_stat_waiting);
 
 // NGINX array API.
 #[no_mangle]
-pub unsafe extern "C" fn ngx_array_push(
-    _a: *mut nginx_sys::ngx_array_t,
-) -> *mut c_void {
+pub unsafe extern "C" fn ngx_array_push(_a: *mut nginx_sys::ngx_array_t) -> *mut c_void {
     core::ptr::null_mut()
 }
 
@@ -188,10 +187,8 @@ pub static mut ngx_http_module: nginx_sys::ngx_module_t = nginx_sys::ngx_module_
 
 // nginx posted-events queue (used by event loop).
 #[no_mangle]
-pub static mut ngx_posted_next_events: nginx_sys::ngx_queue_t = nginx_sys::ngx_queue_t {
-    prev: core::ptr::null_mut(),
-    next: core::ptr::null_mut(),
-};
+pub static mut ngx_posted_next_events: nginx_sys::ngx_queue_t =
+    nginx_sys::ngx_queue_t { prev: core::ptr::null_mut(), next: core::ptr::null_mut() };
 
 // nginx pool cleanup API (used by ngx::core::Pool).
 #[no_mangle]

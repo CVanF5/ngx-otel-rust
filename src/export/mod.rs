@@ -50,9 +50,9 @@ use crate::data_model::{
     NumberDataPoint, NumberValue, Resource, Scope, SumData,
 };
 use crate::encoder::{Encoder, OtlpHttpEncoder};
-use crate::metric_source::MetricSource;
 use crate::metric_source::instrumented::InstrumentedSource;
 use crate::metric_source::stub_status::StubStatusSource;
+use crate::metric_source::MetricSource;
 use crate::transport::hyper_http::NgxConnector;
 use crate::transport::{GrpcTransport, HyperHttpTransport, Transport};
 
@@ -130,7 +130,10 @@ enum ExportTransport {
 }
 
 impl Transport for ExportTransport {
-    async fn send(&mut self, bytes: std::vec::Vec<u8>) -> Result<(), crate::transport::TransportError> {
+    async fn send(
+        &mut self,
+        bytes: std::vec::Vec<u8>,
+    ) -> Result<(), crate::transport::TransportError> {
         match self {
             Self::Http(t) => t.send(bytes).await,
             Self::Grpc(t) => t.send(bytes).await,
@@ -395,7 +398,13 @@ pub async fn export_loop(amcf: &'static MainConfig) {
         while let Some((bytes, n_pts)) = queue_snapshot.pop_front() {
             if drain_failed {
                 // Transport is down; re-enqueue remaining items without sending.
-                enqueue_with_eviction(&mut retry_queue, bytes, n_pts, retry_buffer_depth, log.as_ptr());
+                enqueue_with_eviction(
+                    &mut retry_queue,
+                    bytes,
+                    n_pts,
+                    retry_buffer_depth,
+                    log.as_ptr(),
+                );
                 continue;
             }
             match transport.send(bytes.clone()).await {
@@ -415,7 +424,13 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                         e
                     );
                     SEND_FAILURES.fetch_add(1, Ordering::Relaxed);
-                    enqueue_with_eviction(&mut retry_queue, bytes, n_pts, retry_buffer_depth, log.as_ptr());
+                    enqueue_with_eviction(
+                        &mut retry_queue,
+                        bytes,
+                        n_pts,
+                        retry_buffer_depth,
+                        log.as_ptr(),
+                    );
                     drain_failed = true;
                 }
             }
@@ -446,7 +461,13 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                     "otel export: send failed ({}); queuing for retry",
                     e
                 );
-                enqueue_with_eviction(&mut retry_queue, bytes, n_pts, retry_buffer_depth, log.as_ptr());
+                enqueue_with_eviction(
+                    &mut retry_queue,
+                    bytes,
+                    n_pts,
+                    retry_buffer_depth,
+                    log.as_ptr(),
+                );
                 SEND_FAILURES.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -588,11 +609,7 @@ async fn graceful_drain(
         }
     }
 
-    ngx::ngx_log_error!(
-        NGX_LOG_NOTICE,
-        log.as_ptr(),
-        "otel export: graceful drain complete"
-    );
+    ngx::ngx_log_error!(NGX_LOG_NOTICE, log.as_ptr(), "otel export: graceful drain complete");
 }
 
 // ── Deadline-bounded future ─────────────────────────────────────────────────
@@ -631,10 +648,7 @@ impl<F: Future> Future for WithDeadline<F> {
 /// future is dropped — for a hyper send this means the in-flight connection
 /// future is cancelled cleanly via [`Drop`].
 fn with_deadline<F: Future>(fut: F, timeout: Duration) -> WithDeadline<F> {
-    WithDeadline {
-        fut,
-        timer: ngx::async_::sleep(timeout),
-    }
+    WithDeadline { fut, timer: ngx::async_::sleep(timeout) }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -707,7 +721,9 @@ fn collect_all_sources(amcf: &MainConfig, worker_start_ns: u64) -> Batch {
             let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
             (avail / core::mem::size_of::<crate::shm::WorkerSlots>()).max(1)
         };
-        metrics.extend(InstrumentedSource { base, n_workers, start_time_unix_nano: worker_start_ns }.collect());
+        metrics.extend(
+            InstrumentedSource { base, n_workers, start_time_unix_nano: worker_start_ns }.collect(),
+        );
     }
 
     // 3. Self-metrics (dropped_records, send_failures, export_interval).
@@ -730,33 +746,23 @@ fn collect_all_sources(amcf: &MainConfig, worker_start_ns: u64) -> Batch {
         }
     }
     for kv in &amcf.resource_attrs {
-        if let (Ok(k), Ok(v)) = (
-            core::str::from_utf8(kv.key.as_bytes()),
-            core::str::from_utf8(kv.value.as_bytes()),
-        ) {
-            resource_attrs.push(KeyValue {
-                key: k.into(),
-                value: AnyValue::String(v.into()),
-            });
+        if let (Ok(k), Ok(v)) =
+            (core::str::from_utf8(kv.key.as_bytes()), core::str::from_utf8(kv.value.as_bytes()))
+        {
+            resource_attrs.push(KeyValue { key: k.into(), value: AnyValue::String(v.into()) });
         }
     }
 
     Batch {
         resource: Resource { attributes: resource_attrs },
-        scope: Scope {
-            name: "ngx-otel-rust".into(),
-            version: env!("CARGO_PKG_VERSION").into(),
-        },
+        scope: Scope { name: "ngx-otel-rust".into(), version: env!("CARGO_PKG_VERSION").into() },
         metrics,
     }
 }
 
 fn now_unix_nano() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64
 }
 
 /// Build a monotonic cumulative Sum metric carrying a single i64 data point.
@@ -844,11 +850,7 @@ pub fn exit_process_flush(amcf: &MainConfig) {
         return;
     }
 
-    ngx::ngx_log_error!(
-        NGX_LOG_NOTICE,
-        log.as_ptr(),
-        "exit_process: sync flush starting"
-    );
+    ngx::ngx_log_error!(NGX_LOG_NOTICE, log.as_ptr(), "exit_process: sync flush starting");
 
     let batch = collect_all_sources(amcf, worker_start_ns);
     let n_pts = count_data_points(&batch);
@@ -892,11 +894,7 @@ pub fn exit_process_flush(amcf: &MainConfig) {
             );
         }
         Err(ref e) if e.is_timeout() => {
-            ngx::ngx_log_error!(
-                NGX_LOG_NOTICE,
-                log.as_ptr(),
-                "exit_process: sync flush timed out"
-            );
+            ngx::ngx_log_error!(NGX_LOG_NOTICE, log.as_ptr(), "exit_process: sync flush timed out");
         }
         Err(ref e) => {
             ngx::ngx_log_error!(
@@ -944,12 +942,7 @@ mod tests {
         let after = DROPPED_RECORDS.load(Ordering::SeqCst);
 
         // Queue must be bounded at depth.
-        assert_eq!(
-            queue.len(),
-            depth,
-            "retry queue must not exceed configured depth = {}",
-            depth
-        );
+        assert_eq!(queue.len(), depth, "retry queue must not exceed configured depth = {}", depth);
 
         // The two evicted items had n_pts = 1 and n_pts = 2.
         let expected_dropped: u64 = 1 + 2;

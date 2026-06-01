@@ -35,17 +35,13 @@ use ngx_http_otel_module::transport::{HyperHttpTransport, Transport, TransportEr
 /// transport wraps in `TransportError::Connection`.
 #[test]
 fn connection_refused_returns_error() {
-    let mut transport =
-        HyperHttpTransport::new("http://127.0.0.1:1/v1/metrics", vec![])
-            .expect("endpoint must parse");
+    let mut transport = HyperHttpTransport::new("http://127.0.0.1:1/v1/metrics", vec![])
+        .expect("endpoint must parse");
 
     let result = block_on(transport.send(vec![0u8; 16]));
     match result {
         Err(TransportError::Connection { .. }) => { /* expected */ }
-        other => panic!(
-            "expected TransportError::Connection, got: {:?}",
-            other
-        ),
+        other => panic!("expected TransportError::Connection, got: {:?}", other),
     }
 }
 
@@ -56,22 +52,15 @@ fn connection_refused_returns_error() {
 /// even after a prior failure.
 #[test]
 fn second_send_after_failure_does_not_panic() {
-    let mut transport =
-        HyperHttpTransport::new("http://127.0.0.1:1/v1/metrics", vec![])
-            .expect("endpoint must parse");
+    let mut transport = HyperHttpTransport::new("http://127.0.0.1:1/v1/metrics", vec![])
+        .expect("endpoint must parse");
 
     let first = block_on(transport.send(vec![0u8; 16]));
-    assert!(
-        first.is_err(),
-        "first send to closed port must fail"
-    );
+    assert!(first.is_err(), "first send to closed port must fail");
 
     // Must not panic; must return an error (not Ok).
     let second = block_on(transport.send(vec![0u8; 16]));
-    assert!(
-        second.is_err(),
-        "second send to closed port must also fail"
-    );
+    assert!(second.is_err(), "second send to closed port must also fail");
 }
 
 /// Parsing an unsupported scheme returns an `InvalidEndpoint` error at
@@ -81,10 +70,7 @@ fn invalid_scheme_rejected_at_construction() {
     let result = HyperHttpTransport::new("grpc://127.0.0.1:4317/", vec![]);
     match result {
         Err(TransportError::InvalidEndpoint { .. }) => { /* expected */ }
-        other => panic!(
-            "expected TransportError::InvalidEndpoint, got: {:?}",
-            other
-        ),
+        other => panic!("expected TransportError::InvalidEndpoint, got: {:?}", other),
     }
 }
 
@@ -94,10 +80,9 @@ fn https_returns_tls_config_error() {
     let result = HyperHttpTransport::new("https://127.0.0.1:4318/v1/metrics", vec![]);
     match result {
         Err(TransportError::TlsConfig { .. }) => { /* expected */ }
-        Ok(transport) => panic!(
-            "expected TransportError::TlsConfig for https://, got Ok: {:?}",
-            transport
-        ),
+        Ok(transport) => {
+            panic!("expected TransportError::TlsConfig for https://, got Ok: {:?}", transport)
+        }
         Err(other) => panic!(
             "expected TransportError::TlsConfig for https://, got different error: {:?}",
             other
@@ -115,9 +100,6 @@ fn unix_socket_not_found_returns_error() {
     let result = block_on(transport.send(vec![0u8; 16]));
     match result {
         Err(TransportError::Connection { .. }) => { /* expected */ }
-        other => panic!(
-            "expected TransportError::Connection for missing socket, got: {:?}",
-            other
-        ),
+        other => panic!("expected TransportError::Connection for missing socket, got: {:?}", other),
     }
 }
