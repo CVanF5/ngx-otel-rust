@@ -664,6 +664,18 @@ mod nginx_test_stubs {
     #[no_mangle]
     pub static mut ngx_current_msec: nginx_sys::ngx_msec_t = 0;
 
+    // `ngx_cached_time` is a `*mut ngx_time_t`; `ngx_timeofday()` dereferences
+    // it. The log-phase handler's request-duration calc calls `ngx_timeofday()`
+    // (since the metrics-correctness fix `9e2138e`), so this data symbol must be
+    // stubbed too — otherwise macOS dyld aborts loading the debug
+    // `cargo test --lib` binary on the unresolved `_ngx_cached_time`. Points at
+    // a zeroed `ngx_time_t` (sec = msec = 0 → duration clamps to 0 in tests).
+    static mut STUB_CACHED_TIME: nginx_sys::ngx_time_t = unsafe { core::mem::zeroed() };
+
+    #[no_mangle]
+    pub static mut ngx_cached_time: *mut nginx_sys::ngx_time_t =
+        core::ptr::addr_of_mut!(STUB_CACHED_TIME);
+
     // nginx process-type globals accessed by ngx_otel_init_process.
     #[no_mangle]
     pub static mut ngx_process: nginx_sys::ngx_uint_t =
