@@ -59,6 +59,7 @@ pub mod data_model;
 pub mod encoder;
 mod export;
 pub(crate) mod exporter;
+pub(crate) mod logs;
 mod metric_source;
 mod shm;
 pub mod transport;

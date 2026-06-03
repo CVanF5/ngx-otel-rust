@@ -160,11 +160,86 @@ pub struct Batch {
 }
 
 // ────────────────────────────────────────────────────────────────
+// Log types (Phase 2.1)
+// ────────────────────────────────────────────────────────────────
+
+/// OTel severity number per the OTel Log Data Model spec.
+///
+/// Values mirror the `SeverityNumber` enum in `logs.proto`; only the
+/// subset used by the nginx-level → OTel mapping is listed here.
+/// Numeric values match the proto field numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum SeverityNumber {
+    Unspecified = 0,
+    Trace = 1,
+    Trace2 = 2,
+    Trace3 = 3,
+    Trace4 = 4,
+    Debug = 5,
+    Debug2 = 6,
+    Debug3 = 7,
+    Debug4 = 8,
+    Info = 9,
+    Info2 = 10,
+    Info3 = 11,
+    Info4 = 12,
+    Warn = 13,
+    Warn2 = 14,
+    Warn3 = 15,
+    Warn4 = 16,
+    Error = 17,
+    Error2 = 18,
+    Error3 = 19,
+    Error4 = 20,
+    Fatal = 21,
+    Fatal2 = 22,
+    Fatal3 = 23,
+    Fatal4 = 24,
+}
+
+/// A single OTel log record.
+///
+/// Mirrors the `LogRecord` proto message shape (Phase 2.1).
+/// `trace_id` / `span_id` are left empty — Phase 3 will correlate with
+/// spans.  `body` carries a short string for access logs; structured
+/// attributes carry the HTTP semconv fields.
+#[derive(Debug, Clone)]
+pub struct LogRecord {
+    /// When the event occurred (Unix epoch, nanoseconds).
+    pub time_unix_nano: u64,
+    /// When the event was observed by the collector (Unix epoch, nanoseconds).
+    pub observed_time_unix_nano: u64,
+    /// Normalized severity level.
+    pub severity_number: SeverityNumber,
+    /// Severity text (e.g. `"info"`, `"error"`).
+    pub severity_text: std::string::String,
+    /// Log body — free-form string.  Empty for access logs (attributes carry
+    /// the HTTP semconv fields).
+    pub body: AnyValue,
+    /// HTTP semconv and other structured attributes.
+    pub attributes: std::vec::Vec<KeyValue>,
+    /// Event name (e.g. `"http.access"` or `"nginx.error"`).
+    pub event_name: std::string::String,
+}
+
+/// A batch of log records ready for export.
+///
+/// Parallels [`Batch`] for metrics.  Groups records from all workers
+/// under a single `Resource` and `Scope` before sending to the collector.
+#[derive(Debug, Clone)]
+pub struct LogsBatch {
+    pub resource: Resource,
+    pub scope: Scope,
+    pub logs: std::vec::Vec<LogRecord>,
+}
+
+// ────────────────────────────────────────────────────────────────
 // Unit tests
 // ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Construct a Batch with one histogram metric, one resource attribute,
@@ -225,5 +300,55 @@ mod tests {
         assert_eq!(dp.bucket_counts.len(), 9); // 8 boundaries + 1 overflow
         assert_eq!(dp.attributes[0].key, "http.response.status_code");
         assert_eq!(dp.attributes[0].value, AnyValue::Int(200));
+    }
+
+    /// Construct a LogsBatch with two LogRecords; inspect the shape manually.
+    #[test]
+    fn logs_batch_round_trip() {
+        let resource = Resource {
+            attributes: std::vec![KeyValue {
+                key: "service.name".into(),
+                value: AnyValue::String("test-nginx".into()),
+            }],
+        };
+        let scope = Scope { name: "ngx-otel-rust".into(), version: "0.1.0".into() };
+
+        let record1 = LogRecord {
+            time_unix_nano: 1_700_000_000_000_000_000,
+            observed_time_unix_nano: 1_700_000_000_000_000_001,
+            severity_number: SeverityNumber::Info,
+            severity_text: "info".into(),
+            body: AnyValue::String(std::string::String::new()),
+            attributes: std::vec![
+                KeyValue { key: "http.request.method".into(), value: AnyValue::String("GET".into()) },
+                KeyValue {
+                    key: "http.response.status_code".into(),
+                    value: AnyValue::Int(200),
+                },
+            ],
+            event_name: "http.access".into(),
+        };
+
+        let record2 = LogRecord {
+            time_unix_nano: 1_700_000_001_000_000_000,
+            observed_time_unix_nano: 1_700_000_001_000_000_002,
+            severity_number: SeverityNumber::Error,
+            severity_text: "error".into(),
+            body: AnyValue::String("upstream connect failed".into()),
+            attributes: std::vec![],
+            event_name: "nginx.error".into(),
+        };
+
+        let batch = LogsBatch { resource, scope, logs: std::vec![record1, record2] };
+
+        assert_eq!(batch.resource.attributes.len(), 1);
+        assert_eq!(batch.resource.attributes[0].key, "service.name");
+        assert_eq!(batch.logs.len(), 2);
+        assert_eq!(batch.logs[0].event_name, "http.access");
+        assert_eq!(batch.logs[0].severity_number, SeverityNumber::Info);
+        assert_eq!(batch.logs[0].severity_number as i32, 9);
+        assert_eq!(batch.logs[1].event_name, "nginx.error");
+        assert_eq!(batch.logs[1].severity_number, SeverityNumber::Error);
+        assert_eq!(batch.logs[1].severity_number as i32, 17);
     }
 }
