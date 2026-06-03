@@ -261,15 +261,19 @@ if (( TOTAL_REQUESTS > 0 )); then
             pass "Delivery > 0 at extreme ~${RPS_ESTIMATE} req/s (${PCT}%; ring saturated, drops expected)"
         fi
     else
-        # 0 records delivered.
+        # 0 records delivered. A working drain ALWAYS delivers something, even
+        # under saturation: post-FU2 the exporter drains every
+        # SHUTDOWN_POLL_INTERVAL, so overload shows up as high DROPS, never as
+        # zero DELIVERY. Zero delivery means the drain is broken, not merely
+        # overloaded — so this is a HARD FAIL on Linux at EVERY RPS tier (no
+        # >=100k escape hatch: extreme load relaxes the delivery-% and drop-%
+        # gates, but never the "drain is alive" gate). macOS stays soft: the
+        # exporter CPU-starves on this busy dev host (see the dev-host
+        # benchmarking note), so /healthz p99 is the macOS signal.
         if [[ "${PLATFORM}" == "Darwin" ]]; then
-            info "SKIP (macOS): 0 LogRecords — p99 gate below is the key assertion"
+            info "SKIP (macOS soft): 0 LogRecords — exporter CPU-starves on this host; p99 gate below is the macOS assertion"
         else
-            if (( RPS_ESTIMATE < 100000 )); then
-                fail "Linux gate: 0 LogRecords at ~${RPS_ESTIMATE} req/s — drain broken"
-            else
-                info "INFO (Linux, extreme load): 0 LogRecords — exporter may be CPU-starved; p99 is the gate"
-            fi
+            fail "Linux gate: 0 LogRecords at ~${RPS_ESTIMATE} req/s — drain broken (saturation expects drops, not zero delivery)"
         fi
     fi
 else
