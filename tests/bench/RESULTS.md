@@ -463,3 +463,14 @@ and single outliers. Tracked as a bench-tooling refinement, independent of
 this gate.
 
 **Metrics-correctness loop: zero-cost gate PASS (dedicated cloud, N=50). Loop closed.**
+
+## Phase 2.1 Zero-cost logs bench — 2026-06-03
+
+| Config | Median (req/s) | p95 (req/s) | Regression vs BL |
+|--------|---------------|-------------|-----------------|
+| BL (access_log OFF) | 59404.60 | 59548.94 | — |
+| TA (access_log ON)  | 58934.23 | 59108.38 | 0.8% |
+| TB (access_log ON, high RPS) | 58612.45 | 58626.64 | 1.3% (informational) |
+
+Host: C6CQ3045N2; nginx: tests/bench/zero_cost_logs.sh: line 207: "/Users/c.vandesande/project-nginx-otel/ngx-otel-rust/objs-debug/nginx": No such file or directory
+INFORMATIONAL — ±1% gate requires N≥50 on isolated hardware.
