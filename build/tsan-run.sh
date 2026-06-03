@@ -167,6 +167,14 @@ echo "[tsan-run] === Running run_grpc_export.sh under TSAN (production gRPC expo
 # no data races on the production gRPC export loop.
 bash tests/integration/run_grpc_export.sh
 
+echo ""
+echo "[tsan-run] === Running run_access_log.sh under TSAN (Phase 2.1 access-log path) ==="
+# Exercises the SPSC logs ring (workers write, exporter reads) and the new
+# multi-dim WorkerSlots (request_duration_combos array) under TSAN.
+# This covers the Phase 2.1 shared-state additions that the Phase 2.1 loop
+# was obligated to verify (RALPH_PHASE_2_1_FOLLOWUP.md FU6).
+bash tests/integration/run_access_log.sh
+
 # ── Step 5: Belt-and-suspenders ThreadSanitizer warning scan ─────────────────
 
 echo ""
@@ -174,7 +182,8 @@ echo "[tsan-run] Checking for ThreadSanitizer warnings in error logs..."
 TSAN_WARNINGS=0
 for log in /tmp/ngx-otel-grpc-smoke.*/logs/error.log \
            /tmp/ngx-otel-grpc-bidi-smoke.*/logs/error.log \
-           /tmp/ngx-otel-grpc-export.*/logs/error.log; do
+           /tmp/ngx-otel-grpc-export.*/logs/error.log \
+           /tmp/ngx-otel-access-log.*/logs/error.log; do
     if [[ -f "${log}" ]]; then
         count=$(grep -c "WARNING: ThreadSanitizer" "${log}" 2>/dev/null || true)
         if [[ "${count}" -gt 0 ]]; then
