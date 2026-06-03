@@ -230,7 +230,13 @@ pub(crate) mod tests {
     use super::*;
     use std::boxed::Box;
 
-    type SmallRing = LogsWorkerRing<1024>; // tiny ring for tests
+    pub type SmallRing = LogsWorkerRing<1024>; // tiny ring for tests
+
+    /// Create a zero-initialised small ring on the heap.  Used by ring tests
+    /// and by `logs::tests::log_producer_trait_object_safe`.
+    pub fn make_ring_small() -> Box<SmallRing> {
+        make_ring()
+    }
 
     fn make_ring() -> Box<SmallRing> {
         // Safety: zeroing a SmallRing is valid — all fields are integers /
