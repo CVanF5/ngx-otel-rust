@@ -145,14 +145,38 @@ rm -f "${WRK_OUTPUT_FILE}"
 info "Stress load complete."
 echo "${WRK_STDOUT}" | tail -5
 
-# Extract total request count from wrk output.
-TOTAL_REQUESTS=$(echo "${WRK_STDOUT}" | grep "requests in" | awk '{print $1}' || echo 0)
-# Handle wrk output format: "300000 requests in 60.04s, 36.62MB read"
-if echo "${TOTAL_REQUESTS}" | grep -qE '^[0-9]+$'; then
+# ─── Extract total request count robustly ────────────────────────────────────
+# wrk output line: "803487 requests in 15.08s, 129.09MB read"
+# Strip leading whitespace (macOS wc/awk can add it) and ensure numeric.
+_parse_wrk_total() {
+    local stdout="$1"
+    # Primary: parse "N requests in ..."
+    local val
+    val=$(echo "${stdout}" | grep "requests in" | grep -oE '[0-9]+' | head -1 || true)
+    if [[ "${val}" =~ ^[0-9]+$ ]] && (( val > 0 )); then
+        echo "${val}"
+        return 0
+    fi
+    # Fallback: estimate from Requests/sec × duration
+    val=$(echo "${stdout}" | grep "Requests/sec:" | awk -v d="${STRESS_DURATION_S}" '{printf "%d", $2 * d}' || true)
+    if [[ "${val}" =~ ^[0-9]+$ ]] && (( val > 0 )); then
+        echo "${val}"
+        return 0
+    fi
+    echo "0"
+}
+
+TOTAL_REQUESTS=$(_parse_wrk_total "${WRK_STDOUT}")
+PLATFORM="$(uname -s)"
+if [[ "${TOTAL_REQUESTS}" =~ ^[0-9]+$ ]] && (( TOTAL_REQUESTS > 0 )); then
     info "Total requests sent: ${TOTAL_REQUESTS}"
 else
-    TOTAL_REQUESTS=$(echo "${WRK_STDOUT}" | grep "Requests/sec" | awk '{print int($2 * '"${STRESS_DURATION_S}"')}' || echo 0)
-    info "Total requests (estimated from RPS): ${TOTAL_REQUESTS}"
+    TOTAL_REQUESTS=0
+    if [[ "${PLATFORM}" == "Darwin" ]]; then
+        info "WARN: could not parse total request count from wrk output (macOS) — coverage check skipped"
+    else
+        fail "Could not parse total request count from wrk output — check wrk version/output format"
+    fi
 fi
 
 # ─── Wait for flush ───────────────────────────────────────────────────────────
@@ -187,56 +211,87 @@ if [[ -f "${LOGS_LOG}" ]]; then
     fi
 fi
 
-LOG_RECORD_COUNT=$(echo "${NEW_LOGS}" | grep -o '"http.access"' | wc -l || echo 0)
+# Count log records: grep for event name in new logs content.
+LOG_RECORD_COUNT=$(echo "${NEW_LOGS}" | grep -o '"http.access"' | wc -l | tr -d ' ')
+LOG_RECORD_COUNT="${LOG_RECORD_COUNT:-0}"
 info "LogRecord count in logs.json: ${LOG_RECORD_COUNT}"
 
-# Under very high RPS on dev hardware (macOS arm64), the exporter process can
-# be starved of CPU time by the worker processes, causing large batch sends to
-# fail mid-connection.  The plan explicitly notes this test "may be flaky due
-# to event-loop scheduling differences" on macOS and documents it as
-# Linux-only if needed.  We apply a platform-aware gate here:
-#   - Linux: hard gate (fail if 0 records)
-#   - macOS: soft gate (warn, never fail on coverage alone)
-PLATFORM="$(uname -s)"
-if (( TOTAL_REQUESTS > 0 && LOG_RECORD_COUNT > 0 )); then
-    PCT=$(awk "BEGIN { printf \"%.1f\", ${LOG_RECORD_COUNT} / ${TOTAL_REQUESTS} * 100 }")
-    info "Coverage: ${LOG_RECORD_COUNT}/${TOTAL_REQUESTS} = ${PCT}%"
-    if (( LOG_RECORD_COUNT * 2 >= TOTAL_REQUESTS )); then
-        pass ">=50% of requests appeared as LogRecords (${PCT}%, drain kept up)"
+# ── Coverage assertion (platform-aware) ──────────────────────────────────────
+# FU2 (decoupled drain, 250ms cadence) dramatically improves Linux delivery.
+# macOS remains a soft gate due to exporter CPU-starvation under extreme load.
+if (( TOTAL_REQUESTS > 0 )); then
+    if (( LOG_RECORD_COUNT > 0 )); then
+        PCT=$(awk "BEGIN { printf \"%.1f\", ${LOG_RECORD_COUNT} / ${TOTAL_REQUESTS} * 100 }")
+        info "Coverage: ${LOG_RECORD_COUNT}/${TOTAL_REQUESTS} = ${PCT}%"
+        if awk "BEGIN { exit !(${LOG_RECORD_COUNT} * 2 >= ${TOTAL_REQUESTS}) }"; then
+            pass ">=50% of requests appeared as LogRecords (${PCT}%, drain kept up)"
+        else
+            if [[ "${PLATFORM}" == "Darwin" ]]; then
+                info "INFO (macOS soft): coverage ${PCT}% < 50% — ring saturation or CPU starvation"
+            else
+                fail "Linux hard gate: coverage ${PCT}% < 50% — drain is not keeping up"
+            fi
+        fi
     else
-        info "INFO: ${PCT}% of requests appeared as LogRecords (below 50%)"
-        info "      Drops are expected at high RPS — ring saturated."
-    fi
-elif (( TOTAL_REQUESTS > 0 && LOG_RECORD_COUNT == 0 )); then
-    if [[ "${PLATFORM}" == "Darwin" ]]; then
-        info "SKIP (macOS): 0 LogRecords in logs.json under high load"
-        info "       Known limitation: large batches can fail under CPU saturation on macOS arm64."
-        info "       The /healthz p99 assertion still guards against producer blocking."
-        info "       Run on Linux arm64 for the hard coverage gate."
-    else
-        fail "No LogRecords found in logs.json — drain may not be working (Linux arm64 hard gate)"
+        # 0 records delivered.
+        if [[ "${PLATFORM}" == "Darwin" ]]; then
+            info "SKIP (macOS): 0 LogRecords — known CPU-starvation limitation under extreme load"
+            info "      /healthz p99 assertion below still guards against producer blocking"
+        else
+            fail "Linux hard gate: 0 LogRecords delivered — drain broken"
+        fi
     fi
 else
-    info "Total request count not available; skipping coverage check"
+    info "SKIP: total request count unavailable — coverage check omitted"
 fi
 
-# Assertion 4: drop_count > 0 AND < 50% of total.
-DROP_COUNT_IN_METRICS=$(echo "${NEW_LOGS}" | grep -o '"ngx_otel.logs.access.dropped_records"' | wc -l || echo 0)
-info "Dropped-records metric seen in logs.json: ${DROP_COUNT_IN_METRICS} (expected > 0 under high load)"
-# Note: the dropped_records metric is in metrics.json, not logs.json.
-# Check metrics.json for the self-metric.
+# ── Drop assertion: read the ACTUAL VALUE from metrics.json ──────────────────
+# The dropped_records metric is exported as a monotonic sum in metrics.json.
+# We need the numeric VALUE, not just the metric NAME.
 NEW_METRICS=""
-PRE_METRICS_SIZE=0
 if [[ -f "${METRICS_LOG}" ]]; then
-    # We don't have a pre-snapshot for metrics; just check the tail.
-    NEW_METRICS=$(tail -c 102400 "${METRICS_LOG}" 2>/dev/null || true)
+    NEW_METRICS=$(tail -c 204800 "${METRICS_LOG}" 2>/dev/null || true)
 fi
-DROPS_REPORTED=$(echo "${NEW_METRICS}" | grep -c "ngx_otel.logs.access.dropped_records" || echo 0)
-if (( DROPS_REPORTED > 0 )); then
-    pass "ngx_otel.logs.access.dropped_records metric present (drop path exercised)"
+
+# Extract the max asInt value for ngx_otel.logs.access.dropped_records using python3.
+DROPS_VALUE=0
+if command -v python3 >/dev/null 2>&1; then
+    DROPS_VALUE=$(echo "${NEW_METRICS}" | python3 -c "
+import sys, json
+best = 0
+for line in sys.stdin:
+    try:
+        d = json.loads(line.strip())
+        for rm in d.get('resourceMetrics', []):
+            for sm in rm.get('scopeMetrics', []):
+                for m in sm.get('metrics', []):
+                    if m.get('name') == 'ngx_otel.logs.access.dropped_records':
+                        for dp in m.get('sum', {}).get('dataPoints', []):
+                            v = int(dp.get('asInt', dp.get('asDouble', 0)))
+                            if v > best:
+                                best = v
+    except Exception:
+        pass
+print(best)
+" 2>/dev/null || echo 0)
+fi
+DROPS_VALUE="${DROPS_VALUE:-0}"
+info "ngx_otel.logs.access.dropped_records = ${DROPS_VALUE}"
+
+if (( DROPS_VALUE > 0 )); then
+    # Also check drops < 50% of TOTAL_REQUESTS if we have the count.
+    if (( TOTAL_REQUESTS > 0 )); then
+        if awk "BEGIN { exit !( ${DROPS_VALUE} < ${TOTAL_REQUESTS} * 0.5 ) }"; then
+            pass "Drops = ${DROPS_VALUE} > 0 and < 50% of ${TOTAL_REQUESTS} requests (bounded)"
+        else
+            fail "Drops = ${DROPS_VALUE} is >= 50% of ${TOTAL_REQUESTS} — drops are NOT bounded"
+        fi
+    else
+        pass "ngx_otel.logs.access.dropped_records = ${DROPS_VALUE} > 0 (drop path exercised)"
+    fi
 else
-    info "INFO: ngx_otel.logs.access.dropped_records not found in metrics.json tail"
-    info "      (drops may not have occurred on this hardware, or metric not exported yet)"
+    info "INFO: ngx_otel.logs.access.dropped_records = 0 (no drops observed on this run)"
+    info "      This may happen when the ring is large enough to absorb the load."
 fi
 
 # Assertion 5: /healthz p99 < 50ms.
