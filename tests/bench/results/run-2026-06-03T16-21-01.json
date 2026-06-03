@@ -1,0 +1,1202 @@
+[
+  {
+    "config": "c1",
+    "round": 1,
+    "median_ms": 0.186,
+    "p99_ms": 0.385,
+    "req_per_sec": 262520.48,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.85us   61.70us   4.80ms   92.21%\n    Req/Sec   132.07k     1.42k  135.00k    72.67%\n  Latency Distribution\n     50%  186.00us\n     75%  193.00us\n     90%  211.00us\n     99%  385.00us\n  7883391 requests in 30.03s, 1.10GB read\nRequests/sec: 262520.48\nTransfer/sec:     37.55MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 1,
+    "median_ms": 0.185,
+    "p99_ms": 0.389,
+    "req_per_sec": 261964.99,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   202.39us   58.82us   2.07ms   90.98%\n    Req/Sec   131.79k     3.57k  134.51k    98.83%\n  Latency Distribution\n     50%  185.00us\n     75%  192.00us\n     90%  223.00us\n     99%  389.00us\n  7867859 requests in 30.03s, 1.10GB read\nRequests/sec: 261964.99\nTransfer/sec:     37.47MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 1,
+    "median_ms": 0.185,
+    "p99_ms": 0.386,
+    "req_per_sec": 262596.68,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   201.25us   55.31us   1.26ms   91.54%\n    Req/Sec   132.07k     2.88k  134.81k    99.17%\n  Latency Distribution\n     50%  185.00us\n     75%  192.00us\n     90%  217.00us\n     99%  386.00us\n  7884862 requests in 30.03s, 1.10GB read\nRequests/sec: 262596.68\nTransfer/sec:     37.56MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 2,
+    "median_ms": 0.185,
+    "p99_ms": 0.384,
+    "req_per_sec": 263255.99,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.10us   55.53us   5.38ms   92.18%\n    Req/Sec   132.38k     1.00k  134.71k    68.33%\n  Latency Distribution\n     50%  185.00us\n     75%  192.00us\n     90%  211.00us\n     99%  384.00us\n  7903495 requests in 30.02s, 1.10GB read\nRequests/sec: 263255.99\nTransfer/sec:     37.66MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 2,
+    "median_ms": 0.186,
+    "p99_ms": 0.389,
+    "req_per_sec": 261821.53,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   201.74us   64.39us   4.66ms   91.99%\n    Req/Sec   131.73k     3.67k  135.02k    97.67%\n  Latency Distribution\n     50%  186.00us\n     75%  193.00us\n     90%  214.00us\n     99%  389.00us\n  7863883 requests in 30.04s, 1.10GB read\nRequests/sec: 261821.53\nTransfer/sec:     37.45MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 2,
+    "median_ms": 0.184,
+    "p99_ms": 0.384,
+    "req_per_sec": 263562.74,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   201.12us   55.17us   1.38ms   90.84%\n    Req/Sec   132.57k     0.94k  135.11k    65.33%\n  Latency Distribution\n     50%  184.00us\n     75%  192.00us\n     90%  224.00us\n     99%  384.00us\n  7913785 requests in 30.03s, 1.11GB read\nRequests/sec: 263562.74\nTransfer/sec:     37.70MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 3,
+    "median_ms": 0.187,
+    "p99_ms": 0.386,
+    "req_per_sec": 261595.43,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.97us   51.17us   1.21ms   92.40%\n    Req/Sec   131.55k     1.15k  134.55k    62.83%\n  Latency Distribution\n     50%  187.00us\n     75%  193.00us\n     90%  211.00us\n     99%  386.00us\n  7853236 requests in 30.02s, 1.10GB read\nRequests/sec: 261595.43\nTransfer/sec:     37.42MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 3,
+    "median_ms": 0.184,
+    "p99_ms": 0.383,
+    "req_per_sec": 264008.45,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.45us   54.90us   1.50ms   91.15%\n    Req/Sec   132.82k     1.30k  135.17k    80.33%\n  Latency Distribution\n     50%  184.00us\n     75%  191.00us\n     90%  220.00us\n     99%  383.00us\n  7929275 requests in 30.03s, 1.11GB read\nRequests/sec: 264008.45\nTransfer/sec:     37.77MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 3,
+    "median_ms": 0.185,
+    "p99_ms": 0.382,
+    "req_per_sec": 264254.25,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.76us   55.57us   4.03ms   91.74%\n    Req/Sec   132.91k     1.15k  135.79k    66.83%\n  Latency Distribution\n     50%  185.00us\n     75%  191.00us\n     90%  214.00us\n     99%  382.00us\n  7934120 requests in 30.02s, 1.11GB read\nRequests/sec: 264254.25\nTransfer/sec:     37.80MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 4,
+    "median_ms": 0.188,
+    "p99_ms": 0.387,
+    "req_per_sec": 260991.11,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   201.55us   54.55us   4.33ms   92.35%\n    Req/Sec   131.27k     1.12k  134.77k    74.33%\n  Latency Distribution\n     50%  188.00us\n     75%  194.00us\n     90%  211.00us\n     99%  387.00us\n  7835594 requests in 30.02s, 1.09GB read\nRequests/sec: 260991.11\nTransfer/sec:     37.33MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 4,
+    "median_ms": 0.185,
+    "p99_ms": 0.384,
+    "req_per_sec": 263263.78,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.92us   55.05us   2.58ms   91.20%\n    Req/Sec   132.48k     1.43k  135.73k    67.67%\n  Latency Distribution\n     50%  185.00us\n     75%  192.00us\n     90%  220.00us\n     99%  384.00us\n  7908007 requests in 30.04s, 1.10GB read\nRequests/sec: 263263.78\nTransfer/sec:     37.66MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 4,
+    "median_ms": 0.186,
+    "p99_ms": 0.388,
+    "req_per_sec": 262455.77,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   201.18us   61.26us   3.89ms   92.06%\n    Req/Sec   131.99k     3.83k  135.37k    98.83%\n  Latency Distribution\n     50%  186.00us\n     75%  192.00us\n     90%  213.00us\n     99%  388.00us\n  7880641 requests in 30.03s, 1.10GB read\nRequests/sec: 262455.77\nTransfer/sec:     37.54MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 5,
+    "median_ms": 0.186,
+    "p99_ms": 0.384,
+    "req_per_sec": 262974.73,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.02us   51.27us   1.25ms   92.27%\n    Req/Sec   132.26k     1.04k  134.66k    67.67%\n  Latency Distribution\n     50%  186.00us\n     75%  192.00us\n     90%  210.00us\n     99%  384.00us\n  7897197 requests in 30.03s, 1.10GB read\nRequests/sec: 262974.73\nTransfer/sec:     37.62MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 5,
+    "median_ms": 0.185,
+    "p99_ms": 0.385,
+    "req_per_sec": 262755.34,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   201.21us   57.07us   4.08ms   91.43%\n    Req/Sec   132.15k     0.86k  134.41k    68.33%\n  Latency Distribution\n     50%  185.00us\n     75%  192.00us\n     90%  218.00us\n     99%  385.00us\n  7889535 requests in 30.03s, 1.10GB read\nRequests/sec: 262755.34\nTransfer/sec:     37.59MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 5,
+    "median_ms": 0.185,
+    "p99_ms": 0.385,
+    "req_per_sec": 263230.28,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.49us   58.90us   3.85ms   92.02%\n    Req/Sec   132.38k     2.83k  135.13k    99.17%\n  Latency Distribution\n     50%  185.00us\n     75%  192.00us\n     90%  213.00us\n     99%  385.00us\n  7903752 requests in 30.03s, 1.10GB read\nRequests/sec: 263230.28\nTransfer/sec:     37.65MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 6,
+    "median_ms": 0.185,
+    "p99_ms": 0.383,
+    "req_per_sec": 264072.07,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.65us   57.13us   4.08ms   92.07%\n    Req/Sec   132.79k     1.15k  135.25k    67.00%\n  Latency Distribution\n     50%  185.00us\n     75%  192.00us\n     90%  212.00us\n     99%  383.00us\n  7928049 requests in 30.02s, 1.11GB read\nRequests/sec: 264072.07\nTransfer/sec:     37.77MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 6,
+    "median_ms": 0.184,
+    "p99_ms": 0.385,
+    "req_per_sec": 264109.45,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.29us   57.09us   2.54ms   91.48%\n    Req/Sec   132.80k     2.56k  135.51k    97.00%\n  Latency Distribution\n     50%  184.00us\n     75%  191.00us\n     90%  217.00us\n     99%  385.00us\n  7929127 requests in 30.02s, 1.11GB read\nRequests/sec: 264109.45\nTransfer/sec:     37.78MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 6,
+    "median_ms": 0.184,
+    "p99_ms": 0.382,
+    "req_per_sec": 264583.45,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.89us   61.24us   4.87ms   91.65%\n    Req/Sec   133.06k     1.11k  135.52k    68.33%\n  Latency Distribution\n     50%  184.00us\n     75%  191.00us\n     90%  216.00us\n     99%  382.00us\n  7942986 requests in 30.02s, 1.11GB read\nRequests/sec: 264583.45\nTransfer/sec:     37.85MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 7,
+    "median_ms": 0.185,
+    "p99_ms": 0.389,
+    "req_per_sec": 262856.69,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   202.39us   60.63us   2.03ms   90.61%\n    Req/Sec   132.22k     3.33k  135.21k    98.50%\n  Latency Distribution\n     50%  185.00us\n     75%  192.00us\n     90%  226.00us\n     99%  389.00us\n  7893637 requests in 30.03s, 1.10GB read\nRequests/sec: 262856.69\nTransfer/sec:     37.60MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 7,
+    "median_ms": 0.184,
+    "p99_ms": 0.382,
+    "req_per_sec": 264489.81,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.52us   52.75us   0.87ms   91.64%\n    Req/Sec   133.05k     1.01k  136.12k    66.50%\n  Latency Distribution\n     50%  184.00us\n     75%  191.00us\n     90%  215.00us\n     99%  382.00us\n  7942655 requests in 30.03s, 1.11GB read\nRequests/sec: 264489.81\nTransfer/sec:     37.83MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 7,
+    "median_ms": 0.187,
+    "p99_ms": 0.386,
+    "req_per_sec": 261606.22,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.78us   51.08us   1.19ms   92.52%\n    Req/Sec   131.62k     1.69k  134.60k    83.33%\n  Latency Distribution\n     50%  187.00us\n     75%  193.00us\n     90%  210.00us\n     99%  386.00us\n  7856080 requests in 30.03s, 1.10GB read\nRequests/sec: 261606.22\nTransfer/sec:     37.42MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 8,
+    "median_ms": 0.186,
+    "p99_ms": 0.386,
+    "req_per_sec": 262278.08,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   201.00us   62.30us   5.35ms   92.48%\n    Req/Sec   131.88k     1.56k  134.79k    81.00%\n  Latency Distribution\n     50%  186.00us\n     75%  192.00us\n     90%  210.00us\n     99%  386.00us\n  7873108 requests in 30.02s, 1.10GB read\nRequests/sec: 262278.08\nTransfer/sec:     37.52MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 8,
+    "median_ms": 0.186,
+    "p99_ms": 0.385,
+    "req_per_sec": 262233.74,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.37us   50.71us   1.17ms   92.49%\n    Req/Sec   131.89k     1.08k  135.71k    69.00%\n  Latency Distribution\n     50%  186.00us\n     75%  193.00us\n     90%  209.00us\n     99%  385.00us\n  7872796 requests in 30.02s, 1.10GB read\nRequests/sec: 262233.74\nTransfer/sec:     37.51MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 8,
+    "median_ms": 0.186,
+    "p99_ms": 0.386,
+    "req_per_sec": 262485.77,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   201.16us   54.19us   1.42ms   91.55%\n    Req/Sec   132.04k     1.33k  135.34k    71.83%\n  Latency Distribution\n     50%  186.00us\n     75%  193.00us\n     90%  217.00us\n     99%  386.00us\n  7882218 requests in 30.03s, 1.10GB read\nRequests/sec: 262485.77\nTransfer/sec:     37.55MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 9,
+    "median_ms": 0.186,
+    "p99_ms": 0.387,
+    "req_per_sec": 261719.73,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   201.88us   61.00us   3.96ms   91.85%\n    Req/Sec   131.63k     1.79k  135.47k    86.83%\n  Latency Distribution\n     50%  186.00us\n     75%  193.00us\n     90%  215.00us\n     99%  387.00us\n  7858466 requests in 30.03s, 1.10GB read\nRequests/sec: 261719.73\nTransfer/sec:     37.44MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 9,
+    "median_ms": 0.186,
+    "p99_ms": 0.384,
+    "req_per_sec": 263376.90,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.61us   51.18us   1.56ms   92.38%\n    Req/Sec   132.44k     1.27k  135.41k    67.67%\n  Latency Distribution\n     50%  186.00us\n     75%  192.00us\n     90%  209.00us\n     99%  384.00us\n  7907150 requests in 30.02s, 1.10GB read\nRequests/sec: 263376.90\nTransfer/sec:     37.68MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 9,
+    "median_ms": 0.184,
+    "p99_ms": 0.382,
+    "req_per_sec": 264669.04,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.28us   53.12us   1.24ms   91.68%\n    Req/Sec   133.19k     1.54k  135.97k    82.50%\n  Latency Distribution\n     50%  184.00us\n     75%  191.00us\n     90%  214.00us\n     99%  382.00us\n  7951231 requests in 30.04s, 1.11GB read\nRequests/sec: 264669.04\nTransfer/sec:     37.86MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 10,
+    "median_ms": 0.185,
+    "p99_ms": 0.382,
+    "req_per_sec": 263852.81,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.20us   54.20us   4.39ms   92.59%\n    Req/Sec   132.72k     1.04k  135.67k    71.50%\n  Latency Distribution\n     50%  185.00us\n     75%  192.00us\n     90%  208.00us\n     99%  382.00us\n  7921440 requests in 30.02s, 1.11GB read\nRequests/sec: 263852.81\nTransfer/sec:     37.74MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 10,
+    "median_ms": 0.185,
+    "p99_ms": 0.383,
+    "req_per_sec": 263927.96,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.67us   55.06us   4.29ms   92.06%\n    Req/Sec   132.73k     2.08k  136.18k    95.67%\n  Latency Distribution\n     50%  185.00us\n     75%  191.00us\n     90%  211.00us\n     99%  383.00us\n  7924746 requests in 30.03s, 1.11GB read\nRequests/sec: 263927.96\nTransfer/sec:     37.75MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 10,
+    "median_ms": 0.184,
+    "p99_ms": 0.383,
+    "req_per_sec": 264400.39,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.38us   55.58us   2.67ms   91.01%\n    Req/Sec   132.96k     1.20k  134.99k    68.17%\n  Latency Distribution\n     50%  184.00us\n     75%  191.00us\n     90%  221.00us\n     99%  383.00us\n  7937872 requests in 30.02s, 1.11GB read\nRequests/sec: 264400.39\nTransfer/sec:     37.82MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 11,
+    "median_ms": 0.186,
+    "p99_ms": 0.385,
+    "req_per_sec": 263042.24,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.45us   57.24us   5.92ms   92.03%\n    Req/Sec   132.33k     1.23k  135.74k    69.17%\n  Latency Distribution\n     50%  186.00us\n     75%  192.00us\n     90%  213.00us\n     99%  385.00us\n  7899216 requests in 30.03s, 1.10GB read\nRequests/sec: 263042.24\nTransfer/sec:     37.63MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 11,
+    "median_ms": 0.187,
+    "p99_ms": 0.388,
+    "req_per_sec": 261287.22,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   201.49us   59.86us   4.18ms   92.49%\n    Req/Sec   131.43k     2.22k  135.57k    92.50%\n  Latency Distribution\n     50%  187.00us\n     75%  193.00us\n     90%  210.00us\n     99%  388.00us\n  7847378 requests in 30.03s, 1.10GB read\nRequests/sec: 261287.22\nTransfer/sec:     37.38MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 11,
+    "median_ms": 0.184,
+    "p99_ms": 0.382,
+    "req_per_sec": 264941.63,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.87us   56.64us   3.83ms   91.15%\n    Req/Sec   133.24k     0.98k  135.65k    69.17%\n  Latency Distribution\n     50%  184.00us\n     75%  190.00us\n     90%  219.00us\n     99%  382.00us\n  7953721 requests in 30.02s, 1.11GB read\nRequests/sec: 264941.63\nTransfer/sec:     37.90MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 12,
+    "median_ms": 0.184,
+    "p99_ms": 0.383,
+    "req_per_sec": 264365.24,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.25us   54.28us   1.15ms   91.10%\n    Req/Sec   132.96k     0.99k  135.54k    68.67%\n  Latency Distribution\n     50%  184.00us\n     75%  191.00us\n     90%  220.00us\n     99%  383.00us\n  7938102 requests in 30.03s, 1.11GB read\nRequests/sec: 264365.24\nTransfer/sec:     37.82MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 12,
+    "median_ms": 0.186,
+    "p99_ms": 0.384,
+    "req_per_sec": 263513.68,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.58us   52.65us   2.09ms   92.39%\n    Req/Sec   132.55k     1.92k  136.32k    88.67%\n  Latency Distribution\n     50%  186.00us\n     75%  192.00us\n     90%  209.00us\n     99%  384.00us\n  7913322 requests in 30.03s, 1.11GB read\nRequests/sec: 263513.68\nTransfer/sec:     37.69MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 12,
+    "median_ms": 0.184,
+    "p99_ms": 0.382,
+    "req_per_sec": 264496.29,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.81us   53.39us   1.20ms   91.40%\n    Req/Sec   133.01k     0.97k  135.68k    68.33%\n  Latency Distribution\n     50%  184.00us\n     75%  191.00us\n     90%  217.00us\n     99%  382.00us\n  7941563 requests in 30.03s, 1.11GB read\nRequests/sec: 264496.29\nTransfer/sec:     37.84MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 13,
+    "median_ms": 0.185,
+    "p99_ms": 0.383,
+    "req_per_sec": 263858.01,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.76us   52.63us   2.25ms   91.98%\n    Req/Sec   132.71k     1.20k  135.84k    73.83%\n  Latency Distribution\n     50%  185.00us\n     75%  192.00us\n     90%  212.00us\n     99%  383.00us\n  7921351 requests in 30.02s, 1.11GB read\nRequests/sec: 263858.01\nTransfer/sec:     37.74MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 13,
+    "median_ms": 0.185,
+    "p99_ms": 0.386,
+    "req_per_sec": 263234.00,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.50us   55.66us   3.71ms   91.86%\n    Req/Sec   132.38k     2.92k  134.85k    98.17%\n  Latency Distribution\n     50%  185.00us\n     75%  192.00us\n     90%  214.00us\n     99%  386.00us\n  7904223 requests in 30.03s, 1.10GB read\nRequests/sec: 263234.00\nTransfer/sec:     37.65MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 13,
+    "median_ms": 0.185,
+    "p99_ms": 0.386,
+    "req_per_sec": 262443.74,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   201.43us   54.22us   1.06ms   91.29%\n    Req/Sec   132.03k     1.23k  136.18k    66.17%\n  Latency Distribution\n     50%  185.00us\n     75%  192.00us\n     90%  220.00us\n     99%  386.00us\n  7880190 requests in 30.03s, 1.10GB read\nRequests/sec: 262443.74\nTransfer/sec:     37.54MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 14,
+    "median_ms": 0.184,
+    "p99_ms": 0.382,
+    "req_per_sec": 265009.68,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.85us   57.97us   4.10ms   91.16%\n    Req/Sec   133.32k     1.19k  135.67k    75.83%\n  Latency Distribution\n     50%  184.00us\n     75%  191.00us\n     90%  220.00us\n     99%  382.00us\n  7959309 requests in 30.03s, 1.11GB read\nRequests/sec: 265009.68\nTransfer/sec:     37.91MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 14,
+    "median_ms": 0.186,
+    "p99_ms": 0.384,
+    "req_per_sec": 262474.31,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.18us   50.59us   1.28ms   92.51%\n    Req/Sec   131.95k     1.12k  135.12k    66.33%\n  Latency Distribution\n     50%  186.00us\n     75%  193.00us\n     90%  209.00us\n     99%  384.00us\n  7879010 requests in 30.02s, 1.10GB read\nRequests/sec: 262474.31\nTransfer/sec:     37.55MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 14,
+    "median_ms": 0.184,
+    "p99_ms": 0.382,
+    "req_per_sec": 264492.92,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.27us   52.06us   1.29ms   91.96%\n    Req/Sec   133.03k     1.11k  136.12k    67.33%\n  Latency Distribution\n     50%  184.00us\n     75%  191.00us\n     90%  212.00us\n     99%  382.00us\n  7940765 requests in 30.02s, 1.11GB read\nRequests/sec: 264492.92\nTransfer/sec:     37.83MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 15,
+    "median_ms": 0.185,
+    "p99_ms": 0.384,
+    "req_per_sec": 263483.08,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.20us   53.34us   1.19ms   91.75%\n    Req/Sec   132.58k     1.67k  135.17k    92.33%\n  Latency Distribution\n     50%  185.00us\n     75%  191.00us\n     90%  214.00us\n     99%  384.00us\n  7913497 requests in 30.03s, 1.11GB read\nRequests/sec: 263483.08\nTransfer/sec:     37.69MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 15,
+    "median_ms": 0.185,
+    "p99_ms": 0.383,
+    "req_per_sec": 263929.38,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.43us   51.38us   1.16ms   92.17%\n    Req/Sec   132.73k     1.06k  135.41k    68.33%\n  Latency Distribution\n     50%  185.00us\n     75%  191.00us\n     90%  210.00us\n     99%  383.00us\n  7923746 requests in 30.02s, 1.11GB read\nRequests/sec: 263929.38\nTransfer/sec:     37.75MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 15,
+    "median_ms": 0.183,
+    "p99_ms": 0.385,
+    "req_per_sec": 265433.12,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.87us   60.80us   4.35ms   90.90%\n    Req/Sec   133.58k     3.73k  139.54k    82.00%\n  Latency Distribution\n     50%  183.00us\n     75%  191.00us\n     90%  221.00us\n     99%  385.00us\n  7973206 requests in 30.04s, 1.11GB read\nRequests/sec: 265433.12\nTransfer/sec:     37.97MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 16,
+    "median_ms": 0.181,
+    "p99_ms": 0.381,
+    "req_per_sec": 267879.21,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   198.85us   56.57us   1.30ms   89.93%\n    Req/Sec   134.67k     2.64k  139.84k    54.67%\n  Latency Distribution\n     50%  181.00us\n     75%  189.00us\n     90%  311.00us\n     99%  381.00us\n  8040404 requests in 30.02s, 1.12GB read\nRequests/sec: 267879.21\nTransfer/sec:     38.32MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 16,
+    "median_ms": 0.18,
+    "p99_ms": 0.38,
+    "req_per_sec": 268601.14,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   198.35us   57.08us   1.46ms   89.80%\n    Req/Sec   135.16k     2.69k  140.11k    57.67%\n  Latency Distribution\n     50%  180.00us\n     75%  188.00us\n     90%  337.00us\n     99%  380.00us\n  8068264 requests in 30.04s, 1.13GB read\nRequests/sec: 268601.14\nTransfer/sec:     38.42MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 16,
+    "median_ms": 0.18,
+    "p99_ms": 0.382,
+    "req_per_sec": 268222.74,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.94us   67.07us   4.90ms   88.95%\n    Req/Sec   134.98k     3.76k  140.38k    86.33%\n  Latency Distribution\n     50%  180.00us\n     75%  188.00us\n     90%  347.00us\n     99%  382.00us\n  8057144 requests in 30.04s, 1.13GB read\nRequests/sec: 268222.74\nTransfer/sec:     38.37MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 17,
+    "median_ms": 0.18,
+    "p99_ms": 0.383,
+    "req_per_sec": 267911.16,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.72us   59.86us   1.41ms   89.17%\n    Req/Sec   134.73k     3.74k  139.43k    89.17%\n  Latency Distribution\n     50%  180.00us\n     75%  189.00us\n     90%  347.00us\n     99%  383.00us\n  8044374 requests in 30.03s, 1.12GB read\nRequests/sec: 267911.16\nTransfer/sec:     38.32MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 17,
+    "median_ms": 0.182,
+    "p99_ms": 0.382,
+    "req_per_sec": 267501.21,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.07us   59.77us   4.39ms   90.21%\n    Req/Sec   134.51k     3.67k  140.14k    84.83%\n  Latency Distribution\n     50%  182.00us\n     75%  190.00us\n     90%  230.00us\n     99%  382.00us\n  8029885 requests in 30.02s, 1.12GB read\nRequests/sec: 267501.21\nTransfer/sec:     38.27MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 17,
+    "median_ms": 0.187,
+    "p99_ms": 0.383,
+    "req_per_sec": 262743.35,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.34us   51.56us   3.78ms   93.12%\n    Req/Sec   132.17k     1.06k  135.44k    66.83%\n  Latency Distribution\n     50%  187.00us\n     75%  193.00us\n     90%  207.00us\n     99%  383.00us\n  7891268 requests in 30.03s, 1.10GB read\nRequests/sec: 262743.35\nTransfer/sec:     37.58MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 18,
+    "median_ms": 0.186,
+    "p99_ms": 0.383,
+    "req_per_sec": 263430.38,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   198.83us   48.71us   1.64ms   93.04%\n    Req/Sec   132.49k     1.11k  135.68k    67.00%\n  Latency Distribution\n     50%  186.00us\n     75%  192.00us\n     90%  206.00us\n     99%  383.00us\n  7909843 requests in 30.03s, 1.10GB read\nRequests/sec: 263430.38\nTransfer/sec:     37.68MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 18,
+    "median_ms": 0.186,
+    "p99_ms": 0.382,
+    "req_per_sec": 264156.66,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   198.80us   58.72us   5.82ms   92.98%\n    Req/Sec   132.86k     1.23k  135.88k    71.33%\n  Latency Distribution\n     50%  186.00us\n     75%  192.00us\n     90%  206.00us\n     99%  382.00us\n  7931638 requests in 30.03s, 1.11GB read\nRequests/sec: 264156.66\nTransfer/sec:     37.79MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 18,
+    "median_ms": 0.186,
+    "p99_ms": 0.382,
+    "req_per_sec": 263317.45,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   198.63us   47.91us   1.33ms   93.28%\n    Req/Sec   132.47k     1.28k  135.67k    65.83%\n  Latency Distribution\n     50%  186.00us\n     75%  193.00us\n     90%  206.00us\n     99%  382.00us\n  7909556 requests in 30.04s, 1.10GB read\nRequests/sec: 263317.45\nTransfer/sec:     37.67MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 19,
+    "median_ms": 0.18,
+    "p99_ms": 0.38,
+    "req_per_sec": 268874.04,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.01us   65.27us   4.02ms   89.54%\n    Req/Sec   135.25k     2.39k  139.30k    67.67%\n  Latency Distribution\n     50%  180.00us\n     75%  188.00us\n     90%  344.00us\n     99%  380.00us\n  8074322 requests in 30.03s, 1.13GB read\nRequests/sec: 268874.04\nTransfer/sec:     38.46MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 19,
+    "median_ms": 0.182,
+    "p99_ms": 0.381,
+    "req_per_sec": 267116.71,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.30us   56.88us   2.43ms   89.99%\n    Req/Sec   134.36k     2.73k  139.57k    66.67%\n  Latency Distribution\n     50%  182.00us\n     75%  190.00us\n     90%  249.00us\n     99%  381.00us\n  8021566 requests in 30.03s, 1.12GB read\nRequests/sec: 267116.71\nTransfer/sec:     38.21MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 19,
+    "median_ms": 0.187,
+    "p99_ms": 0.384,
+    "req_per_sec": 261937.72,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.18us   46.49us   1.17ms   93.76%\n    Req/Sec   131.80k     1.14k  135.68k    64.33%\n  Latency Distribution\n     50%  187.00us\n     75%  193.00us\n     90%  205.00us\n     99%  384.00us\n  7868076 requests in 30.04s, 1.10GB read\nRequests/sec: 261937.72\nTransfer/sec:     37.47MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 20,
+    "median_ms": 0.184,
+    "p99_ms": 0.384,
+    "req_per_sec": 265240.62,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.55us   59.55us   4.20ms   91.44%\n    Req/Sec   133.41k     2.86k  139.04k    81.83%\n  Latency Distribution\n     50%  184.00us\n     75%  191.00us\n     90%  216.00us\n     99%  384.00us\n  7963889 requests in 30.03s, 1.11GB read\nRequests/sec: 265240.62\nTransfer/sec:     37.94MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 20,
+    "median_ms": 0.184,
+    "p99_ms": 0.381,
+    "req_per_sec": 264630.26,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   198.99us   51.60us   1.40ms   92.05%\n    Req/Sec   133.14k     1.06k  136.10k    67.00%\n  Latency Distribution\n     50%  184.00us\n     75%  191.00us\n     90%  211.00us\n     99%  381.00us\n  7947965 requests in 30.03s, 1.11GB read\nRequests/sec: 264630.26\nTransfer/sec:     37.85MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 20,
+    "median_ms": 0.185,
+    "p99_ms": 0.383,
+    "req_per_sec": 264300.54,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.32us   52.46us   1.36ms   92.08%\n    Req/Sec   132.89k     2.06k  135.19k    96.50%\n  Latency Distribution\n     50%  185.00us\n     75%  191.00us\n     90%  211.00us\n     99%  383.00us\n  7934860 requests in 30.02s, 1.11GB read\nRequests/sec: 264300.54\nTransfer/sec:     37.81MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 21,
+    "median_ms": 0.186,
+    "p99_ms": 0.385,
+    "req_per_sec": 262851.31,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.83us   61.76us   4.05ms   92.06%\n    Req/Sec   132.22k     1.53k  134.99k    81.67%\n  Latency Distribution\n     50%  186.00us\n     75%  192.00us\n     90%  213.00us\n     99%  385.00us\n  7893461 requests in 30.03s, 1.10GB read\nRequests/sec: 262851.31\nTransfer/sec:     37.60MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 21,
+    "median_ms": 0.185,
+    "p99_ms": 0.384,
+    "req_per_sec": 263637.86,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.17us   52.83us   1.26ms   91.70%\n    Req/Sec   132.56k     0.96k  135.06k    65.00%\n  Latency Distribution\n     50%  185.00us\n     75%  192.00us\n     90%  215.00us\n     99%  384.00us\n  7913422 requests in 30.02s, 1.11GB read\nRequests/sec: 263637.86\nTransfer/sec:     37.71MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 21,
+    "median_ms": 0.185,
+    "p99_ms": 0.394,
+    "req_per_sec": 263574.69,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   201.94us   62.83us   4.38ms   90.12%\n    Req/Sec   132.55k     1.35k  135.57k    70.17%\n  Latency Distribution\n     50%  185.00us\n     75%  192.00us\n     90%  227.00us\n     99%  394.00us\n  7913041 requests in 30.02s, 1.11GB read\nRequests/sec: 263574.69\nTransfer/sec:     37.70MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 22,
+    "median_ms": 0.184,
+    "p99_ms": 0.383,
+    "req_per_sec": 264293.62,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.25us   54.43us   1.36ms   91.07%\n    Req/Sec   132.98k     1.14k  135.30k    71.00%\n  Latency Distribution\n     50%  184.00us\n     75%  191.00us\n     90%  221.00us\n     99%  383.00us\n  7937845 requests in 30.03s, 1.11GB read\nRequests/sec: 264293.62\nTransfer/sec:     37.81MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 22,
+    "median_ms": 0.183,
+    "p99_ms": 0.381,
+    "req_per_sec": 265734.96,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.82us   55.44us   1.19ms   90.55%\n    Req/Sec   133.64k     0.93k  135.62k    69.67%\n  Latency Distribution\n     50%  183.00us\n     75%  190.00us\n     90%  225.00us\n     99%  381.00us\n  7977899 requests in 30.02s, 1.11GB read\nRequests/sec: 265734.96\nTransfer/sec:     38.01MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 22,
+    "median_ms": 0.185,
+    "p99_ms": 0.383,
+    "req_per_sec": 263632.09,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.04us   56.50us   4.01ms   92.02%\n    Req/Sec   132.61k     1.15k  135.13k    81.00%\n  Latency Distribution\n     50%  185.00us\n     75%  192.00us\n     90%  212.00us\n     99%  383.00us\n  7915869 requests in 30.03s, 1.11GB read\nRequests/sec: 263632.09\nTransfer/sec:     37.71MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 23,
+    "median_ms": 0.187,
+    "p99_ms": 0.384,
+    "req_per_sec": 262191.96,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.69us   48.77us   1.52ms   93.17%\n    Req/Sec   131.87k     1.00k  135.69k    65.83%\n  Latency Distribution\n     50%  187.00us\n     75%  193.00us\n     90%  206.00us\n     99%  384.00us\n  7872067 requests in 30.02s, 1.10GB read\nRequests/sec: 262191.96\nTransfer/sec:     37.51MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 23,
+    "median_ms": 0.185,
+    "p99_ms": 0.384,
+    "req_per_sec": 263662.39,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.84us   55.12us   3.34ms   92.13%\n    Req/Sec   132.66k     1.58k  135.14k    86.50%\n  Latency Distribution\n     50%  185.00us\n     75%  192.00us\n     90%  211.00us\n     99%  384.00us\n  7919913 requests in 30.04s, 1.11GB read\nRequests/sec: 263662.39\nTransfer/sec:     37.72MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 23,
+    "median_ms": 0.179,
+    "p99_ms": 0.378,
+    "req_per_sec": 269990.22,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   197.83us   59.43us   4.37ms   89.46%\n    Req/Sec   135.76k     2.49k  140.57k    67.33%\n  Latency Distribution\n     50%  179.00us\n     75%  187.00us\n     90%  344.00us\n     99%  378.00us\n  8105679 requests in 30.02s, 1.13GB read\nRequests/sec: 269990.22\nTransfer/sec:     38.62MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 24,
+    "median_ms": 0.181,
+    "p99_ms": 0.381,
+    "req_per_sec": 267525.83,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.57us   58.21us   1.28ms   89.45%\n    Req/Sec   134.55k     1.93k  138.15k    59.33%\n  Latency Distribution\n     50%  181.00us\n     75%  188.00us\n     90%  348.00us\n     99%  381.00us\n  8032752 requests in 30.03s, 1.12GB read\nRequests/sec: 267525.83\nTransfer/sec:     38.27MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 24,
+    "median_ms": 0.183,
+    "p99_ms": 0.387,
+    "req_per_sec": 265120.49,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.56us   59.28us   2.07ms   90.43%\n    Req/Sec   133.35k     4.94k  138.02k    98.83%\n  Latency Distribution\n     50%  183.00us\n     75%  191.00us\n     90%  227.00us\n     99%  387.00us\n  7960548 requests in 30.03s, 1.11GB read\nRequests/sec: 265120.49\nTransfer/sec:     37.92MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 24,
+    "median_ms": 0.182,
+    "p99_ms": 0.383,
+    "req_per_sec": 266144.67,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.47us   55.92us   1.17ms   90.59%\n    Req/Sec   133.86k     2.38k  138.09k    69.17%\n  Latency Distribution\n     50%  182.00us\n     75%  190.00us\n     90%  224.00us\n     99%  383.00us\n  7990208 requests in 30.02s, 1.12GB read\nRequests/sec: 266144.67\nTransfer/sec:     38.07MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 25,
+    "median_ms": 0.184,
+    "p99_ms": 0.383,
+    "req_per_sec": 264953.81,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.40us   53.33us   1.64ms   91.46%\n    Req/Sec   133.22k     2.36k  137.63k    59.83%\n  Latency Distribution\n     50%  184.00us\n     75%  192.00us\n     90%  216.00us\n     99%  383.00us\n  7952885 requests in 30.02s, 1.11GB read\nRequests/sec: 264953.81\nTransfer/sec:     37.90MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 25,
+    "median_ms": 0.187,
+    "p99_ms": 0.386,
+    "req_per_sec": 261515.30,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   201.54us   72.70us   9.30ms   92.91%\n    Req/Sec   131.53k     1.27k  134.26k    84.33%\n  Latency Distribution\n     50%  187.00us\n     75%  194.00us\n     90%  210.00us\n     99%  386.00us\n  7851244 requests in 30.02s, 1.10GB read\nRequests/sec: 261515.30\nTransfer/sec:     37.41MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 25,
+    "median_ms": 0.186,
+    "p99_ms": 0.383,
+    "req_per_sec": 263104.06,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.57us   50.41us   1.82ms   92.57%\n    Req/Sec   132.31k     1.25k  135.54k    63.33%\n  Latency Distribution\n     50%  186.00us\n     75%  193.00us\n     90%  209.00us\n     99%  383.00us\n  7898489 requests in 30.02s, 1.10GB read\nRequests/sec: 263104.06\nTransfer/sec:     37.64MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 26,
+    "median_ms": 0.186,
+    "p99_ms": 0.382,
+    "req_per_sec": 263971.89,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.51us   70.96us   6.06ms   92.89%\n    Req/Sec   132.78k     1.24k  135.68k    78.83%\n  Latency Distribution\n     50%  186.00us\n     75%  192.00us\n     90%  207.00us\n     99%  382.00us\n  7927123 requests in 30.03s, 1.11GB read\nRequests/sec: 263971.89\nTransfer/sec:     37.76MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 26,
+    "median_ms": 0.182,
+    "p99_ms": 0.382,
+    "req_per_sec": 266867.17,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.01us   56.14us   2.07ms   90.39%\n    Req/Sec   134.25k     2.87k  138.96k    55.83%\n  Latency Distribution\n     50%  182.00us\n     75%  190.00us\n     90%  227.00us\n     99%  382.00us\n  8015300 requests in 30.03s, 1.12GB read\nRequests/sec: 266867.17\nTransfer/sec:     38.17MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 26,
+    "median_ms": 0.183,
+    "p99_ms": 0.386,
+    "req_per_sec": 266838.57,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   198.72us   60.30us   2.86ms   91.55%\n    Req/Sec   134.21k     5.02k  141.04k    96.33%\n  Latency Distribution\n     50%  183.00us\n     75%  191.00us\n     90%  214.00us\n     99%  386.00us\n  8011042 requests in 30.02s, 1.12GB read\nRequests/sec: 266838.57\nTransfer/sec:     38.17MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 27,
+    "median_ms": 0.183,
+    "p99_ms": 0.381,
+    "req_per_sec": 267451.71,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   197.19us   59.77us   5.06ms   92.22%\n    Req/Sec   134.52k     2.76k  139.33k    63.33%\n  Latency Distribution\n     50%  183.00us\n     75%  190.00us\n     90%  209.00us\n     99%  381.00us\n  8030497 requests in 30.03s, 1.12GB read\nRequests/sec: 267451.71\nTransfer/sec:     38.26MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 27,
+    "median_ms": 0.189,
+    "p99_ms": 0.383,
+    "req_per_sec": 261678.00,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   198.73us   44.29us   1.26ms   94.36%\n    Req/Sec   131.56k     1.03k  135.08k    70.33%\n  Latency Distribution\n     50%  189.00us\n     75%  195.00us\n     90%  205.00us\n     99%  383.00us\n  7855116 requests in 30.02s, 1.10GB read\nRequests/sec: 261678.00\nTransfer/sec:     37.43MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 27,
+    "median_ms": 0.182,
+    "p99_ms": 0.382,
+    "req_per_sec": 267538.17,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   197.47us   65.09us   5.89ms   92.03%\n    Req/Sec   134.56k     3.46k  140.02k    76.50%\n  Latency Distribution\n     50%  182.00us\n     75%  189.00us\n     90%  210.00us\n     99%  382.00us\n  8032025 requests in 30.02s, 1.12GB read\nRequests/sec: 267538.17\nTransfer/sec:     38.27MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 28,
+    "median_ms": 0.187,
+    "p99_ms": 0.382,
+    "req_per_sec": 262887.96,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   198.22us   51.81us   6.26ms   94.34%\n    Req/Sec   132.20k     1.07k  135.26k    74.83%\n  Latency Distribution\n     50%  187.00us\n     75%  193.00us\n     90%  204.00us\n     99%  382.00us\n  7892043 requests in 30.02s, 1.10GB read\nRequests/sec: 262887.96\nTransfer/sec:     37.61MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 28,
+    "median_ms": 0.182,
+    "p99_ms": 0.38,
+    "req_per_sec": 268066.41,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   196.76us   52.03us   2.08ms   91.79%\n    Req/Sec   134.81k     2.61k  139.66k    60.00%\n  Latency Distribution\n     50%  182.00us\n     75%  190.00us\n     90%  211.00us\n     99%  380.00us\n  8047947 requests in 30.02s, 1.12GB read\nRequests/sec: 268066.41\nTransfer/sec:     38.35MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 28,
+    "median_ms": 0.182,
+    "p99_ms": 0.381,
+    "req_per_sec": 267316.32,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   197.81us   63.09us   4.43ms   91.89%\n    Req/Sec   134.42k     3.34k  139.32k    86.50%\n  Latency Distribution\n     50%  182.00us\n     75%  190.00us\n     90%  212.00us\n     99%  381.00us\n  8025410 requests in 30.02s, 1.12GB read\nRequests/sec: 267316.32\nTransfer/sec:     38.24MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 29,
+    "median_ms": 0.182,
+    "p99_ms": 0.382,
+    "req_per_sec": 267397.77,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   198.88us   56.60us   2.40ms   90.23%\n    Req/Sec   134.45k     3.08k  140.01k    58.17%\n  Latency Distribution\n     50%  182.00us\n     75%  190.00us\n     90%  230.00us\n     99%  382.00us\n  8027827 requests in 30.02s, 1.12GB read\nRequests/sec: 267397.77\nTransfer/sec:     38.25MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 29,
+    "median_ms": 0.189,
+    "p99_ms": 0.386,
+    "req_per_sec": 260686.71,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.43us   47.39us   1.22ms   93.57%\n    Req/Sec   131.09k     1.04k  133.83k    70.83%\n  Latency Distribution\n     50%  189.00us\n     75%  195.00us\n     90%  206.00us\n     99%  386.00us\n  7824712 requests in 30.02s, 1.09GB read\nRequests/sec: 260686.71\nTransfer/sec:     37.29MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 29,
+    "median_ms": 0.187,
+    "p99_ms": 0.382,
+    "req_per_sec": 263151.65,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   198.55us   50.77us   4.12ms   93.63%\n    Req/Sec   132.35k     1.09k  135.19k    69.17%\n  Latency Distribution\n     50%  187.00us\n     75%  193.00us\n     90%  205.00us\n     99%  382.00us\n  7901430 requests in 30.03s, 1.10GB read\nRequests/sec: 263151.65\nTransfer/sec:     37.64MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 30,
+    "median_ms": 0.18,
+    "p99_ms": 0.38,
+    "req_per_sec": 268642.18,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   198.03us   56.40us   1.79ms   90.12%\n    Req/Sec   135.14k     2.69k  140.06k    60.33%\n  Latency Distribution\n     50%  180.00us\n     75%  188.00us\n     90%  232.00us\n     99%  380.00us\n  8067503 requests in 30.03s, 1.13GB read\nRequests/sec: 268642.18\nTransfer/sec:     38.43MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 30,
+    "median_ms": 0.18,
+    "p99_ms": 0.381,
+    "req_per_sec": 268522.97,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   198.91us   57.73us   1.12ms   89.38%\n    Req/Sec   135.04k     2.86k  140.34k    58.33%\n  Latency Distribution\n     50%  180.00us\n     75%  188.00us\n     90%  344.00us\n     99%  381.00us\n  8061631 requests in 30.02s, 1.13GB read\nRequests/sec: 268522.97\nTransfer/sec:     38.41MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 30,
+    "median_ms": 0.186,
+    "p99_ms": 0.385,
+    "req_per_sec": 262779.15,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.38us   55.68us   4.11ms   92.20%\n    Req/Sec   132.19k     2.77k  139.54k    87.33%\n  Latency Distribution\n     50%  186.00us\n     75%  194.00us\n     90%  212.00us\n     99%  385.00us\n  7890209 requests in 30.03s, 1.10GB read\nRequests/sec: 262779.15\nTransfer/sec:     37.59MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 31,
+    "median_ms": 0.178,
+    "p99_ms": 0.379,
+    "req_per_sec": 270582.37,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.32us   67.37us   4.35ms   88.10%\n    Req/Sec   136.09k     2.73k  139.72k    84.50%\n  Latency Distribution\n     50%  178.00us\n     75%  186.00us\n     90%  348.00us\n     99%  379.00us\n  8124560 requests in 30.03s, 1.13GB read\nRequests/sec: 270582.37\nTransfer/sec:     38.71MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 31,
+    "median_ms": 0.177,
+    "p99_ms": 0.376,
+    "req_per_sec": 271641.97,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   197.70us   60.38us   3.02ms   88.42%\n    Req/Sec   136.60k     1.95k  139.63k    80.83%\n  Latency Distribution\n     50%  177.00us\n     75%  186.00us\n     90%  346.00us\n     99%  376.00us\n  8156365 requests in 30.03s, 1.14GB read\nRequests/sec: 271641.97\nTransfer/sec:     38.86MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 31,
+    "median_ms": 0.189,
+    "p99_ms": 0.387,
+    "req_per_sec": 260326.64,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.71us   55.60us   4.11ms   93.93%\n    Req/Sec   130.91k     1.42k  135.33k    71.50%\n  Latency Distribution\n     50%  189.00us\n     75%  196.00us\n     90%  208.00us\n     99%  387.00us\n  7816266 requests in 30.02s, 1.09GB read\nRequests/sec: 260326.64\nTransfer/sec:     37.24MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 32,
+    "median_ms": 0.191,
+    "p99_ms": 0.391,
+    "req_per_sec": 258006.97,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   202.34us   54.82us   4.70ms   94.13%\n    Req/Sec   129.77k     2.63k  133.72k    96.83%\n  Latency Distribution\n     50%  191.00us\n     75%  197.00us\n     90%  209.00us\n     99%  391.00us\n  7746967 requests in 30.03s, 1.08GB read\nRequests/sec: 258006.97\nTransfer/sec:     36.91MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 32,
+    "median_ms": 0.185,
+    "p99_ms": 0.386,
+    "req_per_sec": 265034.59,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   198.23us   52.31us   3.19ms   92.65%\n    Req/Sec   133.29k     3.72k  140.22k    61.50%\n  Latency Distribution\n     50%  185.00us\n     75%  193.00us\n     90%  209.00us\n     99%  386.00us\n  7956936 requests in 30.02s, 1.11GB read\nRequests/sec: 265034.59\nTransfer/sec:     37.91MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 32,
+    "median_ms": 0.18,
+    "p99_ms": 0.379,
+    "req_per_sec": 269675.42,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   197.27us   55.67us   1.56ms   90.19%\n    Req/Sec   135.60k     2.94k  140.24k    54.50%\n  Latency Distribution\n     50%  180.00us\n     75%  188.00us\n     90%  230.00us\n     99%  379.00us\n  8095138 requests in 30.02s, 1.13GB read\nRequests/sec: 269675.42\nTransfer/sec:     38.58MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 33,
+    "median_ms": 0.184,
+    "p99_ms": 0.39,
+    "req_per_sec": 264528.07,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.62us   69.93us   4.94ms   91.60%\n    Req/Sec   133.05k     4.62k  139.17k    92.33%\n  Latency Distribution\n     50%  184.00us\n     75%  192.00us\n     90%  216.00us\n     99%  390.00us\n  7942746 requests in 30.03s, 1.11GB read\nRequests/sec: 264528.07\nTransfer/sec:     37.84MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 33,
+    "median_ms": 0.184,
+    "p99_ms": 0.382,
+    "req_per_sec": 266367.94,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   197.02us   49.73us   1.13ms   92.72%\n    Req/Sec   133.98k     2.70k  139.30k    61.67%\n  Latency Distribution\n     50%  184.00us\n     75%  191.00us\n     90%  205.00us\n     99%  382.00us\n  7997676 requests in 30.02s, 1.12GB read\nRequests/sec: 266367.94\nTransfer/sec:     38.10MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 33,
+    "median_ms": 0.184,
+    "p99_ms": 0.382,
+    "req_per_sec": 266155.99,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   197.56us   50.50us   1.19ms   92.37%\n    Req/Sec   133.85k     2.41k  138.07k    59.50%\n  Latency Distribution\n     50%  184.00us\n     75%  191.00us\n     90%  208.00us\n     99%  382.00us\n  7988969 requests in 30.02s, 1.12GB read\nRequests/sec: 266155.99\nTransfer/sec:     38.07MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 34,
+    "median_ms": 0.184,
+    "p99_ms": 0.382,
+    "req_per_sec": 266394.84,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   197.72us   55.22us   4.31ms   92.22%\n    Req/Sec   133.93k     2.60k  138.93k    61.50%\n  Latency Distribution\n     50%  184.00us\n     75%  191.00us\n     90%  209.00us\n     99%  382.00us\n  7996076 requests in 30.02s, 1.12GB read\nRequests/sec: 266394.84\nTransfer/sec:     38.11MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 34,
+    "median_ms": 0.187,
+    "p99_ms": 0.384,
+    "req_per_sec": 262324.18,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.34us   47.69us   1.17ms   93.39%\n    Req/Sec   131.95k     1.14k  135.36k    66.33%\n  Latency Distribution\n     50%  187.00us\n     75%  193.00us\n     90%  206.00us\n     99%  384.00us\n  7875525 requests in 30.02s, 1.10GB read\nRequests/sec: 262324.18\nTransfer/sec:     37.52MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 34,
+    "median_ms": 0.187,
+    "p99_ms": 0.383,
+    "req_per_sec": 262501.49,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.03us   50.87us   4.31ms   93.69%\n    Req/Sec   132.04k     1.16k  135.89k    63.00%\n  Latency Distribution\n     50%  187.00us\n     75%  193.00us\n     90%  205.00us\n     99%  383.00us\n  7881976 requests in 30.03s, 1.10GB read\nRequests/sec: 262501.49\nTransfer/sec:     37.55MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 35,
+    "median_ms": 0.188,
+    "p99_ms": 0.387,
+    "req_per_sec": 260593.32,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.66us   48.03us   1.26ms   93.35%\n    Req/Sec   131.09k     1.88k  135.36k    61.50%\n  Latency Distribution\n     50%  188.00us\n     75%  195.00us\n     90%  208.00us\n     99%  387.00us\n  7826674 requests in 30.03s, 1.09GB read\nRequests/sec: 260593.32\nTransfer/sec:     37.28MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 35,
+    "median_ms": 0.188,
+    "p99_ms": 0.406,
+    "req_per_sec": 261240.57,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   202.28us   56.93us   2.41ms   91.35%\n    Req/Sec   131.41k     4.17k  138.07k    86.67%\n  Latency Distribution\n     50%  188.00us\n     75%  195.00us\n     90%  214.00us\n     99%  406.00us\n  7844140 requests in 30.03s, 1.10GB read\nRequests/sec: 261240.57\nTransfer/sec:     37.37MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 35,
+    "median_ms": 0.181,
+    "p99_ms": 0.385,
+    "req_per_sec": 266494.11,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.22us   59.15us   1.26ms   89.64%\n    Req/Sec   134.09k     3.85k  138.57k    93.67%\n  Latency Distribution\n     50%  181.00us\n     75%  189.00us\n     90%  347.00us\n     99%  385.00us\n  8003508 requests in 30.03s, 1.12GB read\nRequests/sec: 266494.11\nTransfer/sec:     38.12MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 36,
+    "median_ms": 0.186,
+    "p99_ms": 0.389,
+    "req_per_sec": 263013.33,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.71us   54.82us   2.95ms   91.67%\n    Req/Sec   132.28k     3.45k  137.85k    56.00%\n  Latency Distribution\n     50%  186.00us\n     75%  194.00us\n     90%  215.00us\n     99%  389.00us\n  7897470 requests in 30.03s, 1.10GB read\nRequests/sec: 263013.33\nTransfer/sec:     37.62MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 36,
+    "median_ms": 0.187,
+    "p99_ms": 0.387,
+    "req_per_sec": 262022.96,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.32us   56.46us   3.70ms   93.11%\n    Req/Sec   131.76k     2.61k  135.12k    82.33%\n  Latency Distribution\n     50%  187.00us\n     75%  194.00us\n     90%  208.00us\n     99%  387.00us\n  7867521 requests in 30.03s, 1.10GB read\nRequests/sec: 262022.96\nTransfer/sec:     37.48MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 36,
+    "median_ms": 0.189,
+    "p99_ms": 0.391,
+    "req_per_sec": 259541.60,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   201.76us   50.92us   1.43ms   93.28%\n    Req/Sec   130.49k     3.36k  137.73k    88.50%\n  Latency Distribution\n     50%  189.00us\n     75%  197.00us\n     90%  210.00us\n     99%  391.00us\n  7790490 requests in 30.02s, 1.09GB read\nRequests/sec: 259541.60\nTransfer/sec:     37.13MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 37,
+    "median_ms": 0.187,
+    "p99_ms": 0.382,
+    "req_per_sec": 263200.28,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   198.22us   46.21us   1.26ms   93.79%\n    Req/Sec   132.41k     1.19k  134.97k    67.50%\n  Latency Distribution\n     50%  187.00us\n     75%  193.00us\n     90%  204.00us\n     99%  382.00us\n  7904547 requests in 30.03s, 1.10GB read\nRequests/sec: 263200.28\nTransfer/sec:     37.65MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 37,
+    "median_ms": 0.186,
+    "p99_ms": 0.385,
+    "req_per_sec": 262968.84,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.04us   57.09us   4.40ms   92.76%\n    Req/Sec   132.22k     2.86k  134.88k    97.67%\n  Latency Distribution\n     50%  186.00us\n     75%  192.00us\n     90%  208.00us\n     99%  385.00us\n  7893900 requests in 30.02s, 1.10GB read\nRequests/sec: 262968.84\nTransfer/sec:     37.62MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 37,
+    "median_ms": 0.186,
+    "p99_ms": 0.393,
+    "req_per_sec": 263086.34,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   201.22us   56.67us   3.69ms   90.82%\n    Req/Sec   132.30k     3.17k  137.64k    54.00%\n  Latency Distribution\n     50%  186.00us\n     75%  194.00us\n     90%  218.00us\n     99%  393.00us\n  7898264 requests in 30.02s, 1.10GB read\nRequests/sec: 263086.34\nTransfer/sec:     37.63MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 38,
+    "median_ms": 0.19,
+    "p99_ms": 0.389,
+    "req_per_sec": 259421.82,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   201.43us   47.64us   1.22ms   93.54%\n    Req/Sec   130.44k     2.06k  134.99k    59.17%\n  Latency Distribution\n     50%  190.00us\n     75%  196.00us\n     90%  209.00us\n     99%  389.00us\n  7788380 requests in 30.02s, 1.09GB read\nRequests/sec: 259421.82\nTransfer/sec:     37.11MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 38,
+    "median_ms": 0.181,
+    "p99_ms": 0.382,
+    "req_per_sec": 267239.67,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.82us   58.00us   1.28ms   89.41%\n    Req/Sec   134.39k     2.13k  138.54k    59.83%\n  Latency Distribution\n     50%  181.00us\n     75%  189.00us\n     90%  347.00us\n     99%  382.00us\n  8024164 requests in 30.03s, 1.12GB read\nRequests/sec: 267239.67\nTransfer/sec:     38.23MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 38,
+    "median_ms": 0.19,
+    "p99_ms": 0.393,
+    "req_per_sec": 258474.23,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   203.62us   63.66us   4.09ms   92.99%\n    Req/Sec   129.99k     2.27k  133.88k    73.67%\n  Latency Distribution\n     50%  190.00us\n     75%  197.00us\n     90%  213.00us\n     99%  393.00us\n  7760828 requests in 30.03s, 1.08GB read\nRequests/sec: 258474.23\nTransfer/sec:     36.97MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 39,
+    "median_ms": 0.19,
+    "p99_ms": 0.388,
+    "req_per_sec": 259621.17,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.44us   46.45us   3.21ms   94.37%\n    Req/Sec   130.59k     1.45k  133.39k    66.00%\n  Latency Distribution\n     50%  190.00us\n     75%  195.00us\n     90%  205.00us\n     99%  388.00us\n  7795347 requests in 30.03s, 1.09GB read\nRequests/sec: 259621.17\nTransfer/sec:     37.14MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 39,
+    "median_ms": 0.185,
+    "p99_ms": 0.384,
+    "req_per_sec": 264269.06,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.02us   59.98us   4.64ms   91.68%\n    Req/Sec   132.86k     2.31k  137.48k    72.00%\n  Latency Distribution\n     50%  185.00us\n     75%  192.00us\n     90%  215.00us\n     99%  384.00us\n  7933444 requests in 30.02s, 1.11GB read\nRequests/sec: 264269.06\nTransfer/sec:     37.80MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 39,
+    "median_ms": 0.188,
+    "p99_ms": 0.39,
+    "req_per_sec": 261086.49,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   201.20us   54.07us   2.02ms   92.94%\n    Req/Sec   131.27k     3.88k  136.28k    96.33%\n  Latency Distribution\n     50%  188.00us\n     75%  195.00us\n     90%  209.00us\n     99%  390.00us\n  7837796 requests in 30.02s, 1.09GB read\nRequests/sec: 261086.49\nTransfer/sec:     37.35MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 40,
+    "median_ms": 0.188,
+    "p99_ms": 0.387,
+    "req_per_sec": 261276.85,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.67us   53.39us   4.14ms   93.06%\n    Req/Sec   131.40k     1.54k  137.92k    73.17%\n  Latency Distribution\n     50%  188.00us\n     75%  195.00us\n     90%  208.00us\n     99%  387.00us\n  7844077 requests in 30.02s, 1.10GB read\nRequests/sec: 261276.85\nTransfer/sec:     37.37MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 40,
+    "median_ms": 0.189,
+    "p99_ms": 0.389,
+    "req_per_sec": 259593.67,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   201.60us   52.33us   4.22ms   93.28%\n    Req/Sec   130.62k     2.00k  138.31k    65.67%\n  Latency Distribution\n     50%  189.00us\n     75%  196.00us\n     90%  209.00us\n     99%  389.00us\n  7798813 requests in 30.04s, 1.09GB read\nRequests/sec: 259593.67\nTransfer/sec:     37.13MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 40,
+    "median_ms": 0.181,
+    "p99_ms": 0.382,
+    "req_per_sec": 267526.85,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.34us   60.05us   3.13ms   89.88%\n    Req/Sec   134.53k     2.71k  138.92k    82.17%\n  Latency Distribution\n     50%  181.00us\n     75%  188.00us\n     90%  330.00us\n     99%  382.00us\n  8032660 requests in 30.03s, 1.12GB read\nRequests/sec: 267526.85\nTransfer/sec:     38.27MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 41,
+    "median_ms": 0.19,
+    "p99_ms": 0.39,
+    "req_per_sec": 260235.05,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.99us   50.67us   4.06ms   93.10%\n    Req/Sec   130.91k     2.02k  135.06k    63.33%\n  Latency Distribution\n     50%  190.00us\n     75%  196.00us\n     90%  207.00us\n     99%  390.00us\n  7814886 requests in 30.03s, 1.09GB read\nRequests/sec: 260235.05\nTransfer/sec:     37.23MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 41,
+    "median_ms": 0.182,
+    "p99_ms": 0.382,
+    "req_per_sec": 266471.93,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.73us   60.79us   3.95ms   90.28%\n    Req/Sec   134.01k     1.96k  137.26k    59.17%\n  Latency Distribution\n     50%  182.00us\n     75%  190.00us\n     90%  229.00us\n     99%  382.00us\n  7999563 requests in 30.02s, 1.12GB read\nRequests/sec: 266471.93\nTransfer/sec:     38.12MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 41,
+    "median_ms": 0.187,
+    "p99_ms": 0.384,
+    "req_per_sec": 262677.52,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.49us   52.19us   3.54ms   93.17%\n    Req/Sec   132.08k     1.17k  135.73k    69.17%\n  Latency Distribution\n     50%  187.00us\n     75%  193.00us\n     90%  207.00us\n     99%  384.00us\n  7885086 requests in 30.02s, 1.10GB read\nRequests/sec: 262677.52\nTransfer/sec:     37.58MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 42,
+    "median_ms": 0.181,
+    "p99_ms": 0.383,
+    "req_per_sec": 266578.46,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.27us   58.19us   1.25ms   89.55%\n    Req/Sec   134.04k     2.44k  137.95k    61.50%\n  Latency Distribution\n     50%  181.00us\n     75%  189.00us\n     90%  347.00us\n     99%  383.00us\n  8001499 requests in 30.02s, 1.12GB read\nRequests/sec: 266578.46\nTransfer/sec:     38.13MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 42,
+    "median_ms": 0.182,
+    "p99_ms": 0.382,
+    "req_per_sec": 266702.37,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.42us   56.80us   1.35ms   90.24%\n    Req/Sec   134.16k     2.26k  138.08k    57.83%\n  Latency Distribution\n     50%  182.00us\n     75%  189.00us\n     90%  229.00us\n     99%  382.00us\n  8006956 requests in 30.02s, 1.12GB read\nRequests/sec: 266702.37\nTransfer/sec:     38.15MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 42,
+    "median_ms": 0.183,
+    "p99_ms": 0.383,
+    "req_per_sec": 265791.70,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.05us   53.99us   1.29ms   91.14%\n    Req/Sec   133.67k     2.54k  137.82k    55.67%\n  Latency Distribution\n     50%  183.00us\n     75%  191.00us\n     90%  218.00us\n     99%  383.00us\n  7980711 requests in 30.03s, 1.11GB read\nRequests/sec: 265791.70\nTransfer/sec:     38.02MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 43,
+    "median_ms": 0.187,
+    "p99_ms": 0.385,
+    "req_per_sec": 262035.22,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.26us   57.30us   4.46ms   93.28%\n    Req/Sec   131.76k     2.47k  137.09k    93.67%\n  Latency Distribution\n     50%  187.00us\n     75%  193.00us\n     90%  206.00us\n     99%  385.00us\n  7865972 requests in 30.02s, 1.10GB read\nRequests/sec: 262035.22\nTransfer/sec:     37.48MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 43,
+    "median_ms": 0.185,
+    "p99_ms": 0.381,
+    "req_per_sec": 264337.87,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   198.38us   49.43us   1.93ms   92.85%\n    Req/Sec   132.97k     1.19k  136.24k    72.50%\n  Latency Distribution\n     50%  185.00us\n     75%  192.00us\n     90%  207.00us\n     99%  381.00us\n  7937051 requests in 30.03s, 1.11GB read\nRequests/sec: 264337.87\nTransfer/sec:     37.81MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 43,
+    "median_ms": 0.187,
+    "p99_ms": 0.383,
+    "req_per_sec": 262879.49,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   198.51us   46.48us   1.32ms   93.74%\n    Req/Sec   132.22k     1.61k  136.38k    63.00%\n  Latency Distribution\n     50%  187.00us\n     75%  192.00us\n     90%  204.00us\n     99%  383.00us\n  7892999 requests in 30.03s, 1.10GB read\nRequests/sec: 262879.49\nTransfer/sec:     37.60MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 44,
+    "median_ms": 0.186,
+    "p99_ms": 0.391,
+    "req_per_sec": 261961.85,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   201.98us   58.80us   6.48ms   91.40%\n    Req/Sec   131.76k     3.70k  137.95k    76.33%\n  Latency Distribution\n     50%  186.00us\n     75%  194.00us\n     90%  219.00us\n     99%  391.00us\n  7865696 requests in 30.03s, 1.10GB read\nRequests/sec: 261961.85\nTransfer/sec:     37.47MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 44,
+    "median_ms": 0.186,
+    "p99_ms": 0.395,
+    "req_per_sec": 264077.68,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.18us   60.16us   4.30ms   91.64%\n    Req/Sec   132.76k     0.96k  135.11k    72.33%\n  Latency Distribution\n     50%  186.00us\n     75%  192.00us\n     90%  212.00us\n     99%  395.00us\n  7927037 requests in 30.02s, 1.11GB read\nRequests/sec: 264077.68\nTransfer/sec:     37.78MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 44,
+    "median_ms": 0.188,
+    "p99_ms": 0.389,
+    "req_per_sec": 261045.10,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   201.13us   55.60us   4.12ms   92.84%\n    Req/Sec   131.30k     2.09k  135.54k    65.00%\n  Latency Distribution\n     50%  188.00us\n     75%  195.00us\n     90%  211.00us\n     99%  389.00us\n  7839227 requests in 30.03s, 1.10GB read\nRequests/sec: 261045.10\nTransfer/sec:     37.34MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 45,
+    "median_ms": 0.189,
+    "p99_ms": 0.391,
+    "req_per_sec": 259572.26,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   201.80us   55.32us   4.18ms   93.31%\n    Req/Sec   130.54k     3.45k  135.26k    91.50%\n  Latency Distribution\n     50%  189.00us\n     75%  196.00us\n     90%  209.00us\n     99%  391.00us\n  7792802 requests in 30.02s, 1.09GB read\nRequests/sec: 259572.26\nTransfer/sec:     37.13MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 45,
+    "median_ms": 0.18,
+    "p99_ms": 0.385,
+    "req_per_sec": 266721.88,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   201.50us   62.75us   2.97ms   88.32%\n    Req/Sec   134.14k     4.12k  138.35k    98.67%\n  Latency Distribution\n     50%  180.00us\n     75%  189.00us\n     90%  352.00us\n     99%  385.00us\n  8007528 requests in 30.02s, 1.12GB read\nRequests/sec: 266721.88\nTransfer/sec:     38.15MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 45,
+    "median_ms": 0.183,
+    "p99_ms": 0.383,
+    "req_per_sec": 265783.06,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   198.92us   53.65us   1.25ms   91.32%\n    Req/Sec   133.67k     2.51k  137.67k    56.83%\n  Latency Distribution\n     50%  183.00us\n     75%  190.00us\n     90%  216.00us\n     99%  383.00us\n  7978948 requests in 30.02s, 1.11GB read\nRequests/sec: 265783.06\nTransfer/sec:     38.02MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 46,
+    "median_ms": 0.181,
+    "p99_ms": 0.381,
+    "req_per_sec": 267852.65,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   198.31us   55.86us   1.28ms   90.40%\n    Req/Sec   134.73k     2.83k  139.28k    55.50%\n  Latency Distribution\n     50%  181.00us\n     75%  189.00us\n     90%  226.00us\n     99%  381.00us\n  8043604 requests in 30.03s, 1.12GB read\nRequests/sec: 267852.65\nTransfer/sec:     38.32MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 46,
+    "median_ms": 0.186,
+    "p99_ms": 0.384,
+    "req_per_sec": 263461.03,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.43us   53.43us   4.61ms   92.70%\n    Req/Sec   132.47k     2.11k  135.26k    94.67%\n  Latency Distribution\n     50%  186.00us\n     75%  193.00us\n     90%  209.00us\n     99%  384.00us\n  7908616 requests in 30.02s, 1.10GB read\nRequests/sec: 263461.03\nTransfer/sec:     37.69MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 46,
+    "median_ms": 0.186,
+    "p99_ms": 0.384,
+    "req_per_sec": 262913.81,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.86us   54.58us   4.16ms   92.79%\n    Req/Sec   132.21k     1.42k  137.01k    79.50%\n  Latency Distribution\n     50%  186.00us\n     75%  193.00us\n     90%  209.00us\n     99%  384.00us\n  7893154 requests in 30.02s, 1.10GB read\nRequests/sec: 262913.81\nTransfer/sec:     37.61MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 47,
+    "median_ms": 0.186,
+    "p99_ms": 0.384,
+    "req_per_sec": 263299.95,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.83us   52.15us   2.08ms   92.17%\n    Req/Sec   132.45k     2.10k  137.78k    70.33%\n  Latency Distribution\n     50%  186.00us\n     75%  193.00us\n     90%  211.00us\n     99%  384.00us\n  7907953 requests in 30.03s, 1.10GB read\nRequests/sec: 263299.95\nTransfer/sec:     37.66MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 47,
+    "median_ms": 0.182,
+    "p99_ms": 0.383,
+    "req_per_sec": 266106.82,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.14us   62.61us   3.14ms   90.43%\n    Req/Sec   133.88k     2.62k  137.92k    82.67%\n  Latency Distribution\n     50%  182.00us\n     75%  189.00us\n     90%  226.00us\n     99%  383.00us\n  7990146 requests in 30.03s, 1.12GB read\nRequests/sec: 266106.82\nTransfer/sec:     38.07MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 47,
+    "median_ms": 0.185,
+    "p99_ms": 0.383,
+    "req_per_sec": 264504.93,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.32us   55.06us   3.98ms   92.05%\n    Req/Sec   133.02k     1.99k  137.72k    66.17%\n  Latency Distribution\n     50%  185.00us\n     75%  192.00us\n     90%  212.00us\n     99%  383.00us\n  7940372 requests in 30.02s, 1.11GB read\nRequests/sec: 264504.93\nTransfer/sec:     37.84MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 48,
+    "median_ms": 0.188,
+    "p99_ms": 0.384,
+    "req_per_sec": 262076.33,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.06us   46.15us   1.31ms   93.83%\n    Req/Sec   131.80k     1.20k  135.68k    64.67%\n  Latency Distribution\n     50%  188.00us\n     75%  194.00us\n     90%  205.00us\n     99%  384.00us\n  7868096 requests in 30.02s, 1.10GB read\nRequests/sec: 262076.33\nTransfer/sec:     37.49MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 48,
+    "median_ms": 0.184,
+    "p99_ms": 0.385,
+    "req_per_sec": 264646.70,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.98us   65.08us   3.92ms   90.70%\n    Req/Sec   133.09k     2.35k  137.59k    73.33%\n  Latency Distribution\n     50%  184.00us\n     75%  191.00us\n     90%  225.00us\n     99%  385.00us\n  7946989 requests in 30.03s, 1.11GB read\nRequests/sec: 264646.70\nTransfer/sec:     37.86MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 48,
+    "median_ms": 0.182,
+    "p99_ms": 0.383,
+    "req_per_sec": 266461.93,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.58us   56.82us   2.53ms   90.25%\n    Req/Sec   134.02k     2.43k  138.12k    58.00%\n  Latency Distribution\n     50%  182.00us\n     75%  190.00us\n     90%  230.00us\n     99%  383.00us\n  7999386 requests in 30.02s, 1.12GB read\nRequests/sec: 266461.93\nTransfer/sec:     38.12MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 49,
+    "median_ms": 0.187,
+    "p99_ms": 0.384,
+    "req_per_sec": 262526.16,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   199.52us   49.22us   1.28ms   92.88%\n    Req/Sec   132.00k     1.14k  135.62k    66.33%\n  Latency Distribution\n     50%  187.00us\n     75%  194.00us\n     90%  208.00us\n     99%  384.00us\n  7880120 requests in 30.02s, 1.10GB read\nRequests/sec: 262526.16\nTransfer/sec:     37.55MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 49,
+    "median_ms": 0.187,
+    "p99_ms": 0.386,
+    "req_per_sec": 261775.74,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.38us   59.32us   4.48ms   93.31%\n    Req/Sec   131.70k     2.51k  135.24k    94.00%\n  Latency Distribution\n     50%  187.00us\n     75%  193.00us\n     90%  206.00us\n     99%  386.00us\n  7862313 requests in 30.03s, 1.10GB read\nRequests/sec: 261775.74\nTransfer/sec:     37.45MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 49,
+    "median_ms": 0.187,
+    "p99_ms": 0.386,
+    "req_per_sec": 262788.23,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.44us   65.67us   5.24ms   92.89%\n    Req/Sec   132.17k     2.61k  135.80k    95.83%\n  Latency Distribution\n     50%  187.00us\n     75%  193.00us\n     90%  208.00us\n     99%  386.00us\n  7889430 requests in 30.02s, 1.10GB read\nRequests/sec: 262788.23\nTransfer/sec:     37.59MB\n"
+  },
+  {
+    "config": "c1",
+    "round": 50,
+    "median_ms": 0.182,
+    "p99_ms": 0.38,
+    "req_per_sec": 267337.03,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   198.18us   54.46us   1.24ms   90.86%\n    Req/Sec   134.49k     2.09k  138.20k    57.83%\n  Latency Distribution\n     50%  182.00us\n     75%  189.00us\n     90%  219.00us\n     99%  380.00us\n  8029230 requests in 30.03s, 1.12GB read\nRequests/sec: 267337.03\nTransfer/sec:     38.24MB\n"
+  },
+  {
+    "config": "c3",
+    "round": 50,
+    "median_ms": 0.184,
+    "p99_ms": 0.385,
+    "req_per_sec": 264238.40,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   200.34us   58.46us   4.40ms   91.13%\n    Req/Sec   132.95k     2.40k  137.72k    72.50%\n  Latency Distribution\n     50%  184.00us\n     75%  191.00us\n     90%  220.00us\n     99%  385.00us\n  7938234 requests in 30.04s, 1.11GB read\nRequests/sec: 264238.40\nTransfer/sec:     37.80MB\n"
+  },
+  {
+    "config": "c2",
+    "round": 50,
+    "median_ms": 0.182,
+    "p99_ms": 0.46,
+    "req_per_sec": 266464.52,
+    "raw_wrk_output": "Running 30s test @ http://127.0.0.1:9101/\n  2 threads and 100 connections\n  Thread Stats   Avg      Stdev     Max   +/- Stdev\n    Latency   201.59us   66.60us   2.06ms   89.05%\n    Req/Sec   133.97k     3.14k  138.41k    85.17%\n  Latency Distribution\n     50%  182.00us\n     75%  190.00us\n     90%  347.00us\n     99%  460.00us\n  7998702 requests in 30.02s, 1.12GB read\nRequests/sec: 266464.52\nTransfer/sec:     38.12MB\n"
+  }
+]

@@ -475,22 +475,52 @@ this gate.
 Host: C6CQ3045N2; nginx: tests/bench/zero_cost_logs.sh: line 207: "/Users/c.vandesande/project-nginx-otel/ngx-otel-rust/objs-debug/nginx": No such file or directory
 INFORMATIONAL — ±1% gate requires N≥50 on isolated hardware.
 
-## Phase 2.1-FU fix3b zero-cost gate — 2026-06-03
+## Phase 2.1-FU fix3b zero-cost gate — FORMAL (dedicated hardware) — 2026-06-03
 
-Bench: zero_cost.sh C1 vs C2 (SKIP_C3=1), Docker containers stopped,
-macOS arm64 (C6CQ3045N2). N=17 rounds each.
+**Supersedes the informal N=17 macOS run below.** Bench: `zero_cost.sh`
+**C1/C2/C3, N=50** rounds (randomized config order per round), `SKIP_BUILD=1`,
+native `otelcol-contrib` 0.153.0 collector (no Docker). Host: **AWS `c7a.xlarge`**
+— AMD EPYC 9R14 (Genoa), **4 real cores / no SMT**, non-burstable, Debian 13
+x86_64, dedicated + idle. Adapted to **2 nginx workers + 2 wrk threads** to mirror
+the prior 8-core `m7a.2xlarge` gate's 1-thread/core ratio (relative deltas are
+invariant to this). Results JSON: `results/run-2026-06-03T16-21-01.json`.
 
-| Config | Median latency | Regression vs C1 |
-|--------|---------------|------------------|
-| C1 (no module) | 1.67 ms | — |
-| C2 (module loaded, no exporter) | 1.67 ms | **0.00%** |
+| Config | median | p99 | req/s |
+|--------|--------|-----|-------|
+| C1 (no module) | 0.186 ms | 0.384 ms | 263,445 |
+| C2 (module loaded, no exporter — fix3b path NOT recording) | 0.185 ms | 0.383 ms | 264,163 |
+| C3 (module loaded + exporter — **fix3b per-request recording ACTIVE**) | 0.1845 ms | 0.384 ms | 263,569 |
 
-**fix3b zero-cost gate: PASS** — multi-dim `request_duration_combos[160]` array
-in WorkerSlots adds zero measurable latency when the module is loaded but
-disabled. The extra shm struct size is pre-allocated at zone-init time;
-the per-request path is unchanged (handler not registered when `otel_exporter`
-is absent).
+**Deltas:**
+- **C3-vs-C1 (the fix3b gate metric): median −0.81%, p99 +0.00%, throughput
+  +0.05% — within ±1%, effectively zero.** (C3 measured marginally *faster*:
+  noise around true zero, same signature as the Phase 1.3.3 re-bench.)
+- C2-vs-C1 (loaded-disabled): median 0.54%, p99 0.26%, throughput 0.27% — PASS.
 
-Note: N=17 rounds (informal, not N≥100 on isolated hardware). The formal
-dedicated-hardware confirmation (N≥50, isolated EPYC) is a pending follow-up.
-The 0.00% result at N=17 on this hardware leaves no structural concern.
+**fix3b zero-cost gate: PASS on dedicated isolated hardware.** The multi-dim
+`request_duration_combos[160]` histogram + the per-request combo-index + 3
+`Relaxed` `fetch_add`s add **no measurable hot-path cost** at N=50.
+
+**Important correction vs the N=17 run:** that earlier run compared **C1-vs-C2
+with `SKIP_C3=1`**, i.e. the module-loaded-but-*disabled* path — which does NOT
+register the recording handler (no `otel_exporter`), so **it never exercised
+fix3b at all**. This C3-inclusive run is the FIRST to actually measure fix3b's
+per-request cost. The disabled-path 0.00% still holds (C2-vs-C1 above); the new
+result is the operational (C3) gate fix3b actually needed.
+
+**`analyse.sh` reported a `FAIL`** — but only on the **C1 run-to-run variance**
+check (6.99% median / 5.00% throughput vs a 3% threshold). That check is
+peak-to-peak-range ÷ median, which is outlier/quantization-dominated at sub-200µs
+medians (per-round C1 medians were a steady 0.182–0.188 ms); it is the documented
+range-metric artifact (see the "Future tooling note: switch to CV/IQR or a µs
+floor" item), pure C1 baseline jitter, unrelated to fix3b. The zero-cost deltas
+(C2-vs-C1, C3-vs-C1) — the actual gate — all pass.
+
+---
+
+### (Informal, superseded) fix3b N=17 — macOS arm64 — 2026-06-03
+
+Bench: zero_cost.sh C1 vs C2 (SKIP_C3=1), Docker stopped, macOS arm64. N=17.
+C1=C2=1.67 ms, 0.00%. **Did not exercise fix3b** (C2 has no exporter → no
+recording handler) and was on the noisy dev host. Kept for history; the formal
+c7a run above is the gate of record.
