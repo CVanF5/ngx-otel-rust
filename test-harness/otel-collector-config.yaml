@@ -18,9 +18,19 @@ exporters:
     sampling_initial: 100
     sampling_thereafter: 100
 
-  # Also write to a JSON file we can inspect after a test run
+  # Also write metrics to a JSON file we can inspect after a test run
   file:
     path: /var/log/otel/metrics.json
+    rotation:
+      max_megabytes: 10
+      max_days: 1
+      max_backups: 3
+
+  # Dedicated logs file — logs pipeline writes here so integration scripts
+  # can grep for LogRecords without disambiguating against metric records.
+  # Named instance of the 'file' exporter: "file/logs".
+  file/logs:
+    path: /var/log/otel/logs.json
     rotation:
       max_megabytes: 10
       max_days: 1
@@ -38,7 +48,7 @@ service:
     logs:
       receivers: [otlp]
       processors: [batch]
-      exporters: [debug, file]
+      exporters: [debug, file/logs]
     traces:
       receivers: [otlp]
       processors: [batch]
