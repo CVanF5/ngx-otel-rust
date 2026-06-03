@@ -176,7 +176,10 @@ impl Default for MainConfig {
             shm_zone: ptr::null_mut(),
             control_shm_zone: ptr::null_mut(),
             logs_shm_zone: ptr::null_mut(),
-            access_log_enabled: 0,
+            // UNSET_FLAG (-1): nginx's ngx_conf_set_flag_slot checks for this sentinel
+            // to detect duplicate directives.  Using 0 would incorrectly trigger the
+            // duplicate guard on the first set.
+            access_log_enabled: UNSET_FLAG,
         }
     }
 }
@@ -491,10 +494,14 @@ impl MainConfig {
         Some(unsafe { addr.cast::<u8>().add(crate::shm::data_offset()) })
     }
 
-    /// Returns `true` when `otel_access_log on;` was set.
+    /// Returns `true` when `otel_access_log on;` was explicitly set to on.
+    ///
+    /// UNSET_FLAG (-1) = not configured → off.
+    /// 0 = explicitly `off` → off.
+    /// 1 = explicitly `on` → on.
     #[inline]
     pub fn is_access_log_enabled(&self) -> bool {
-        self.access_log_enabled > 0
+        self.access_log_enabled == 1
     }
 
     /// Returns the base address of our WorkerSlots data within the shared memory zone.
