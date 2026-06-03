@@ -67,23 +67,23 @@ README.  See the Confluence proposal (link below) for the full phase plan.
 flowchart LR
     Req((HTTP<br/>requests))
 
-    subgraph workers["NGINX worker processes"]
+    subgraph workers["NGINX worker processes (hot path)"]
         direction TB
         W0[Worker 0]
         W1[Worker 1]
         WN[Worker N]
     end
 
-    subgraph shm["Per-worker shm slots<br/>(no cross-worker writes)"]
+    subgraph shm["Per-worker shm — no cross-worker writes"]
         direction TB
-        S0[("Slot 0")]
-        S1[("Slot 1")]
-        SN[("Slot N")]
+        S0[("Slot 0<br/>counters + log/trace ring")]
+        S1[("Slot 1<br/>counters + log/trace ring")]
+        SN[("Slot N<br/>counters + log/trace ring")]
     end
 
-    subgraph exporter["nginx: otel exporter process<br/>(cold path; every otel_metric_interval)"]
+    subgraph exporter["nginx: otel exporter process — single cold path for ALL signals<br/>(metrics now; logs + traces Phase 2/3)"]
         direction LR
-        Src["MetricSource"] --> Enc["Encoder<br/>OTLP protobuf"] --> Tx["Transport<br/>HTTP/1 or gRPC/h2"]
+        Src["Metric source +<br/>log/trace drain"] --> Enc["Encoder<br/>OTLP protobuf"] --> Tx["Transport<br/>HTTP/1 or gRPC/h2"]
     end
 
     Ctl[("Control shm<br/>flags + heartbeat")]
@@ -94,9 +94,9 @@ flowchart LR
     Req --> W1
     Req --> WN
 
-    W0 -->|"Log-phase<br/>atomic +="| S0
-    W1 -->|"Log-phase<br/>atomic +="| S1
-    WN -->|"Log-phase<br/>atomic +="| SN
+    W0 -->|"log-phase: atomic += (metrics)<br/>+ push record (logs/traces, Phase 2/3)"| S0
+    W1 --> S1
+    WN --> SN
 
     W0 -.flags load.-> Ctl
     Ctl -.heartbeat.-> exporter
@@ -106,7 +106,7 @@ flowchart LR
     SN -.read.-> Src
     NS -.read.-> Src
 
-    Tx -->|"OTLP/HTTP POST /v1/metrics<br/>or OTLP/gRPC Export"| Coll
+    Tx -->|"OTLP/HTTP or gRPC<br/>/v1/metrics (now) · /v1/logs · /v1/traces (Phase 2/3)"| Coll
 ```
 
 Per-worker shm counter slots for instrumented metrics; atomic increments
@@ -124,6 +124,15 @@ the request path (one `Relaxed` atomic read — the sole hot-path branch,
 reserved for Phase 5 dynamic reconfiguration).  Three trait boundaries —
 `MetricSource`, `Encoder`, `Transport` — keep an eventual OTAP /
 columnar migration a swap, not a rewrite.
+
+This one dedicated exporter is deliberately the **single cold path for all
+three signals** — metrics today, logs and traces in Phases 2–3 — so per-signal
+differences stay confined to the shm shape on the left while one process owns
+all collector I/O.  The per-worker-export alternative (the model the production
+C++ `nginx/nginx-otel` module uses: a background thread and its own connection
+in every worker) was weighed across all three signals and declined; the
+reasoning and the conditions that would reverse it are recorded in the proposal
+§6.5.
 
 When `otel_exporter` is not configured the Log-phase handler is not
 registered and the exporter process is not spawned — no work runs on the
