@@ -139,29 +139,14 @@ pub fn emit_access_record(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::logs::{ring::LogsWorkerRing, WorkerRingProducer};
-
-    type TestRing = LogsWorkerRing<{ 4 * 1024 }>;
-
-    fn make_ring() -> std::boxed::Box<TestRing> {
-        unsafe {
-            let layout = std::alloc::Layout::new::<TestRing>();
-            let ptr = std::alloc::alloc_zeroed(layout) as *mut TestRing;
-            std::boxed::Box::from_raw(ptr)
-        }
-    }
-
-    fn drain_one(ring: &TestRing) -> std::vec::Vec<u8> {
-        let mut out = std::vec::Vec::new();
-        let ok = ring.pop_into(&mut out);
-        assert!(ok, "expected a record in the ring");
-        out
-    }
+    use crate::logs::WorkerRingProducer;
+    use crate::logs::ring::tests::make_ring_with_cap;
 
     #[test]
     fn access_record_pushes_bytes_to_ring() {
-        let ring = make_ring();
-        let producer = WorkerRingProducer { ring: ring.as_ref() };
+        let (_buf, ring) = make_ring_with_cap(4096);
+        // LogsWorkerRing is Copy, so we can use it for both the producer and drain.
+        let producer = WorkerRingProducer { ring };
 
         let pushed = emit_access_record(
             &producer,
@@ -174,7 +159,8 @@ mod tests {
         );
         assert!(pushed, "push must succeed on an empty ring");
 
-        let record = drain_one(&ring);
+        let mut record = std::vec::Vec::new();
+        assert!(ring.pop_into(&mut record), "expected a record in the ring");
         // Check kind byte.
         assert_eq!(record[0], KIND_ACCESS);
         // Check ngx_level (at byte 9, after 1 kind + 8 ts).
@@ -191,12 +177,13 @@ mod tests {
 
     #[test]
     fn access_record_long_method_truncated() {
-        let ring = make_ring();
-        let producer = WorkerRingProducer { ring: ring.as_ref() };
+        let (_buf, ring) = make_ring_with_cap(4096);
+        let producer = WorkerRingProducer { ring };
         // Method longer than 16 bytes should be truncated.
         let long_method = b"VERYLONGMETHODNAME_EXCEEDS_LIMIT";
         emit_access_record(&producer, long_method, 200, 0, 0, b"127.0.0.1", 0);
-        let record = drain_one(&ring);
+        let mut record = std::vec::Vec::new();
+        assert!(ring.pop_into(&mut record));
         let method_len = u16::from_be_bytes([record[10], record[11]]) as usize;
         assert!(method_len <= 16, "method must be truncated to 16 bytes");
     }

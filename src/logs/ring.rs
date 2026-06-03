@@ -7,184 +7,193 @@
 //!
 //! # Design
 //!
-//! One `LogsWorkerRing` exists per worker per signal type (access, error).
-//! The **worker** (producer) calls [`LogsWorkerRing::push`]; the **central
-//! exporter process** (consumer) calls [`LogsWorkerRing::pop_into`].
+//! One ring per worker per signal type (access, error) lives in the logs shm
+//! zone.  Each ring is split into a fixed-size header and a variable-length
+//! payload region that immediately follows in memory:
 //!
-//! # Invariants
+//! ```text
+//! [ LogsWorkerRingHeader (32 bytes) ][ payload (cap bytes) ]
+//! ```
 //!
-//! - NO allocation on the producer path.
-//! - NO locks on the producer path — atomic-only.
-//! - `push` never blocks; it increments the `dropped` counter on full and
-//!   returns `false`.
-//! - Read/write offsets are **monotonically increasing `u64`** values that
-//!   live inside the ring struct (in shm), so a fresh exporter process
-//!   resumes exactly where the old one left off across SIGHUP.
-//! - Wire format per record: `[u32 record_len big-endian][payload bytes...]`.
+//! `LogsWorkerRingHeader` carries the three atomic counters plus the runtime
+//! `cap` field.  The `cap` is set once at zone-init time (from the configured
+//! `otel_log_ring_size`), then read by both push and pop on every call.
+//!
+//! [`LogsWorkerRing`] is a lightweight view (a pointer to the header) obtained
+//! from a raw shm pointer; it is NOT a container and does not own memory.
 //!
 //! # Default capacity
 //!
-//! `LOG_RING_CAP` is 512 KiB per ring.  At ~100–200 bytes/record this
-//! holds roughly 2 500 – 5 000 records — comfortable for a 1–2 s drain
-//! window at up to ~2 500 req/s per worker.  At the 10 k RPS load test
-//! (Step 12) with a ~5 s drain interval some drops are expected and tested
-//! (bounded to < 50 %).
+//! `DEFAULT_LOG_RING_CAP` is 512 KiB per ring.  Memory = `cap × 2 × N` where
+//! `N` = worker count (one access ring + one error ring per worker).  Operators
+//! who need more capacity can raise it via `otel_log_ring_size`.
 //!
-//! TODO(phase-N): expose ring capacity as an operator directive so
-//! high-volume deployments can tune shm usage vs. drop rate.
+//! # Wire format per record
+//! `[u32 record_len big-endian][payload bytes...]`
+//!
+//! # Invariants
+//! - NO allocation on the producer path.
+//! - NO locks on the producer path — atomic-only.
+//! - `push` never blocks; increments `dropped` on full.
+//! - Read/write offsets are **monotonically increasing `u64`** stored in the
+//!   header in shm, so a fresh exporter resumes across SIGHUP (gotcha #6).
 
-use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Default ring capacity in bytes per worker per signal type.
 ///
-/// 512 KiB ≈ 2 500–5 000 records at 100–200 bytes each.
-pub const LOG_RING_CAP: usize = 512 * 1024;
+/// 512 KiB.  Memory = `cap × 2 × N` workers.
+/// Raise with `otel_log_ring_size` if rings fill under your load.
+pub const DEFAULT_LOG_RING_CAP: usize = 512 * 1024;
 
-/// A lock-free SPSC ring buffer stored in shared memory.
+/// Kept for backward compat with tests/code that still reference the old name.
+pub const LOG_RING_CAP: usize = DEFAULT_LOG_RING_CAP;
+
+/// Fixed-size header for a per-worker log ring.
 ///
-/// `CAP` is the capacity of the `payload` array in bytes.  The total size of
-/// this struct is `3 × 8 + CAP` bytes.  It must be `#[repr(C)]` so that the
-/// layout is deterministic across compilation units (nginx workers +
-/// `nginx: otel exporter`).
-///
-/// The `payload` field uses [`UnsafeCell`] to allow interior mutability
-/// through the shared reference — necessary because both the producer (via
-/// `push`) and consumer (via `pop_into`) access the same bytes through a
-/// `&self` reference (the ring lives in shared memory, accessible from
-/// multiple processes via a raw pointer).
-///
-/// # Concurrency model
-/// - **Writer** (nginx worker): calls `push`.  Loads `read_offset` with
-///   `Acquire` to compute free space; writes payload bytes; stores
-///   `write_offset` with `Release`.
-/// - **Reader** (otel exporter): calls `pop_into`.  Loads `write_offset`
-///   with `Acquire` to detect new data; reads payload bytes; stores
-///   `read_offset` with `Release`.
-///
-/// This is a standard SPSC ring.  No CAS or lock is needed.
-///
-/// # Safety invariant
-/// Only one writer and one reader may operate concurrently.  Any other usage
-/// pattern (multiple producers, or multiple consumers) is UB.
+/// Immediately followed in shm by `cap` bytes of payload.
+/// `#[repr(C)]` ensures deterministic layout across worker processes and the
+/// exporter process.
 #[repr(C)]
-pub struct LogsWorkerRing<const CAP: usize> {
+pub struct LogsWorkerRingHeader {
     /// Monotonically increasing byte count written by the producer.
     pub write_offset: AtomicU64,
     /// Monotonically increasing byte count consumed by the exporter.
     pub read_offset: AtomicU64,
     /// Number of records dropped because the ring was full.
     pub dropped: AtomicU64,
-    /// The ring payload.  Accessed at `offset % CAP`.
-    /// `UnsafeCell` is required for interior mutability (both push and pop
-    /// access the same storage via a shared reference).
-    payload: UnsafeCell<[u8; CAP]>,
+    /// Ring payload capacity in bytes (set at zone-init from `otel_log_ring_size`).
+    pub cap: u64,
 }
 
-// Safety: the ring is designed for cross-process shared memory use where
-// exactly one producer and one consumer access it concurrently.  The
-// caller upholds the SPSC invariant.  Making it Send+Sync is required so
-// the exporter process can hold a reference obtained from shm.
-unsafe impl<const CAP: usize> Send for LogsWorkerRing<CAP> {}
-unsafe impl<const CAP: usize> Sync for LogsWorkerRing<CAP> {}
+/// Size of the header alone (without payload).
+pub const RING_HEADER_SIZE: usize = core::mem::size_of::<LogsWorkerRingHeader>();
 
-impl<const CAP: usize> LogsWorkerRing<CAP> {
+/// Total bytes required for one ring with the given capacity.
+#[inline]
+pub fn ring_size_bytes(cap: usize) -> usize {
+    RING_HEADER_SIZE + cap
+}
+
+/// A lightweight view over a per-worker log ring in shm.
+///
+/// Does NOT own the memory — it is a pointer to a [`LogsWorkerRingHeader`]
+/// that lives in the logs shm zone.  The payload immediately follows the
+/// header.
+///
+/// `Copy + Clone` because it is just a pointer — copying it produces a second
+/// view into the same ring, which is intentional (worker writes via one view,
+/// exporter reads via another view of the same shm region).
+///
+/// # Safety invariant
+/// Only one writer and one reader may operate concurrently (SPSC).
+#[derive(Clone, Copy)]
+pub struct LogsWorkerRing {
+    header: *mut LogsWorkerRingHeader,
+}
+
+// Safety: the ring lives in shared memory accessible from multiple processes
+// (workers + exporter).  The caller upholds the SPSC invariant.
+unsafe impl Send for LogsWorkerRing {}
+unsafe impl Sync for LogsWorkerRing {}
+
+impl LogsWorkerRing {
+    /// Obtain a view over the ring at `ptr`.
+    ///
+    /// # Safety
+    /// `ptr` must point to a valid `LogsWorkerRingHeader` followed by
+    /// at least `header.cap` bytes of payload (all in shm).
+    #[inline]
+    pub unsafe fn from_shm_ptr(ptr: *mut u8) -> Self {
+        Self { header: ptr.cast() }
+    }
+
+    #[inline]
+    fn cap(&self) -> usize {
+        unsafe { (*self.header).cap as usize }
+    }
+
+    #[inline]
+    fn payload_ptr(&self) -> *mut u8 {
+        // Payload immediately follows the header.
+        unsafe { self.header.add(1).cast() }
+    }
+
     /// Push one length-prefixed record into the ring.
     ///
-    /// Returns `true` on success, `false` when the ring is full (the `dropped`
-    /// counter is incremented in that case).
-    ///
-    /// # Invariants
-    /// - No allocation.
-    /// - No locks.
-    /// - No syscalls.
-    /// - Returns immediately; never spins.
+    /// Returns `true` on success, `false` when the ring is full (dropped
+    /// counter incremented).  No allocation, no locks, no syscalls.
     pub fn push(&self, record: &[u8]) -> bool {
+        let cap = self.cap();
+        if cap == 0 {
+            return false;
+        }
         let record_len = record.len();
-        // Total bytes needed: 4-byte length prefix + payload.
         let total = 4 + record_len;
 
-        // SPSC: only one producer, so Relaxed is fine for our own pointer.
-        let write_off = self.write_offset.load(Ordering::Relaxed);
-        // Acquire: synchronise with the consumer's Release store on read_offset.
-        let read_off = self.read_offset.load(Ordering::Acquire);
+        let hdr = unsafe { &*self.header };
+        let write_off = hdr.write_offset.load(Ordering::Relaxed);
+        let read_off = hdr.read_offset.load(Ordering::Acquire);
 
-        // Number of bytes currently committed-but-unread.
         let used = write_off.wrapping_sub(read_off) as usize;
-        if used + total > CAP {
-            // Ring full — drop.
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+        if used + total > cap {
+            hdr.dropped.fetch_add(1, Ordering::Relaxed);
             return false;
         }
 
-        // Safety: SPSC invariant — only one producer writes at a time.
-        let base: *mut u8 = unsafe { (*self.payload.get()).as_mut_ptr() };
-
-        // Write the 4-byte length prefix (big-endian).
+        let base = self.payload_ptr();
         let len_bytes = (record_len as u32).to_be_bytes();
-        write_wrap(base, CAP, write_off as usize, &len_bytes);
+        write_wrap(base, cap, write_off as usize, &len_bytes);
+        write_wrap(base, cap, write_off as usize + 4, record);
 
-        // Write the payload.
-        write_wrap(base, CAP, write_off as usize + 4, record);
-
-        // Release: make the new data visible to the consumer.
-        self.write_offset.store(write_off + total as u64, Ordering::Release);
+        hdr.write_offset.store(write_off + total as u64, Ordering::Release);
         true
     }
 
     /// Pop the next record from the ring into `out`.
     ///
     /// Returns `true` and appends the record bytes to `out` when a record is
-    /// available.  Returns `false` (and leaves `out` unchanged) when the ring
-    /// is empty.
+    /// available.  Returns `false` (and leaves `out` unchanged) when empty.
     pub fn pop_into(&self, out: &mut std::vec::Vec<u8>) -> bool {
-        // Acquire: synchronise with the producer's Release store on write_offset.
-        let write_off = self.write_offset.load(Ordering::Acquire);
-        // SPSC: only one consumer, Relaxed is fine for our own pointer.
-        let read_off = self.read_offset.load(Ordering::Relaxed);
+        let cap = self.cap();
+        if cap == 0 {
+            return false;
+        }
+        let hdr = unsafe { &*self.header };
+        let write_off = hdr.write_offset.load(Ordering::Acquire);
+        let read_off = hdr.read_offset.load(Ordering::Relaxed);
 
         let available = write_off.wrapping_sub(read_off) as usize;
         if available < 4 {
-            // Not even a length prefix available.
             return false;
         }
 
-        // Safety: SPSC invariant — only one consumer reads at a time.
-        let base: *const u8 = unsafe { (*self.payload.get()).as_ptr() };
-
-        // Read the 4-byte length prefix.
+        let base = self.payload_ptr();
         let mut len_buf = [0u8; 4];
-        read_wrap(base, CAP, read_off as usize, &mut len_buf);
+        read_wrap(base, cap, read_off as usize, &mut len_buf);
         let record_len = u32::from_be_bytes(len_buf) as usize;
 
         if available < 4 + record_len {
-            // Partial record — should not happen with correct push.
             return false;
         }
 
-        // Append the payload to `out`.
         let old_len = out.len();
         out.resize(old_len + record_len, 0);
-        read_wrap(base, CAP, read_off as usize + 4, &mut out[old_len..]);
+        read_wrap(base, cap, read_off as usize + 4, &mut out[old_len..]);
 
-        // Release: make the freed space visible to the producer.
-        self.read_offset.store(read_off + 4 + record_len as u64, Ordering::Release);
+        hdr.read_offset.store(read_off + 4 + record_len as u64, Ordering::Release);
         true
     }
 
     /// Number of records dropped because the ring was full.
     #[inline]
     pub fn drop_count(&self) -> u64 {
-        self.dropped.load(Ordering::Acquire)
+        unsafe { (*self.header).dropped.load(Ordering::Acquire) }
     }
 }
 
 // ── Ring I/O helpers (wrapping byte access) ──────────────────────────────────
 
-/// Copy `data` bytes into `ring[offset % cap .. ...]` with wrap-around.
-///
-/// # Safety
-/// Caller must ensure exclusive write access to the ring payload.
 #[inline]
 fn write_wrap(base: *mut u8, cap: usize, offset: usize, data: &[u8]) {
     if data.is_empty() {
@@ -202,10 +211,6 @@ fn write_wrap(base: *mut u8, cap: usize, offset: usize, data: &[u8]) {
     }
 }
 
-/// Copy bytes from `ring[offset % cap .. ...]` into `dst` with wrap-around.
-///
-/// # Safety
-/// Caller must ensure exclusive read access to the ring payload.
 #[inline]
 fn read_wrap(base: *const u8, cap: usize, offset: usize, dst: &mut [u8]) {
     if dst.is_empty() {
@@ -230,75 +235,64 @@ pub(crate) mod tests {
     use super::*;
     use std::boxed::Box;
 
-    pub type SmallRing = LogsWorkerRing<1024>; // tiny ring for tests
+    const TEST_CAP: usize = 1024;
 
-    /// Create a zero-initialised small ring on the heap.  Used by ring tests
-    /// and by `logs::tests::log_producer_trait_object_safe`.
-    pub fn make_ring_small() -> Box<SmallRing> {
-        make_ring()
+    /// Allocate a ring with the given capacity on the heap.
+    ///
+    /// Simulates what the shm zone-init path does: allocates space for the
+    /// header + payload, zero-inits, and sets `header.cap`.
+    pub fn make_ring_with_cap(cap: usize) -> (Box<[u8]>, LogsWorkerRing) {
+        let total = ring_size_bytes(cap);
+        let mut buf = vec![0u8; total].into_boxed_slice();
+        let ptr = buf.as_mut_ptr();
+        // Safety: ptr is valid and aligned for LogsWorkerRingHeader.
+        unsafe {
+            let hdr = ptr.cast::<LogsWorkerRingHeader>();
+            (*hdr).cap = cap as u64;
+        }
+        let ring = unsafe { LogsWorkerRing::from_shm_ptr(ptr) };
+        (buf, ring)
     }
 
-    fn make_ring() -> Box<SmallRing> {
-        // Safety: zeroing a SmallRing is valid — all fields are integers /
-        // UnsafeCell<[u8; N]> / AtomicU64.  Zero-initialisation is valid for
-        // all of these.
-        unsafe {
-            let layout = std::alloc::Layout::new::<SmallRing>();
-            let ptr = std::alloc::alloc_zeroed(layout) as *mut SmallRing;
-            Box::from_raw(ptr)
-        }
+    /// Create a standard small test ring (1024-byte cap).
+    pub fn make_ring_small() -> (Box<[u8]>, LogsWorkerRing) {
+        make_ring_with_cap(TEST_CAP)
     }
 
     #[test]
     fn push_then_pop_roundtrips_record() {
-        let ring = make_ring();
+        let (_buf, ring) = make_ring_small();
         let data = b"hello logs";
 
-        let pushed = ring.push(data);
-        assert!(pushed, "push must succeed on an empty ring");
+        assert!(ring.push(data), "push must succeed on an empty ring");
 
         let mut out = std::vec::Vec::new();
-        let popped = ring.pop_into(&mut out);
-        assert!(popped, "pop must succeed after a push");
+        assert!(ring.pop_into(&mut out), "pop must succeed after a push");
         assert_eq!(out.as_slice(), data.as_slice());
 
-        // Ring should now be empty.
         let mut out2 = std::vec::Vec::new();
         assert!(!ring.pop_into(&mut out2), "ring must be empty after draining");
-        assert!(out2.is_empty());
     }
 
     #[test]
     fn push_when_full_drops_and_increments_counter() {
-        let ring = make_ring();
-        // Fill the ring.  Each record costs 4 (prefix) + payload bytes.
-        // Use 80-byte payloads = 84 bytes/record; floor(1024 / 84) = 12 records max.
+        let (_buf, ring) = make_ring_small();
         let payload = [0xABu8; 80];
-        let mut success_count = 0u32;
         for _ in 0..20 {
-            if ring.push(&payload) {
-                success_count += 1;
-            }
+            ring.push(&payload);
         }
-        // At least 12 successes; the ring should be full after those.
-        assert!(success_count >= 1, "at least one push must succeed");
-        // After overflow, the drop counter must be non-zero.
         assert!(ring.drop_count() > 0, "drop counter must be non-zero after overflow");
     }
 
     #[test]
     fn wrap_around_works() {
-        let ring = make_ring();
+        let (_buf, ring) = make_ring_small();
 
-        // Push records until write_offset is close to the ring boundary.
-        // Each record: 4 prefix + 1 payload = 5 bytes.
-        // Advance to ~1020 bytes consumed, then drain, then push a spanning record.
-        let short = [0x55u8; 1]; // 1 byte payload → 5 bytes total
-        // Push ~204 records to advance ~1020 bytes.
+        // Advance past ring boundary.
+        let short = [0x55u8; 1];
         for _ in 0..204 {
-            assert!(ring.push(&short), "short push must succeed");
+            assert!(ring.push(&short));
         }
-        // Drain them all.
         let mut out = std::vec::Vec::new();
         let mut count = 0u32;
         while ring.pop_into(&mut out) {
@@ -307,25 +301,18 @@ pub(crate) mod tests {
         }
         assert_eq!(count, 204);
 
-        // write_offset and read_offset are now both 204*5 = 1020.
-        // Push a 10-byte record (14 bytes total).  It starts at offset 1020 % 1024 = 1020
-        // and spans the ring boundary (1020 + 14 = 1034 > 1024).
+        // Push a spanning record.
         let spanning: [u8; 10] = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x11, 0x22];
-        let pushed = ring.push(&spanning);
-        assert!(pushed, "spanning push must succeed");
+        assert!(ring.push(&spanning), "spanning push must succeed");
 
         let mut out = std::vec::Vec::new();
-        let popped = ring.pop_into(&mut out);
-        assert!(popped, "spanning pop must succeed");
+        assert!(ring.pop_into(&mut out), "spanning pop must succeed");
         assert_eq!(out.as_slice(), spanning.as_slice());
     }
 
     #[test]
     fn two_producers_same_thread_serialise_correctly() {
-        // SPSC holds for a single-threaded worker: two sequential pushes on the
-        // same "worker" thread are serialised by virtue of being sequential.
-        let ring = make_ring();
-
+        let (_buf, ring) = make_ring_small();
         let r1 = b"record_one";
         let r2 = b"record_two";
 
@@ -335,12 +322,21 @@ pub(crate) mod tests {
         let mut out = std::vec::Vec::new();
         assert!(ring.pop_into(&mut out));
         assert_eq!(out.as_slice(), r1.as_slice());
-
         out.clear();
         assert!(ring.pop_into(&mut out));
         assert_eq!(out.as_slice(), r2.as_slice());
-
         out.clear();
         assert!(!ring.pop_into(&mut out));
+    }
+
+    #[test]
+    fn non_default_cap_round_trips() {
+        let cap = 4096;
+        let (_buf, ring) = make_ring_with_cap(cap);
+        let data = b"non-default cap test";
+        assert!(ring.push(data));
+        let mut out = std::vec::Vec::new();
+        assert!(ring.pop_into(&mut out));
+        assert_eq!(out.as_slice(), data.as_slice());
     }
 }

@@ -8,7 +8,7 @@
 //! This module is the top-level home for all log-emission infrastructure:
 //!
 //! - `severity` — nginx log level → OTel SeverityNumber mapping (Step 3).
-//! - `ring`     — per-worker SPSC lock-free byte ring (Step 5).
+//! - `ring`     — per-worker SPSC lock-free byte ring (Step 5 + FU3).
 //! - `access`   — access-record formatter (Step 7).
 //! - [`LogProducer`] trait — the platform-axis API for pushing records into
 //!   the ring (Step 6).
@@ -61,17 +61,17 @@ pub trait LogProducer {
 
 // ── WorkerRingProducer ───────────────────────────────────────────────────────
 
-/// A thin [`LogProducer`] wrapper around a [`ring::LogsWorkerRing`] reference.
+/// A thin [`LogProducer`] wrapper around a [`ring::LogsWorkerRing`].
 ///
 /// Constructed by `LogPhaseHandler` on each request (Step 8) and by the
 /// error-log writer on each error event (Phase 2.2).  Zero cost: just an
-/// opaque pointer to the ring, which lives in shm.
-pub struct WorkerRingProducer<'a, const CAP: usize> {
-    /// Reference to the calling worker's ring.
-    pub ring: &'a ring::LogsWorkerRing<CAP>,
+/// opaque view (raw pointer) into the ring in shm.
+pub struct WorkerRingProducer {
+    /// View of the calling worker's ring (a raw pointer into shm).
+    pub ring: ring::LogsWorkerRing,
 }
 
-impl<'a, const CAP: usize> LogProducer for WorkerRingProducer<'a, CAP> {
+impl LogProducer for WorkerRingProducer {
     #[inline]
     fn push(&self, record: &[u8]) -> bool {
         self.ring.push(record)
@@ -83,7 +83,6 @@ impl<'a, const CAP: usize> LogProducer for WorkerRingProducer<'a, CAP> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ring::LogsWorkerRing;
 
     /// Confirm `LogProducer` is dyn-compatible — future modules will use
     /// `Box<dyn LogProducer>` or `&dyn LogProducer`.
@@ -93,8 +92,8 @@ mod tests {
         fn accepts_dyn(_producer: &dyn LogProducer) {}
 
         // Allocate a tiny ring and wrap it in WorkerRingProducer.
-        let ring = ring::tests::make_ring_small();
-        let producer = WorkerRingProducer { ring: &ring };
+        let (_buf, ring) = ring::tests::make_ring_small();
+        let producer = WorkerRingProducer { ring };
         accepts_dyn(&producer);
     }
 }

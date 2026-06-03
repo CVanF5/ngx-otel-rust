@@ -21,7 +21,7 @@ use ngx::http::{HttpModuleMainConf, HttpPhase, HttpRequestHandler, Request};
 
 use crate::logs::{WorkerRingProducer, access::emit_access_record};
 use crate::shm::{
-    logs_worker_slot, worker_slots, BYTES_BOUNDS, DURATION_BOUNDS_MS, N_BYTES_BUCKETS,
+    logs_access_ring, worker_slots, BYTES_BOUNDS, DURATION_BOUNDS_MS, N_BYTES_BUCKETS,
     N_DURATION_BUCKETS,
 };
 use crate::HttpOtelModule;
@@ -137,10 +137,10 @@ impl HttpRequestHandler for LogPhaseHandler {
         // Only the branch check runs; the ring is never touched.
         if amcf.is_access_log_enabled() {
             if let Some(logs_base) = amcf.logs_shm_base() {
-                // Safety: logs zone was sized for ≥ worker_id slots during
-                // postconfiguration (register_logs_zone).
-                let logs_slot = unsafe { &*logs_worker_slot(logs_base, worker_id) };
-                let producer = WorkerRingProducer { ring: &logs_slot.access };
+                let cap = amcf.log_ring_cap();
+                // Safety: zone was sized for ≥ worker_id slots at registration.
+                let access_ring = unsafe { logs_access_ring(logs_base, worker_id, cap) };
+                let producer = WorkerRingProducer { ring: access_ring };
 
                 // Gather HTTP semconv fields from the request.
                 let method: &[u8] = r.method_name.as_bytes();
@@ -452,32 +452,18 @@ fn now_unix_nano() -> u64 {
 #[cfg(test)]
 mod tests {
     use crate::logs::{WorkerRingProducer, access::emit_access_record};
-    use crate::logs::ring::LogsWorkerRing;
-
-    type TestRing = LogsWorkerRing<{ 4 * 1024 }>;
-
-    fn make_ring() -> std::boxed::Box<TestRing> {
-        unsafe {
-            let layout = std::alloc::Layout::new::<TestRing>();
-            let ptr = std::alloc::alloc_zeroed(layout) as *mut TestRing;
-            std::boxed::Box::from_raw(ptr)
-        }
-    }
+    use crate::logs::ring::tests::make_ring_with_cap;
 
     /// With `access_log_enabled = false` (the default), the access-log
     /// emission gate is closed: no ring operations occur.
-    ///
-    /// This test simulates the gate check by calling `emit_access_record`
-    /// only when the gate is open, mirroring the `if amcf.is_access_log_enabled()`
-    /// branch in `LogPhaseHandler::handler`.
     #[test]
     fn access_emission_off_no_ring_touch() {
-        let ring = make_ring();
+        let (_buf, ring) = make_ring_with_cap(4096);
 
-        // Simulate the gate check: access_log_enabled = false → skip emit.
+        // Gate check: access_log_enabled = false → skip emit.
         let access_log_enabled = false;
         if access_log_enabled {
-            let producer = WorkerRingProducer { ring: ring.as_ref() };
+            let producer = WorkerRingProducer { ring };
             emit_access_record(&producer, b"GET", 200, 0, 512, b"127.0.0.1", 0);
         }
 
@@ -494,12 +480,12 @@ mod tests {
     /// access record into the ring with the expected fields.
     #[test]
     fn access_emission_on_pushes_record() {
-        let ring = make_ring();
+        let (_buf, ring) = make_ring_with_cap(4096);
 
-        // Simulate the gate check: access_log_enabled = true → emit.
+        // Gate check: access_log_enabled = true → emit.
         let access_log_enabled = true;
         if access_log_enabled {
-            let producer = WorkerRingProducer { ring: ring.as_ref() };
+            let producer = WorkerRingProducer { ring };
             emit_access_record(
                 &producer,
                 b"POST",

@@ -54,7 +54,7 @@ use crate::logs::severity::nginx_to_otel;
 use crate::metric_source::instrumented::InstrumentedSource;
 use crate::metric_source::stub_status::StubStatusSource;
 use crate::metric_source::MetricSource;
-use crate::shm::{logs_worker_slot, LogsWorkerSlot};
+use crate::shm::{logs_access_ring, logs_n_workers_from_zone, logs_slot_size};
 use crate::transport::hyper_http::NgxConnector;
 use crate::transport::{GrpcTransport, HyperHttpTransport, Transport};
 
@@ -482,7 +482,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                     let n_workers = unsafe {
                         let zone = &*amcf.logs_shm_zone;
                         let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
-                        (avail / core::mem::size_of::<LogsWorkerSlot>()).max(1)
+                        logs_n_workers_from_zone(avail, amcf.log_ring_cap())
                     };
                     let logs_batch =
                         collect_log_records(amcf, logs_base, n_workers, worker_start_ns);
@@ -804,7 +804,7 @@ async fn graceful_drain(
             let n_workers = unsafe {
                 let zone = &*amcf.logs_shm_zone;
                 let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
-                (avail / core::mem::size_of::<LogsWorkerSlot>()).max(1)
+                logs_n_workers_from_zone(avail, amcf.log_ring_cap())
             };
             let logs_batch = collect_log_records(amcf, logs_base, n_workers, worker_start_ns);
             if !logs_batch.logs.is_empty() {
@@ -1031,11 +1031,12 @@ fn collect_log_records(
     let mut logs: std::vec::Vec<LogRecord> = std::vec::Vec::new();
     let mut total_dropped: u64 = 0;
 
+    let cap = amcf.log_ring_cap();
+
     // Drain access rings for all workers.
     for w in 0..n_workers {
-        // Safety: logs zone was sized for n_workers; w < n_workers.
-        let slot = unsafe { &*logs_worker_slot(logs_base, w) };
-        let ring = &slot.access;
+        // Safety: zone was sized for n_workers at registration; w < n_workers.
+        let ring = unsafe { logs_access_ring(logs_base, w, cap) };
 
         // Accumulate drop counts.
         total_dropped += ring.drop_count();
@@ -1322,7 +1323,7 @@ pub fn exit_process_flush(amcf: &MainConfig) {
             let n_workers = unsafe {
                 let zone = &*amcf.logs_shm_zone;
                 let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
-                (avail / core::mem::size_of::<LogsWorkerSlot>()).max(1)
+                logs_n_workers_from_zone(avail, amcf.log_ring_cap())
             };
             let logs_batch = collect_log_records(amcf, logs_base, n_workers, worker_start_ns);
             if !logs_batch.logs.is_empty() {
@@ -1456,20 +1457,31 @@ mod tests {
     /// `collect_log_records` with empty rings produces an empty LogsBatch.
     #[test]
     fn logs_drain_handles_empty_rings() {
-        use crate::logs::ring::LogsWorkerRing;
-        use crate::shm::LogsWorkerSlot;
+        use crate::logs::ring::{DEFAULT_LOG_RING_CAP, ring_size_bytes, RING_HEADER_SIZE, LogsWorkerRingHeader};
+        use crate::shm::logs_slot_size;
 
-        // Allocate a single LogsWorkerSlot (one worker).
-        let slot_layout = std::alloc::Layout::new::<LogsWorkerSlot>();
-        let slot_ptr = unsafe { std::alloc::alloc_zeroed(slot_layout) as *mut LogsWorkerSlot };
+        // Allocate one worker slot with default cap.
+        let cap = DEFAULT_LOG_RING_CAP;
+        let slot_sz = logs_slot_size(cap);
+        let layout = std::alloc::Layout::from_size_align(slot_sz, 8).unwrap();
+        let slot_ptr = unsafe { std::alloc::alloc_zeroed(layout) };
 
-        // Synthesize a minimal config.
+        // Stamp cap into both ring headers (mirrors logs_shm_zone_init).
+        unsafe {
+            let access_hdr = slot_ptr.cast::<LogsWorkerRingHeader>();
+            (*access_hdr).cap = cap as u64;
+            let error_hdr = slot_ptr.add(ring_size_bytes(cap)).cast::<LogsWorkerRingHeader>();
+            (*error_hdr).cap = cap as u64;
+        }
+
+        // Synthesize a minimal config (log_ring_cap() = DEFAULT_LOG_RING_CAP).
         let amcf = crate::config::MainConfig::default();
 
-        let batch = collect_log_records(&amcf, slot_ptr as *mut u8, 1, 0);
+        let batch = collect_log_records(&amcf, slot_ptr, 1, 0);
         assert!(batch.logs.is_empty(), "empty rings must produce empty LogsBatch");
 
-        unsafe { std::alloc::dealloc(slot_ptr as *mut u8, slot_layout) };
+        unsafe { std::alloc::dealloc(slot_ptr, layout) };
+        let _ = RING_HEADER_SIZE; // suppress unused import
     }
 
     /// `collect_log_records` drains rings and returns parsed LogRecords.

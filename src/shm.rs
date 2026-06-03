@@ -226,52 +226,79 @@ pub unsafe extern "C" fn otel_shm_zone_init(
 
 // ── Logs shm zone (Phase 2.1) ─────────────────────────────────────────────
 
-use crate::logs::ring::{LogsWorkerRing, LOG_RING_CAP};
+use crate::logs::ring::{LogsWorkerRing, ring_size_bytes, LogsWorkerRingHeader, RING_HEADER_SIZE};
 
-/// Per-worker slot for the logs shm zone.
+/// Bytes occupied by one worker's logs slot (access ring + error ring).
 ///
-/// Contains one access ring and one error ring.  They are kept separate so
-/// the exporter can drain them independently and tag records with the correct
-/// signal type.
-///
-/// `CAP` defaults to [`LOG_RING_CAP`] (512 KiB) for each ring.  Both rings
-/// use the same capacity for Phase 2.1 simplicity; the error ring is unused
-/// until Phase 2.2.
-///
-/// Layout: `#[repr(C)]` for deterministic cross-process access.
-#[repr(C)]
-pub struct LogsWorkerSlot {
-    /// Access-log ring (producer: worker, consumer: otel exporter).
-    pub access: LogsWorkerRing<LOG_RING_CAP>,
-    /// Error-log ring (used in Phase 2.2; reserved here so the zone size is
-    /// stable across SIGHUP reloads).
-    pub error: LogsWorkerRing<LOG_RING_CAP>,
-}
-
-/// Minimum logs zone size for `n_workers` worker processes.
+/// Both rings use the same `cap` for Phase 2.1.
+/// Memory per worker = `cap × 2 + 2 × RING_HEADER_SIZE`.
+/// Total logs shm = `slab_pool_header + n_workers × logs_slot_size(cap)`.
 #[inline]
-pub fn logs_zone_size_for(n_workers: usize) -> usize {
-    data_offset() + n_workers * mem::size_of::<LogsWorkerSlot>()
+pub fn logs_slot_size(cap: usize) -> usize {
+    2 * ring_size_bytes(cap)
 }
 
-/// Obtain a pointer to the logs slot for the given `worker_id`.
+/// Minimum logs zone size for `n_workers` worker processes with ring `cap`.
+#[inline]
+pub fn logs_zone_size_for(n_workers: usize, cap: usize) -> usize {
+    data_offset() + n_workers * logs_slot_size(cap)
+}
+
+/// Infer worker count from the logs zone metadata.
+///
+/// Used by the exporter when it must compute `n_workers` from the zone itself.
+/// `cap` must match the value used at zone registration.
+#[inline]
+pub fn logs_n_workers_from_zone(zone_data_bytes: usize, cap: usize) -> usize {
+    let slot = logs_slot_size(cap);
+    if slot == 0 {
+        0
+    } else {
+        (zone_data_bytes / slot).max(1)
+    }
+}
+
+/// Obtain a [`LogsWorkerRing`] view of the **access** ring for `worker_id`.
+///
+/// Layout per slot (base = `shm.addr + data_offset()`):
+/// ```text
+/// slot_i = base + i × logs_slot_size(cap)
+/// access_ring_header = slot_i + 0
+/// access_ring_payload = slot_i + RING_HEADER_SIZE
+/// error_ring_header   = slot_i + ring_size_bytes(cap)
+/// error_ring_payload  = slot_i + ring_size_bytes(cap) + RING_HEADER_SIZE
+/// ```
 ///
 /// # Safety
-/// - `base_addr` must point to the start of the logs shm zone (past the slab
-///   pool header, i.e. at `shm.addr + data_offset()`).
-/// - `worker_id` must be < the number of workers the zone was sized for.
-/// - The returned pointer must not outlive the zone mapping.
+/// - `base_addr` must point past the slab-pool header (`shm.addr + data_offset()`).
+/// - `worker_id < n_workers` and `cap` must match the zone registration.
+/// - The returned ring must not outlive the zone mapping.
 #[inline]
-pub unsafe fn logs_worker_slot(base_addr: *mut u8, worker_id: usize) -> *mut LogsWorkerSlot {
-    let offset = worker_id * mem::size_of::<LogsWorkerSlot>();
-    unsafe { base_addr.add(offset).cast() }
+pub unsafe fn logs_access_ring(base_addr: *mut u8, worker_id: usize, cap: usize) -> LogsWorkerRing {
+    let slot_off = worker_id * logs_slot_size(cap);
+    unsafe { LogsWorkerRing::from_shm_ptr(base_addr.add(slot_off)) }
+}
+
+/// Obtain a [`LogsWorkerRing`] view of the **error** ring for `worker_id`.
+///
+/// Error ring follows immediately after the access ring within the same slot.
+#[inline]
+pub unsafe fn logs_error_ring(base_addr: *mut u8, worker_id: usize, cap: usize) -> LogsWorkerRing {
+    let slot_off = worker_id * logs_slot_size(cap);
+    let error_off = slot_off + ring_size_bytes(cap);
+    unsafe { LogsWorkerRing::from_shm_ptr(base_addr.add(error_off)) }
 }
 
 /// Zone initialisation callback for the logs shm zone.
 ///
-/// On a fresh start, zero only the `LogsWorkerSlot` area (not the slab-pool
-/// header).  On SIGHUP (`old_data` is non-null) the same physical pages are
-/// re-mapped; the ring offsets carry over automatically — do NOT zero them.
+/// On a fresh start, zeros the slot area and sets `cap` in every ring header
+/// so that subsequent push/pop calls know the ring capacity.  On SIGHUP
+/// (`old_data` is non-null) the same physical pages are re-mapped; ring offsets
+/// carry over automatically — do NOT zero them (gotcha #6 in the plan).
+///
+/// The configured `cap` is stored in `(*zone).data` as a `usize` cast to
+/// `*mut c_void` (tagged pointer pattern; safe because usize fits in a pointer
+/// on all supported arches).
 ///
 /// # Safety
 /// nginx guarantees the callback args are valid non-null pointers.
@@ -280,18 +307,43 @@ pub unsafe extern "C" fn logs_shm_zone_init(
     old_data: *mut core::ffi::c_void,
 ) -> ngx_int_t {
     if !old_data.is_null() {
-        // SIGHUP: same physical pages re-mapped.  Offsets in the rings survive;
-        // the exporter resumes where it left off (gotcha #6 in the plan).
+        // SIGHUP: same physical pages re-mapped.  Ring offsets survive.
         return Status::NGX_OK.into();
     }
-    // Fresh start: zero the LogsWorkerSlot area.
+
     let zone = unsafe { &*shm_zone };
     let offset = data_offset();
-    if zone.shm.size > offset {
-        let base: *mut u8 = unsafe { zone.shm.addr.cast::<u8>().add(offset) };
-        let size = zone.shm.size - offset;
-        unsafe { ptr::write_bytes(base, 0, size) };
+    let zone_data_bytes = zone.shm.size.saturating_sub(offset);
+    if zone_data_bytes == 0 {
+        return Status::NGX_OK.into();
     }
+
+    let base: *mut u8 = unsafe { zone.shm.addr.cast::<u8>().add(offset) };
+
+    // Recover `cap` from the tagged-pointer stored in zone.data.
+    // `register_logs_zone` stores `cap` as `usize` → `*mut c_void`.
+    let cap = zone.data as usize;
+    let slot_sz = logs_slot_size(cap);
+    if slot_sz == 0 {
+        return Status::NGX_OK.into();
+    }
+
+    // Zero the whole slot area first.
+    unsafe { ptr::write_bytes(base, 0, zone_data_bytes) };
+
+    // Then stamp `cap` into every ring header so push/pop know the capacity.
+    let n_workers = (zone_data_bytes / slot_sz).max(1);
+    for w in 0..n_workers {
+        let slot_off = w * slot_sz;
+        // Access ring header.
+        let access_hdr = unsafe { base.add(slot_off).cast::<LogsWorkerRingHeader>() };
+        unsafe { (*access_hdr).cap = cap as u64 };
+        // Error ring header.
+        let error_hdr =
+            unsafe { base.add(slot_off + ring_size_bytes(cap)).cast::<LogsWorkerRingHeader>() };
+        unsafe { (*error_hdr).cap = cap as u64 };
+    }
+
     Status::NGX_OK.into()
 }
 

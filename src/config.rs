@@ -145,8 +145,9 @@ pub struct MainConfig {
     /// load (Phase 1.3.3). Phase 5 wires the bidi control channel to it.
     pub control_shm_zone: *mut nginx_sys::ngx_shm_zone_t,
     /// The registered logs shm zone (set during postconfiguration when
-    /// `access_log_enabled || error_log_enabled`).  Holds one
-    /// [`shm::LogsWorkerSlot`] per worker — access ring + error ring.
+    /// `access_log_enabled || error_log_enabled`).  Per-worker layout:
+    /// two rings per slot (access + error), each of `log_ring_cap` bytes.
+    /// Memory = `log_ring_cap × 2 × N` + slab-pool header overhead.
     pub logs_shm_zone: *mut nginx_sys::ngx_shm_zone_t,
     /// `otel_access_log on | off` — whether to push access records into the
     /// per-worker logs ring on every request.  Defaults to false (off).
@@ -154,6 +155,9 @@ pub struct MainConfig {
     /// Using `ngx_flag_t` (i64) to match `ngx_conf_set_flag_slot` semantics;
     /// read via [`is_access_log_enabled`].
     pub access_log_enabled: nginx_sys::ngx_flag_t,
+    /// `otel_log_ring_size <size>` — per-worker ring capacity in bytes.
+    /// `0` = not configured (uses `DEFAULT_LOG_RING_CAP`).
+    pub log_ring_size: usize,
 }
 
 impl Default for MainConfig {
@@ -180,6 +184,7 @@ impl Default for MainConfig {
             // to detect duplicate directives.  Using 0 would incorrectly trigger the
             // duplicate guard on the first set.
             access_log_enabled: UNSET_FLAG,
+            log_ring_size: 0,
         }
     }
 }
@@ -457,7 +462,8 @@ impl MainConfig {
             if core_conf.is_null() { 1 } else { (*core_conf).worker_processes.max(1) as usize }
         };
 
-        let zone_size = shm::logs_zone_size_for(n_workers);
+        let cap = self.log_ring_cap();
+        let zone_size = shm::logs_zone_size_for(n_workers, cap);
         let mut zone_name = ngx::ngx_string!("ngx_http_otel_logs_zone");
 
         let Some(zone) = (unsafe { shm::register_zone(cf, &mut zone_name, zone_size, module) })
@@ -474,7 +480,10 @@ impl MainConfig {
 
         unsafe {
             (*zone).init = Some(shm::logs_shm_zone_init);
-            (*zone).data = ptr::from_mut(self).cast();
+            // Store `cap` as a tagged pointer in `zone.data` so the init
+            // callback can stamp it into every ring header without needing a
+            // MainConfig pointer (which would be stale after a reload).
+            (*zone).data = cap as *mut core::ffi::c_void;
         }
 
         self.logs_shm_zone = zone;
@@ -502,6 +511,19 @@ impl MainConfig {
     #[inline]
     pub fn is_access_log_enabled(&self) -> bool {
         self.access_log_enabled == 1
+    }
+
+    /// Effective per-worker log ring capacity in bytes.
+    ///
+    /// Uses the value from `otel_log_ring_size` if set; otherwise
+    /// [`crate::logs::ring::DEFAULT_LOG_RING_CAP`].
+    #[inline]
+    pub fn log_ring_cap(&self) -> usize {
+        if self.log_ring_size > 0 {
+            self.log_ring_size
+        } else {
+            crate::logs::ring::DEFAULT_LOG_RING_CAP
+        }
     }
 
     /// Returns the base address of our WorkerSlots data within the shared memory zone.
@@ -793,25 +815,36 @@ macro_rules! production_commands {
                 offset: mem::offset_of!(MainConfig, access_log_enabled),
                 post: ptr::null_mut(),
             },
+            // otel_log_ring_size <size>;  (Phase 2.1 FU3)
+            // Per-worker ring capacity in bytes.  Memory = size × 2 × N workers.
+            // Default: 512k (DEFAULT_LOG_RING_CAP).  Raise for high-RPS deployments.
+            ngx_command_t {
+                name: ngx_string!("otel_log_ring_size"),
+                type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+                set: Some(cmd_set_log_ring_size),
+                conf: NGX_HTTP_MAIN_CONF_OFFSET,
+                offset: 0,
+                post: ptr::null_mut(),
+            },
         ]
     };
 }
 
-/// Production build: 14 production commands + terminator.
+/// Production build: 15 production commands + terminator.
 #[cfg(not(any(test, feature = "test-support")))]
-pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 15] = {
-    let mut cmds = [ngx_command_t::empty(); 15];
+pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 16] = {
+    let mut cmds = [ngx_command_t::empty(); 16];
     let prod = production_commands!();
     let mut i = 0;
-    while i < 14 {
+    while i < 15 {
         cmds[i] = prod[i];
         i += 1;
     }
-    // cmds[14] stays empty() — terminator
+    // cmds[15] stays empty() — terminator
     cmds
 };
 
-/// test-support build: 14 production commands + otel_status_endpoint + terminator.
+/// test-support build: 15 production commands + otel_status_endpoint + terminator.
 ///
 /// `otel_status_endpoint;` is a location-level directive (no args) that registers
 /// a content handler returning `control_shm.version` as plain text. Used by the
@@ -819,16 +852,16 @@ pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 15] = {
 /// process-level introspection. Absent from production builds (verified by grep
 /// on `objs-release/ngx_http_otel_module.so`).
 #[cfg(any(test, feature = "test-support"))]
-pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 16] = {
-    let mut cmds = [ngx_command_t::empty(); 16];
+pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 17] = {
+    let mut cmds = [ngx_command_t::empty(); 17];
     let prod = production_commands!();
     let mut i = 0;
-    while i < 14 {
+    while i < 15 {
         cmds[i] = prod[i];
         i += 1;
     }
-    // Index 14: otel_status_endpoint (test-support only).
-    cmds[14] = ngx_command_t {
+    // Index 15: otel_status_endpoint (test-support only).
+    cmds[15] = ngx_command_t {
         name: ngx_string!("otel_status_endpoint"),
         type_: (nginx_sys::NGX_HTTP_LOC_CONF | NGX_CONF_NOARGS) as ngx_uint_t,
         set: Some(cmd_set_otel_status_endpoint),
@@ -836,7 +869,7 @@ pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 16] = {
         offset: 0,
         post: ptr::null_mut(),
     };
-    // cmds[15] stays empty() — terminator.
+    // cmds[16] stays empty() — terminator.
     cmds
 };
 
@@ -1053,6 +1086,42 @@ extern "C" fn cmd_set_export_protocol(
             );
         }
         NGX_CONF_ERROR
+    }
+}
+
+/// Directive callback for `otel_log_ring_size <size>;`.
+///
+/// Parses a size value (e.g. `"512k"`, `"1m"`) using `parse_size_bytes` and
+/// stores the result in `MainConfig::log_ring_size`.
+extern "C" fn cmd_set_log_ring_size(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    let amcf = unsafe { conf.cast::<MainConfig>().as_mut().expect("main config") };
+
+    if amcf.log_ring_size > 0 {
+        return c"is duplicate".as_ptr().cast_mut();
+    }
+
+    let args = unsafe { cf_args(cf) };
+    let raw = args[1].as_bytes();
+
+    match parse_size_bytes(raw) {
+        Some(n) if n > 0 => {
+            amcf.log_ring_size = n;
+            NGX_CONF_OK
+        }
+        _ => {
+            unsafe {
+                ngx_conf_log_error!(
+                    NGX_LOG_EMERG,
+                    &mut *cf,
+                    "otel_log_ring_size: invalid size (use e.g. \"512k\" or \"1m\")"
+                );
+            }
+            NGX_CONF_ERROR
+        }
     }
 }
 
