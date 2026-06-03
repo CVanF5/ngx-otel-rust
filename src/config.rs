@@ -768,25 +768,36 @@ macro_rules! production_commands {
                 offset: 0,
                 post: ptr::null_mut(),
             },
+            // otel_access_log on | off;  (Phase 2.1)
+            // When on, the log-phase handler pushes one access record per
+            // request into the per-worker logs ring.  Default: off.
+            ngx_command_t {
+                name: ngx_string!("otel_access_log"),
+                type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_FLAG) as ngx_uint_t,
+                set: Some(nginx_sys::ngx_conf_set_flag_slot),
+                conf: NGX_HTTP_MAIN_CONF_OFFSET,
+                offset: mem::offset_of!(MainConfig, access_log_enabled),
+                post: ptr::null_mut(),
+            },
         ]
     };
 }
 
-/// Production build: 13 production commands + terminator.
+/// Production build: 14 production commands + terminator.
 #[cfg(not(any(test, feature = "test-support")))]
-pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 14] = {
-    let mut cmds = [ngx_command_t::empty(); 14];
+pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 15] = {
+    let mut cmds = [ngx_command_t::empty(); 15];
     let prod = production_commands!();
     let mut i = 0;
-    while i < 13 {
+    while i < 14 {
         cmds[i] = prod[i];
         i += 1;
     }
-    // cmds[13] stays empty() — terminator
+    // cmds[14] stays empty() — terminator
     cmds
 };
 
-/// test-support build: 13 production commands + otel_status_endpoint + terminator.
+/// test-support build: 14 production commands + otel_status_endpoint + terminator.
 ///
 /// `otel_status_endpoint;` is a location-level directive (no args) that registers
 /// a content handler returning `control_shm.version` as plain text. Used by the
@@ -794,16 +805,16 @@ pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 14] = {
 /// process-level introspection. Absent from production builds (verified by grep
 /// on `objs-release/ngx_http_otel_module.so`).
 #[cfg(any(test, feature = "test-support"))]
-pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 15] = {
-    let mut cmds = [ngx_command_t::empty(); 15];
+pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 16] = {
+    let mut cmds = [ngx_command_t::empty(); 16];
     let prod = production_commands!();
     let mut i = 0;
-    while i < 13 {
+    while i < 14 {
         cmds[i] = prod[i];
         i += 1;
     }
-    // Index 13: otel_status_endpoint (test-support only).
-    cmds[13] = ngx_command_t {
+    // Index 14: otel_status_endpoint (test-support only).
+    cmds[14] = ngx_command_t {
         name: ngx_string!("otel_status_endpoint"),
         type_: (nginx_sys::NGX_HTTP_LOC_CONF | NGX_CONF_NOARGS) as ngx_uint_t,
         set: Some(cmd_set_otel_status_endpoint),
@@ -811,7 +822,7 @@ pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 15] = {
         offset: 0,
         post: ptr::null_mut(),
     };
-    // cmds[14] stays empty() — terminator.
+    // cmds[15] stays empty() — terminator.
     cmds
 };
 
@@ -1169,6 +1180,25 @@ mod tests {
         assert_eq!(cfg.interval_ms(), DEFAULT_INTERVAL_MS);
         assert_eq!(cfg.batch_size(), DEFAULT_BATCH_SIZE);
         assert!(cfg.status_code_class_enabled()); // UNSET treated as on
+        // access log is off by default (Phase 2.1)
+        assert!(!cfg.is_access_log_enabled(), "access log must default to off");
+    }
+
+    /// Verify that the otel_access_log directive flips is_access_log_enabled().
+    ///
+    /// This is a unit test of the accessor and field — the directive handler
+    /// (`ngx_conf_set_flag_slot`) is tested implicitly by the integration tests
+    /// that send a real nginx.conf containing `otel_access_log on;`.
+    #[test]
+    fn test_access_log_directive() {
+        let mut cfg = MainConfig::default();
+        // Default: off.
+        assert!(!cfg.is_access_log_enabled());
+        // Set via the raw ngx_flag_t field (mirrors what ngx_conf_set_flag_slot does).
+        cfg.access_log_enabled = 1; // on
+        assert!(cfg.is_access_log_enabled());
+        cfg.access_log_enabled = 0; // off
+        assert!(!cfg.is_access_log_enabled());
     }
 
     /// Zero-cost-when-disabled invariant: the boolean gate relied upon by both
