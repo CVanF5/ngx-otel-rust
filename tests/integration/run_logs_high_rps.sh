@@ -35,8 +35,12 @@ esac
 MODULE_PATH="${CRATE_DIR}/target/release/libngx_http_otel_module.${MODULE_EXT}"
 
 STRESS_DURATION_S="${STRESS_DURATION_S:-60}"
-WRK_THREADS="${WRK_THREADS:-8}"
-WRK_CONNECTIONS="${WRK_CONNECTIONS:-500}"
+# Target ~10k RPS: use a modest connection count so workers and the exporter
+# process can share CPU.  At 500 connections the Linux arm64 VM runs at
+# 450k+ req/s, starving the exporter.  20 connections ≈ 10–30k RPS on most
+# hardware; override with WRK_CONNECTIONS=500 for an extreme-load experiment.
+WRK_THREADS="${WRK_THREADS:-4}"
+WRK_CONNECTIONS="${WRK_CONNECTIONS:-20}"
 WRK_URL="http://127.0.0.1:9103/"
 HEALTHZ_URL="http://127.0.0.1:9103/healthz"
 # Latency script for wrk
