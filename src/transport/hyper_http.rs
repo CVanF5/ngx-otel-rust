@@ -1004,6 +1004,27 @@ impl<C: Connector> Transport for HyperHttpTransport<C> {
     }
 }
 
+impl<C: Connector> HyperHttpTransport<C> {
+    /// POST `bytes` to an explicit `path`, overriding the endpoint's default path.
+    ///
+    /// Used by the export loop to send logs to `/v1/logs` on the same host as
+    /// the metrics endpoint (which uses `/v1/metrics`).  Everything else (host,
+    /// port, TLS, headers) comes from the existing configured endpoint.
+    ///
+    /// # Phase 2.1 note
+    /// This method is intentionally kept separate from `send` so the `Transport`
+    /// trait signature does not need to change for the signal selector.
+    pub async fn send_to_path(
+        &mut self,
+        path: &str,
+        bytes: std::vec::Vec<u8>,
+    ) -> Result<(), TransportError> {
+        let io = self.connector.connect(&self.endpoint).await?;
+        let authority = self.endpoint.authority();
+        http_post(io, &authority, path, &self.headers, bytes).await
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Core HTTP/1.1 POST via hyper
 // ──────────────────────────────────────────────────────────────────────────────

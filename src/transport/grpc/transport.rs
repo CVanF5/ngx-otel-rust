@@ -34,6 +34,9 @@ use http::uri::Uri;
 use nginx_sys::ngx_log_t;
 use prost::Message;
 
+use crate::encoder::opentelemetry::proto::collector::logs::v1::{
+    logs_service_client::LogsServiceClient, ExportLogsServiceRequest,
+};
 use crate::encoder::opentelemetry::proto::collector::metrics::v1::{
     metrics_service_client::MetricsServiceClient, ExportMetricsServiceRequest,
 };
@@ -63,9 +66,12 @@ pub struct GrpcTransport<C: Connector> {
     origin: Uri,
     /// Connector used to open new connections (NgxConnector in production).
     connector: C,
-    /// Cached gRPC client over the persistent h2 connection.
+    /// Cached gRPC metrics client over the persistent h2 connection.
     /// `None` on construction and after any failed `send`; rebuilt lazily.
     client: Option<MetricsServiceClient<SendRequestService<tonic::body::Body>>>,
+    /// Cached gRPC logs client (Phase 2.1).  Uses a separate h2 connection;
+    /// a future optimisation could share the sender via `SendRequest::clone()`.
+    logs_client: Option<LogsServiceClient<SendRequestService<tonic::body::Body>>>,
 }
 
 // SAFETY: `GrpcTransport` is only used from NGINX's single-threaded exporter
@@ -130,7 +136,7 @@ impl<C: Connector> GrpcTransport<C> {
             }
         })?;
 
-        Ok(Self { endpoint, origin, connector, client: None })
+        Ok(Self { endpoint, origin, connector, client: None, logs_client: None })
     }
 }
 
@@ -208,6 +214,66 @@ impl<C: Connector + Send> Transport for GrpcTransport<C> {
                     cause: std::format!("gRPC Export RPC failed: {status}"),
                 })
             }
+        }
+    }
+}
+
+// ── Logs send (Phase 2.1) ─────────────────────────────────────────────────────
+
+#[allow(private_bounds)]
+impl<C: Connector + Send> GrpcTransport<C> {
+    /// Send an `ExportLogsServiceRequest` (already prost-encoded) to the
+    /// `LogsService/Export` RPC.
+    ///
+    /// Mirrors [`Transport::send`] but decodes `ExportLogsServiceRequest` and
+    /// uses the `LogsServiceClient`.  Drops and re-creates the logs client on
+    /// failure (same reconnect-on-failure parity as the metrics client).
+    pub async fn send_logs(
+        &mut self,
+        bytes: std::vec::Vec<u8>,
+    ) -> Result<(), crate::transport::TransportError> {
+        use crate::transport::TransportError;
+
+        let req = ExportLogsServiceRequest::decode(bytes.as_slice()).map_err(|e| {
+            TransportError::Connection {
+                cause: std::format!(
+                    "gRPC logs transport: failed to decode ExportLogsServiceRequest: {e}"
+                ),
+            }
+        })?;
+
+        if self.logs_client.is_none() {
+            let io = self.connector.connect(&self.endpoint).await?;
+            let (sender, conn) =
+                hyper::client::conn::http2::handshake::<_, _, tonic::body::Body>(
+                    crate::transport::grpc::executor::NgxExecutor,
+                    io,
+                )
+                .await
+                .map_err(|e| TransportError::Connection {
+                    cause: std::format!("gRPC logs h2 handshake failed: {e}"),
+                })?;
+            ngx::async_::spawn(async move {
+                let _ = conn.await;
+            })
+            .detach();
+            self.logs_client = Some(LogsServiceClient::with_origin(
+                crate::transport::grpc::shim::SendRequestService::new(sender),
+                self.origin.clone(),
+            ));
+        }
+
+        let mut client = self.logs_client.take().expect("just connected above");
+        let result = client.export(tonic::Request::new(req)).await;
+
+        match result {
+            Ok(_resp) => {
+                self.logs_client = Some(client);
+                Ok(())
+            }
+            Err(status) => Err(TransportError::Connection {
+                cause: std::format!("gRPC LogsService/Export RPC failed: {status}"),
+            }),
         }
     }
 }

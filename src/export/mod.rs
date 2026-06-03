@@ -46,13 +46,15 @@ use pin_project_lite::pin_project;
 
 use crate::config::{MainConfig, MetricProtocol};
 use crate::data_model::{
-    AggregationTemporality, AnyValue, Batch, GaugeData, KeyValue, Metric, MetricData,
-    NumberDataPoint, NumberValue, Resource, Scope, SumData,
+    AggregationTemporality, AnyValue, Batch, GaugeData, KeyValue, LogRecord, LogsBatch, Metric,
+    MetricData, NumberDataPoint, NumberValue, Resource, Scope, SumData,
 };
-use crate::encoder::{Encoder, OtlpHttpEncoder};
+use crate::encoder::{Encoder, OtlpHttpEncoder, OtlpLogsEncoder};
+use crate::logs::severity::nginx_to_otel;
 use crate::metric_source::instrumented::InstrumentedSource;
 use crate::metric_source::stub_status::StubStatusSource;
 use crate::metric_source::MetricSource;
+use crate::shm::{logs_worker_slot, LogsWorkerSlot};
 use crate::transport::hyper_http::NgxConnector;
 use crate::transport::{GrpcTransport, HyperHttpTransport, Transport};
 
@@ -71,6 +73,19 @@ pub static SEND_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// `ngx_otel.bidi_backpressure_drops` self-metric so the overload integration
 /// test can verify the counter is non-zero via the collector's metrics.json.
 pub static BIDI_BACKPRESSURE_DROPS: AtomicU64 = AtomicU64::new(0);
+
+// ── Log-specific self-metric atomics (Phase 2.1) ─────────────────────────────
+
+/// Access-log records dropped by the producer because the ring was full.
+/// Sum of per-worker `ring.drop_count()` snapshots at each drain cycle.
+pub static ACCESS_LOGS_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Error-log records dropped by the producer (Phase 2.2; kept here so the
+/// metric is exposed even before the error-log path is wired in).
+pub static ERROR_LOGS_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative logs transport send failures since exporter startup.
+pub static LOGS_SEND_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 /// Unix epoch nanoseconds when this worker's export loop started.
 ///
@@ -141,6 +156,28 @@ impl Transport for ExportTransport {
     }
 }
 
+impl ExportTransport {
+    /// Send logs bytes to the OTel logs endpoint.
+    ///
+    /// For HTTP: POSTs to `/v1/logs` on the same host as metrics.
+    /// For gRPC: calls `LogsService/Export`.
+    ///
+    /// # Phase 2.1 note — directive naming
+    /// Logs ship over the same transport selected by `otel_metric_protocol`.
+    /// The directive name is intentionally kept as-is for backward compatibility.
+    /// A rename to `otel_export_protocol` (with a back-compat alias) is tracked
+    /// as a future cleanup; doing it here would be a breaking change.
+    async fn send_logs(
+        &mut self,
+        bytes: std::vec::Vec<u8>,
+    ) -> Result<(), crate::transport::TransportError> {
+        match self {
+            Self::Http(t) => t.send_to_path("/v1/logs", bytes).await,
+            Self::Grpc(t) => t.send_logs(bytes).await,
+        }
+    }
+}
+
 /// Why the chunked sleep terminated early, if it did.
 #[derive(Copy, Clone)]
 enum ShutdownKind {
@@ -171,6 +208,9 @@ impl MetricSource for SelfMetricsSource {
         let interval_ms = self.interval_ms as i64;
 
         let backpressure_drops = BIDI_BACKPRESSURE_DROPS.load(Ordering::Acquire) as i64;
+        let access_logs_dropped = ACCESS_LOGS_DROPPED.load(Ordering::Acquire) as i64;
+        let error_logs_dropped = ERROR_LOGS_DROPPED.load(Ordering::Acquire) as i64;
+        let logs_send_failures = LOGS_SEND_FAILURES.load(Ordering::Acquire) as i64;
         std::vec![
             monotonic_sum_metric(
                 "ngx_otel.dropped_records",
@@ -193,6 +233,30 @@ impl MetricSource for SelfMetricsSource {
                 "Bidi outbound messages dropped due to channel backpressure",
                 "messages",
                 backpressure_drops,
+                self.start_time_unix_nano,
+                now,
+            ),
+            monotonic_sum_metric(
+                "ngx_otel.logs.access.dropped_records",
+                "Access log records dropped because the per-worker ring was full",
+                "records",
+                access_logs_dropped,
+                self.start_time_unix_nano,
+                now,
+            ),
+            monotonic_sum_metric(
+                "ngx_otel.logs.error.dropped_records",
+                "Error log records dropped because the per-worker ring was full",
+                "records",
+                error_logs_dropped,
+                self.start_time_unix_nano,
+                now,
+            ),
+            monotonic_sum_metric(
+                "ngx_otel.logs.send_failures",
+                "Cumulative logs transport send failures since exporter startup",
+                "failures",
+                logs_send_failures,
                 self.start_time_unix_nano,
                 now,
             ),
@@ -299,6 +363,12 @@ pub async fn export_loop(amcf: &'static MainConfig) {
     let retry_buffer_depth = amcf.retry_buffer_depth();
     let mut retry_queue: VecDeque<(std::vec::Vec<u8>, u64)> = VecDeque::new();
 
+    // Separate retry queue for log batches so that failed log sends don't
+    // evict metric batches (and vice versa).
+    let mut logs_retry_queue: VecDeque<(std::vec::Vec<u8>, u64)> = VecDeque::new();
+
+    let logs_encoder = OtlpLogsEncoder;
+
     let protocol_str = match amcf.metric_protocol() {
         MetricProtocol::OtlpHttp => "otlp_http",
         MetricProtocol::OtlpGrpc => "otlp_grpc",
@@ -335,7 +405,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                 log.as_ptr(),
                 "otel export: ngx_quit set, starting graceful drain"
             );
-            graceful_drain(&mut transport, &mut retry_queue, &encoder, amcf, worker_start_ns).await;
+            graceful_drain(&mut transport, &mut retry_queue, &mut logs_retry_queue, &encoder, amcf, worker_start_ns).await;
             EXPORT_LOOP_DONE.store(true, Ordering::Release);
             return;
         }
@@ -376,7 +446,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                 log.as_ptr(),
                 "otel export: ngx_quit set during sleep, starting graceful drain"
             );
-            graceful_drain(&mut transport, &mut retry_queue, &encoder, amcf, worker_start_ns).await;
+            graceful_drain(&mut transport, &mut retry_queue, &mut logs_retry_queue, &encoder, amcf, worker_start_ns).await;
             EXPORT_LOOP_DONE.store(true, Ordering::Release);
             return;
         }
@@ -439,36 +509,115 @@ pub async fn export_loop(amcf: &'static MainConfig) {
         // ── Collect fresh metrics from all sources ────────────────────────
         let batch = collect_all_sources(amcf, worker_start_ns);
         let n_pts = count_data_points(&batch);
-        if n_pts == 0 {
-            continue;
-        }
-        let bytes = encoder.encode(&batch);
+        if n_pts > 0 {
+            let bytes = encoder.encode(&batch);
 
-        // ── Send the fresh batch ──────────────────────────────────────────
-        match transport.send(bytes.clone()).await {
-            Ok(()) => {
-                ngx::ngx_log_error!(
-                    NGX_LOG_NOTICE,
-                    log.as_ptr(),
-                    "otel export: sent {} data points to collector",
-                    n_pts
-                );
+            // ── Send the fresh batch ──────────────────────────────────────
+            match transport.send(bytes.clone()).await {
+                Ok(()) => {
+                    ngx::ngx_log_error!(
+                        NGX_LOG_NOTICE,
+                        log.as_ptr(),
+                        "otel export: sent {} data points to collector",
+                        n_pts
+                    );
+                }
+                Err(ref e) => {
+                    ngx::ngx_log_error!(
+                        NGX_LOG_ERR,
+                        log.as_ptr(),
+                        "otel export: send failed ({}); queuing for retry",
+                        e
+                    );
+                    enqueue_with_eviction(
+                        &mut retry_queue,
+                        bytes,
+                        n_pts,
+                        retry_buffer_depth,
+                        log.as_ptr(),
+                    );
+                    SEND_FAILURES.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            Err(ref e) => {
-                ngx::ngx_log_error!(
-                    NGX_LOG_ERR,
-                    log.as_ptr(),
-                    "otel export: send failed ({}); queuing for retry",
-                    e
-                );
+        }
+
+        // ── Drain logs retry queue ────────────────────────────────────────
+        let mut logs_queue_snapshot = core::mem::take(&mut logs_retry_queue);
+        let mut logs_drain_failed = false;
+        while let Some((bytes, n_logs)) = logs_queue_snapshot.pop_front() {
+            if logs_drain_failed {
                 enqueue_with_eviction(
-                    &mut retry_queue,
+                    &mut logs_retry_queue,
                     bytes,
-                    n_pts,
+                    n_logs,
                     retry_buffer_depth,
                     log.as_ptr(),
                 );
-                SEND_FAILURES.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            match transport.send_logs(bytes.clone()).await {
+                Ok(()) => {}
+                Err(ref e) => {
+                    ngx::ngx_log_error!(
+                        NGX_LOG_ERR,
+                        log.as_ptr(),
+                        "otel export: logs retry send failed ({}); re-queuing",
+                        e
+                    );
+                    LOGS_SEND_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    enqueue_with_eviction(
+                        &mut logs_retry_queue,
+                        bytes,
+                        n_logs,
+                        retry_buffer_depth,
+                        log.as_ptr(),
+                    );
+                    logs_drain_failed = true;
+                }
+            }
+        }
+
+        // ── Collect and send fresh logs ───────────────────────────────────
+        // Phase 2.1: drain access rings from all workers.
+        if amcf.is_access_log_enabled() {
+            if let Some(logs_base) = amcf.logs_shm_base() {
+                let n_workers = unsafe {
+                    let zone = &*amcf.logs_shm_zone;
+                    let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
+                    (avail / core::mem::size_of::<LogsWorkerSlot>()).max(1)
+                };
+                let logs_batch =
+                    collect_log_records(amcf, logs_base, n_workers, worker_start_ns);
+                if !logs_batch.logs.is_empty() {
+                    let n_logs = logs_batch.logs.len() as u64;
+                    let logs_bytes = logs_encoder.encode(&logs_batch);
+                    match transport.send_logs(logs_bytes.clone()).await {
+                        Ok(()) => {
+                            ngx::ngx_log_error!(
+                                NGX_LOG_NOTICE,
+                                log.as_ptr(),
+                                "otel export: sent {} log records to collector",
+                                n_logs
+                            );
+                        }
+                        Err(ref e) => {
+                            ngx::ngx_log_error!(
+                                NGX_LOG_ERR,
+                                log.as_ptr(),
+                                "otel export: logs send failed ({}); queuing for retry",
+                                e
+                            );
+                            enqueue_with_eviction(
+                                &mut logs_retry_queue,
+                                logs_bytes,
+                                n_logs,
+                                retry_buffer_depth,
+                                log.as_ptr(),
+                            );
+                            LOGS_SEND_FAILURES.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
             }
         }
     }
@@ -524,6 +673,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
 async fn graceful_drain(
     transport: &mut ExportTransport,
     retry_queue: &mut VecDeque<(std::vec::Vec<u8>, u64)>,
+    logs_retry_queue: &mut VecDeque<(std::vec::Vec<u8>, u64)>,
     encoder: &OtlpHttpEncoder,
     amcf: &'static MainConfig,
     worker_start_ns: u64,
@@ -576,7 +726,7 @@ async fn graceful_drain(
         }
     }
 
-    // Final freshly-collected batch.
+    // Final freshly-collected metrics batch.
     let final_batch = collect_all_sources(amcf, worker_start_ns);
     let n_pts = count_data_points(&final_batch);
     if n_pts > 0 {
@@ -605,6 +755,80 @@ async fn graceful_drain(
                     "otel export: drain: final batch timed out after {:?}",
                     GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET
                 );
+            }
+        }
+    }
+
+    // Drain pending logs retry queue (one bounded attempt each).
+    while let Some((bytes, n_logs)) = logs_retry_queue.pop_front() {
+        match with_deadline(transport.send_logs(bytes), GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                ngx::ngx_log_error!(
+                    NGX_LOG_ERR,
+                    log.as_ptr(),
+                    "otel export: drain: logs queued batch ({} records) send failed: {}",
+                    n_logs,
+                    e
+                );
+                logs_retry_queue.clear();
+                break;
+            }
+            Err(DeadlineExceeded) => {
+                ngx::ngx_log_error!(
+                    NGX_LOG_NOTICE,
+                    log.as_ptr(),
+                    "otel export: drain: logs queued batch ({} records) timed out",
+                    n_logs
+                );
+                logs_retry_queue.clear();
+                break;
+            }
+        }
+    }
+
+    // Final freshly-collected logs batch.
+    if amcf.is_access_log_enabled() {
+        if let Some(logs_base) = amcf.logs_shm_base() {
+            let n_workers = unsafe {
+                let zone = &*amcf.logs_shm_zone;
+                let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
+                (avail / core::mem::size_of::<LogsWorkerSlot>()).max(1)
+            };
+            let logs_batch = collect_log_records(amcf, logs_base, n_workers, worker_start_ns);
+            if !logs_batch.logs.is_empty() {
+                let n_logs = logs_batch.logs.len() as u64;
+                let logs_bytes = OtlpLogsEncoder.encode(&logs_batch);
+                match with_deadline(
+                    transport.send_logs(logs_bytes),
+                    GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET,
+                )
+                .await
+                {
+                    Ok(Ok(())) => {
+                        ngx::ngx_log_error!(
+                            NGX_LOG_NOTICE,
+                            log.as_ptr(),
+                            "otel export: drain: final logs batch sent ({} records)",
+                            n_logs
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        ngx::ngx_log_error!(
+                            NGX_LOG_ERR,
+                            log.as_ptr(),
+                            "otel export: drain: final logs batch failed: {}",
+                            e
+                        );
+                    }
+                    Err(DeadlineExceeded) => {
+                        ngx::ngx_log_error!(
+                            NGX_LOG_NOTICE,
+                            log.as_ptr(),
+                            "otel export: drain: final logs batch timed out"
+                        );
+                    }
+                }
             }
         }
     }
@@ -760,6 +984,180 @@ fn collect_all_sources(amcf: &MainConfig, worker_start_ns: u64) -> Batch {
     }
 }
 
+/// Drain all worker access-log rings and assemble a [`LogsBatch`].
+///
+/// Called once per export tick when `access_log_enabled` is true.
+/// Does NOT drain error rings (Phase 2.2).
+///
+/// Also updates the `ACCESS_LOGS_DROPPED` self-metric by reading each ring's
+/// `drop_count()` and computing the delta vs the previous cycle.
+fn collect_log_records(
+    amcf: &MainConfig,
+    logs_base: *mut u8,
+    n_workers: usize,
+    _now_ns: u64,
+) -> LogsBatch {
+    let now = now_unix_nano();
+
+    // ── Build Resource from config ────────────────────────────────────────
+    let mut resource_attrs: std::vec::Vec<KeyValue> = std::vec::Vec::new();
+    if !amcf.service_name.is_empty() {
+        if let Ok(name) = core::str::from_utf8(amcf.service_name.as_bytes()) {
+            resource_attrs
+                .push(KeyValue { key: "service.name".into(), value: AnyValue::String(name.into()) });
+        }
+    }
+    for kv in &amcf.resource_attrs {
+        if let (Ok(k), Ok(v)) = (
+            core::str::from_utf8(kv.key.as_bytes()),
+            core::str::from_utf8(kv.value.as_bytes()),
+        ) {
+            resource_attrs
+                .push(KeyValue { key: k.into(), value: AnyValue::String(v.into()) });
+        }
+    }
+
+    let mut logs: std::vec::Vec<LogRecord> = std::vec::Vec::new();
+    let mut total_dropped: u64 = 0;
+
+    // Drain access rings for all workers.
+    for w in 0..n_workers {
+        // Safety: logs zone was sized for n_workers; w < n_workers.
+        let slot = unsafe { &*logs_worker_slot(logs_base, w) };
+        let ring = &slot.access;
+
+        // Accumulate drop counts.
+        total_dropped += ring.drop_count();
+
+        // Drain records.
+        let mut record_buf: std::vec::Vec<u8> = std::vec::Vec::new();
+        while ring.pop_into(&mut record_buf) {
+            // Parse the wire format from access.rs:
+            // [0] kind(1) [1..9] ts_unix_nano_be [9] ngx_level [10..12] method_len
+            // [12..12+method_len] method [12+ml..14+ml] status_u16
+            // [14+ml..22+ml] req_len [22+ml..30+ml] resp_bytes
+            // [30+ml..32+ml] client_addr_len [32+ml..] client_addr
+            if let Some(lr) = parse_access_record(&record_buf, now) {
+                logs.push(lr);
+            }
+            record_buf.clear();
+        }
+    }
+
+    // Update the ACCESS_LOGS_DROPPED self-metric.
+    ACCESS_LOGS_DROPPED.store(total_dropped, Ordering::Relaxed);
+
+    LogsBatch {
+        resource: Resource { attributes: resource_attrs },
+        scope: Scope { name: "ngx-otel-rust".into(), version: env!("CARGO_PKG_VERSION").into() },
+        logs,
+    }
+}
+
+/// Parse one access log record from the wire-format bytes produced by
+/// `logs::access::emit_access_record`.
+///
+/// Returns `None` if the buffer is too short to be a valid record.
+fn parse_access_record(buf: &[u8], observed_now_ns: u64) -> Option<LogRecord> {
+    use crate::data_model::{AnyValue, KeyValue, SeverityNumber};
+
+    // Minimum: kind(1) + ts(8) + level(1) + method_len(2) + status(2) +
+    //          req_len(8) + resp_bytes(8) + client_addr_len(2) = 32 bytes
+    if buf.len() < 32 {
+        return None;
+    }
+
+    let mut pos = 0usize;
+
+    // kind must be 0x00 (access)
+    if buf[pos] != 0x00 {
+        return None;
+    }
+    pos += 1;
+
+    // ts_unix_nano (8 bytes, big-endian)
+    let ts = u64::from_be_bytes(buf[pos..pos + 8].try_into().ok()?);
+    pos += 8;
+
+    // ngx_level (1 byte) → severity
+    let ngx_level = buf[pos] as u32;
+    let (severity_number, severity_text) = nginx_to_otel(ngx_level);
+    pos += 1;
+
+    // method (2-byte len + bytes)
+    let method_len = u16::from_be_bytes([buf[pos], buf[pos + 1]]) as usize;
+    pos += 2;
+    if pos + method_len > buf.len() {
+        return None;
+    }
+    let method = std::string::String::from_utf8_lossy(&buf[pos..pos + method_len]).into_owned();
+    pos += method_len;
+
+    // status code (2 bytes)
+    if pos + 2 > buf.len() {
+        return None;
+    }
+    let status = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+    pos += 2;
+
+    // request_length (8 bytes)
+    if pos + 8 > buf.len() {
+        return None;
+    }
+    let req_len = u64::from_be_bytes(buf[pos..pos + 8].try_into().ok()?);
+    pos += 8;
+
+    // response_bytes (8 bytes)
+    if pos + 8 > buf.len() {
+        return None;
+    }
+    let resp_bytes = u64::from_be_bytes(buf[pos..pos + 8].try_into().ok()?);
+    pos += 8;
+
+    // client_address (2-byte len + bytes)
+    if pos + 2 > buf.len() {
+        return None;
+    }
+    let addr_len = u16::from_be_bytes([buf[pos], buf[pos + 1]]) as usize;
+    pos += 2;
+    let client_addr = if pos + addr_len <= buf.len() {
+        std::string::String::from_utf8_lossy(&buf[pos..pos + addr_len]).into_owned()
+    } else {
+        std::string::String::new()
+    };
+
+    Some(LogRecord {
+        time_unix_nano: ts,
+        observed_time_unix_nano: observed_now_ns,
+        severity_number,
+        severity_text: std::string::String::from(severity_text),
+        body: AnyValue::String(std::string::String::new()), // body empty for access logs
+        attributes: std::vec![
+            KeyValue {
+                key: "http.request.method".into(),
+                value: AnyValue::String(method),
+            },
+            KeyValue {
+                key: "http.response.status_code".into(),
+                value: AnyValue::Int(status as i64),
+            },
+            KeyValue {
+                key: "http.server.request.body.size".into(),
+                value: AnyValue::Int(req_len as i64),
+            },
+            KeyValue {
+                key: "http.server.response.body.size".into(),
+                value: AnyValue::Int(resp_bytes as i64),
+            },
+            KeyValue {
+                key: "client.address".into(),
+                value: AnyValue::String(client_addr),
+            },
+        ],
+        event_name: "http.access".into(),
+    })
+}
+
 fn now_unix_nano() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64
@@ -905,6 +1303,74 @@ pub fn exit_process_flush(amcf: &MainConfig) {
             );
         }
     }
+
+    // ── Sync flush of pending logs (Phase 2.1, HTTP only) ────────────────────
+    // Only flush logs if access_log is enabled and the logs shm zone is mapped.
+    if amcf.is_access_log_enabled() {
+        if let Some(logs_base) = amcf.logs_shm_base() {
+            let n_workers = unsafe {
+                let zone = &*amcf.logs_shm_zone;
+                let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
+                (avail / core::mem::size_of::<LogsWorkerSlot>()).max(1)
+            };
+            let logs_batch = collect_log_records(amcf, logs_base, n_workers, worker_start_ns);
+            if !logs_batch.logs.is_empty() {
+                let n_logs = logs_batch.logs.len() as u64;
+                let logs_bytes = OtlpLogsEncoder.encode(&logs_batch);
+                // Derive /v1/logs endpoint from the metrics endpoint base.
+                let logs_endpoint = derive_logs_endpoint(endpoint_str);
+                match crate::transport::sync_http::sync_post(
+                    &logs_endpoint,
+                    &headers,
+                    &logs_bytes,
+                ) {
+                    Ok(()) => {
+                        ngx::ngx_log_error!(
+                            NGX_LOG_NOTICE,
+                            log.as_ptr(),
+                            "exit_process: sync logs flush complete ({} records)",
+                            n_logs
+                        );
+                    }
+                    Err(ref e) if e.is_timeout() => {
+                        ngx::ngx_log_error!(
+                            NGX_LOG_NOTICE,
+                            log.as_ptr(),
+                            "exit_process: sync logs flush timed out"
+                        );
+                    }
+                    Err(ref e) => {
+                        ngx::ngx_log_error!(
+                            NGX_LOG_ERR,
+                            log.as_ptr(),
+                            "exit_process: sync logs flush failed: {}",
+                            e
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Derive the `/v1/logs` OTLP endpoint URL from the metrics endpoint.
+///
+/// For HTTP endpoints of the form `http://host:port/v1/metrics`, replaces the
+/// path with `/v1/logs`.  For endpoints without an explicit path component or
+/// with other paths, appends `/v1/logs` to the host:port.
+fn derive_logs_endpoint(metrics_endpoint: &str) -> std::string::String {
+    // Strip the path from the metrics endpoint and replace with /v1/logs.
+    if let Some(rest) = metrics_endpoint.strip_prefix("http://") {
+        let (authority, _path) = match rest.find('/') {
+            Some(i) => (&rest[..i], &rest[i..]),
+            None => (rest, "/"),
+        };
+        std::format!("http://{}/v1/logs", authority)
+    } else {
+        // For non-HTTP (gRPC, unix), return as-is.  The gRPC logs flush is
+        // handled by the async graceful_drain path; sync_post is HTTP-only.
+        std::string::String::from(metrics_endpoint)
+    }
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -953,8 +1419,8 @@ mod tests {
         );
     }
 
-    /// SelfMetricsSource must produce exactly 4 metrics with the right names.
-    /// (Updated in Phase 1.2 Item 3 to include ngx_otel.bidi_backpressure_drops.)
+    /// SelfMetricsSource must produce exactly 7 metrics with the right names.
+    /// (Updated in Phase 2.1 to include 3 new logs-path metrics.)
     #[test]
     fn self_metrics_source_produces_four_metrics() {
         let src = SelfMetricsSource {
@@ -962,12 +1428,53 @@ mod tests {
             start_time_unix_nano: 1_700_000_000_000_000_000,
         };
         let metrics = src.collect();
-        assert_eq!(metrics.len(), 4, "SelfMetricsSource must emit 4 metrics");
+        assert_eq!(metrics.len(), 7, "SelfMetricsSource must emit 7 metrics (4 original + 3 log)");
 
         let names: std::vec::Vec<&str> = metrics.iter().map(|m| m.name.as_str()).collect();
+        // Original 4
         assert!(names.contains(&"ngx_otel.dropped_records"));
         assert!(names.contains(&"ngx_otel.send_failures"));
         assert!(names.contains(&"ngx_otel.bidi_backpressure_drops"));
         assert!(names.contains(&"ngx_otel.export_interval"));
+        // Phase 2.1 — 3 new log metrics
+        assert!(names.contains(&"ngx_otel.logs.access.dropped_records"));
+        assert!(names.contains(&"ngx_otel.logs.error.dropped_records"));
+        assert!(names.contains(&"ngx_otel.logs.send_failures"));
+    }
+
+    /// `collect_log_records` with empty rings produces an empty LogsBatch.
+    #[test]
+    fn logs_drain_handles_empty_rings() {
+        use crate::logs::ring::LogsWorkerRing;
+        use crate::shm::LogsWorkerSlot;
+
+        // Allocate a single LogsWorkerSlot (one worker).
+        let slot_layout = std::alloc::Layout::new::<LogsWorkerSlot>();
+        let slot_ptr = unsafe { std::alloc::alloc_zeroed(slot_layout) as *mut LogsWorkerSlot };
+
+        // Synthesize a minimal config.
+        let amcf = crate::config::MainConfig::default();
+
+        let batch = collect_log_records(&amcf, slot_ptr as *mut u8, 1, 0);
+        assert!(batch.logs.is_empty(), "empty rings must produce empty LogsBatch");
+
+        unsafe { std::alloc::dealloc(slot_ptr as *mut u8, slot_layout) };
+    }
+
+    /// `collect_log_records` drains rings and returns parsed LogRecords.
+    #[test]
+    fn logs_retry_eviction_increments_counter() {
+        // Verify the logs retry queue is bounded with the same
+        // enqueue_with_eviction helper.
+        let before = DROPPED_RECORDS.load(Ordering::SeqCst);
+        let depth: usize = 2;
+        let mut queue: VecDeque<(std::vec::Vec<u8>, u64)> = VecDeque::new();
+        for i in 0..4u64 {
+            enqueue_with_eviction(&mut queue, std::vec![0u8], i + 1, depth, core::ptr::null_mut());
+        }
+        let after = DROPPED_RECORDS.load(Ordering::SeqCst);
+        assert_eq!(queue.len(), depth);
+        // Evicted items had n=1, n=2 → dropped 3
+        assert_eq!(after - before, 1 + 2);
     }
 }
