@@ -22,4 +22,5 @@
 //! This is the **central dedicated-exporter model** (proposal §6.5); do
 //! NOT pivot to per-worker export.
 
+pub mod ring;
 pub mod severity;

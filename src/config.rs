@@ -144,6 +144,16 @@ pub struct MainConfig {
     /// the liveness heartbeat and by workers for the hot-path placeholder
     /// load (Phase 1.3.3). Phase 5 wires the bidi control channel to it.
     pub control_shm_zone: *mut nginx_sys::ngx_shm_zone_t,
+    /// The registered logs shm zone (set during postconfiguration when
+    /// `access_log_enabled || error_log_enabled`).  Holds one
+    /// [`shm::LogsWorkerSlot`] per worker — access ring + error ring.
+    pub logs_shm_zone: *mut nginx_sys::ngx_shm_zone_t,
+    /// `otel_access_log on | off` — whether to push access records into the
+    /// per-worker logs ring on every request.  Defaults to false (off).
+    ///
+    /// Using `ngx_flag_t` (i64) to match `ngx_conf_set_flag_slot` semantics;
+    /// read via [`is_access_log_enabled`].
+    pub access_log_enabled: nginx_sys::ngx_flag_t,
 }
 
 impl Default for MainConfig {
@@ -165,6 +175,8 @@ impl Default for MainConfig {
             metric_protocol: None,
             shm_zone: ptr::null_mut(),
             control_shm_zone: ptr::null_mut(),
+            logs_shm_zone: ptr::null_mut(),
+            access_log_enabled: 0,
         }
     }
 }
@@ -415,6 +427,67 @@ impl MainConfig {
 
         self.control_shm_zone = zone;
         Ok(())
+    }
+
+    /// Register the per-worker logs shm zone with nginx.
+    ///
+    /// Must be called from `postconfiguration` when `access_log_enabled ||
+    /// error_log_enabled`.  Sizes the zone for `n_workers` workers.
+    /// Parallels [`register_shm_zone`].
+    pub fn register_logs_zone(
+        &mut self,
+        cf: *mut ngx_conf_t,
+        module: *mut ngx_module_t,
+    ) -> Result<(), Status> {
+        let n_workers: usize = unsafe {
+            let cycle = (*cf).cycle.as_ref().ok_or(Status::NGX_ERROR)?;
+            let core_idx = nginx_sys::ngx_core_module.index;
+            let raw_conf: *mut *mut *mut core::ffi::c_void = *cycle.conf_ctx.add(core_idx);
+            let core_conf: *const nginx_sys::ngx_core_conf_t = raw_conf.cast();
+            if core_conf.is_null() { 1 } else { (*core_conf).worker_processes.max(1) as usize }
+        };
+
+        let zone_size = shm::logs_zone_size_for(n_workers);
+        let mut zone_name = ngx::ngx_string!("ngx_http_otel_logs_zone");
+
+        let Some(zone) = (unsafe { shm::register_zone(cf, &mut zone_name, zone_size, module) })
+        else {
+            unsafe {
+                ngx_conf_log_error!(
+                    NGX_LOG_EMERG,
+                    &mut *cf,
+                    "otel: failed to register logs shared memory zone"
+                );
+            }
+            return Err(Status::NGX_ERROR);
+        };
+
+        unsafe {
+            (*zone).init = Some(shm::logs_shm_zone_init);
+            (*zone).data = ptr::from_mut(self).cast();
+        }
+
+        self.logs_shm_zone = zone;
+        Ok(())
+    }
+
+    /// Returns the base address of our LogsWorkerSlot data within the logs shm zone.
+    ///
+    /// Parallels [`shm_base`].  Returns `None` if the logs zone was not
+    /// registered (access log disabled) or not yet mapped.
+    pub fn logs_shm_base(&self) -> Option<*mut u8> {
+        let zone = unsafe { self.logs_shm_zone.as_ref()? };
+        let addr = zone.shm.addr;
+        if addr.is_null() {
+            return None;
+        }
+        Some(unsafe { addr.cast::<u8>().add(crate::shm::data_offset()) })
+    }
+
+    /// Returns `true` when `otel_access_log on;` was set.
+    #[inline]
+    pub fn is_access_log_enabled(&self) -> bool {
+        self.access_log_enabled > 0
     }
 
     /// Returns the base address of our WorkerSlots data within the shared memory zone.

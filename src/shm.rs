@@ -224,6 +224,77 @@ pub unsafe extern "C" fn otel_shm_zone_init(
     Status::NGX_OK.into()
 }
 
+// ── Logs shm zone (Phase 2.1) ─────────────────────────────────────────────
+
+use crate::logs::ring::{LogsWorkerRing, LOG_RING_CAP};
+
+/// Per-worker slot for the logs shm zone.
+///
+/// Contains one access ring and one error ring.  They are kept separate so
+/// the exporter can drain them independently and tag records with the correct
+/// signal type.
+///
+/// `CAP` defaults to [`LOG_RING_CAP`] (512 KiB) for each ring.  Both rings
+/// use the same capacity for Phase 2.1 simplicity; the error ring is unused
+/// until Phase 2.2.
+///
+/// Layout: `#[repr(C)]` for deterministic cross-process access.
+#[repr(C)]
+pub struct LogsWorkerSlot {
+    /// Access-log ring (producer: worker, consumer: otel exporter).
+    pub access: LogsWorkerRing<LOG_RING_CAP>,
+    /// Error-log ring (used in Phase 2.2; reserved here so the zone size is
+    /// stable across SIGHUP reloads).
+    pub error: LogsWorkerRing<LOG_RING_CAP>,
+}
+
+/// Minimum logs zone size for `n_workers` worker processes.
+#[inline]
+pub fn logs_zone_size_for(n_workers: usize) -> usize {
+    data_offset() + n_workers * mem::size_of::<LogsWorkerSlot>()
+}
+
+/// Obtain a pointer to the logs slot for the given `worker_id`.
+///
+/// # Safety
+/// - `base_addr` must point to the start of the logs shm zone (past the slab
+///   pool header, i.e. at `shm.addr + data_offset()`).
+/// - `worker_id` must be < the number of workers the zone was sized for.
+/// - The returned pointer must not outlive the zone mapping.
+#[inline]
+pub unsafe fn logs_worker_slot(base_addr: *mut u8, worker_id: usize) -> *mut LogsWorkerSlot {
+    let offset = worker_id * mem::size_of::<LogsWorkerSlot>();
+    unsafe { base_addr.add(offset).cast() }
+}
+
+/// Zone initialisation callback for the logs shm zone.
+///
+/// On a fresh start, zero only the `LogsWorkerSlot` area (not the slab-pool
+/// header).  On SIGHUP (`old_data` is non-null) the same physical pages are
+/// re-mapped; the ring offsets carry over automatically — do NOT zero them.
+///
+/// # Safety
+/// nginx guarantees the callback args are valid non-null pointers.
+pub unsafe extern "C" fn logs_shm_zone_init(
+    shm_zone: *mut ngx_shm_zone_t,
+    old_data: *mut core::ffi::c_void,
+) -> ngx_int_t {
+    if !old_data.is_null() {
+        // SIGHUP: same physical pages re-mapped.  Offsets in the rings survive;
+        // the exporter resumes where it left off (gotcha #6 in the plan).
+        return Status::NGX_OK.into();
+    }
+    // Fresh start: zero the LogsWorkerSlot area.
+    let zone = unsafe { &*shm_zone };
+    let offset = data_offset();
+    if zone.shm.size > offset {
+        let base: *mut u8 = unsafe { zone.shm.addr.cast::<u8>().add(offset) };
+        let size = zone.shm.size - offset;
+        unsafe { ptr::write_bytes(base, 0, size) };
+    }
+    Status::NGX_OK.into()
+}
+
 /* ──────────────────────── unit tests ──────────────────────── */
 
 #[cfg(test)]
