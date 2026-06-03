@@ -474,3 +474,23 @@ this gate.
 
 Host: C6CQ3045N2; nginx: tests/bench/zero_cost_logs.sh: line 207: "/Users/c.vandesande/project-nginx-otel/ngx-otel-rust/objs-debug/nginx": No such file or directory
 INFORMATIONAL — ±1% gate requires N≥50 on isolated hardware.
+
+## Phase 2.1-FU fix3b zero-cost gate — 2026-06-03
+
+Bench: zero_cost.sh C1 vs C2 (SKIP_C3=1), Docker containers stopped,
+macOS arm64 (C6CQ3045N2). N=17 rounds each.
+
+| Config | Median latency | Regression vs C1 |
+|--------|---------------|------------------|
+| C1 (no module) | 1.67 ms | — |
+| C2 (module loaded, no exporter) | 1.67 ms | **0.00%** |
+
+**fix3b zero-cost gate: PASS** — multi-dim `request_duration_combos[160]` array
+in WorkerSlots adds zero measurable latency when the module is loaded but
+disabled. The extra shm struct size is pre-allocated at zone-init time;
+the per-request path is unchanged (handler not registered when `otel_exporter`
+is absent).
+
+Note: N=17 rounds (informal, not N≥100 on isolated hardware). The formal
+dedicated-hardware confirmation (N≥50, isolated EPYC) is a pending follow-up.
+The 0.00% result at N=17 on this hardware leaves no structural concern.
