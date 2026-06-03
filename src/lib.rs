@@ -293,219 +293,179 @@ extern "C" fn ngx_otel_init_process(_cycle: *mut ngx_cycle_t) -> ngx_int_t {
             let cycle_ref = unsafe { &mut *cycle };
             if let Some(amcf) = HttpOtelModule::main_conf(cycle_ref) {
                 let pool = unsafe { Pool::from_ngx_pool((*cycle).pool) };
+                // `log` is shared by all three harnesses; guard it once.
+                let Some(log_nn) = core::ptr::NonNull::new(log) else {
+                    ngx::ngx_log_error!(
+                        nginx_sys::NGX_LOG_ERR,
+                        log,
+                        "otel grpc smoke harness: null log pointer; skipping"
+                    );
+                    return Status::NGX_OK.into();
+                };
 
-                if !amcf.grpc_smoke_endpoint.is_empty() {
-                    let endpoint_bytes = amcf.grpc_smoke_endpoint.as_bytes();
-                    if let Ok(endpoint_str) = core::str::from_utf8(endpoint_bytes) {
-                        let endpoint_owned = std::string::String::from(endpoint_str);
-                        let Some(log_nn) = core::ptr::NonNull::new(log) else {
-                            ngx::ngx_log_error!(
-                                nginx_sys::NGX_LOG_ERR,
-                                log,
-                                "grpc smoke: null log pointer; skipping"
-                            );
-                            return Status::NGX_OK.into();
-                        };
-
-                        ngx::ngx_log_error!(
-                            nginx_sys::NGX_LOG_NOTICE,
-                            log,
-                            "grpc smoke: firing one unary OTLP/gRPC export (endpoint={})",
-                            endpoint_owned
-                        );
-
-                        let smoke_task = ngx::async_::spawn(async move {
-                            let result = crate::transport::grpc::smoke::fire_one_grpc_export(
-                                &endpoint_owned,
-                                log_nn,
-                            )
-                            .await;
-                            let log_ptr = log_nn.as_ptr();
-                            match result {
-                                Ok(()) => {
-                                    // This exact line is what `run_grpc_smoke.sh` asserts on.
-                                    ngx::ngx_log_error!(
-                                        nginx_sys::NGX_LOG_NOTICE,
-                                        log_ptr,
-                                        "grpc smoke: export complete"
-                                    );
-                                }
-                                Err(e) => {
-                                    ngx::ngx_log_error!(
-                                        nginx_sys::NGX_LOG_ERR,
-                                        log_ptr,
-                                        "grpc smoke: export failed: {}",
-                                        e
-                                    );
-                                }
+                // Phase 1.2 Item 1: in-worker unary OTLP/gRPC viability harness.
+                run_grpc_smoke_harness(
+                    GrpcSmokeSpec {
+                        endpoint_bytes: amcf.grpc_smoke_endpoint.as_bytes(),
+                        not_utf8_msg:
+                            "grpc smoke: otel_grpc_smoke_endpoint is not valid UTF-8; skipping",
+                        firing_prefix: "grpc smoke: firing one unary OTLP/gRPC export",
+                        alloc_fail_msg: "grpc smoke: pool allocation for smoke task failed",
+                    },
+                    &pool,
+                    log_nn,
+                    |endpoint_owned, log_nn| async move {
+                        let result = crate::transport::grpc::smoke::fire_one_grpc_export(
+                            &endpoint_owned,
+                            log_nn,
+                        )
+                        .await;
+                        let log_ptr = log_nn.as_ptr();
+                        match result {
+                            Ok(()) => {
+                                // This exact line is what `run_grpc_smoke.sh` asserts on.
+                                ngx::ngx_log_error!(
+                                    nginx_sys::NGX_LOG_NOTICE,
+                                    log_ptr,
+                                    "grpc smoke: export complete"
+                                );
                             }
-                        });
-
-                        if pool.allocate(smoke_task).is_null() {
-                            ngx::ngx_log_error!(
-                                nginx_sys::NGX_LOG_ERR,
-                                log,
-                                "grpc smoke: pool allocation for smoke task failed"
-                            );
-                            // Non-fatal.
-                        }
-                    } else {
-                        ngx::ngx_log_error!(
-                            nginx_sys::NGX_LOG_ERR,
-                            log,
-                            "grpc smoke: otel_grpc_smoke_endpoint is not valid UTF-8; skipping"
-                        );
-                    }
-                }
-
-                // ── Phase 1.2 Item 2: bidi gRPC viability harness ───────────────────
-                //
-                // Only compiled when the `test-support` feature is enabled.  When set,
-                // and the `otel_grpc_bidi_smoke_endpoint` directive carries a non-empty
-                // value, fire one bidi `Echo.BidiEcho` call from Worker 0 via the same
-                // `NgxExecutor` + `SendRequestService` + `NgxConnIo` stack as Item 1,
-                // against the stand-alone `examples/bidi_echo_server` process.  Proves
-                // the send-half and receive-half are independently pollable without
-                // deadlock or livelock on the nginx event loop.  Result is logged at
-                // NOTICE; the integration test in `run_grpc_bidi_smoke.sh` greps for
-                // the success line.
-                if !amcf.bidi_smoke_endpoint.is_empty() {
-                    let endpoint_bytes = amcf.bidi_smoke_endpoint.as_bytes();
-                    if let Ok(endpoint_str) = core::str::from_utf8(endpoint_bytes) {
-                        let endpoint_owned = std::string::String::from(endpoint_str);
-                        let Some(log_nn) = core::ptr::NonNull::new(log) else {
-                            ngx::ngx_log_error!(
-                                nginx_sys::NGX_LOG_ERR,
-                                log,
-                                "bidi smoke: null log pointer; skipping"
-                            );
-                            return Status::NGX_OK.into();
-                        };
-
-                        ngx::ngx_log_error!(
-                            nginx_sys::NGX_LOG_NOTICE,
-                            log,
-                            "bidi smoke: firing one bidi stream (endpoint={})",
-                            endpoint_owned
-                        );
-
-                        let bidi_task = ngx::async_::spawn(async move {
-                            let result = crate::transport::grpc::smoke::fire_one_bidi_stream(
-                                &endpoint_owned,
-                                log_nn,
-                            )
-                            .await;
-                            let log_ptr = log_nn.as_ptr();
-                            match result {
-                                Ok(()) => {
-                                    // fire_one_bidi_stream already logs the
-                                    // "bidi complete" line at NOTICE inside the
-                                    // function.  No additional log needed here.
-                                }
-                                Err(e) => {
-                                    // This exact pattern is what run_grpc_bidi_smoke.sh
-                                    // asserts must appear zero times.
-                                    ngx::ngx_log_error!(
-                                        nginx_sys::NGX_LOG_ERR,
-                                        log_ptr,
-                                        "bidi smoke: bidi failed: {}",
-                                        e
-                                    );
-                                }
+                            Err(e) => {
+                                ngx::ngx_log_error!(
+                                    nginx_sys::NGX_LOG_ERR,
+                                    log_ptr,
+                                    "grpc smoke: export failed: {}",
+                                    e
+                                );
                             }
-                        });
-
-                        if pool.allocate(bidi_task).is_null() {
-                            ngx::ngx_log_error!(
-                                nginx_sys::NGX_LOG_ERR,
-                                log,
-                                "bidi smoke: pool allocation for bidi task failed"
-                            );
-                            // Non-fatal: the task is already running.
                         }
-                    } else {
-                        ngx::ngx_log_error!(
-                            nginx_sys::NGX_LOG_ERR,
-                            log,
-                            "bidi smoke: otel_grpc_bidi_smoke_endpoint is not valid UTF-8; skipping"
-                        );
-                    }
-                }
+                    },
+                );
 
-                // ── Phase 1.2 Item 3: bidi backpressure overload ─────────────────────
-                //
-                // Only compiled when the `test-support` feature is enabled.  When set,
-                // and the `otel_grpc_bidi_overload_endpoint` directive carries a non-empty
-                // value, fire a sustained bidi overload from Worker 0 against the echo
-                // server to exercise the give-up / backpressure path.  Increments the
-                // `BIDI_BACKPRESSURE_DROPS` counter for each send that exceeded the
-                // give-up deadline.  Result is logged at NOTICE; the integration test in
-                // `run_grpc_bidi_overload.sh` greps for the summary line and asserts
-                // dropped > 0 and received > 0.
-                if !amcf.bidi_overload_endpoint.is_empty() {
-                    let endpoint_bytes = amcf.bidi_overload_endpoint.as_bytes();
-                    if let Ok(endpoint_str) = core::str::from_utf8(endpoint_bytes) {
-                        let endpoint_owned = std::string::String::from(endpoint_str);
-                        let Some(log_nn) = core::ptr::NonNull::new(log) else {
-                            ngx::ngx_log_error!(
-                                nginx_sys::NGX_LOG_ERR,
-                                log,
-                                "bidi overload: null log pointer; skipping"
-                            );
-                            return Status::NGX_OK.into();
-                        };
-
-                        ngx::ngx_log_error!(
-                            nginx_sys::NGX_LOG_NOTICE,
-                            log,
-                            "bidi overload: queueing overload task (endpoint={})",
-                            endpoint_owned
-                        );
-
-                        let overload_task = ngx::async_::spawn(async move {
-                            let result = crate::transport::grpc::smoke::fire_bidi_overload(
-                                &endpoint_owned,
-                                log_nn,
-                            )
-                            .await;
-                            let log_ptr = log_nn.as_ptr();
-                            match result {
-                                Ok(()) => {
-                                    // fire_bidi_overload logs the summary line at NOTICE
-                                    // internally.  No additional log needed here.
-                                }
-                                Err(e) => {
-                                    ngx::ngx_log_error!(
-                                        nginx_sys::NGX_LOG_ERR,
-                                        log_ptr,
-                                        "bidi overload: failed: {}",
-                                        e
-                                    );
-                                }
+                // Phase 1.2 Item 2: bidi gRPC viability harness (Echo.BidiEcho).
+                run_grpc_smoke_harness(
+                    GrpcSmokeSpec {
+                        endpoint_bytes: amcf.bidi_smoke_endpoint.as_bytes(),
+                        not_utf8_msg:
+                            "bidi smoke: otel_grpc_bidi_smoke_endpoint is not valid UTF-8; skipping",
+                        firing_prefix: "bidi smoke: firing one bidi stream",
+                        alloc_fail_msg: "bidi smoke: pool allocation for bidi task failed",
+                    },
+                    &pool,
+                    log_nn,
+                    |endpoint_owned, log_nn| async move {
+                        let result = crate::transport::grpc::smoke::fire_one_bidi_stream(
+                            &endpoint_owned,
+                            log_nn,
+                        )
+                        .await;
+                        let log_ptr = log_nn.as_ptr();
+                        match result {
+                            Ok(()) => {
+                                // fire_one_bidi_stream already logs the
+                                // "bidi complete" line at NOTICE inside the
+                                // function.  No additional log needed here.
                             }
-                        });
-
-                        if pool.allocate(overload_task).is_null() {
-                            ngx::ngx_log_error!(
-                                nginx_sys::NGX_LOG_ERR,
-                                log,
-                                "bidi overload: pool allocation for overload task failed"
-                            );
-                            // Non-fatal: the task is already running.
+                            Err(e) => {
+                                // This exact pattern is what run_grpc_bidi_smoke.sh
+                                // asserts must appear zero times.
+                                ngx::ngx_log_error!(
+                                    nginx_sys::NGX_LOG_ERR,
+                                    log_ptr,
+                                    "bidi smoke: bidi failed: {}",
+                                    e
+                                );
+                            }
                         }
-                    } else {
-                        ngx::ngx_log_error!(
-                            nginx_sys::NGX_LOG_ERR,
-                            log,
-                            "bidi overload: otel_grpc_bidi_overload_endpoint is not valid UTF-8; skipping"
-                        );
-                    }
-                }
+                    },
+                );
+
+                // Phase 1.2 Item 3: bidi backpressure overload harness.
+                run_grpc_smoke_harness(
+                    GrpcSmokeSpec {
+                        endpoint_bytes: amcf.bidi_overload_endpoint.as_bytes(),
+                        not_utf8_msg:
+                            "bidi overload: otel_grpc_bidi_overload_endpoint is not valid UTF-8; skipping",
+                        firing_prefix: "bidi overload: queueing overload task",
+                        alloc_fail_msg: "bidi overload: pool allocation for overload task failed",
+                    },
+                    &pool,
+                    log_nn,
+                    |endpoint_owned, log_nn| async move {
+                        let result = crate::transport::grpc::smoke::fire_bidi_overload(
+                            &endpoint_owned,
+                            log_nn,
+                        )
+                        .await;
+                        let log_ptr = log_nn.as_ptr();
+                        match result {
+                            Ok(()) => {
+                                // fire_bidi_overload logs the summary line at NOTICE
+                                // internally.  No additional log needed here.
+                            }
+                            Err(e) => {
+                                ngx::ngx_log_error!(
+                                    nginx_sys::NGX_LOG_ERR,
+                                    log_ptr,
+                                    "bidi overload: failed: {}",
+                                    e
+                                );
+                            }
+                        }
+                    },
+                )
             }
         }
     }
 
     Status::NGX_OK.into()
+}
+
+/// Descriptor for one `#[cfg(test-support)]` gRPC smoke harness (see
+/// [`run_grpc_smoke_harness`]). Message fields are logged verbatim so the
+/// integration scripts keep matching their expected lines.
+#[cfg(any(test, feature = "test-support"))]
+struct GrpcSmokeSpec<'a> {
+    /// Raw bytes of the configured endpoint directive; empty disables the harness.
+    endpoint_bytes: &'a [u8],
+    /// Logged at ERR when the endpoint is not valid UTF-8.
+    not_utf8_msg: &'a str,
+    /// Logged at NOTICE before spawning, as `"{firing_prefix} (endpoint=<ep>)"`.
+    firing_prefix: &'a str,
+    /// Logged at ERR if the spawned task cannot be pool-allocated.
+    alloc_fail_msg: &'a str,
+}
+
+/// Shared scaffold for the three Phase 1.2 gRPC smoke harnesses on the
+/// designated worker: skip when the endpoint is unset, decode it, log the
+/// firing line, spawn `make_future` on the nginx event loop, and account a
+/// pool-allocation failure. The harness-specific task body — including the
+/// exact log lines the integration scripts assert on — is supplied by
+/// `make_future`. Never compiled into production builds.
+#[cfg(any(test, feature = "test-support"))]
+fn run_grpc_smoke_harness<Fut>(
+    spec: GrpcSmokeSpec<'_>,
+    pool: &ngx::core::Pool,
+    log_nn: core::ptr::NonNull<nginx_sys::ngx_log_t>,
+    make_future: impl FnOnce(std::string::String, core::ptr::NonNull<nginx_sys::ngx_log_t>) -> Fut,
+) where
+    Fut: core::future::Future<Output = ()> + 'static,
+{
+    if spec.endpoint_bytes.is_empty() {
+        return;
+    }
+    let log = log_nn.as_ptr();
+    let Ok(endpoint_str) = core::str::from_utf8(spec.endpoint_bytes) else {
+        ngx::ngx_log_error!(nginx_sys::NGX_LOG_ERR, log, "{}", spec.not_utf8_msg);
+        return;
+    };
+    let endpoint_owned = std::string::String::from(endpoint_str);
+    let firing = std::format!("{} (endpoint={})", spec.firing_prefix, endpoint_owned);
+    ngx::ngx_log_error!(nginx_sys::NGX_LOG_NOTICE, log, "{}", firing);
+    let task = ngx::async_::spawn(make_future(endpoint_owned, log_nn));
+    if pool.allocate(task).is_null() {
+        ngx::ngx_log_error!(nginx_sys::NGX_LOG_ERR, log, "{}", spec.alloc_fail_msg);
+    }
 }
 
 // ── exit_process callback ─────────────────────────────────────────────────────
