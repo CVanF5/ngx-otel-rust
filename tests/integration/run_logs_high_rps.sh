@@ -39,8 +39,8 @@ STRESS_DURATION_S="${STRESS_DURATION_S:-60}"
 # process can share CPU.  At 500 connections the Linux arm64 VM runs at
 # 450k+ req/s, starving the exporter.  20 connections ≈ 10–30k RPS on most
 # hardware; override with WRK_CONNECTIONS=500 for an extreme-load experiment.
-WRK_THREADS="${WRK_THREADS:-2}"
-WRK_CONNECTIONS="${WRK_CONNECTIONS:-4}"
+WRK_THREADS="${WRK_THREADS:-4}"
+WRK_CONNECTIONS="${WRK_CONNECTIONS:-50}"
 WRK_URL="http://127.0.0.1:9103/"
 HEALTHZ_URL="http://127.0.0.1:9103/healthz"
 # Latency script for wrk
@@ -103,6 +103,11 @@ sed \
 PRE_LOGS_SIZE=0
 if [[ -f "${LOGS_LOG}" ]]; then PRE_LOGS_SIZE=$(wc -c < "${LOGS_LOG}"); fi
 info "logs.json pre-size: ${PRE_LOGS_SIZE} bytes"
+
+# Pre-snapshot metrics.json to compute DELTA for the drops assertion.
+PRE_METRICS_SIZE=0
+if [[ -f "${METRICS_LOG}" ]]; then PRE_METRICS_SIZE=$(wc -c < "${METRICS_LOG}"); fi
+info "metrics.json pre-size: ${PRE_METRICS_SIZE} bytes"
 
 # ─── Start NGINX ──────────────────────────────────────────────────────────────
 
@@ -254,10 +259,14 @@ fi
 # We need the numeric VALUE, not just the metric NAME.
 NEW_METRICS=""
 if [[ -f "${METRICS_LOG}" ]]; then
-    NEW_METRICS=$(tail -c 204800 "${METRICS_LOG}" 2>/dev/null || true)
+    POST_METRICS_SIZE=$(wc -c < "${METRICS_LOG}")
+    if (( POST_METRICS_SIZE > PRE_METRICS_SIZE )); then
+        NEW_METRICS=$(tail -c "+$(( PRE_METRICS_SIZE + 1 ))" "${METRICS_LOG}")
+    fi
 fi
 
-# Extract the max asInt value for ngx_otel.logs.access.dropped_records using python3.
+# Extract the max asInt value for ngx_otel.logs.access.dropped_records
+# from the DELTA of metrics.json (only records produced by THIS test run).
 DROPS_VALUE=0
 if command -v python3 >/dev/null 2>&1; then
     DROPS_VALUE=$(echo "${NEW_METRICS}" | python3 -c "
