@@ -88,6 +88,8 @@ fn compile_protos() {
         proto_root.join("opentelemetry/proto/resource/v1/resource.proto"),
         proto_root.join("opentelemetry/proto/metrics/v1/metrics.proto"),
         proto_root.join("opentelemetry/proto/collector/metrics/v1/metrics_service.proto"),
+        proto_root.join("opentelemetry/proto/logs/v1/logs.proto"),
+        proto_root.join("opentelemetry/proto/collector/logs/v1/logs_service.proto"),
     ];
 
     if otel_protos.iter().all(|p| p.exists()) {

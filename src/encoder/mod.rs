@@ -44,12 +44,25 @@ pub(crate) mod opentelemetry {
                 include!(concat!(env!("OUT_DIR"), "/opentelemetry.proto.metrics.v1.rs"));
             }
         }
+        pub mod logs {
+            pub mod v1 {
+                include!(concat!(env!("OUT_DIR"), "/opentelemetry.proto.logs.v1.rs"));
+            }
+        }
         pub mod collector {
             pub mod metrics {
                 pub mod v1 {
                     include!(concat!(
                         env!("OUT_DIR"),
                         "/opentelemetry.proto.collector.metrics.v1.rs"
+                    ));
+                }
+            }
+            pub mod logs {
+                pub mod v1 {
+                    include!(concat!(
+                        env!("OUT_DIR"),
+                        "/opentelemetry.proto.collector.logs.v1.rs"
                     ));
                 }
             }
