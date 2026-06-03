@@ -21,6 +21,7 @@ use ngx::http::{HttpModuleMainConf, HttpPhase, HttpRequestHandler, Request};
 
 use crate::logs::{WorkerRingProducer, access::emit_access_record};
 use crate::shm::{
+    HttpMethod, ProtoVersion, StatusClass, combo_index,
     logs_access_ring, worker_slots, BYTES_BOUNDS, DURATION_BOUNDS_MS, N_BYTES_BUCKETS,
     N_DURATION_BUCKETS,
 };
@@ -88,7 +89,14 @@ impl HttpRequestHandler for LogPhaseHandler {
                 (tp.sec as i64 - r.start_sec) * 1000 + (tp.msec as i64 - r.start_msec as i64);
             ms.max(0) as u64
         };
-        slot.request_duration_ms.record(duration_ms, &DURATION_BOUNDS_MS);
+        // ── request duration (multi-dim, fix3b FU4b) ──────────────────────
+        // Compute combination index from bounded dimensions (no alloc, no lock).
+        let method = HttpMethod::from_bytes(r.method_name.as_bytes());
+        let status = r.headers_out.status as u16;
+        let status_class = StatusClass::from_status(status);
+        let proto = ProtoVersion::from_ngx(r.http_version as core::ffi::c_uint);
+        let idx = combo_index(method, status_class, proto);
+        slot.request_duration_combos[idx].record(duration_ms, &DURATION_BOUNDS_MS);
 
         // ── request body bytes ────────────────────────────────────────────
         slot.request_body_bytes.record(r.request_length as u64, &BYTES_BOUNDS);
@@ -103,16 +111,6 @@ impl HttpRequestHandler for LogPhaseHandler {
             }
         };
         slot.response_body_bytes.record(resp_bytes, &BYTES_BOUNDS);
-
-        // ── status code class ─────────────────────────────────────────────
-        let status = r.headers_out.status as u16;
-        match status {
-            100..=199 => slot.status_1xx.fetch_add(1, Ordering::Relaxed),
-            200..=299 => slot.status_2xx.fetch_add(1, Ordering::Relaxed),
-            300..=399 => slot.status_3xx.fetch_add(1, Ordering::Relaxed),
-            400..=499 => slot.status_4xx.fetch_add(1, Ordering::Relaxed),
-            _ => slot.status_5xx.fetch_add(1, Ordering::Relaxed),
-        };
 
         // ── upstream timings (if an upstream was used) ────────────────────
         if let Some(upstream) = request.upstream() {
@@ -199,11 +197,12 @@ pub struct InstrumentedSource {
     /// Number of workers whose slots are in the zone.
     pub n_workers: usize,
     /// Unix epoch nanoseconds when the exporter (and therefore these
-    /// cumulative windows) started. Used as `start_time_unix_nano` on all
-    /// histogram datapoints so downstream Prometheus/OTAP consumers can
-    /// anchor cumulative rate windows correctly.  Must equal the value
-    /// used by [`crate::export::SelfMetricsSource`].
+    /// cumulative windows) started.
     pub start_time_unix_nano: u64,
+    /// When `true`, emit `http.server.request.duration` with bounded semconv
+    /// attributes per combination (`otel_metric_status_code_class on`).
+    /// When `false`, emit a single aggregated data point.
+    pub status_code_class_enabled: bool,
 }
 
 // Safety: InstrumentedSource is only used on Worker 0's export loop.
@@ -212,20 +211,21 @@ unsafe impl Sync for InstrumentedSource {}
 
 impl crate::metric_source::MetricSource for InstrumentedSource {
     fn collect(&self) -> std::vec::Vec<crate::data_model::Metric> {
-        use crate::data_model::AggregationTemporality;
+        use crate::data_model::{AggregationTemporality, AnyValue, HistogramDataPoint, KeyValue};
+        use crate::shm::{
+            HttpMethod, N_HTTP_METHODS, ProtoVersion, N_PROTO_VERSIONS,
+            StatusClass, N_STATUS_CLASSES, N_COMBOS, BYTES_BOUNDS, DURATION_BOUNDS_MS,
+        };
 
         let start = self.start_time_unix_nano;
         let now = now_unix_nano();
 
-        // Aggregate all workers.
-        let mut dur = ([0u64; N_DURATION_BUCKETS], 0u64, 0u64);
+        // Aggregate per-combination duration histograms over all workers.
+        // combo_agg[idx] = (bucket_counts, sum, count) for combination idx.
+        let mut combo_agg: std::vec::Vec<([u64; N_DURATION_BUCKETS], u64, u64)> =
+            std::vec![(([0u64; N_DURATION_BUCKETS], 0u64, 0u64)); N_COMBOS];
         let mut req_bytes = ([0u64; N_BYTES_BUCKETS], 0u64, 0u64);
         let mut resp_bytes = ([0u64; N_BYTES_BUCKETS], 0u64, 0u64);
-        let mut s1xx = 0u64;
-        let mut s2xx = 0u64;
-        let mut s3xx = 0u64;
-        let mut s4xx = 0u64;
-        let mut s5xx = 0u64;
         let mut up_resp = ([0u64; N_DURATION_BUCKETS], 0u64, 0u64);
         let mut up_hdr = ([0u64; N_DURATION_BUCKETS], 0u64, 0u64);
         let mut up_conn = ([0u64; N_DURATION_BUCKETS], 0u64, 0u64);
@@ -235,20 +235,17 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
         for i in 0..self.n_workers {
             let slot = unsafe { &*worker_slots(self.base, i) };
 
-            let (bc, bs, bcount) = slot.request_duration_ms.snapshot();
-            add_histogram(&mut dur, &bc, bs, bcount);
+            // Sum per-combination duration histograms.
+            for idx in 0..N_COMBOS {
+                let (bc, bs, bcount) = slot.request_duration_combos[idx].snapshot();
+                add_histogram(&mut combo_agg[idx], &bc, bs, bcount);
+            }
 
             let (bc, bs, bcount) = slot.request_body_bytes.snapshot();
             add_histogram(&mut req_bytes, &bc, bs, bcount);
 
             let (bc, bs, bcount) = slot.response_body_bytes.snapshot();
             add_histogram(&mut resp_bytes, &bc, bs, bcount);
-
-            s1xx += slot.status_1xx.load(Ordering::Acquire);
-            s2xx += slot.status_2xx.load(Ordering::Acquire);
-            s3xx += slot.status_3xx.load(Ordering::Acquire);
-            s4xx += slot.status_4xx.load(Ordering::Acquire);
-            s5xx += slot.status_5xx.load(Ordering::Acquire);
 
             let (bc, bs, bcount) = slot.upstream_response_ms.snapshot();
             add_histogram(&mut up_resp, &bc, bs, bcount);
@@ -262,52 +259,91 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
             add_histogram(&mut up_bytes_sent, &bc, bs, bcount);
         }
 
-        use crate::shm::{BYTES_BOUNDS, DURATION_BOUNDS_MS};
-
         let dur_bounds: std::vec::Vec<f64> = DURATION_BOUNDS_MS.iter().map(|&b| b as f64).collect();
         let byte_bounds: std::vec::Vec<f64> = BYTES_BOUNDS.iter().map(|&b| b as f64).collect();
 
-        // TODO(fix3b): Per OTel semconv, http.server.request.duration should be
-        // broken down by {http.request.method, http.response.status_code,
-        // network.protocol.version}. Doing this with per-request attributes
-        // requires one histogram slot per {method × status_class × protocol}
-        // combination in WorkerSlots (multi-dimensional shm histogram). The
-        // current design has a single aggregated histogram; the multi-dim
-        // slots arrive in a follow-on architectural pass (requires shm layout
-        // change + migration).
-        //
-        // Cardinality discipline (proposal §6.4 "Producer-side cardinality
-        // discipline"): when the multi-dim slots land, the attribute keys MUST
-        // be a closed Rust enum drawn from the OTel HTTP semantic conventions
-        // ONLY. The bounded set is:
-        //   - http.request.method        (~7 values; WithinU8 for the OTAP
-        //                                  classifier)
-        //   - http.response.status_code  (~30 values, or 5 status classes;
-        //                                  WithinU8 either way)
-        //   - network.protocol.version   (H1/H2/H3; WithinU8)
-        //
-        // No free-form String keys; no raw url.path, no client.address, no
-        // user_agent.original on data points by default. Unbounded attribute
-        // values would defeat the OTAP collector-side classifier's dictionary
-        // encoding (concatenate.rs::estimate_cardinality → GreaterThanU16,
-        // plain column on the wire) and explode per-point bytes on the wire.
-        // High-cardinality attributes stay opt-in-only behind the explicit
-        // directives specified in proposal §3 Phase 1.1.
-        //
-        // The status class totals (s1xx–s5xx) are available for reference but
-        // are not emitted as separate metrics: per OTel semconv the status
-        // breakdown belongs as an attribute on the duration histogram, not as
-        // standalone counters. They will be wired in once the multi-dim
-        // histogram slots exist.
-        let _ = (s1xx, s2xx, s3xx, s4xx, s5xx);
-
-        // All histograms are cumulative running totals (snapshot() reads the
-        // shm counters without resetting them). Emit as Cumulative with a
-        // fixed start_time_unix_nano anchored to the exporter start, matching
-        // the stub_status discipline. This removes the need for the collector-
-        // side transform/fix_temporality workaround.
-        std::vec![
-            // ── request metrics ───────────────────────────────────────────
+        // ── Build http.server.request.duration (fix3b FU4c) ──────────────
+        // All histograms are cumulative running totals.
+        let duration_metric = if self.status_code_class_enabled {
+            // Emit one data point per non-empty combination with bounded semconv
+            // attributes (method, status_class, protocol).  Only OTel-semconv
+            // attributes are emitted; no free-form / unbounded keys.
+            let mut data_points: std::vec::Vec<HistogramDataPoint> = std::vec::Vec::new();
+            for m_idx in 0..N_HTTP_METHODS {
+                for sc_idx in 0..N_STATUS_CLASSES {
+                    for p_idx in 0..N_PROTO_VERSIONS {
+                        let combo = m_idx * N_STATUS_CLASSES * N_PROTO_VERSIONS
+                            + sc_idx * N_PROTO_VERSIONS
+                            + p_idx;
+                        let (bc, bs, bcount) = combo_agg[combo];
+                        if bcount == 0 {
+                            continue; // skip empty combinations
+                        }
+                        // SAFETY: enum values are fully covered by the index ranges.
+                        let method = match m_idx {
+                            0 => HttpMethod::Get,
+                            1 => HttpMethod::Head,
+                            2 => HttpMethod::Post,
+                            3 => HttpMethod::Put,
+                            4 => HttpMethod::Delete,
+                            5 => HttpMethod::Patch,
+                            6 => HttpMethod::Options,
+                            _ => HttpMethod::Other,
+                        };
+                        let status_class = match sc_idx {
+                            0 => StatusClass::S1xx,
+                            1 => StatusClass::S2xx,
+                            2 => StatusClass::S3xx,
+                            3 => StatusClass::S4xx,
+                            _ => StatusClass::S5xx,
+                        };
+                        let proto = match p_idx {
+                            0 => ProtoVersion::Http10,
+                            1 => ProtoVersion::Http11,
+                            2 => ProtoVersion::Http2,
+                            _ => ProtoVersion::Http3,
+                        };
+                        data_points.push(HistogramDataPoint {
+                            attributes: std::vec![
+                                KeyValue {
+                                    key: "http.request.method".into(),
+                                    value: AnyValue::String(method.as_str().into()),
+                                },
+                                KeyValue {
+                                    key: "http.response.status_code".into(),
+                                    value: AnyValue::Int(status_class.representative_status()),
+                                },
+                                KeyValue {
+                                    key: "network.protocol.version".into(),
+                                    value: AnyValue::String(proto.as_str().into()),
+                                },
+                            ],
+                            start_time_unix_nano: start,
+                            time_unix_nano: now,
+                            count: bcount,
+                            sum: bs as f64,
+                            bucket_counts: bc.to_vec(),
+                            explicit_bounds: dur_bounds.clone(),
+                        });
+                    }
+                }
+            }
+            use crate::data_model::{HistogramData, Metric, MetricData};
+            Metric {
+                name: "http.server.request.duration".into(),
+                description: "HTTP server request duration".into(),
+                unit: "ms".into(),
+                data: MetricData::Histogram(HistogramData {
+                    aggregation_temporality: AggregationTemporality::Cumulative,
+                    data_points,
+                }),
+            }
+        } else {
+            // Aggregate across all combinations → single data point (backward compat).
+            let mut dur = ([0u64; N_DURATION_BUCKETS], 0u64, 0u64);
+            for agg in &combo_agg {
+                add_histogram(&mut dur, &agg.0, agg.1, agg.2);
+            }
             hist_metric(
                 "http.server.request.duration",
                 "HTTP server request duration",
@@ -317,7 +353,11 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                 start,
                 now,
                 AggregationTemporality::Cumulative,
-            ),
+            )
+        };
+
+        std::vec![
+            duration_metric,
             hist_metric(
                 "http.server.request.body.size",
                 "HTTP server request body size",

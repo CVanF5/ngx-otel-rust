@@ -957,7 +957,13 @@ fn collect_all_sources(amcf: &MainConfig, worker_start_ns: u64) -> Batch {
             (avail / core::mem::size_of::<crate::shm::WorkerSlots>()).max(1)
         };
         metrics.extend(
-            InstrumentedSource { base, n_workers, start_time_unix_nano: worker_start_ns }.collect(),
+            InstrumentedSource {
+                base,
+                n_workers,
+                start_time_unix_nano: worker_start_ns,
+                status_code_class_enabled: amcf.status_code_class_enabled(),
+            }
+            .collect(),
         );
     }
 

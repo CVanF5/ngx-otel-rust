@@ -85,25 +85,185 @@ impl<const BUCKETS: usize> Histogram<BUCKETS> {
     }
 }
 
+// ── Closed cardinality dimension enums (fix3b, FU4a) ────────────────────────
+//
+// Attribute keys MUST be drawn from OTel HTTP semconv ONLY (proposal §6.4).
+// All variants are WithinU8 cardinality so the OTAP classifier can
+// dictionary-encode every per-point column at u8 key width.
+
+/// OTel `http.request.method` — 7 standard values + catch-all.
+///
+/// `N_HTTP_METHODS` = 8.  Computed from `r.method_name` bytes in the handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum HttpMethod {
+    Get = 0,
+    Head = 1,
+    Post = 2,
+    Put = 3,
+    Delete = 4,
+    Patch = 5,
+    Options = 6,
+    Other = 7,
+}
+
+pub const N_HTTP_METHODS: usize = 8;
+
+impl HttpMethod {
+    #[inline]
+    pub fn from_bytes(method: &[u8]) -> Self {
+        match method {
+            b"GET" => Self::Get,
+            b"HEAD" => Self::Head,
+            b"POST" => Self::Post,
+            b"PUT" => Self::Put,
+            b"DELETE" => Self::Delete,
+            b"PATCH" => Self::Patch,
+            b"OPTIONS" => Self::Options,
+            _ => Self::Other,
+        }
+    }
+
+    /// OTel attribute string value for this method.
+    #[inline]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Head => "HEAD",
+            Self::Post => "POST",
+            Self::Put => "PUT",
+            Self::Delete => "DELETE",
+            Self::Patch => "PATCH",
+            Self::Options => "OPTIONS",
+            Self::Other => "_OTHER",
+        }
+    }
+}
+
+/// HTTP response status class (s1xx–s5xx).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum StatusClass {
+    S1xx = 0,
+    S2xx = 1,
+    S3xx = 2,
+    S4xx = 3,
+    S5xx = 4,
+}
+
+pub const N_STATUS_CLASSES: usize = 5;
+
+impl StatusClass {
+    #[inline]
+    pub fn from_status(status: u16) -> Self {
+        match status {
+            100..=199 => Self::S1xx,
+            200..=299 => Self::S2xx,
+            300..=399 => Self::S3xx,
+            400..=499 => Self::S4xx,
+            _ => Self::S5xx,
+        }
+    }
+
+    /// OTel attribute integer value for this status class.
+    #[inline]
+    pub fn representative_status(self) -> i64 {
+        match self {
+            Self::S1xx => 100,
+            Self::S2xx => 200,
+            Self::S3xx => 300,
+            Self::S4xx => 400,
+            Self::S5xx => 500,
+        }
+    }
+}
+
+/// OTel `network.protocol.version` — 4 buckets.
+///
+/// HTTP/1.0 and HTTP/1.1 are separate (both common; grouping loses information).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ProtoVersion {
+    Http10 = 0,
+    Http11 = 1,
+    Http2 = 2,
+    Http3 = 3,
+}
+
+pub const N_PROTO_VERSIONS: usize = 4;
+
+impl ProtoVersion {
+    /// Map a nginx `r.http_version` value to `ProtoVersion`.
+    ///
+    /// nginx constants (`ngx_http_request.h:23-26`):
+    ///   `NGX_HTTP_VERSION_10 = 1000`, `NGX_HTTP_VERSION_11 = 1001`,
+    ///   `NGX_HTTP_VERSION_20 = 2000`, `NGX_HTTP_VERSION_30 = 3000`.
+    #[inline]
+    pub fn from_ngx(http_version: core::ffi::c_uint) -> Self {
+        match http_version {
+            1000 => Self::Http10,
+            1001 => Self::Http11,
+            2000 => Self::Http2,
+            3000 => Self::Http3,
+            // Unrecognised version → bucket as HTTP/1.1 (most common).
+            _ => Self::Http11,
+        }
+    }
+
+    /// OTel attribute string value for `network.protocol.version`.
+    #[inline]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Http10 => "1.0",
+            Self::Http11 => "1.1",
+            Self::Http2 => "2",
+            Self::Http3 => "3",
+        }
+    }
+}
+
+/// Total number of `{method × status_class × protocol}` combinations.
+///
+/// Each combination maps to one [`Histogram`] slot in `WorkerSlots::request_duration_combos`.
+pub const N_COMBOS: usize = N_HTTP_METHODS * N_STATUS_CLASSES * N_PROTO_VERSIONS;
+
+/// Compute the combination index from the three bounded dimensions.
+///
+/// Returns a value in `0 .. N_COMBOS`.  The mapping is:
+/// `method * N_STATUS_CLASSES * N_PROTO_VERSIONS + status_class * N_PROTO_VERSIONS + proto`
+#[inline]
+pub fn combo_index(method: HttpMethod, status_class: StatusClass, proto: ProtoVersion) -> usize {
+    (method as usize) * N_STATUS_CLASSES * N_PROTO_VERSIONS
+        + (status_class as usize) * N_PROTO_VERSIONS
+        + proto as usize
+}
+
 /// Per-worker slot block.
 ///
 /// One of these exists per nginx worker process, mapped at a fixed offset in
 /// the shared memory zone. A worker only ever writes to its own slot
 /// (`ngx_worker`-indexed); the export worker reads from all slots.
+///
+/// **fix3b (FU4)**: `request_duration_ms` is now multi-dimensional — one
+/// `Histogram` per `{http.request.method × status_class × network.protocol.version}`
+/// combination (`N_COMBOS` = 160 total).  The flat array is indexed via
+/// [`combo_index`].  When `otel_metric_status_code_class` is ON, the exporter
+/// emits each non-empty combination as a separate data point with bounded
+/// semconv attributes.  When OFF, it sums across all combinations and emits
+/// a single aggregate data point (same behaviour as before fix3b).
+///
+/// The five `status_Nxx` counters have been removed — their information is
+/// captured by the per-combination histograms.
 #[repr(C)]
 pub struct WorkerSlots {
-    /// `http.server.request.duration` (ms)
-    pub request_duration_ms: Histogram<N_DURATION_BUCKETS>,
+    /// `http.server.request.duration` (ms), broken down by
+    /// `{method × status_class × protocol}` — `N_COMBOS` slots total.
+    /// Index with [`combo_index`].
+    pub request_duration_combos: [Histogram<N_DURATION_BUCKETS>; N_COMBOS],
     /// `http.server.request.body.size` (bytes)
     pub request_body_bytes: Histogram<N_BYTES_BUCKETS>,
     /// `http.server.response.body.size` (bytes)
     pub response_body_bytes: Histogram<N_BYTES_BUCKETS>,
-    /// Status code class counters
-    pub status_1xx: AtomicU64,
-    pub status_2xx: AtomicU64,
-    pub status_3xx: AtomicU64,
-    pub status_4xx: AtomicU64,
-    pub status_5xx: AtomicU64,
     /// `http.server.upstream.response.duration` (ms)
     pub upstream_response_ms: Histogram<N_DURATION_BUCKETS>,
     /// `http.server.upstream.header.duration` (ms)
@@ -355,70 +515,89 @@ mod tests {
 
     /// Verifies that two "workers" write exclusively to their own slots and
     /// a third "reader" can sum them without cross-contamination.
+    ///
+    /// Uses the GET/2xx/HTTP1.1 combination slot (combo 0×5×4+1×4+1=9 — but we
+    /// use combo_index directly for clarity).
     #[test]
     fn two_workers_isolated_slots() {
-        // Allocate space for 2 workers on the heap (simulates shm).
         let n_workers: usize = 2;
         let zone_size = zone_size_for(n_workers);
         let mut buffer = std::vec![0u8; zone_size];
         let base = buffer.as_mut_ptr();
 
-        // Init slots
         for i in 0..n_workers {
             unsafe { WorkerSlots::init_at(worker_slots(base, i)) };
         }
 
-        // Worker 0 records 3 requests of 100 ms each.
+        // Use GET/2xx/HTTP1.1 combo for the test.
+        let combo = combo_index(HttpMethod::Get, StatusClass::S2xx, ProtoVersion::Http11);
+
         let slot0 = unsafe { &*worker_slots(base, 0) };
         for _ in 0..3 {
-            slot0.request_duration_ms.record(100, &DURATION_BOUNDS_MS);
+            slot0.request_duration_combos[combo].record(100, &DURATION_BOUNDS_MS);
         }
 
-        // Worker 1 records 2 requests of 500 ms each.
         let slot1 = unsafe { &*worker_slots(base, 1) };
         for _ in 0..2 {
-            slot1.request_duration_ms.record(500, &DURATION_BOUNDS_MS);
+            slot1.request_duration_combos[combo].record(500, &DURATION_BOUNDS_MS);
         }
 
-        // Verify slot 0: 3 observations summing to 300 ms.
-        let (_, sum0, count0) = slot0.request_duration_ms.snapshot();
+        let (_, sum0, count0) = slot0.request_duration_combos[combo].snapshot();
         assert_eq!(count0, 3, "worker 0 count");
         assert_eq!(sum0, 300, "worker 0 sum");
 
-        // Verify slot 1: 2 observations summing to 1000 ms.
-        let (_, sum1, count1) = slot1.request_duration_ms.snapshot();
+        let (_, sum1, count1) = slot1.request_duration_combos[combo].snapshot();
         assert_eq!(count1, 2, "worker 1 count");
         assert_eq!(sum1, 1000, "worker 1 sum");
 
-        // Reader sums both.
         let total_count = count0 + count1;
         let total_sum = sum0 + sum1;
         assert_eq!(total_count, 5);
         assert_eq!(total_sum, 1300);
 
-        // Confirm slot 0 has zero data in slot 1's range (no cross-write).
-        let (buckets0, _, _) = slot0.request_duration_ms.snapshot();
-        let (buckets1, _, _) = slot1.request_duration_ms.snapshot();
+        // Confirm no cross-write between slots.
+        let (buckets0, _, _) = slot0.request_duration_combos[combo].snapshot();
+        let (buckets1, _, _) = slot1.request_duration_combos[combo].snapshot();
 
-        // 100 ms falls into bucket at index where bound >= 100; first bound >= 100 is bounds[5]=100
-        // partition_point returns first index where value <= bound → index 5 (bound=100)
-        // Actually: record uses value > b, so partition_point gives first b where !(value > b)
-        // i.e. first b >= value. For value=100, bounds[5]=100 >= 100, so idx=5.
         let bucket_100ms = DURATION_BOUNDS_MS.partition_point(|&b| 100 > b);
         let bucket_500ms = DURATION_BOUNDS_MS.partition_point(|&b| 500 > b);
 
         assert_eq!(buckets0[bucket_100ms], 3, "worker 0 bucket for 100ms");
         assert_eq!(buckets1[bucket_500ms], 2, "worker 1 bucket for 500ms");
-
-        // No other worker wrote to slot 0's 500ms bucket.
         assert_eq!(buckets0[bucket_500ms], 0, "slot 0 not written by worker 1");
-        // No other worker wrote to slot 1's 100ms bucket.
         assert_eq!(buckets1[bucket_100ms], 0, "slot 1 not written by worker 0");
+    }
+
+    /// Combo index mapping: all N_COMBOS combinations must be distinct.
+    #[test]
+    fn combo_index_all_unique() {
+        let mut seen = std::vec![false; N_COMBOS];
+        for m in 0..N_HTTP_METHODS {
+            for sc in 0..N_STATUS_CLASSES {
+                for p in 0..N_PROTO_VERSIONS {
+                    let method = [
+                        HttpMethod::Get, HttpMethod::Head, HttpMethod::Post, HttpMethod::Put,
+                        HttpMethod::Delete, HttpMethod::Patch, HttpMethod::Options, HttpMethod::Other,
+                    ][m];
+                    let status = [
+                        StatusClass::S1xx, StatusClass::S2xx, StatusClass::S3xx,
+                        StatusClass::S4xx, StatusClass::S5xx,
+                    ][sc];
+                    let proto = [
+                        ProtoVersion::Http10, ProtoVersion::Http11,
+                        ProtoVersion::Http2, ProtoVersion::Http3,
+                    ][p];
+                    let idx = combo_index(method, status, proto);
+                    assert!(!seen[idx], "duplicate combo index {}", idx);
+                    seen[idx] = true;
+                }
+            }
+        }
+        assert!(seen.iter().all(|&v| v), "all N_COMBOS combinations must be reachable");
     }
 
     #[test]
     fn zone_size_alignment() {
-        // Zone size must accommodate the slab-pool header plus the slot array.
         let slab = data_offset();
         assert!(slab > 0, "slab pool offset must be positive");
         assert_eq!(zone_size_for(4), slab + 4 * mem::size_of::<WorkerSlots>());
@@ -430,16 +609,15 @@ mod tests {
         let mut buf = std::vec![0u8; mem::size_of::<WorkerSlots>()];
         let slot = unsafe { &*buf.as_mut_ptr().cast::<WorkerSlots>() };
 
-        // Record a value beyond the last boundary (10_000 ms → overflow bucket).
+        // Record a large value in the GET/2xx/HTTP1.1 combo.
+        let combo = combo_index(HttpMethod::Get, StatusClass::S2xx, ProtoVersion::Http11);
         let very_large = 99_999u64;
-        slot.request_duration_ms.record(very_large, &DURATION_BOUNDS_MS);
+        slot.request_duration_combos[combo].record(very_large, &DURATION_BOUNDS_MS);
 
-        let (buckets, sum, count) = slot.request_duration_ms.snapshot();
+        let (buckets, sum, count) = slot.request_duration_combos[combo].snapshot();
         assert_eq!(count, 1);
         assert_eq!(sum, very_large);
-        // Overflow bucket is the last one.
         assert_eq!(buckets[N_DURATION_BUCKETS - 1], 1);
-        // All other buckets should be 0.
         for b in &buckets[..N_DURATION_BUCKETS - 1] {
             assert_eq!(*b, 0);
         }
