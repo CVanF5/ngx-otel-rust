@@ -57,10 +57,14 @@ wait_for_collector() {
 start_traffic() {
     # Light, varied background load so every histogram populates.
     ( while true; do
-        curl -s -o /dev/null "http://127.0.0.1:9400/"      || true
-        curl -s -o /dev/null "http://127.0.0.1:9400/big"   || true
-        curl -s -o /dev/null "http://127.0.0.1:9400/api/"  || true
-        curl -s -o /dev/null "http://127.0.0.1:9400/api/"  || true
+        curl -s -o /dev/null "http://127.0.0.1:9400/"               || true
+        curl -s -o /dev/null "http://127.0.0.1:9400/big"            || true
+        curl -s -o /dev/null "http://127.0.0.1:9400/api/"           || true
+        curl -s -o /dev/null "http://127.0.0.1:9400/api/"           || true
+        curl -s -o /dev/null -X POST "http://127.0.0.1:9400/"       || true  # method=POST
+        curl -s -o /dev/null "http://127.0.0.1:9400/client-error"   || true  # 4xx
+        # 5xx less often, so the breakdown shows a realistic error mix
+        [ $((RANDOM % 4)) -eq 0 ] && curl -s -o /dev/null "http://127.0.0.1:9400/server-error" || true
         sleep 0.05
       done ) >/dev/null 2>&1 &
     echo $! > "${PREFIX}/traffic.pid"

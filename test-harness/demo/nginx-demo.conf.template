@@ -35,6 +35,12 @@ http {
     # Ship OTLP/gRPC to the collector (Phase 2 grpc_transport).
     # Default is otlp_http; this directive promotes the demo to gRPC.
     otel_export_protocol otlp_grpc;
+    # fix3b: break the request-duration histogram down by
+    # {method × status_class × protocol} as bounded semconv attributes,
+    # so the Grafana dashboard can split p99 / rate by those dimensions.
+    # The status attribute carries the CLASS representative (200/400/500…),
+    # not the exact code — bounded to 5 classes (§6.4 cardinality discipline).
+    otel_metric_status_code_class on;
 
     # Backend the front server proxies to (populates upstream.* metrics).
     upstream demo_backend {
@@ -48,6 +54,14 @@ http {
 
         location / {
             return 200 "ngx-otel-rust demo: ok\n";
+        }
+        # Error endpoints so the fix3b status-class breakdown shows 4xx/5xx,
+        # not just 2xx — drives the "request rate by status class" panel.
+        location = /client-error {
+            return 404 "not found\n";
+        }
+        location = /server-error {
+            return 500 "boom\n";
         }
 
         location /big {
