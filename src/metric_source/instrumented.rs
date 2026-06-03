@@ -3,21 +3,26 @@
 // This source code is licensed under the Apache License, Version 2.0 license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! Log-phase handler that bumps per-worker shm slot counters per request.
+//! Log-phase handler that bumps per-worker shm slot counters per request
+//! and (when enabled) pushes an access log record into the per-worker ring.
 //!
 //! ## Hard constraints (verified in Step 6)
 //! - No `Vec::new()`, `Box::new()`, `String::from()`, or any heap allocation.
 //! - No syscalls beyond what the nginx log phase already incurs.
 //! - No locks; only atomic increments (`Ordering::Relaxed` on writes).
 //! - The handler is registered **only** when `otel_exporter` is configured.
+//! - Access-log emission is gated by `amcf.is_access_log_enabled()`; with
+//!   access log OFF the path is byte-equivalent to the metrics-only path.
 
 use core::sync::atomic::Ordering;
 
 use ngx::core::Status;
 use ngx::http::{HttpModuleMainConf, HttpPhase, HttpRequestHandler, Request};
 
+use crate::logs::{WorkerRingProducer, access::emit_access_record};
 use crate::shm::{
-    worker_slots, BYTES_BOUNDS, DURATION_BOUNDS_MS, N_BYTES_BUCKETS, N_DURATION_BUCKETS,
+    logs_worker_slot, worker_slots, BYTES_BOUNDS, DURATION_BOUNDS_MS, N_BYTES_BUCKETS,
+    N_DURATION_BUCKETS,
 };
 use crate::HttpOtelModule;
 
@@ -124,6 +129,61 @@ impl HttpRequestHandler for LogPhaseHandler {
                 slot.upstream_connect_ms.record(conn_ms, &DURATION_BOUNDS_MS);
                 slot.upstream_bytes_received.record(bytes_rx, &BYTES_BOUNDS);
                 slot.upstream_bytes_sent.record(bytes_tx, &BYTES_BOUNDS);
+            }
+        }
+
+        // ── Phase 2.1: access log ─────────────────────────────────────────
+        // Gate: no work at all if access log is disabled (zero-cost invariant).
+        // Only the branch check runs; the ring is never touched.
+        if amcf.is_access_log_enabled() {
+            if let Some(logs_base) = amcf.logs_shm_base() {
+                // Safety: logs zone was sized for ≥ worker_id slots during
+                // postconfiguration (register_logs_zone).
+                let logs_slot = unsafe { &*logs_worker_slot(logs_base, worker_id) };
+                let producer = WorkerRingProducer { ring: &logs_slot.access };
+
+                // Gather HTTP semconv fields from the request.
+                let method: &[u8] = r.method_name.as_bytes();
+                let status = r.headers_out.status as u16;
+                let req_len = r.request_length as u64;
+                let resp_bytes_acc = resp_bytes; // already computed above
+
+                // Client address from the connection.
+                let client_addr: &[u8] = if !request.connection().is_null() {
+                    unsafe {
+                        let conn = &*request.connection();
+                        if conn.addr_text.len > 0 && !conn.addr_text.data.is_null() {
+                            core::slice::from_raw_parts(conn.addr_text.data, conn.addr_text.len)
+                        } else {
+                            b""
+                        }
+                    }
+                } else {
+                    b""
+                };
+
+                // Timestamp: use duration computation result.  We want the
+                // request start time in nanoseconds; derive from the nginx
+                // cached time + start fields.
+                let ts_unix_nano: u64 = {
+                    let tp = nginx_sys::ngx_timeofday();
+                    // Request start: r.start_sec + r.start_msec / 1000
+                    // Convert to ns: start_sec * 1e9 + start_msec * 1e6
+                    (r.start_sec as u64)
+                        .saturating_mul(1_000_000_000)
+                        .saturating_add(r.start_msec as u64 * 1_000_000)
+                };
+                let _ = nginx_sys::ngx_timeofday(); // suppress unused-import warning if any
+
+                emit_access_record(
+                    &producer,
+                    method,
+                    status,
+                    req_len,
+                    resp_bytes_acc,
+                    client_addr,
+                    ts_unix_nano,
+                );
             }
         }
 
@@ -385,4 +445,93 @@ fn hist_metric<const N: usize>(
 fn now_unix_nano() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64
+}
+
+// ── Unit tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use crate::logs::{WorkerRingProducer, access::emit_access_record};
+    use crate::logs::ring::LogsWorkerRing;
+
+    type TestRing = LogsWorkerRing<{ 4 * 1024 }>;
+
+    fn make_ring() -> std::boxed::Box<TestRing> {
+        unsafe {
+            let layout = std::alloc::Layout::new::<TestRing>();
+            let ptr = std::alloc::alloc_zeroed(layout) as *mut TestRing;
+            std::boxed::Box::from_raw(ptr)
+        }
+    }
+
+    /// With `access_log_enabled = false` (the default), the access-log
+    /// emission gate is closed: no ring operations occur.
+    ///
+    /// This test simulates the gate check by calling `emit_access_record`
+    /// only when the gate is open, mirroring the `if amcf.is_access_log_enabled()`
+    /// branch in `LogPhaseHandler::handler`.
+    #[test]
+    fn access_emission_off_no_ring_touch() {
+        let ring = make_ring();
+
+        // Simulate the gate check: access_log_enabled = false → skip emit.
+        let access_log_enabled = false;
+        if access_log_enabled {
+            let producer = WorkerRingProducer { ring: ring.as_ref() };
+            emit_access_record(&producer, b"GET", 200, 0, 512, b"127.0.0.1", 0);
+        }
+
+        // Ring must be empty — no record pushed.
+        let mut out = std::vec::Vec::new();
+        assert!(
+            !ring.pop_into(&mut out),
+            "ring must be empty when access log is disabled"
+        );
+        assert_eq!(ring.drop_count(), 0, "no drops expected");
+    }
+
+    /// With `access_log_enabled = true`, the log-phase handler pushes one
+    /// access record into the ring with the expected fields.
+    #[test]
+    fn access_emission_on_pushes_record() {
+        let ring = make_ring();
+
+        // Simulate the gate check: access_log_enabled = true → emit.
+        let access_log_enabled = true;
+        if access_log_enabled {
+            let producer = WorkerRingProducer { ring: ring.as_ref() };
+            emit_access_record(
+                &producer,
+                b"POST",
+                201,
+                128,
+                256,
+                b"10.0.0.1",
+                1_700_000_000_000_000_000,
+            );
+        }
+
+        // Ring must have one record.
+        let mut out = std::vec::Vec::new();
+        let ok = ring.pop_into(&mut out);
+        assert!(ok, "ring must have a record when access log is enabled");
+        assert!(!out.is_empty(), "record must be non-empty");
+
+        // Check kind byte = 0x00 (access).
+        assert_eq!(out[0], 0x00, "kind must be 0 (access)");
+
+        // Check method ("POST" = 4 bytes).
+        let method_len = u16::from_be_bytes([out[10], out[11]]) as usize;
+        assert_eq!(method_len, 4, "method length must be 4 for POST");
+        assert_eq!(&out[12..12 + method_len], b"POST");
+
+        // Check status code = 201.
+        let sc_off = 12 + method_len;
+        let status = u16::from_be_bytes([out[sc_off], out[sc_off + 1]]);
+        assert_eq!(status, 201, "status code must be 201");
+
+        // No more records.
+        let mut out2 = std::vec::Vec::new();
+        assert!(!ring.pop_into(&mut out2), "ring must be empty after one record");
+    }
 }

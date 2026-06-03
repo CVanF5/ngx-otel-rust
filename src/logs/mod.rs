@@ -29,6 +29,7 @@
 //! ring.  Multi-module MPSC sharing (Phase N) would need a per-ring mutex
 //! or a lock-free MPSC ring; that complexity is deferred.
 
+pub mod access;
 pub mod ring;
 pub mod severity;
 

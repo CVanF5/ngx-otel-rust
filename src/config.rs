@@ -333,6 +333,13 @@ impl MainConfig {
         // both are mapped before workers fork.
         self.register_control_shm_zone(cf, module)?;
 
+        // Register the per-worker logs shm zone when access log is enabled
+        // (Phase 2.1).  Error-log enablement (Phase 2.2) will extend this gate
+        // to `self.is_access_log_enabled() || self.error_log_enabled`.
+        if self.is_access_log_enabled() {
+            self.register_logs_zone(cf, module)?;
+        }
+
         Ok(())
     }
 
