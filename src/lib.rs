@@ -298,16 +298,13 @@ extern "C" fn ngx_otel_init_process(_cycle: *mut ngx_cycle_t) -> ngx_int_t {
                     let endpoint_bytes = amcf.grpc_smoke_endpoint.as_bytes();
                     if let Ok(endpoint_str) = core::str::from_utf8(endpoint_bytes) {
                         let endpoint_owned = std::string::String::from(endpoint_str);
-                        let log_nn = match core::ptr::NonNull::new(log) {
-                            Some(p) => p,
-                            None => {
-                                ngx::ngx_log_error!(
-                                    nginx_sys::NGX_LOG_ERR,
-                                    log,
-                                    "grpc smoke: null log pointer; skipping"
-                                );
-                                return Status::NGX_OK.into();
-                            }
+                        let Some(log_nn) = core::ptr::NonNull::new(log) else {
+                            ngx::ngx_log_error!(
+                                nginx_sys::NGX_LOG_ERR,
+                                log,
+                                "grpc smoke: null log pointer; skipping"
+                            );
+                            return Status::NGX_OK.into();
                         };
 
                         ngx::ngx_log_error!(
@@ -376,16 +373,13 @@ extern "C" fn ngx_otel_init_process(_cycle: *mut ngx_cycle_t) -> ngx_int_t {
                     let endpoint_bytes = amcf.bidi_smoke_endpoint.as_bytes();
                     if let Ok(endpoint_str) = core::str::from_utf8(endpoint_bytes) {
                         let endpoint_owned = std::string::String::from(endpoint_str);
-                        let log_nn = match core::ptr::NonNull::new(log) {
-                            Some(p) => p,
-                            None => {
-                                ngx::ngx_log_error!(
-                                    nginx_sys::NGX_LOG_ERR,
-                                    log,
-                                    "bidi smoke: null log pointer; skipping"
-                                );
-                                return Status::NGX_OK.into();
-                            }
+                        let Some(log_nn) = core::ptr::NonNull::new(log) else {
+                            ngx::ngx_log_error!(
+                                nginx_sys::NGX_LOG_ERR,
+                                log,
+                                "bidi smoke: null log pointer; skipping"
+                            );
+                            return Status::NGX_OK.into();
                         };
 
                         ngx::ngx_log_error!(
@@ -452,16 +446,13 @@ extern "C" fn ngx_otel_init_process(_cycle: *mut ngx_cycle_t) -> ngx_int_t {
                     let endpoint_bytes = amcf.bidi_overload_endpoint.as_bytes();
                     if let Ok(endpoint_str) = core::str::from_utf8(endpoint_bytes) {
                         let endpoint_owned = std::string::String::from(endpoint_str);
-                        let log_nn = match core::ptr::NonNull::new(log) {
-                            Some(p) => p,
-                            None => {
-                                ngx::ngx_log_error!(
-                                    nginx_sys::NGX_LOG_ERR,
-                                    log,
-                                    "bidi overload: null log pointer; skipping"
-                                );
-                                return Status::NGX_OK.into();
-                            }
+                        let Some(log_nn) = core::ptr::NonNull::new(log) else {
+                            ngx::ngx_log_error!(
+                                nginx_sys::NGX_LOG_ERR,
+                                log,
+                                "bidi overload: null log pointer; skipping"
+                            );
+                            return Status::NGX_OK.into();
                         };
 
                         ngx::ngx_log_error!(
@@ -559,17 +550,11 @@ pub(crate) unsafe extern "C" fn otel_status_content_handler(
 
     // Read control_shm version via the request's module conf (one Relaxed load).
     // ngx_http_request_t implements HttpModuleConfExt, so main_conf() works directly.
-    let version = if let Some(r_ref) = unsafe { r.as_ref() } {
-        if let Some(amcf) = HttpOtelModule::main_conf(r_ref) {
-            amcf.control_shm_ptr()
-                .map(|ctrl| unsafe { (*ctrl).version.load(Ordering::Relaxed) })
-                .unwrap_or(0)
-        } else {
-            0
-        }
-    } else {
-        0
-    };
+    let version = unsafe { r.as_ref() }
+        .and_then(HttpOtelModule::main_conf)
+        .and_then(|amcf| amcf.control_shm_ptr())
+        .map(|ctrl| unsafe { (*ctrl).version.load(Ordering::Relaxed) })
+        .unwrap_or(0);
 
     // Format as "version\n".
     let body = std::format!("{}\n", version);
