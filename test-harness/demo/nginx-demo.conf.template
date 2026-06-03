@@ -34,7 +34,7 @@ http {
     otel_metric_interval 2s;
     # Ship OTLP/gRPC to the collector (Phase 2 grpc_transport).
     # Default is otlp_http; this directive promotes the demo to gRPC.
-    otel_metric_protocol otlp_grpc;
+    otel_export_protocol otlp_grpc;
 
     # Backend the front server proxies to (populates upstream.* metrics).
     upstream demo_backend {
