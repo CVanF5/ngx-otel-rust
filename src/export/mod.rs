@@ -415,6 +415,12 @@ pub async fn export_loop(amcf: &'static MainConfig) {
         // SIGQUIT during a long sleep doesn't delay the drain significantly.
         // Phase 1.3.2: unlike workers, the exporter is not subject to
         // ngx_event_no_timers_left, so cancelable timers fire reliably on quit.
+        //
+        // Phase 2.1 (FU2): logs are drained on EVERY sub-interval wake
+        // (SHUTDOWN_POLL_INTERVAL, default 250 ms) to decouple log throughput
+        // from the metric aggregation interval.  This keeps rings from saturating
+        // under high RPS and improves delivery fraction.  Metrics continue to
+        // aggregate and export only at the full otel_metric_interval boundary.
         let interval = Duration::from_millis(amcf.interval_ms());
         let mut slept = Duration::ZERO;
         let mut shutdown_during_sleep = ShutdownKind::None;
@@ -429,6 +435,88 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             if unsafe { nginx_sys::ngx_quit } != 0 {
                 shutdown_during_sleep = ShutdownKind::Exiting;
                 break;
+            }
+
+            // ── Log drain: every sub-interval wake ──────────────────────────
+            // Drain the logs retry queue first (best-effort; stop on failure).
+            {
+                let mut logs_queue_snap = core::mem::take(&mut logs_retry_queue);
+                let mut logs_retry_failed = false;
+                while let Some((bytes, n_logs)) = logs_queue_snap.pop_front() {
+                    if logs_retry_failed {
+                        enqueue_with_eviction(
+                            &mut logs_retry_queue,
+                            bytes,
+                            n_logs,
+                            retry_buffer_depth,
+                            log.as_ptr(),
+                        );
+                        continue;
+                    }
+                    match transport.send_logs(bytes.clone()).await {
+                        Ok(()) => {}
+                        Err(ref e) => {
+                            ngx::ngx_log_error!(
+                                NGX_LOG_ERR,
+                                log.as_ptr(),
+                                "otel export: logs retry send failed ({}); re-queuing",
+                                e
+                            );
+                            LOGS_SEND_FAILURES.fetch_add(1, Ordering::Relaxed);
+                            enqueue_with_eviction(
+                                &mut logs_retry_queue,
+                                bytes,
+                                n_logs,
+                                retry_buffer_depth,
+                                log.as_ptr(),
+                            );
+                            logs_retry_failed = true;
+                        }
+                    }
+                }
+            }
+
+            // Drain fresh log records from all workers' rings and ship them.
+            if amcf.is_access_log_enabled() {
+                if let Some(logs_base) = amcf.logs_shm_base() {
+                    let n_workers = unsafe {
+                        let zone = &*amcf.logs_shm_zone;
+                        let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
+                        (avail / core::mem::size_of::<LogsWorkerSlot>()).max(1)
+                    };
+                    let logs_batch =
+                        collect_log_records(amcf, logs_base, n_workers, worker_start_ns);
+                    if !logs_batch.logs.is_empty() {
+                        let n_logs = logs_batch.logs.len() as u64;
+                        let logs_bytes = logs_encoder.encode(&logs_batch);
+                        match transport.send_logs(logs_bytes.clone()).await {
+                            Ok(()) => {
+                                ngx::ngx_log_error!(
+                                    NGX_LOG_NOTICE,
+                                    log.as_ptr(),
+                                    "otel export: sent {} log records to collector",
+                                    n_logs
+                                );
+                            }
+                            Err(ref e) => {
+                                ngx::ngx_log_error!(
+                                    NGX_LOG_ERR,
+                                    log.as_ptr(),
+                                    "otel export: logs send failed ({}); queuing for retry",
+                                    e
+                                );
+                                enqueue_with_eviction(
+                                    &mut logs_retry_queue,
+                                    logs_bytes,
+                                    n_logs,
+                                    retry_buffer_depth,
+                                    log.as_ptr(),
+                                );
+                                LOGS_SEND_FAILURES.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -541,85 +629,8 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             }
         }
 
-        // ── Drain logs retry queue ────────────────────────────────────────
-        let mut logs_queue_snapshot = core::mem::take(&mut logs_retry_queue);
-        let mut logs_drain_failed = false;
-        while let Some((bytes, n_logs)) = logs_queue_snapshot.pop_front() {
-            if logs_drain_failed {
-                enqueue_with_eviction(
-                    &mut logs_retry_queue,
-                    bytes,
-                    n_logs,
-                    retry_buffer_depth,
-                    log.as_ptr(),
-                );
-                continue;
-            }
-            match transport.send_logs(bytes.clone()).await {
-                Ok(()) => {}
-                Err(ref e) => {
-                    ngx::ngx_log_error!(
-                        NGX_LOG_ERR,
-                        log.as_ptr(),
-                        "otel export: logs retry send failed ({}); re-queuing",
-                        e
-                    );
-                    LOGS_SEND_FAILURES.fetch_add(1, Ordering::Relaxed);
-                    enqueue_with_eviction(
-                        &mut logs_retry_queue,
-                        bytes,
-                        n_logs,
-                        retry_buffer_depth,
-                        log.as_ptr(),
-                    );
-                    logs_drain_failed = true;
-                }
-            }
-        }
-
-        // ── Collect and send fresh logs ───────────────────────────────────
-        // Phase 2.1: drain access rings from all workers.
-        if amcf.is_access_log_enabled() {
-            if let Some(logs_base) = amcf.logs_shm_base() {
-                let n_workers = unsafe {
-                    let zone = &*amcf.logs_shm_zone;
-                    let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
-                    (avail / core::mem::size_of::<LogsWorkerSlot>()).max(1)
-                };
-                let logs_batch =
-                    collect_log_records(amcf, logs_base, n_workers, worker_start_ns);
-                if !logs_batch.logs.is_empty() {
-                    let n_logs = logs_batch.logs.len() as u64;
-                    let logs_bytes = logs_encoder.encode(&logs_batch);
-                    match transport.send_logs(logs_bytes.clone()).await {
-                        Ok(()) => {
-                            ngx::ngx_log_error!(
-                                NGX_LOG_NOTICE,
-                                log.as_ptr(),
-                                "otel export: sent {} log records to collector",
-                                n_logs
-                            );
-                        }
-                        Err(ref e) => {
-                            ngx::ngx_log_error!(
-                                NGX_LOG_ERR,
-                                log.as_ptr(),
-                                "otel export: logs send failed ({}); queuing for retry",
-                                e
-                            );
-                            enqueue_with_eviction(
-                                &mut logs_retry_queue,
-                                logs_bytes,
-                                n_logs,
-                                retry_buffer_depth,
-                                log.as_ptr(),
-                            );
-                            LOGS_SEND_FAILURES.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                }
-            }
-        }
+        // (Log drain happens every SHUTDOWN_POLL_INTERVAL inside the chunked
+        // sleep above — no separate log drain here.)
     }
 }
 
