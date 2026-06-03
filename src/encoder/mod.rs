@@ -10,7 +10,7 @@
 
 use prost::Message;
 
-use crate::data_model::{AggregationTemporality, AnyValue, Batch, MetricData, NumberValue};
+use crate::data_model::{AggregationTemporality, AnyValue, Batch, LogRecord, LogsBatch, MetricData, NumberValue};
 
 // ── Generated protobuf types ─────────────────────────────────────────────────
 // Include the files emitted by prost-build in the build script.
@@ -71,8 +71,10 @@ pub(crate) mod opentelemetry {
 }
 
 // Convenience re-exports so the rest of this file can use short paths.
+use opentelemetry::proto::collector::logs::v1 as logs_collector;
 use opentelemetry::proto::collector::metrics::v1 as collector;
 use opentelemetry::proto::common::v1 as common;
+use opentelemetry::proto::logs::v1 as logs_proto;
 use opentelemetry::proto::metrics::v1 as metrics_proto;
 use opentelemetry::proto::resource::v1 as resource_proto;
 
@@ -122,6 +124,66 @@ impl Encoder for OtlpHttpEncoder {
         // encode() only errors when the buffer runs out of space; Vec grows.
         request.encode(&mut buf).expect("encode to Vec never fails");
         buf
+    }
+}
+
+// ── OTLP logs encoder ────────────────────────────────────────────────────────
+
+/// Encodes a [`LogsBatch`] as an OTLP `ExportLogsServiceRequest`.
+///
+/// Mirrors [`OtlpHttpEncoder`] but operates on log records.  Reuses the
+/// existing `convert_kv` / `convert_any_value` helpers.
+pub struct OtlpLogsEncoder;
+
+impl OtlpLogsEncoder {
+    /// Encode a [`LogsBatch`] to wire bytes (protobuf).
+    pub fn encode(&self, batch: &LogsBatch) -> std::vec::Vec<u8> {
+        let resource_attrs: std::vec::Vec<common::KeyValue> =
+            batch.resource.attributes.iter().map(convert_kv).collect();
+
+        let proto_records: std::vec::Vec<logs_proto::LogRecord> =
+            batch.logs.iter().map(convert_log_record).collect();
+
+        let request = logs_collector::ExportLogsServiceRequest {
+            resource_logs: std::vec![logs_proto::ResourceLogs {
+                resource: Some(resource_proto::Resource {
+                    attributes: resource_attrs,
+                    dropped_attributes_count: 0,
+                }),
+                scope_logs: std::vec![logs_proto::ScopeLogs {
+                    scope: Some(common::InstrumentationScope {
+                        name: batch.scope.name.clone(),
+                        version: batch.scope.version.clone(),
+                        attributes: std::vec![],
+                        dropped_attributes_count: 0,
+                    }),
+                    log_records: proto_records,
+                    schema_url: std::string::String::new(),
+                }],
+                schema_url: std::string::String::new(),
+            }],
+        };
+
+        let mut buf = std::vec::Vec::with_capacity(request.encoded_len());
+        request.encode(&mut buf).expect("encode to Vec never fails");
+        buf
+    }
+}
+
+/// Convert a [`LogRecord`] into its protobuf equivalent.
+fn convert_log_record(lr: &LogRecord) -> logs_proto::LogRecord {
+    logs_proto::LogRecord {
+        time_unix_nano: lr.time_unix_nano,
+        observed_time_unix_nano: lr.observed_time_unix_nano,
+        severity_number: lr.severity_number as i32,
+        severity_text: lr.severity_text.clone(),
+        body: Some(convert_any_value(&lr.body)),
+        attributes: lr.attributes.iter().map(convert_kv).collect(),
+        dropped_attributes_count: 0,
+        flags: 0,
+        trace_id: std::vec![],
+        span_id: std::vec![],
+        event_name: lr.event_name.clone(),
     }
 }
 
@@ -218,11 +280,12 @@ fn convert_hdp(dp: &crate::data_model::HistogramDataPoint) -> metrics_proto::His
 #[cfg(test)]
 mod tests {
     use super::collector::ExportMetricsServiceRequest;
+    use super::logs_collector::ExportLogsServiceRequest;
     use super::metrics_proto;
     use super::*;
     use crate::data_model::{
         AggregationTemporality, AnyValue, Batch, HistogramData, HistogramDataPoint, KeyValue,
-        Metric, MetricData, Resource, Scope,
+        LogRecord, LogsBatch, Metric, MetricData, Resource, Scope, SeverityNumber,
     };
 
     fn make_batch() -> Batch {
@@ -305,5 +368,97 @@ mod tests {
         assert_eq!(dp.explicit_bounds, std::vec![5.0f64, 10.0, 25.0, 50.0]);
         assert_eq!(dp.start_time_unix_nano, 1_699_999_990_000_000_000);
         assert_eq!(dp.time_unix_nano, 1_700_000_000_000_000_000);
+    }
+
+    /// Encode a LogsBatch with two records, decode it, and assert structural
+    /// equivalence.  Mirrors `round_trip_produces_valid_protobuf`.
+    #[test]
+    fn logs_round_trip() {
+        let batch = LogsBatch {
+            resource: Resource {
+                attributes: std::vec![KeyValue {
+                    key: "service.name".into(),
+                    value: AnyValue::String("test-nginx".into()),
+                }],
+            },
+            scope: Scope { name: "ngx-otel-rust".into(), version: "0.1.0".into() },
+            logs: std::vec![
+                LogRecord {
+                    time_unix_nano: 1_700_000_000_000_000_000,
+                    observed_time_unix_nano: 1_700_000_000_000_000_001,
+                    severity_number: SeverityNumber::Info,
+                    severity_text: "info".into(),
+                    body: AnyValue::String(std::string::String::new()),
+                    attributes: std::vec![
+                        KeyValue {
+                            key: "http.request.method".into(),
+                            value: AnyValue::String("GET".into()),
+                        },
+                        KeyValue {
+                            key: "http.response.status_code".into(),
+                            value: AnyValue::Int(200),
+                        },
+                    ],
+                    event_name: "http.access".into(),
+                },
+                LogRecord {
+                    time_unix_nano: 1_700_000_001_000_000_000,
+                    observed_time_unix_nano: 1_700_000_001_000_000_002,
+                    severity_number: SeverityNumber::Error,
+                    severity_text: "error".into(),
+                    body: AnyValue::String("upstream connect failed".into()),
+                    attributes: std::vec![],
+                    event_name: "nginx.error".into(),
+                },
+            ],
+        };
+
+        let enc = OtlpLogsEncoder;
+        let bytes = enc.encode(&batch);
+
+        // Must be non-empty.
+        assert!(!bytes.is_empty(), "encoded bytes must be non-empty");
+
+        // Must decode back without error.
+        let decoded = ExportLogsServiceRequest::decode(bytes.as_slice())
+            .expect("must decode without error");
+
+        assert_eq!(decoded.resource_logs.len(), 1);
+        let rl = &decoded.resource_logs[0];
+
+        // Resource attributes.
+        let resource = rl.resource.as_ref().expect("resource present");
+        assert_eq!(resource.attributes.len(), 1);
+        assert_eq!(resource.attributes[0].key, "service.name");
+
+        // Scope.
+        assert_eq!(rl.scope_logs.len(), 1);
+        let sl = &rl.scope_logs[0];
+        let scope = sl.scope.as_ref().expect("scope present");
+        assert_eq!(scope.name, "ngx-otel-rust");
+
+        // Log records.
+        assert_eq!(sl.log_records.len(), 2);
+
+        let r0 = &sl.log_records[0];
+        assert_eq!(r0.time_unix_nano, 1_700_000_000_000_000_000);
+        assert_eq!(r0.severity_number, SeverityNumber::Info as i32);
+        assert_eq!(r0.severity_text, "info");
+        assert_eq!(r0.event_name, "http.access");
+        assert_eq!(r0.attributes.len(), 2);
+        assert_eq!(r0.attributes[0].key, "http.request.method");
+        assert_eq!(r0.attributes[1].key, "http.response.status_code");
+
+        let r1 = &sl.log_records[1];
+        assert_eq!(r1.severity_number, SeverityNumber::Error as i32);
+        assert_eq!(r1.event_name, "nginx.error");
+        // body must be a string value
+        let body = r1.body.as_ref().expect("body present");
+        match body.value.as_ref().expect("body value present") {
+            super::common::any_value::Value::StringValue(s) => {
+                assert_eq!(s, "upstream connect failed");
+            }
+            other => panic!("expected StringValue body, got {other:?}"),
+        }
     }
 }
