@@ -524,3 +524,25 @@ Bench: zero_cost.sh C1 vs C2 (SKIP_C3=1), Docker stopped, macOS arm64. N=17.
 C1=C2=1.67 ms, 0.00%. **Did not exercise fix3b** (C2 has no exporter → no
 recording handler) and was on the noisy dev host. Kept for history; the formal
 c7a run above is the gate of record.
+
+## Phase 2.1-FU high-RPS delivery (FU5) — dedicated hardware — 2026-06-03
+
+`tests/integration/run_logs_high_rps.sh` (SKIP_BUILD=1) on the same c7a.xlarge,
+native otelcol collector. The box is fast enough that wrk reached **~210,000
+req/s** (12.6M requests in 60s), landing in the test's **extreme tier**, so this
+validates **graceful degradation under overload** (not the moderate-tier ≥50%
+gate). All assertions PASS:
+
+- **Producer never blocked:** `/healthz` p99 = **2.81 ms** at 210k req/s (< 50 ms).
+- **Drops bounded + accounted:** `ngx_otel.logs.access.dropped_records` =
+  **11,819,291** (reliable atomic counter).
+- **Drain alive:** delivery > 0 (the FU5 fix makes a literal 0 a hard Linux fail).
+- No crash.
+
+This is the §6.5 serialization-point reality in practice: a single central
+exporter cannot ship 210k/s of *unsampled* access logs, so it sheds load
+gracefully — bounded, counted, **without ever harming request serving**. Low-volume
+delivery is covered by `run_access_log.sh` (30/30). ⚠️ The test's file-based
+coverage % is unreliable at extreme volume — the collector's `logs.json` rotates
+at 10 MB so the delta undercounts delivered records (counter math implies ~6%
+delivered here, not the reported 0.1%); trust `dropped_records` + the p99 gate.
