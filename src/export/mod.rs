@@ -1039,6 +1039,15 @@ fn collect_log_records(
 
     let cap = amcf.log_ring_cap();
 
+    // Maximum records to drain from each worker ring per cycle.
+    //
+    // Caps the HTTP POST body size: at ~200 bytes/record, 2 500 records per
+    // worker = ~500 KB/worker → total batch ≤ 2 MB for N ≤ 4 workers.
+    // Remaining records stay in the ring and are drained on the next 250 ms
+    // wake.  This keeps batches within the collector's max request body size
+    // (default 20 MB for otelcol-contrib) even when rings are large.
+    const MAX_RECORDS_PER_WORKER_PER_DRAIN: usize = 2_500;
+
     // Drain access rings for all workers.
     for w in 0..n_workers {
         // Safety: zone was sized for n_workers at registration; w < n_workers.
@@ -1047,9 +1056,10 @@ fn collect_log_records(
         // Accumulate drop counts.
         total_dropped += ring.drop_count();
 
-        // Drain records.
+        // Drain up to MAX_RECORDS_PER_WORKER_PER_DRAIN records per worker.
         let mut record_buf: std::vec::Vec<u8> = std::vec::Vec::new();
-        while ring.pop_into(&mut record_buf) {
+        let mut drained = 0usize;
+        while drained < MAX_RECORDS_PER_WORKER_PER_DRAIN && ring.pop_into(&mut record_buf) {
             // Parse the wire format from access.rs:
             // [0] kind(1) [1..9] ts_unix_nano_be [9] ngx_level [10..12] method_len
             // [12..12+method_len] method [12+ml..14+ml] status_u16
@@ -1059,6 +1069,7 @@ fn collect_log_records(
                 logs.push(lr);
             }
             record_buf.clear();
+            drained += 1;
         }
     }
 
