@@ -47,7 +47,7 @@ const DEFAULT_RETRY_BUFFER_DEPTH: usize = 4;
 
 /// Selects the OTLP wire transport for metric export.
 ///
-/// Corresponds to the `otel_metric_protocol` directive:
+/// Corresponds to the `otel_export_protocol` directive:
 /// - `otlp_http` (default): OTLP/HTTP over HTTP/1.1 (`POST /v1/metrics`).
 /// - `otlp_grpc`:           OTLP/gRPC over HTTP/2 (`MetricsService.Export`).
 /// - `arrow` is reserved for Phase 5 and is rejected at config parse time.
@@ -133,7 +133,7 @@ pub struct MainConfig {
     /// incrementing `BIDI_BACKPRESSURE_DROPS`.  Parsed in all builds; acted
     /// on only with `test-support`.
     pub bidi_overload_endpoint: ngx_str_t,
-    /// `otel_metric_protocol otlp_http | otlp_grpc;` — selects the export
+    /// `otel_export_protocol otlp_http | otlp_grpc;` — selects the export
     /// transport.  `None` means the directive was not set; treated as
     /// `OtlpHttp` (default) by [`metric_protocol`].
     pub metric_protocol: Option<MetricProtocol>,
@@ -240,7 +240,7 @@ impl MainConfig {
     }
 
     /// Effective metric export protocol.  Returns `OtlpHttp` when the
-    /// `otel_metric_protocol` directive was not set (preserves existing
+    /// `otel_export_protocol` directive was not set (preserves existing
     /// byte-identical behaviour for HTTP).
     pub fn metric_protocol(&self) -> MetricProtocol {
         self.metric_protocol.unwrap_or(MetricProtocol::OtlpHttp)
@@ -770,14 +770,14 @@ macro_rules! production_commands {
                 offset: mem::offset_of!(MainConfig, bidi_overload_endpoint),
                 post: ptr::null_mut(),
             },
-            // otel_metric_protocol otlp_http | otlp_grpc;
+            // otel_export_protocol otlp_http | otlp_grpc;
             // Selects the OTLP wire transport.  Default: otlp_http (byte-identical
             // to the pre-existing behaviour when the directive is absent).
             // "arrow" is rejected with a "not yet implemented (Phase 5)" message.
             ngx_command_t {
-                name: ngx_string!("otel_metric_protocol"),
+                name: ngx_string!("otel_export_protocol"),
                 type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-                set: Some(cmd_set_metric_protocol),
+                set: Some(cmd_set_export_protocol),
                 conf: NGX_HTTP_MAIN_CONF_OFFSET,
                 offset: 0,
                 post: ptr::null_mut(),
@@ -1009,12 +1009,12 @@ extern "C" fn cmd_add_high_cardinality_attr(
     NGX_CONF_OK
 }
 
-/// Directive callback for `otel_metric_protocol otlp_http | otlp_grpc;`.
+/// Directive callback for `otel_export_protocol otlp_http | otlp_grpc;`.
 ///
 /// Accepts `otlp_http` and `otlp_grpc`.  Rejects `arrow` with a
 /// "not yet implemented (Phase 5)" message.  Rejects any other value with
 /// an "unknown value" message listing the valid choices.
-extern "C" fn cmd_set_metric_protocol(
+extern "C" fn cmd_set_export_protocol(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
     conf: *mut c_void,
@@ -1039,7 +1039,7 @@ extern "C" fn cmd_set_metric_protocol(
             ngx_conf_log_error!(
                 NGX_LOG_EMERG,
                 &mut *cf,
-                "otel_metric_protocol: \"arrow\" is not yet implemented (Phase 5)"
+                "otel_export_protocol: \"arrow\" is not yet implemented (Phase 5)"
             );
         }
         NGX_CONF_ERROR
@@ -1048,7 +1048,7 @@ extern "C" fn cmd_set_metric_protocol(
             ngx_conf_log_error!(
                 NGX_LOG_EMERG,
                 &mut *cf,
-                "otel_metric_protocol: unknown value \"{}\"; valid values: otlp_http, otlp_grpc",
+                "otel_export_protocol: unknown value \"{}\"; valid values: otlp_http, otlp_grpc",
                 args[1]
             );
         }

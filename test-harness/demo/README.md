@@ -10,7 +10,7 @@ Phase 2 and beyond.
         :9400                            :14317                            :19090            :3000
 ```
 
-The demo ships **OTLP/gRPC** (`otel_metric_protocol otlp_grpc;`) to the
+The demo ships **OTLP/gRPC** (`otel_export_protocol otlp_grpc;`) to the
 collector's gRPC receiver at host port **14317**.  (The previous OTLP/HTTP
 path on `:14318` is still available but no longer used by the demo.)
 

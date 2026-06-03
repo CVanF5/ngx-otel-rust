@@ -3,7 +3,7 @@
 # OTLP/gRPC export end-to-end integration test.
 #
 # Builds the module WITHOUT --features test-support (production path).
-# Starts nginx with `otel_metric_protocol otlp_grpc;` pointing at the
+# Starts nginx with `otel_export_protocol otlp_grpc;` pointing at the
 # collector's OTLP/gRPC receiver (127.0.0.1:4317).  Sends HTTP traffic,
 # waits for a metric flush, then asserts:
 #
@@ -140,7 +140,7 @@ http {
     }
     otel_service_name ${SERVICE_NAME};
     otel_metric_interval ${METRIC_INTERVAL_S}s;
-    otel_metric_protocol otlp_grpc;
+    otel_export_protocol otlp_grpc;
 
     server {
         listen 127.0.0.1:${NGINX_PORT};
@@ -163,7 +163,7 @@ info "metrics.json pre-size: ${PRE_SIZE} bytes"
 
 # ─── Start nginx ─────────────────────────────────────────────────────────────
 
-info "Starting nginx with otel_metric_protocol otlp_grpc..."
+info "Starting nginx with otel_export_protocol otlp_grpc..."
 "${NGINX_BINARY}" \
     -p "${PREFIX}" \
     -c "${PREFIX}/nginx.conf" &

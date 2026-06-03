@@ -28,7 +28,7 @@ What works today:
   path — the async export loop driving hyper-on-`ngx-rust` (no Tokio
   runtime).  Workers hold zero collector sockets; they bump shm counters
   and defer.
-- Two production export transports, selected by `otel_metric_protocol`:
+- Two production export transports, selected by `otel_export_protocol`:
   **OTLP/HTTP** over HTTP/1.1 (`otlp_http`, the default) and **OTLP/gRPC**
   unary over HTTP/2 (`otlp_grpc`).
 - Stub-status equivalents (`nginx.connections.*`, `nginx.requests.total`)
@@ -285,7 +285,7 @@ http {
         # endpoint http://127.0.0.1:4318/v1/metrics; # OTLP/HTTP (the default protocol)
         # endpoint unix:/run/otel-collector.sock;    # Unix sockets also supported
     }
-    otel_metric_protocol otlp_grpc;         # otlp_http (default) | otlp_grpc
+    otel_export_protocol otlp_grpc;         # otlp_http (default) | otlp_grpc
     otel_service_name my-nginx;
     otel_resource_attr deployment.environment production;
     otel_exporter_header authorization "Bearer ...";
@@ -307,7 +307,7 @@ Notes:
 - The module imposes **zero per-request cost when `otel_exporter` is
   not configured**.  Verified statistically via the zero-cost benchmark
   harness (see `tests/bench/RESULTS.md`).
-- `otel_metric_protocol` selects the export wire protocol: `otlp_http`
+- `otel_export_protocol` selects the export wire protocol: `otlp_http`
   (default, OTLP/HTTP over HTTP/1.1) or `otlp_grpc` (OTLP/gRPC unary over
   HTTP/2).  The example above uses gRPC; omit the directive for HTTP.
 - All export work runs in the dedicated `nginx: otel exporter` process;

@@ -163,7 +163,7 @@ impl ExportTransport {
     /// For gRPC: calls `LogsService/Export`.
     ///
     /// # Phase 2.1 note — directive naming
-    /// Logs ship over the same transport selected by `otel_metric_protocol`.
+    /// Logs ship over the same transport selected by `otel_export_protocol`.
     /// The directive name is intentionally kept as-is for backward compatibility.
     /// A rename to `otel_export_protocol` (with a back-compat alias) is tracked
     /// as a future cleanup; doing it here would be a breaking change.
@@ -314,7 +314,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
 
     // ── Construct production transport (NgxConnector; NEVER SpinConnector) ─
     //
-    // Transport selected by `otel_metric_protocol` (default: otlp_http).
+    // Transport selected by `otel_export_protocol` (default: otlp_http).
     // For gRPC the connection is lazy (deferred to first send).
     let mut transport = match amcf.metric_protocol() {
         MetricProtocol::OtlpHttp => {
