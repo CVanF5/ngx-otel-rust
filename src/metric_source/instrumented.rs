@@ -234,6 +234,24 @@ impl HttpRequestHandler for LogPhaseHandler {
                     ts_unix_nano,
                     trace_context,
                 );
+
+                // Write to the exemplar reservoir (Phase 2.2 Step 2.2.4).
+                // One fetch_add + ≤ 6 Relaxed stores = within the hot-path
+                // budget of "one exemplar reservoir write."
+                let effective_size = amcf.access_sample_size().max(1);
+                let (trace_id_opt, span_id_opt) = if let Some((t, s)) = trace_context {
+                    (Some(t), Some(s))
+                } else {
+                    (None, None)
+                };
+                slot.exemplar_reservoir.write(
+                    effective_size,
+                    duration_ms,
+                    idx as u32,
+                    trace_id_opt,
+                    span_id_opt,
+                    ts_unix_nano,
+                );
             }
         }
 
@@ -290,7 +308,7 @@ unsafe impl Sync for InstrumentedSource {}
 
 impl crate::metric_source::MetricSource for InstrumentedSource {
     fn collect(&self) -> std::vec::Vec<crate::data_model::Metric> {
-        use crate::data_model::{AggregationTemporality, AnyValue, KeyValue};
+        use crate::data_model::{AggregationTemporality, AnyValue, Exemplar, KeyValue};
         use crate::shm::{
             HttpMethod, N_HTTP_METHODS, ProtoVersion, N_PROTO_VERSIONS,
             StatusClass, N_STATUS_CLASSES, N_COMBOS, N_ROUTES, N_UPSTREAMS,
@@ -313,6 +331,17 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
         let mut up_conn = ([0u64; N_DURATION_BUCKETS], 0u64, 0u64);
         let mut up_bytes = ([0u64; N_BYTES_BUCKETS], 0u64, 0u64);
         let mut up_bytes_sent = ([0u64; N_BYTES_BUCKETS], 0u64, 0u64);
+
+        // amcf needed before the worker loop for effective_size.
+        let amcf_ref_early: Option<&crate::config::MainConfig> =
+            unsafe { self.amcf.as_ref() };
+        // Effective exemplar reservoir size (from otel_access_log_sample directive).
+        let effective_size = amcf_ref_early
+            .map(|c| c.access_sample_size().max(1))
+            .unwrap_or(1);
+
+        // Collect exemplars from all workers: Vec<(combo_idx, Exemplar)>
+        let mut all_exemplars: std::vec::Vec<(u32, Exemplar)> = std::vec::Vec::new();
 
         for i in 0..self.n_workers {
             let slot = unsafe { &*worker_slots(self.base, i) };
@@ -343,6 +372,20 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
             add_histogram(&mut up_bytes, &bc, bs, bcount);
             let (bc, bs, bcount) = slot.upstream_bytes_sent.snapshot();
             add_histogram(&mut up_bytes_sent, &bc, bs, bcount);
+
+            // Collect exemplars from this worker's reservoir.
+            for (value_ms, combo_idx, has_trace, trace_id, span_id, ts_ns) in
+                slot.exemplar_reservoir.snapshot(effective_size)
+            {
+                all_exemplars.push((combo_idx, Exemplar {
+                    value: value_ms as f64,
+                    time_unix_nano: ts_ns,
+                    trace_id,
+                    span_id,
+                    has_trace,
+                    filtered_attributes: std::vec![],
+                }));
+            }
         }
 
         let dur_bounds: std::vec::Vec<f64> = DURATION_BOUNDS_MS.iter().map(|&b| b as f64).collect();
@@ -351,8 +394,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
         // ── Build http.server.request.duration (Phase 2.2 DP-E) ─────────
         // All histograms are cumulative running totals.
         // amcf provides route/upstream name strings for the attribute values.
-        let amcf_ref: Option<&crate::config::MainConfig> =
-            unsafe { self.amcf.as_ref() };
+        let amcf_ref: Option<&crate::config::MainConfig> = amcf_ref_early;
 
         let duration_metric = if self.status_code_class_enabled {
             // Emit one exp-histogram data point per non-empty combination with
@@ -424,6 +466,14 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                                 if bcount == 0 {
                                     continue; // skip empty combinations
                                 }
+
+                                // Collect exemplars matching this combo.
+                                let combo_exemplars: std::vec::Vec<Exemplar> = all_exemplars
+                                    .iter()
+                                    .filter(|(cidx, _)| *cidx == combo as u32)
+                                    .map(|(_, e)| e.clone())
+                                    .collect();
+
                                 data_points.push(ExponentialHistogramDataPoint {
                                     attributes: std::vec![
                                         KeyValue {
@@ -455,6 +505,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                                     zero_count: zc,
                                     positive_offset: EXP_HISTOGRAM_BUCKET_OFFSET,
                                     positive_bucket_counts: bc.to_vec(),
+                                    exemplars: combo_exemplars,
                                 });
                             }
                         }
@@ -500,6 +551,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                         zero_count: all_zero_count,
                         positive_offset: EXP_HISTOGRAM_BUCKET_OFFSET,
                         positive_bucket_counts: all_buckets.to_vec(),
+                        exemplars: std::vec![],
                     }],
                 }),
             }

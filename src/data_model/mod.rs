@@ -154,6 +154,26 @@ pub struct ExponentialHistogramData {
     pub data_points: std::vec::Vec<ExponentialHistogramDataPoint>,
 }
 
+/// An OTel exemplar attached to a histogram data point (Phase 2.2 Step 2.2.4).
+///
+/// Carries a representative observation with optional trace context.
+#[derive(Debug, Clone)]
+pub struct Exemplar {
+    /// The observed value (ms for request duration).
+    pub value: f64,
+    /// Unix epoch nanoseconds when this observation was made.
+    pub time_unix_nano: u64,
+    /// W3C trace_id (16 bytes), present only when a `traceparent` header was sent.
+    pub trace_id: [u8; 16],
+    /// W3C span_id (8 bytes), present only when a `traceparent` header was sent.
+    pub span_id: [u8; 8],
+    /// Whether `trace_id` / `span_id` carry valid trace context.
+    pub has_trace: bool,
+    /// Per-exemplar high-cardinality attributes (url.path, client.address, user_agent).
+    /// Added in Step 2.2.5; empty in Step 2.2.4.
+    pub filtered_attributes: std::vec::Vec<KeyValue>,
+}
+
 /// One data point in an OTel exponential histogram metric.
 ///
 /// The internal representation uses scale 0 (`EXP_HISTOGRAM_SCALE`), meaning
@@ -181,6 +201,9 @@ pub struct ExponentialHistogramDataPoint {
     pub positive_offset: i32,
     pub positive_bucket_counts: std::vec::Vec<u64>,
     // `negative` is always empty for request durations (non-negative).
+    /// Exemplars sampled from the reservoir (Step 2.2.4).  One per representative
+    /// observation for this histogram data point.  May be empty.
+    pub exemplars: std::vec::Vec<Exemplar>,
 }
 
 // ────────────────────────────────────────────────────────────────

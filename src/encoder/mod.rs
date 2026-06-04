@@ -281,6 +281,17 @@ fn convert_hdp(dp: &crate::data_model::HistogramDataPoint) -> metrics_proto::His
     }
 }
 
+fn convert_exemplar(e: &crate::data_model::Exemplar) -> metrics_proto::Exemplar {
+    use metrics_proto::exemplar::Value as EV;
+    metrics_proto::Exemplar {
+        filtered_attributes: e.filtered_attributes.iter().map(convert_kv).collect(),
+        time_unix_nano: e.time_unix_nano,
+        value: Some(EV::AsDouble(e.value)),
+        span_id: if e.has_trace { e.span_id.to_vec() } else { std::vec![] },
+        trace_id: if e.has_trace { e.trace_id.to_vec() } else { std::vec![] },
+    }
+}
+
 fn convert_exp_hdp(
     dp: &crate::data_model::ExponentialHistogramDataPoint,
 ) -> metrics_proto::ExponentialHistogramDataPoint {
@@ -309,7 +320,7 @@ fn convert_exp_hdp(
             offset: 0,
             bucket_counts: std::vec![],
         }),
-        exemplars: std::vec![],
+        exemplars: dp.exemplars.iter().map(convert_exemplar).collect(),
         flags: 0,
         min: None,
         max: None,
@@ -326,7 +337,8 @@ mod tests {
     use super::metrics_proto;
     use super::*;
     use crate::data_model::{
-        AggregationTemporality, AnyValue, Batch, HistogramData, HistogramDataPoint, KeyValue,
+        AggregationTemporality, AnyValue, Batch, ExponentialHistogramData,
+        ExponentialHistogramDataPoint, HistogramData, HistogramDataPoint, KeyValue,
         LogRecord, LogsBatch, Metric, MetricData, Resource, Scope, SeverityNumber,
     };
 
@@ -540,6 +552,7 @@ mod tests {
             zero_count: 3,
             positive_offset: EXP_HISTOGRAM_BUCKET_OFFSET,
             positive_bucket_counts: buckets.to_vec(),
+            exemplars: std::vec![],
         };
 
         let batch = Batch {

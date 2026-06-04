@@ -436,6 +436,135 @@ pub struct WorkerSlots {
     pub upstream_bytes_received: Histogram<N_BYTES_BUCKETS>,
     /// `http.server.upstream.bytes.sent` (bytes)
     pub upstream_bytes_sent: Histogram<N_BYTES_BUCKETS>,
+    /// Exemplar reservoir (Phase 2.2 Step 2.2.4).
+    /// Shared across all combos; per-entry `combo_idx` identifies the histogram.
+    /// The runtime `access_sample_size` directive caps the effective reservoir
+    /// size to ≤ `MAX_EXEMPLAR_RESERVOIR`.
+    pub exemplar_reservoir: ExemplarReservoir,
+}
+
+// ── Exemplar reservoir (Phase 2.2 Step 2.2.4) ─────────────────────────────
+
+/// Maximum per-worker exemplar reservoir size.
+///
+/// Operators set the effective size via `otel_access_log_sample <size>`
+/// (capped at this value).  At 48 bytes per entry × 64 = 3072 bytes — a
+/// negligible addition to `WorkerSlots`.
+pub const MAX_EXEMPLAR_RESERVOIR: usize = 64;
+
+/// A single exemplar entry in the per-worker reservoir.
+///
+/// Written on the hot path with `Ordering::Relaxed` — field-level tearing is
+/// acceptable for exemplars (they are hints, not accounting primitives).
+/// The `has_trace` flag distinguishes "empty" from "present".
+///
+/// Size: 5 × AtomicU64 + AtomicU32 + AtomicU8 + 3-byte pad = 48 bytes.
+#[repr(C)]
+pub struct ExemplarEntry {
+    /// Observed request duration in ms.
+    pub value_ms: AtomicU64,
+    /// Lower 8 bytes of the W3C trace_id (bytes 0–7).
+    pub trace_id_lo: AtomicU64,
+    /// Upper 8 bytes of the W3C trace_id (bytes 8–15).
+    pub trace_id_hi: AtomicU64,
+    /// W3C span_id (parent_id) — 8 bytes.
+    pub span_id: AtomicU64,
+    /// Unix epoch timestamp of the request in nanoseconds.
+    pub ts_unix_nano: AtomicU64,
+    /// Combo index (identifies the histogram data point this belongs to).
+    pub combo_idx: core::sync::atomic::AtomicU32,
+    /// 1 if `trace_id` / `span_id` are valid; 0 if absent.
+    pub has_trace: core::sync::atomic::AtomicU8,
+    _pad: [u8; 3],
+}
+
+/// Per-worker exemplar reservoir — a fixed-capacity circular buffer of
+/// [`ExemplarEntry`] entries, filled by counter-mod sampling.
+///
+/// # Sampling discipline
+/// Each incoming candidate calls `count.fetch_add(1)` to claim a slot index:
+/// `slot = count % effective_size`.  When `count < effective_size` the slot
+/// is freshly allocated; afterwards it overwrites an older entry.  This is
+/// NOT Vitter-style reservoir sampling (biased towards recent entries) but is
+/// O(1), alloc-free, and lock-free — the single `fetch_add` IS the one
+/// permitted hot-path write.
+#[repr(C)]
+pub struct ExemplarReservoir {
+    /// Sequential counter: how many candidates have been offered to the reservoir.
+    pub count: AtomicU64,
+    pub entries: [ExemplarEntry; MAX_EXEMPLAR_RESERVOIR],
+}
+
+impl ExemplarReservoir {
+    /// Write one exemplar entry on the hot path.
+    ///
+    /// `effective_size` must be in `1..=MAX_EXEMPLAR_RESERVOIR`; values outside
+    /// this range are clamped.  Returns the slot index written.
+    ///
+    /// # Hot-path note
+    /// One `fetch_add` + ≤ 6 `Relaxed` atomic stores.  No alloc, no lock.
+    #[inline]
+    pub fn write(
+        &self,
+        effective_size: usize,
+        value_ms: u64,
+        combo_idx: u32,
+        trace_id: Option<[u8; 16]>,
+        span_id: Option<[u8; 8]>,
+        ts_unix_nano: u64,
+    ) {
+        let k = effective_size.min(MAX_EXEMPLAR_RESERVOIR).max(1);
+        let n = self.count.fetch_add(1, Ordering::Relaxed) as usize;
+        let slot = n % k;
+        let e = &self.entries[slot];
+        e.value_ms.store(value_ms, Ordering::Relaxed);
+        e.ts_unix_nano.store(ts_unix_nano, Ordering::Relaxed);
+        e.combo_idx.store(combo_idx, Ordering::Relaxed);
+        if let (Some(tid), Some(sid)) = (trace_id, span_id) {
+            let lo = u64::from_be_bytes(tid[0..8].try_into().unwrap_or([0u8; 8]));
+            let hi = u64::from_be_bytes(tid[8..16].try_into().unwrap_or([0u8; 8]));
+            e.trace_id_lo.store(lo, Ordering::Relaxed);
+            e.trace_id_hi.store(hi, Ordering::Relaxed);
+            e.span_id.store(
+                u64::from_be_bytes(sid.try_into().unwrap_or([0u8; 8])),
+                Ordering::Relaxed,
+            );
+            e.has_trace.store(1, Ordering::Relaxed);
+        } else {
+            e.has_trace.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Snapshot all active entries.
+    ///
+    /// Returns a Vec of (value_ms, combo_idx, has_trace, trace_id[16], span_id[8], ts_ns).
+    /// Entries whose combo_idx is 0 AND count == 0 are uninitialised; callers should
+    /// skip entries where combo_idx == 0 and count <= slot_index.
+    pub fn snapshot(
+        &self,
+        effective_size: usize,
+    ) -> std::vec::Vec<(u64, u32, bool, [u8; 16], [u8; 8], u64)> {
+        let k = effective_size.min(MAX_EXEMPLAR_RESERVOIR).max(1);
+        let count = self.count.load(Ordering::Acquire) as usize;
+        let filled = count.min(k);
+
+        let mut out = std::vec::Vec::with_capacity(filled);
+        for i in 0..filled {
+            let e = &self.entries[i];
+            let value_ms = e.value_ms.load(Ordering::Acquire);
+            let combo_idx = e.combo_idx.load(Ordering::Acquire);
+            let has_trace = e.has_trace.load(Ordering::Acquire) != 0;
+            let ts_ns = e.ts_unix_nano.load(Ordering::Acquire);
+            let lo = e.trace_id_lo.load(Ordering::Acquire).to_be_bytes();
+            let hi = e.trace_id_hi.load(Ordering::Acquire).to_be_bytes();
+            let mut trace_id = [0u8; 16];
+            trace_id[0..8].copy_from_slice(&lo);
+            trace_id[8..16].copy_from_slice(&hi);
+            let span_id = e.span_id.load(Ordering::Acquire).to_be_bytes();
+            out.push((value_ms, combo_idx, has_trace, trace_id, span_id, ts_ns));
+        }
+        out
+    }
 }
 
 impl WorkerSlots {
@@ -840,5 +969,46 @@ mod tests {
         for b in &buckets[..N_EXP_BUCKETS - 1] {
             assert_eq!(*b, 0, "non-overflow bucket must be zero");
         }
+    }
+
+    /// Exemplar reservoir is bounded, alloc-free, and fills then wraps.
+    #[test]
+    fn exemplar_reservoir_bounded_and_alloc_free() {
+        let mut buf = std::vec![0u8; mem::size_of::<WorkerSlots>()];
+        let slot = unsafe { &*buf.as_mut_ptr().cast::<WorkerSlots>() };
+        let reservoir = &slot.exemplar_reservoir;
+
+        // Write 3 exemplars into a reservoir of size 2 → slot 0 and 1 filled,
+        // slot 0 is overwritten by the 3rd write.
+        let trace_id = Some([0x4bu8, 0xf9, 0x2f, 0x35, 0x77, 0xb3, 0x4d, 0xa6,
+                              0xa3, 0xce, 0x92, 0x9d, 0x0e, 0x0e, 0x47, 0x36]);
+        let span_id  = Some([0x00u8, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7]);
+
+        reservoir.write(2, 100, 5, trace_id, span_id, 1_000_000_000);  // slot 0
+        reservoir.write(2, 200, 6, None, None,        2_000_000_000);  // slot 1
+        reservoir.write(2, 300, 7, trace_id, span_id, 3_000_000_000);  // slot 0 overwritten
+
+        // count must be 3 (candidates seen)
+        assert_eq!(reservoir.count.load(core::sync::atomic::Ordering::Acquire), 3);
+
+        // snapshot with effective_size=2 should return 2 entries (min(count=3, k=2))
+        let snapshot = reservoir.snapshot(2);
+        assert_eq!(snapshot.len(), 2, "snapshot should return min(count, k) entries");
+
+        // Slot 0 was overwritten by write #3 (value=300, combo=7)
+        let (v0, c0, ht0, _, _, _) = snapshot[0];
+        assert_eq!(v0, 300, "slot 0 has latest value");
+        assert_eq!(c0, 7, "slot 0 has latest combo_idx");
+        assert!(ht0, "slot 0 has trace context");
+
+        // Slot 1 was written by write #2 (value=200, combo=6)
+        let (v1, c1, ht1, _, _, _) = snapshot[1];
+        assert_eq!(v1, 200, "slot 1 has its value");
+        assert_eq!(c1, 6, "slot 1 has its combo_idx");
+        assert!(!ht1, "slot 1 has no trace context");
+
+        // snapshot with larger effective_size than count → only min(count, k) slots
+        let snap2 = reservoir.snapshot(10);
+        assert_eq!(snap2.len(), 3, "snapshot with k>count returns count entries");
     }
 }
