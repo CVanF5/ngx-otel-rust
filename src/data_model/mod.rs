@@ -388,11 +388,11 @@ pub(crate) mod tests {
             severity_text: "info".into(),
             body: AnyValue::String(std::string::String::new()),
             attributes: std::vec![
-                KeyValue { key: "http.request.method".into(), value: AnyValue::String("GET".into()) },
                 KeyValue {
-                    key: "http.response.status_code".into(),
-                    value: AnyValue::Int(200),
+                    key: "http.request.method".into(),
+                    value: AnyValue::String("GET".into())
                 },
+                KeyValue { key: "http.response.status_code".into(), value: AnyValue::Int(200) },
             ],
             event_name: "http.access".into(),
             trace_id: std::vec![],

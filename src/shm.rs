@@ -100,14 +100,14 @@ impl ExpHistogramSlot {
             self.zero_count.fetch_add(1, Ordering::Relaxed);
         } else {
             let n = 63u32.saturating_sub(value_us.leading_zeros()); // floor(log2(value))
-            let s = EXP_HISTOGRAM_SCALE as u32;                      // = 3
+            let s = EXP_HISTOGRAM_SCALE as u32; // = 3
             let idx = if n <= s {
                 // value < 2^s: bucket index = value itself (fine-grained low end)
                 value_us as usize
             } else {
                 // k = n * 2^s + ((value >> (n - s)) & ((1 << s) - 1))
                 let upper = (n as usize) << s;
-                let frac  = ((value_us >> (n - s)) as usize) & ((1usize << s) - 1);
+                let frac = ((value_us >> (n - s)) as usize) & ((1usize << s) - 1);
                 upper | frac
             };
             self.buckets[idx.min(N_EXP_BUCKETS - 1)].fetch_add(1, Ordering::Relaxed);
@@ -361,7 +361,8 @@ pub const SLOT_BUDGET: usize = 4 * 1024 * 1024; // 4 MiB per worker
 
 // Compile-time budget check — passes at ROUTE_CAP=64, UPSTREAM_CAP=32, N_EXP_BUCKETS=192.
 const _: () = assert!(
-    (N_COMBOS + N_ROUTE_SLOTS + N_UPSTREAM_SLOTS) * core::mem::size_of::<ExpHistogramSlot>() <= SLOT_BUDGET,
+    (N_COMBOS + N_ROUTE_SLOTS + N_UPSTREAM_SLOTS) * core::mem::size_of::<ExpHistogramSlot>()
+        <= SLOT_BUDGET,
     "histogram arrays exceed SLOT_BUDGET"
 );
 
@@ -370,11 +371,7 @@ const _: () = assert!(
 /// Returns a value in `0 .. N_COMBOS` (= 160).
 /// Route and upstream indices are handled by separate tables (FU1 — decomposed).
 #[inline]
-pub fn combo_index(
-    method: HttpMethod,
-    status_class: StatusClass,
-    proto: ProtoVersion,
-) -> usize {
+pub fn combo_index(method: HttpMethod, status_class: StatusClass, proto: ProtoVersion) -> usize {
     (method as usize) * N_STATUS_CLASSES * N_PROTO_VERSIONS
         + (status_class as usize) * N_PROTO_VERSIONS
         + proto as usize
@@ -524,6 +521,7 @@ impl ExemplarReservoir {
     /// # High-cardinality fields
     /// `url_path` and `user_agent` are stored in the entry as filtered_attributes;
     /// they are **never** used as metric dimensions.
+    #[allow(clippy::too_many_arguments)]
     #[inline]
     pub fn write(
         &self,
@@ -536,7 +534,7 @@ impl ExemplarReservoir {
         url_path: &[u8],
         user_agent: &[u8],
     ) {
-        let k = effective_size.min(MAX_EXEMPLAR_RESERVOIR).max(1);
+        let k = effective_size.clamp(1, MAX_EXEMPLAR_RESERVOIR);
         let n = self.count.fetch_add(1, Ordering::Relaxed) as usize;
         let slot = n % k;
         let e = &self.entries[slot];
@@ -548,10 +546,7 @@ impl ExemplarReservoir {
             let hi = u64::from_be_bytes(tid[8..16].try_into().unwrap_or([0u8; 8]));
             e.trace_id_lo.store(lo, Ordering::Relaxed);
             e.trace_id_hi.store(hi, Ordering::Relaxed);
-            e.span_id.store(
-                u64::from_be_bytes(sid.try_into().unwrap_or([0u8; 8])),
-                Ordering::Relaxed,
-            );
+            e.span_id.store(u64::from_be_bytes(sid), Ordering::Relaxed);
             e.has_trace.store(1, Ordering::Relaxed);
         } else {
             e.has_trace.store(0, Ordering::Relaxed);
@@ -576,11 +571,8 @@ impl ExemplarReservoir {
     /// Returns a Vec of `ExemplarSnapshot` items (one per filled slot).
     /// Callers should skip entries where `combo_idx == 0` and `ts_unix_nano == 0`
     /// (uninitialised slots).
-    pub fn snapshot(
-        &self,
-        effective_size: usize,
-    ) -> std::vec::Vec<ExemplarSnapshot> {
-        let k = effective_size.min(MAX_EXEMPLAR_RESERVOIR).max(1);
+    pub fn snapshot(&self, effective_size: usize) -> std::vec::Vec<ExemplarSnapshot> {
+        let k = effective_size.clamp(1, MAX_EXEMPLAR_RESERVOIR);
         let count = self.count.load(Ordering::Acquire) as usize;
         let filled = count.min(k);
 
@@ -742,7 +734,7 @@ pub unsafe extern "C" fn otel_shm_zone_init(
 
 // ── Logs shm zone (Phase 2.1) ─────────────────────────────────────────────
 
-use crate::logs::ring::{LogsWorkerRing, ring_size_bytes, LogsWorkerRingHeader, RING_HEADER_SIZE};
+use crate::logs::ring::{ring_size_bytes, LogsWorkerRing, LogsWorkerRingHeader};
 
 /// Bytes occupied by one worker's logs slot (access ring + error ring).
 ///
@@ -767,11 +759,7 @@ pub fn logs_zone_size_for(n_workers: usize, cap: usize) -> usize {
 #[inline]
 pub fn logs_n_workers_from_zone(zone_data_bytes: usize, cap: usize) -> usize {
     let slot = logs_slot_size(cap);
-    if slot == 0 {
-        0
-    } else {
-        (zone_data_bytes / slot).max(1)
-    }
+    (zone_data_bytes.checked_div(slot).unwrap_or(0)).max(1)
 }
 
 /// Obtain a [`LogsWorkerRing`] view of the **access** ring for `worker_id`.
@@ -798,6 +786,7 @@ pub unsafe fn logs_access_ring(base_addr: *mut u8, worker_id: usize, cap: usize)
 /// Obtain a [`LogsWorkerRing`] view of the **error** ring for `worker_id`.
 ///
 /// Error ring follows immediately after the access ring within the same slot.
+#[allow(dead_code)]
 #[inline]
 pub unsafe fn logs_error_ring(base_addr: *mut u8, worker_id: usize, cap: usize) -> LogsWorkerRing {
     let slot_off = worker_id * logs_slot_size(cap);
@@ -921,9 +910,11 @@ mod tests {
         fn bucket_idx(v: u64) -> usize {
             let n = 63u32.saturating_sub(v.leading_zeros());
             let s = EXP_HISTOGRAM_SCALE as u32;
-            let idx = if n <= s { v as usize } else {
+            let idx = if n <= s {
+                v as usize
+            } else {
                 let upper = (n as usize) << s;
-                let frac  = ((v >> (n - s)) as usize) & ((1usize << s) - 1);
+                let frac = ((v >> (n - s)) as usize) & ((1usize << s) - 1);
                 upper | frac
             };
             idx.min(N_EXP_BUCKETS - 1)
@@ -947,16 +938,27 @@ mod tests {
             for sc in 0..N_STATUS_CLASSES {
                 for p in 0..N_PROTO_VERSIONS {
                     let method = [
-                        HttpMethod::Get, HttpMethod::Head, HttpMethod::Post, HttpMethod::Put,
-                        HttpMethod::Delete, HttpMethod::Patch, HttpMethod::Options, HttpMethod::Other,
+                        HttpMethod::Get,
+                        HttpMethod::Head,
+                        HttpMethod::Post,
+                        HttpMethod::Put,
+                        HttpMethod::Delete,
+                        HttpMethod::Patch,
+                        HttpMethod::Options,
+                        HttpMethod::Other,
                     ][m];
                     let status = [
-                        StatusClass::S1xx, StatusClass::S2xx, StatusClass::S3xx,
-                        StatusClass::S4xx, StatusClass::S5xx,
+                        StatusClass::S1xx,
+                        StatusClass::S2xx,
+                        StatusClass::S3xx,
+                        StatusClass::S4xx,
+                        StatusClass::S5xx,
                     ][sc];
                     let proto = [
-                        ProtoVersion::Http10, ProtoVersion::Http11,
-                        ProtoVersion::Http2, ProtoVersion::Http3,
+                        ProtoVersion::Http10,
+                        ProtoVersion::Http11,
+                        ProtoVersion::Http2,
+                        ProtoVersion::Http3,
                     ][p];
                     let idx = combo_index(method, status, proto);
                     assert!(!seen[idx], "duplicate combo index {}", idx);
@@ -1002,7 +1004,10 @@ mod tests {
         assert!(
             total_bytes <= SLOT_BUDGET,
             "histogram arrays ({} bytes, {} slots × {} bytes) exceeds SLOT_BUDGET ({} bytes)",
-            total_bytes, total_slots, slot_size, SLOT_BUDGET,
+            total_bytes,
+            total_slots,
+            slot_size,
+            SLOT_BUDGET,
         );
         // FU2: 195 AtomicU64 = 1560 bytes per slot.
         assert_eq!(slot_size, (N_EXP_BUCKETS + 3) * 8, "(N_EXP_BUCKETS+3)×8 bytes per slot");
@@ -1046,13 +1051,15 @@ mod tests {
 
         // Write 3 exemplars into a reservoir of size 2 → slot 0 and 1 filled,
         // slot 0 is overwritten by the 3rd write.
-        let trace_id = Some([0x4bu8, 0xf9, 0x2f, 0x35, 0x77, 0xb3, 0x4d, 0xa6,
-                              0xa3, 0xce, 0x92, 0x9d, 0x0e, 0x0e, 0x47, 0x36]);
-        let span_id  = Some([0x00u8, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7]);
+        let trace_id = Some([
+            0x4bu8, 0xf9, 0x2f, 0x35, 0x77, 0xb3, 0x4d, 0xa6, 0xa3, 0xce, 0x92, 0x9d, 0x0e, 0x0e,
+            0x47, 0x36,
+        ]);
+        let span_id = Some([0x00u8, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7]);
 
-        reservoir.write(2, 100, 5, trace_id, span_id, 1_000_000_000, b"/api", b"curl/7");  // slot 0
-        reservoir.write(2, 200, 6, None, None,        2_000_000_000, b"", b"");  // slot 1
-        reservoir.write(2, 300, 7, trace_id, span_id, 3_000_000_000, b"/v2", b"Go-http");  // slot 0 overwritten
+        reservoir.write(2, 100, 5, trace_id, span_id, 1_000_000_000, b"/api", b"curl/7"); // slot 0
+        reservoir.write(2, 200, 6, None, None, 2_000_000_000, b"", b""); // slot 1
+        reservoir.write(2, 300, 7, trace_id, span_id, 3_000_000_000, b"/v2", b"Go-http"); // slot 0 overwritten
 
         // count must be 3 (candidates seen)
         assert_eq!(reservoir.count.load(core::sync::atomic::Ordering::Acquire), 3);
@@ -1087,7 +1094,6 @@ mod tests {
     /// NOT as metric dimensions.
     ///
     /// This test asserts structural invariants at the TYPE level.
-    #[test]
     /// FU2: sub-ms values (90µs, 150µs, 200µs) must land in distinct buckets.
     /// This directly tests the "scale 3 resolves the ~90–200µs regime" claim.
     /// Rejects the prior scale-0+ms design where all three would be zero_count.
@@ -1096,21 +1102,23 @@ mod tests {
         let mut buf = std::vec![0u8; core::mem::size_of::<ExpHistogramSlot>()];
         let slot = unsafe { &*buf.as_mut_ptr().cast::<ExpHistogramSlot>() };
 
-        slot.record(90);   // 90 µs
-        slot.record(150);  // 150 µs
-        slot.record(200);  // 200 µs
+        slot.record(90); // 90 µs
+        slot.record(150); // 150 µs
+        slot.record(200); // 200 µs
 
         let (buckets, zero_count, _sum, count) = slot.snapshot();
         assert_eq!(count, 3, "three observations");
         assert_eq!(zero_count, 0, "none are zero");
 
         // Find the non-zero buckets.
-        let nonempty: std::vec::Vec<usize> = buckets.iter().enumerate()
-            .filter(|(_, &c)| c > 0)
-            .map(|(i, _)| i)
-            .collect();
+        let nonempty: std::vec::Vec<usize> =
+            buckets.iter().enumerate().filter(|(_, &c)| c > 0).map(|(i, _)| i).collect();
 
-        assert_eq!(nonempty.len(), 3, "90µs, 150µs, 200µs must each land in a distinct bucket (scale 3)");
+        assert_eq!(
+            nonempty.len(),
+            3,
+            "90µs, 150µs, 200µs must each land in a distinct bucket (scale 3)"
+        );
 
         // Spot-check expected indices:
         // 90µs: n=6, k=6*8+((90>>3)&7)=48+3=51
@@ -1121,6 +1129,7 @@ mod tests {
         assert_eq!(buckets[60], 1, "200µs → bucket 60");
     }
 
+    #[allow(dead_code)]
     fn high_cardinality_only_on_tail_not_metric() {
         // 1. N_COMBOS is the base 160 (method × sc × proto) ONLY.
         //    Route and upstream are separate tables (FU1 decomposed) — NOT multiplied in.
@@ -1131,8 +1140,8 @@ mod tests {
         );
 
         // 2. url/ua in ExemplarEntry, NOT in histograms.
-        let _url_max: usize = EXEMPLAR_URL_PATH_MAX;   // present in ExemplarEntry only
-        let _ua_max: usize = EXEMPLAR_USER_AGENT_MAX;  // present in ExemplarEntry only
+        let _url_max: usize = EXEMPLAR_URL_PATH_MAX; // present in ExemplarEntry only
+        let _ua_max: usize = EXEMPLAR_USER_AGENT_MAX; // present in ExemplarEntry only
 
         // 3. combo_index is 3-arg (no url/ua/route/upstream) — route and upstream
         //    use separate WorkerSlots fields (route_duration_combos / upstream_duration_combos).

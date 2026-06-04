@@ -54,7 +54,9 @@ use super::LogProducer;
 /// - 1  (has_trace)
 /// - 16 (trace_id, only when has_trace = 1)
 /// - 8  (span_id,  only when has_trace = 1)
-/// --- Phase 2.2 Step 2.2.5: high-cardinality detail ---
+///
+/// Phase 2.2 Step 2.2.5 — high-cardinality detail:
+///
 /// - 2  (url_path_len) + 64 (url.path, truncated to 64 bytes)
 /// - 2  (user_agent_len) + 128 (user_agent.original, truncated to 128 bytes)
 ///
@@ -96,6 +98,7 @@ const NGX_LEVEL_INFO: u8 = 7;
 /// # High-cardinality fields stay OFF the metric
 /// `url_path`, `user_agent`, and `client_addr` appear ONLY in this tail record
 /// and in exemplar `filtered_attributes`; they are NEVER used as metric dimensions.
+#[allow(clippy::too_many_arguments)]
 #[inline]
 pub fn emit_access_record(
     producer: &dyn LogProducer,
@@ -150,7 +153,7 @@ pub fn emit_access_record(
     write_u8!(NGX_LEVEL_INFO);
     // http.request.method
     write_bytes_with_u16_len!(method, 16); // max method = 16 bytes
-    // http.response.status_code
+                                           // http.response.status_code
     write_u16_be!(status);
     // http.server.request.body.size
     write_u64_be!(request_length);
@@ -222,7 +225,9 @@ pub fn parse_traceparent(header: &[u8]) -> Option<([u8; 16], [u8; 8])> {
 
 /// Decode 32 hex characters into 16 bytes.  Returns false on invalid input.
 fn decode_hex16(hex: &[u8], out: &mut [u8; 16]) -> bool {
-    if hex.len() < 32 { return false; }
+    if hex.len() < 32 {
+        return false;
+    }
     for i in 0..16 {
         let hi = hex_nibble(hex[i * 2]);
         let lo = hex_nibble(hex[i * 2 + 1]);
@@ -236,7 +241,9 @@ fn decode_hex16(hex: &[u8], out: &mut [u8; 16]) -> bool {
 
 /// Decode 16 hex characters into 8 bytes.  Returns false on invalid input.
 fn decode_hex8(hex: &[u8], out: &mut [u8; 8]) -> bool {
-    if hex.len() < 16 { return false; }
+    if hex.len() < 16 {
+        return false;
+    }
     for i in 0..8 {
         let hi = hex_nibble(hex[i * 2]);
         let lo = hex_nibble(hex[i * 2 + 1]);
@@ -264,8 +271,8 @@ fn hex_nibble(c: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::logs::WorkerRingProducer;
     use crate::logs::ring::tests::make_ring_with_cap;
+    use crate::logs::WorkerRingProducer;
 
     #[test]
     fn access_record_pushes_bytes_to_ring() {
@@ -324,19 +331,38 @@ mod tests {
         // Emit record with trace context → has_trace = 1 in the byte stream.
         let (_buf, ring) = make_ring_with_cap(4096);
         let producer = WorkerRingProducer { ring };
-        emit_access_record(&producer, b"GET", 200, 0, 0, b"127.0.0.1", 0, Some((trace_id, span_id)), b"/api/v1", b"Mozilla/5.0");
+        emit_access_record(
+            &producer,
+            b"GET",
+            200,
+            0,
+            0,
+            b"127.0.0.1",
+            0,
+            Some((trace_id, span_id)),
+            b"/api/v1",
+            b"Mozilla/5.0",
+        );
         let mut rec = std::vec::Vec::new();
         assert!(ring.pop_into(&mut rec));
         // Find the has_trace byte: after kind(1)+ts(8)+level(1)+method_len(2)+method(3)+status(2)+reqlen(8)+respbytes(8)+addrlen(2)+addr(9)
         let method_len = u16::from_be_bytes([rec[10], rec[11]]) as usize;
         let addr_off = 12 + method_len + 2 + 8 + 8;
-        let addr_len = u16::from_be_bytes([rec[addr_off], rec[addr_off+1]]) as usize;
+        let addr_len = u16::from_be_bytes([rec[addr_off], rec[addr_off + 1]]) as usize;
         let has_trace_off = addr_off + 2 + addr_len;
         assert_eq!(rec[has_trace_off], 1, "has_trace must be 1 when trace context present");
         // trace_id at has_trace_off+1
-        assert_eq!(&rec[has_trace_off+1..has_trace_off+17], &trace_id[..], "trace_id round-trips");
+        assert_eq!(
+            &rec[has_trace_off + 1..has_trace_off + 17],
+            &trace_id[..],
+            "trace_id round-trips"
+        );
         // span_id at has_trace_off+17
-        assert_eq!(&rec[has_trace_off+17..has_trace_off+25], &span_id[..], "span_id round-trips");
+        assert_eq!(
+            &rec[has_trace_off + 17..has_trace_off + 25],
+            &span_id[..],
+            "span_id round-trips"
+        );
 
         // Emit record without trace context → has_trace = 0.
         let (_buf2, ring2) = make_ring_with_cap(4096);
@@ -346,15 +372,24 @@ mod tests {
         assert!(ring2.pop_into(&mut rec2));
         let m2 = u16::from_be_bytes([rec2[10], rec2[11]]) as usize;
         let a2_off = 12 + m2 + 2 + 8 + 8;
-        let a2_len = u16::from_be_bytes([rec2[a2_off], rec2[a2_off+1]]) as usize;
+        let a2_len = u16::from_be_bytes([rec2[a2_off], rec2[a2_off + 1]]) as usize;
         let ht_off2 = a2_off + 2 + a2_len;
         assert_eq!(rec2[ht_off2], 0, "has_trace must be 0 when no trace context");
 
         // Absent/malformed headers → None.
         assert!(parse_traceparent(b"").is_none(), "empty header → None");
-        assert!(parse_traceparent(b"01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01").is_none(), "non-00 version → None");
-        assert!(parse_traceparent(b"00-00000000000000000000000000000000-00f067aa0ba902b7-01").is_none(), "all-zero trace_id → None");
-        assert!(parse_traceparent(b"00-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-00f067aa0ba902b7-01").is_none(), "invalid hex → None");
+        assert!(
+            parse_traceparent(b"01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01").is_none(),
+            "non-00 version → None"
+        );
+        assert!(
+            parse_traceparent(b"00-00000000000000000000000000000000-00f067aa0ba902b7-01").is_none(),
+            "all-zero trace_id → None"
+        );
+        assert!(
+            parse_traceparent(b"00-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-00f067aa0ba902b7-01").is_none(),
+            "invalid hex → None"
+        );
     }
 
     #[test]

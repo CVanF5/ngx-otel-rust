@@ -47,6 +47,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub const DEFAULT_LOG_RING_CAP: usize = 512 * 1024;
 
 /// Kept for backward compat with tests/code that still reference the old name.
+#[allow(dead_code)]
 pub const LOG_RING_CAP: usize = DEFAULT_LOG_RING_CAP;
 
 /// Fixed-size header for a per-worker log ring.
@@ -206,7 +207,11 @@ fn write_wrap(base: *mut u8, cap: usize, offset: usize, data: &[u8]) {
             core::ptr::copy_nonoverlapping(data.as_ptr(), base.add(start), data.len());
         } else {
             core::ptr::copy_nonoverlapping(data.as_ptr(), base.add(start), end_space);
-            core::ptr::copy_nonoverlapping(data.as_ptr().add(end_space), base, data.len() - end_space);
+            core::ptr::copy_nonoverlapping(
+                data.as_ptr().add(end_space),
+                base,
+                data.len() - end_space,
+            );
         }
     }
 }
@@ -223,7 +228,11 @@ fn read_wrap(base: *const u8, cap: usize, offset: usize, dst: &mut [u8]) {
             core::ptr::copy_nonoverlapping(base.add(start), dst.as_mut_ptr(), dst.len());
         } else {
             core::ptr::copy_nonoverlapping(base.add(start), dst.as_mut_ptr(), end_space);
-            core::ptr::copy_nonoverlapping(base, dst.as_mut_ptr().add(end_space), dst.len() - end_space);
+            core::ptr::copy_nonoverlapping(
+                base,
+                dst.as_mut_ptr().add(end_space),
+                dst.len() - end_space,
+            );
         }
     }
 }

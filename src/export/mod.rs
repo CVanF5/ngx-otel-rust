@@ -36,7 +36,7 @@
 
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use core::task::{Context, Poll};
 use core::time::Duration;
 use std::collections::VecDeque;
@@ -54,7 +54,7 @@ use crate::logs::severity::nginx_to_otel;
 use crate::metric_source::instrumented::InstrumentedSource;
 use crate::metric_source::stub_status::StubStatusSource;
 use crate::metric_source::MetricSource;
-use crate::shm::{logs_access_ring, logs_n_workers_from_zone, logs_slot_size};
+use crate::shm::{logs_access_ring, logs_n_workers_from_zone};
 use crate::transport::hyper_http::NgxConnector;
 use crate::transport::{GrpcTransport, HyperHttpTransport, Transport};
 
@@ -103,6 +103,20 @@ pub static LOGS_SEND_FAILURES: AtomicU64 = AtomicU64::new(0);
 #[allow(dead_code)]
 pub static WORKER_START_NS: AtomicU64 = AtomicU64::new(0);
 
+/// Master (parent) PID captured once at exporter startup via `nginx_sys::ngx_parent`.
+///
+/// Written once by [`export_loop`] before the first export tick.  Used by
+/// [`build_resource_attrs`] to populate the `service.instance.id` resource
+/// attribute on **both** the metrics and logs OTLP Resource.
+///
+/// Key properties:
+/// - **Stable across crash-respawn**: the master re-forks the exporter with the
+///   same `ngx_parent`, so the id is unchanged and cumulative shm series continue.
+/// - **Distinct across USR2 live binary upgrade**: the new master (different PID)
+///   forks the new exporter; `ngx_parent` in the new child is the new master's PID.
+/// - **Zero** = loop not yet started (pre-init, or SIGQUIT before first tick).
+pub static MASTER_PID: AtomicI64 = AtomicI64::new(0);
+
 /// Set to `true` by [`export_loop`] just before it returns after a graceful
 /// drain on `ngx_quit`. The exporter cycle polls this flag in its `ngx_quit`
 /// branch to know when the drain has completed and it is safe to exit.
@@ -139,6 +153,7 @@ const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// exporter process stays alive until `EXPORT_LOOP_DONE` is set (set by
 /// `graceful_drain` after it completes), so `graceful_drain` always runs
 /// before `process::exit`.
+#[allow(clippy::large_enum_variant)]
 enum ExportTransport {
     Http(HyperHttpTransport<NgxConnector>),
     Grpc(GrpcTransport<NgxConnector>),
@@ -357,6 +372,16 @@ pub async fn export_loop(amcf: &'static MainConfig) {
     // read the same epoch anchor without re-computing it (see WORKER_START_NS).
     WORKER_START_NS.store(worker_start_ns, Ordering::Relaxed);
 
+    // Capture the master (parent) PID once at export loop startup.
+    // nginx_sys::ngx_parent is set by ngx_spawn_process to the master's PID
+    // before fork, so in the exporter child it always equals the master PID.
+    // Stable across crash-respawn (same master re-forks with same ngx_parent).
+    // Distinct across USR2 (new master forks with its own PID as ngx_parent).
+    // Safety: ngx_parent is a mutable static written by nginx before fork
+    // and never changed afterwards; reading it here is safe in a single process.
+    let master_pid = unsafe { nginx_sys::ngx_parent } as i64;
+    MASTER_PID.store(master_pid, Ordering::Relaxed);
+
     // Retry buffer: (encoded bytes, number of data points in that batch).
     // Depth is configured (see `MainConfig::retry_buffer_depth`) so that
     // tuning later is a config change, not a code change.
@@ -405,7 +430,15 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                 log.as_ptr(),
                 "otel export: ngx_quit set, starting graceful drain"
             );
-            graceful_drain(&mut transport, &mut retry_queue, &mut logs_retry_queue, &encoder, amcf, worker_start_ns).await;
+            graceful_drain(
+                &mut transport,
+                &mut retry_queue,
+                &mut logs_retry_queue,
+                &encoder,
+                amcf,
+                worker_start_ns,
+            )
+            .await;
             EXPORT_LOOP_DONE.store(true, Ordering::Release);
             return;
         }
@@ -534,7 +567,15 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                 log.as_ptr(),
                 "otel export: ngx_quit set during sleep, starting graceful drain"
             );
-            graceful_drain(&mut transport, &mut retry_queue, &mut logs_retry_queue, &encoder, amcf, worker_start_ns).await;
+            graceful_drain(
+                &mut transport,
+                &mut retry_queue,
+                &mut logs_retry_queue,
+                &encoder,
+                amcf,
+                worker_start_ns,
+            )
+            .await;
             EXPORT_LOOP_DONE.store(true, Ordering::Release);
             return;
         }
@@ -936,6 +977,56 @@ fn count_data_points(batch: &Batch) -> u64 {
         .sum()
 }
 
+/// Build the OTLP `Resource` attribute list for this exporter process.
+///
+/// Populates in order:
+/// 1. `service.name` — from `otel_service_name` (if set).
+/// 2. Operator attributes — from `otel_resource_attr` directives (in config order).
+/// 3. `service.instance.id` — the master (parent) PID as a decimal string.
+///    **Skipped** if the operator already supplied one in step 2 so that
+///    operator-provided values always win.
+///
+/// The master PID is read from [`MASTER_PID`], which is written once at
+/// [`export_loop`] startup from `nginx_sys::ngx_parent`.  In unit tests the
+/// caller sets `MASTER_PID` directly.
+fn build_resource_attrs(amcf: &MainConfig) -> std::vec::Vec<KeyValue> {
+    let mut attrs: std::vec::Vec<KeyValue> = std::vec::Vec::new();
+
+    // 1. service.name
+    if !amcf.service_name.is_empty() {
+        if let Ok(name) = core::str::from_utf8(amcf.service_name.as_bytes()) {
+            attrs.push(KeyValue {
+                key: "service.name".into(),
+                value: AnyValue::String(name.into()),
+            });
+        }
+    }
+
+    // 2. Operator-supplied resource attrs (otel_resource_attr).
+    for kv in &amcf.resource_attrs {
+        if let (Ok(k), Ok(v)) =
+            (core::str::from_utf8(kv.key.as_bytes()), core::str::from_utf8(kv.value.as_bytes()))
+        {
+            attrs.push(KeyValue { key: k.into(), value: AnyValue::String(v.into()) });
+        }
+    }
+
+    // 3. service.instance.id — default to master PID unless operator overrode it.
+    let has_instance_id = attrs.iter().any(|kv| kv.key == "service.instance.id");
+    if !has_instance_id {
+        let pid = MASTER_PID.load(Ordering::Relaxed);
+        // pid = 0 means export_loop has not yet started (pre-init path).
+        // Still emit the attribute so the Resource is always well-formed; the
+        // value "0" is a valid sentinel that will not collide with a real PID.
+        attrs.push(KeyValue {
+            key: "service.instance.id".into(),
+            value: AnyValue::String(std::format!("{}", pid)),
+        });
+    }
+
+    attrs
+}
+
 /// Collect from all configured [`MetricSource`]s and assemble a [`Batch`].
 ///
 /// Accepts `&MainConfig` rather than `&'static MainConfig` so it can be
@@ -978,26 +1069,8 @@ fn collect_all_sources(amcf: &MainConfig, worker_start_ns: u64) -> Batch {
         .collect(),
     );
 
-    // ── Build Resource from config ────────────────────────────────────────
-    let mut resource_attrs: std::vec::Vec<KeyValue> = std::vec::Vec::new();
-    if !amcf.service_name.is_empty() {
-        if let Ok(name) = core::str::from_utf8(amcf.service_name.as_bytes()) {
-            resource_attrs.push(KeyValue {
-                key: "service.name".into(),
-                value: AnyValue::String(name.into()),
-            });
-        }
-    }
-    for kv in &amcf.resource_attrs {
-        if let (Ok(k), Ok(v)) =
-            (core::str::from_utf8(kv.key.as_bytes()), core::str::from_utf8(kv.value.as_bytes()))
-        {
-            resource_attrs.push(KeyValue { key: k.into(), value: AnyValue::String(v.into()) });
-        }
-    }
-
     Batch {
-        resource: Resource { attributes: resource_attrs },
+        resource: Resource { attributes: build_resource_attrs(amcf) },
         scope: Scope { name: "ngx-otel-rust".into(), version: env!("CARGO_PKG_VERSION").into() },
         metrics,
     }
@@ -1018,24 +1091,6 @@ fn collect_log_records(
     _now_ns: u64,
 ) -> LogsBatch {
     let now = now_unix_nano();
-
-    // ── Build Resource from config ────────────────────────────────────────
-    let mut resource_attrs: std::vec::Vec<KeyValue> = std::vec::Vec::new();
-    if !amcf.service_name.is_empty() {
-        if let Ok(name) = core::str::from_utf8(amcf.service_name.as_bytes()) {
-            resource_attrs
-                .push(KeyValue { key: "service.name".into(), value: AnyValue::String(name.into()) });
-        }
-    }
-    for kv in &amcf.resource_attrs {
-        if let (Ok(k), Ok(v)) = (
-            core::str::from_utf8(kv.key.as_bytes()),
-            core::str::from_utf8(kv.value.as_bytes()),
-        ) {
-            resource_attrs
-                .push(KeyValue { key: k.into(), value: AnyValue::String(v.into()) });
-        }
-    }
 
     let mut logs: std::vec::Vec<LogRecord> = std::vec::Vec::new();
     let mut total_dropped: u64 = 0;
@@ -1080,7 +1135,7 @@ fn collect_log_records(
     ACCESS_LOGS_DROPPED.store(total_dropped, Ordering::Relaxed);
 
     LogsBatch {
-        resource: Resource { attributes: resource_attrs },
+        resource: Resource { attributes: build_resource_attrs(amcf) },
         scope: Scope { name: "ngx-otel-rust".into(), version: env!("CARGO_PKG_VERSION").into() },
         logs,
     }
@@ -1091,7 +1146,7 @@ fn collect_log_records(
 ///
 /// Returns `None` if the buffer is too short to be a valid record.
 fn parse_access_record(buf: &[u8], observed_now_ns: u64) -> Option<LogRecord> {
-    use crate::data_model::{AnyValue, KeyValue, SeverityNumber};
+    use crate::data_model::{AnyValue, KeyValue};
 
     // Minimum: kind(1) + ts(8) + level(1) + method_len(2) + status(2) +
     //          req_len(8) + resp_bytes(8) + client_addr_len(2) = 32 bytes
@@ -1181,14 +1236,8 @@ fn parse_access_record(buf: &[u8], observed_now_ns: u64) -> Option<LogRecord> {
     let user_agent = read_u16_prefixed(buf, &mut pos);
 
     let mut attributes = std::vec![
-        KeyValue {
-            key: "http.request.method".into(),
-            value: AnyValue::String(method),
-        },
-        KeyValue {
-            key: "http.response.status_code".into(),
-            value: AnyValue::Int(status as i64),
-        },
+        KeyValue { key: "http.request.method".into(), value: AnyValue::String(method) },
+        KeyValue { key: "http.response.status_code".into(), value: AnyValue::Int(status as i64) },
         KeyValue {
             key: "http.server.request.body.size".into(),
             value: AnyValue::Int(req_len as i64),
@@ -1197,10 +1246,7 @@ fn parse_access_record(buf: &[u8], observed_now_ns: u64) -> Option<LogRecord> {
             key: "http.server.response.body.size".into(),
             value: AnyValue::Int(resp_bytes as i64),
         },
-        KeyValue {
-            key: "client.address".into(),
-            value: AnyValue::String(client_addr),
-        },
+        KeyValue { key: "client.address".into(), value: AnyValue::String(client_addr) },
     ];
     if !url_path.is_empty() {
         attributes.push(KeyValue {
@@ -1211,9 +1257,7 @@ fn parse_access_record(buf: &[u8], observed_now_ns: u64) -> Option<LogRecord> {
     if !user_agent.is_empty() {
         attributes.push(KeyValue {
             key: "user_agent.original".into(),
-            value: AnyValue::String(
-                std::string::String::from_utf8_lossy(&user_agent).into_owned(),
-            ),
+            value: AnyValue::String(std::string::String::from_utf8_lossy(&user_agent).into_owned()),
         });
     }
 
@@ -1407,11 +1451,8 @@ pub fn exit_process_flush(amcf: &MainConfig) {
                 let logs_bytes = OtlpLogsEncoder.encode(&logs_batch);
                 // Derive /v1/logs endpoint from the metrics endpoint base.
                 let logs_endpoint = derive_logs_endpoint(endpoint_str);
-                match crate::transport::sync_http::sync_post(
-                    &logs_endpoint,
-                    &headers,
-                    &logs_bytes,
-                ) {
+                match crate::transport::sync_http::sync_post(&logs_endpoint, &headers, &logs_bytes)
+                {
                     Ok(()) => {
                         ngx::ngx_log_error!(
                             NGX_LOG_NOTICE,
@@ -1496,10 +1537,7 @@ mod tests {
         assert_eq!(queue.len(), depth, "retry queue must not exceed configured depth = {}", depth);
 
         // The two evicted items had n_pts = 1 and n_pts = 2.
-        assert_eq!(
-            dropped, 1 + 2,
-            "evicted data-point counts (helper return) must sum to 3"
-        );
+        assert_eq!(dropped, 1 + 2, "evicted data-point counts (helper return) must sum to 3");
     }
 
     /// SelfMetricsSource must produce exactly 7 metrics with the right names.
@@ -1528,7 +1566,9 @@ mod tests {
     /// `collect_log_records` with empty rings produces an empty LogsBatch.
     #[test]
     fn logs_drain_handles_empty_rings() {
-        use crate::logs::ring::{DEFAULT_LOG_RING_CAP, ring_size_bytes, RING_HEADER_SIZE, LogsWorkerRingHeader};
+        use crate::logs::ring::{
+            ring_size_bytes, LogsWorkerRingHeader, DEFAULT_LOG_RING_CAP, RING_HEADER_SIZE,
+        };
         use crate::shm::logs_slot_size;
 
         // Allocate one worker slot with default cap.
@@ -1566,11 +1606,118 @@ mod tests {
         let mut queue: VecDeque<(std::vec::Vec<u8>, u64)> = VecDeque::new();
         let mut dropped = 0u64;
         for i in 0..4u64 {
-            dropped +=
-                enqueue_with_eviction(&mut queue, std::vec![0u8], i + 1, depth, core::ptr::null_mut());
+            dropped += enqueue_with_eviction(
+                &mut queue,
+                std::vec![0u8],
+                i + 1,
+                depth,
+                core::ptr::null_mut(),
+            );
         }
         assert_eq!(queue.len(), depth);
         // Evicted items had n=1, n=2 → dropped 3
         assert_eq!(dropped, 1 + 2);
+    }
+
+    // ── service.instance.id tests (R1) ───────────────────────────────────────
+
+    /// Helper: look up an attribute by key in a slice.
+    fn find_attr<'a>(attrs: &'a [KeyValue], key: &str) -> Option<&'a AnyValue> {
+        attrs.iter().find(|kv| kv.key == key).map(|kv| &kv.value)
+    }
+
+    /// (a) Metrics Resource and (b) logs Resource both carry `service.instance.id`.
+    /// (b) Its value matches the MASTER_PID we set.
+    /// (c) Two successive calls produce the same id (stability).
+    #[test]
+    fn service_instance_id_present_on_metrics_and_logs_resource() {
+        use crate::logs::ring::{
+            ring_size_bytes, LogsWorkerRingHeader, DEFAULT_LOG_RING_CAP, RING_HEADER_SIZE,
+        };
+        use crate::shm::logs_slot_size;
+
+        let test_pid: i64 = 99_999;
+        MASTER_PID.store(test_pid, Ordering::Relaxed);
+
+        let amcf = crate::config::MainConfig::default();
+
+        // ── (a) Metrics Resource ──────────────────────────────────────────────
+        // Pass 1
+        let batch1 = collect_all_sources(&amcf, 0);
+        let id1 = find_attr(&batch1.resource.attributes, "service.instance.id")
+            .expect("service.instance.id must be present in metrics Resource (pass 1)");
+        assert_eq!(
+            *id1,
+            AnyValue::String(std::format!("{}", test_pid)),
+            "service.instance.id value must equal the master PID (metrics, pass 1)"
+        );
+
+        // Pass 2 — stability: same id without changing MASTER_PID
+        let batch2 = collect_all_sources(&amcf, 0);
+        let id2 = find_attr(&batch2.resource.attributes, "service.instance.id")
+            .expect("service.instance.id must be present in metrics Resource (pass 2)");
+        assert_eq!(id1, id2, "service.instance.id must be stable across successive encode calls");
+
+        // ── (b) Logs Resource ─────────────────────────────────────────────────
+        let cap = DEFAULT_LOG_RING_CAP;
+        let slot_sz = logs_slot_size(cap);
+        let layout = std::alloc::Layout::from_size_align(slot_sz, 8).unwrap();
+        let slot_ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        unsafe {
+            let access_hdr = slot_ptr.cast::<LogsWorkerRingHeader>();
+            (*access_hdr).cap = cap as u64;
+            let error_hdr = slot_ptr.add(ring_size_bytes(cap)).cast::<LogsWorkerRingHeader>();
+            (*error_hdr).cap = cap as u64;
+        }
+        let logs_batch = collect_log_records(&amcf, slot_ptr, 1, 0);
+        unsafe { std::alloc::dealloc(slot_ptr, layout) };
+        let _ = RING_HEADER_SIZE;
+
+        let logs_id = find_attr(&logs_batch.resource.attributes, "service.instance.id")
+            .expect("service.instance.id must be present in logs Resource");
+        assert_eq!(
+            *logs_id,
+            AnyValue::String(std::format!("{}", test_pid)),
+            "service.instance.id value must equal the master PID (logs)"
+        );
+    }
+
+    /// (d) An operator-supplied `service.instance.id` is NOT overridden.
+    #[test]
+    fn operator_service_instance_id_is_not_overridden() {
+        use crate::config::KvPair;
+        use nginx_sys::ngx_str_t;
+
+        let test_pid: i64 = 12_345;
+        MASTER_PID.store(test_pid, Ordering::Relaxed);
+
+        // Build a config with an operator-supplied service.instance.id.
+        // Construct KvPairs pointing at static byte strings.
+        // Safety: the byte strings are `'static`; the KvPairs only live for this test.
+        let key_bytes = b"service.instance.id";
+        let operator_value = b"my-custom-instance";
+        let mut amcf = crate::config::MainConfig::default();
+        let kv = KvPair {
+            key: ngx_str_t { len: key_bytes.len(), data: key_bytes.as_ptr().cast_mut() },
+            value: ngx_str_t {
+                len: operator_value.len(),
+                data: operator_value.as_ptr().cast_mut(),
+            },
+        };
+        amcf.resource_attrs.push(kv);
+
+        let attrs = build_resource_attrs(&amcf);
+        let id =
+            find_attr(&attrs, "service.instance.id").expect("service.instance.id must be present");
+
+        assert_eq!(
+            *id,
+            AnyValue::String("my-custom-instance".into()),
+            "operator-provided service.instance.id must not be overridden by the default"
+        );
+
+        // Verify there's exactly ONE service.instance.id (no duplication).
+        let count = attrs.iter().filter(|kv| kv.key == "service.instance.id").count();
+        assert_eq!(count, 1, "service.instance.id must appear exactly once");
     }
 }

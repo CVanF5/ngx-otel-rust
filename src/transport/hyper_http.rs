@@ -1004,6 +1004,7 @@ impl<C: Connector> Transport for HyperHttpTransport<C> {
     }
 }
 
+#[allow(private_bounds)]
 impl<C: Connector> HyperHttpTransport<C> {
     /// POST `bytes` to an explicit `path`, overriding the endpoint's default path.
     ///

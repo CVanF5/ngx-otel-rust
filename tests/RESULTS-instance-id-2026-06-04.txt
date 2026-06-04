@@ -1,0 +1,81 @@
+service.instance.id unit test evidence — R1 (RALPH_INSTANCE_ID_USR2.md)
+================================================================================
+Host:   dev box (macOS aarch64) — `make unittest` (cargo test --lib)
+Date:   2026-06-04
+Result: 55 passed; 0 failed — new service.instance.id tests PASS
+
+R1 acceptance gates verified:
+  (a) Metrics Resource carries service.instance.id          → [PASS]
+  (b) Logs Resource carries service.instance.id             → [PASS]
+      (value equals captured master PID, not exporter PID)
+  (c) Two successive encodes produce the same id (stability) → [PASS]
+  (d) Operator-supplied service.instance.id not overridden  → [PASS]
+  make check (fmt + clippy) green                           → [PASS]
+
+New tests:
+  export::tests::service_instance_id_present_on_metrics_and_logs_resource ... ok
+  export::tests::operator_service_instance_id_is_not_overridden           ... ok
+
+Full cargo test --lib output:
+--------------------------------------------------------------------------------
+NGINX_SOURCE_DIR="/Users/c.vandesande/project-nginx-otel/nginx" NGINX_BUILD_DIR="/Users/c.vandesande/project-nginx-otel/ngx-otel-rust/objs-debug" cargo test --lib
+
+running 55 tests
+test config::tests::access_sample_directive_toggles_enablement ... ok
+test config::tests::route_is_location_name_not_uri ... ok
+test config::tests::test_is_configured_invariant ... ok
+test config::tests::upstream_idx_matches_registered_zones ... ok
+test config::tests::test_parse_duration_ms ... ok
+test config::tests::test_parse_size_bytes ... ok
+test config::tests::test_default_config ... ok
+test data_model::tests::logs_batch_round_trip ... ok
+test data_model::tests::batch_construction ... ok
+test export::tests::logs_drain_handles_empty_rings ... ok
+test export::tests::logs_retry_eviction_increments_counter ... ok
+test encoder::tests::round_trip_produces_valid_protobuf ... ok
+test encoder::tests::logs_round_trip ... ok
+test encoder::tests::exp_histogram_roundtrips ... ok
+test export::tests::operator_service_instance_id_is_not_overridden ... ok
+test export::tests::retry_buffer_stays_bounded_and_drops_are_counted ... ok
+test export::tests::self_metrics_source_produces_four_metrics ... ok
+test exporter::control_shm::tests::control_shm_init_and_increment ... ok
+test export::tests::service_instance_id_present_on_metrics_and_logs_resource ... ok
+test exporter::control_shm::tests::control_shm_struct_size ... ok
+test exporter::control_shm::tests::zone_size_fits_struct ... ok
+test exporter::tests::ngx_process_returns_exporter_when_flag_set ... ok
+test exporter::tests::ngx_process_returns_helper_when_not_exporter ... ok
+test exporter::tests::ngx_process_returns_worker_zero ... ok
+test logs::access::tests::access_record_long_method_truncated ... ok
+test logs::access::tests::access_record_pushes_bytes_to_ring ... ok
+test logs::access::tests::traceparent_roundtrips ... ok
+test logs::ring::tests::non_default_cap_round_trips ... ok
+test logs::ring::tests::push_then_pop_roundtrips_record ... ok
+test logs::ring::tests::push_when_full_drops_and_increments_counter ... ok
+test logs::ring::tests::two_producers_same_thread_serialise_correctly ... ok
+test logs::ring::tests::wrap_around_works ... ok
+test logs::severity::tests::nginx_to_otel_table_matches_spec ... ok
+test logs::severity::tests::severity_number_values_match_proto ... ok
+test logs::tests::log_producer_trait_object_safe ... ok
+test metric_source::instrumented::tests::access_emission_off_no_ring_touch ... ok
+test metric_source::instrumented::tests::access_emission_on_pushes_record ... ok
+test metric_source::instrumented::tests::tail_predicate_selects_only_interesting ... ok
+test metric_source::stub_status::tests::stub_status_produces_seven_metrics ... ok
+test shm::tests::combo_index_all_unique ... ok
+test shm::tests::decomposed_route_upstream_tables ... ok
+test shm::tests::exemplar_reservoir_bounded_and_alloc_free ... ok
+test shm::tests::histogram_overflow_bucket ... ok
+test shm::tests::sub_ms_values_land_in_distinct_buckets ... ok
+test shm::tests::worker_slots_within_memory_budget ... ok
+test shm::tests::zone_size_alignment ... ok
+test shm::tests::two_workers_isolated_slots ... ok
+test transport::grpc::executor::tests::ngx_executor_implements_hyper_executor ... ok
+test transport::grpc::shim::tests::send_request_service_satisfies_grpc_service_bounds ... ok
+test transport::grpc::transport::tests::grpc_transport_rejects_https_endpoint ... ok
+test transport::grpc::transport::tests::grpc_transport_rejects_unix_endpoint ... ok
+test transport::grpc::transport::tests::grpc_transport_satisfies_transport_send_bounds ... ok
+test transport::grpc::transport::tests::grpc_transport_valid_endpoint_parses ... ok
+test transport::sync_http::tests::sync_post_sends_correct_http_request ... ok
+test transport::sync_http::tests::sync_post_via_unix_socket_sends_correct_http_request ... ok
+
+test result: ok. 55 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

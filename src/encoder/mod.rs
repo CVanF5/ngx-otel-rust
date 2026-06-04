@@ -10,7 +10,9 @@
 
 use prost::Message;
 
-use crate::data_model::{AggregationTemporality, AnyValue, Batch, LogRecord, LogsBatch, MetricData, NumberValue};
+use crate::data_model::{
+    AggregationTemporality, AnyValue, Batch, LogRecord, LogsBatch, MetricData, NumberValue,
+};
 
 // ── Generated protobuf types ─────────────────────────────────────────────────
 // Include the files emitted by prost-build in the build script.
@@ -60,10 +62,7 @@ pub(crate) mod opentelemetry {
             }
             pub mod logs {
                 pub mod v1 {
-                    include!(concat!(
-                        env!("OUT_DIR"),
-                        "/opentelemetry.proto.collector.logs.v1.rs"
-                    ));
+                    include!(concat!(env!("OUT_DIR"), "/opentelemetry.proto.collector.logs.v1.rs"));
                 }
             }
         }
@@ -312,14 +311,8 @@ fn convert_exp_hdp(
         sum: if dp.count > 0 { Some(dp.sum) } else { None },
         scale: dp.scale,
         zero_count: dp.zero_count,
-        positive: Some(Buckets {
-            offset: dp.positive_offset,
-            bucket_counts: positive_counts,
-        }),
-        negative: Some(Buckets {
-            offset: 0,
-            bucket_counts: std::vec![],
-        }),
+        positive: Some(Buckets { offset: dp.positive_offset, bucket_counts: positive_counts }),
+        negative: Some(Buckets { offset: 0, bucket_counts: std::vec![] }),
         exemplars: dp.exemplars.iter().map(convert_exemplar).collect(),
         flags: 0,
         min: None,
@@ -337,8 +330,7 @@ mod tests {
     use super::metrics_proto;
     use super::*;
     use crate::data_model::{
-        AggregationTemporality, AnyValue, Batch, ExponentialHistogramData,
-        ExponentialHistogramDataPoint, HistogramData, HistogramDataPoint, KeyValue,
+        AggregationTemporality, AnyValue, Batch, HistogramData, HistogramDataPoint, KeyValue,
         LogRecord, LogsBatch, Metric, MetricData, Resource, Scope, SeverityNumber,
     };
 
@@ -478,8 +470,8 @@ mod tests {
         assert!(!bytes.is_empty(), "encoded bytes must be non-empty");
 
         // Must decode back without error.
-        let decoded = ExportLogsServiceRequest::decode(bytes.as_slice())
-            .expect("must decode without error");
+        let decoded =
+            ExportLogsServiceRequest::decode(bytes.as_slice()).expect("must decode without error");
 
         assert_eq!(decoded.resource_logs.len(), 1);
         let rl = &decoded.resource_logs[0];
@@ -528,7 +520,7 @@ mod tests {
         use crate::data_model::{
             ExponentialHistogramData, ExponentialHistogramDataPoint, MetricData,
         };
-        use crate::shm::{EXP_HISTOGRAM_SCALE, EXP_HISTOGRAM_BUCKET_OFFSET, N_EXP_BUCKETS};
+        use crate::shm::{EXP_HISTOGRAM_BUCKET_OFFSET, EXP_HISTOGRAM_SCALE, N_EXP_BUCKETS};
 
         // Bucket counts: simulate some observations (FU2: µs input, scale 3).
         // bucket[6] = 6*8 = 48? Actually bucket 6 is valid at scale 3 too.
@@ -543,15 +535,12 @@ mod tests {
                     key: "http.request.method".into(),
                     value: AnyValue::String("GET".into()),
                 },
-                KeyValue {
-                    key: "http.route".into(),
-                    value: AnyValue::String("/api".into()),
-                },
+                KeyValue { key: "http.route".into(), value: AnyValue::String("/api".into()) },
             ],
             start_time_unix_nano: 1_700_000_000_000_000_000,
             time_unix_nano: 1_700_000_010_000_000_000,
-            count: 10,   // 5 + 2 + 3 zero
-            sum: 810.0,  // 5×96 + 2×384 + 3×0 = 480 + 768 = ... approximate
+            count: 10,  // 5 + 2 + 3 zero
+            sum: 810.0, // 5×96 + 2×384 + 3×0 = 480 + 768 = ... approximate
             scale: EXP_HISTOGRAM_SCALE,
             zero_count: 3,
             positive_offset: EXP_HISTOGRAM_BUCKET_OFFSET,
@@ -577,8 +566,8 @@ mod tests {
         let bytes = enc.encode(&batch);
         assert!(!bytes.is_empty(), "encoded bytes non-empty");
 
-        let decoded = ExportMetricsServiceRequest::decode(bytes.as_slice())
-            .expect("decode without error");
+        let decoded =
+            ExportMetricsServiceRequest::decode(bytes.as_slice()).expect("decode without error");
 
         assert_eq!(decoded.resource_metrics.len(), 1);
         let rm = &decoded.resource_metrics[0];

@@ -244,15 +244,14 @@ impl<C: Connector + Send> GrpcTransport<C> {
 
         if self.logs_client.is_none() {
             let io = self.connector.connect(&self.endpoint).await?;
-            let (sender, conn) =
-                hyper::client::conn::http2::handshake::<_, _, tonic::body::Body>(
-                    crate::transport::grpc::executor::NgxExecutor,
-                    io,
-                )
-                .await
-                .map_err(|e| TransportError::Connection {
-                    cause: std::format!("gRPC logs h2 handshake failed: {e}"),
-                })?;
+            let (sender, conn) = hyper::client::conn::http2::handshake::<_, _, tonic::body::Body>(
+                crate::transport::grpc::executor::NgxExecutor,
+                io,
+            )
+            .await
+            .map_err(|e| TransportError::Connection {
+                cause: std::format!("gRPC logs h2 handshake failed: {e}"),
+            })?;
             ngx::async_::spawn(async move {
                 let _ = conn.await;
             })

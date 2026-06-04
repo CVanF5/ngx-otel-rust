@@ -793,6 +793,14 @@ mod nginx_test_stubs {
     #[no_mangle]
     pub static mut ngx_http_module: nginx_sys::ngx_module_t = nginx_sys::ngx_module_t::default();
 
+    // nginx upstream module descriptor — `config.rs` reads `ctx_index` from it
+    // to locate the upstream main config. macOS flat-namespace resolves the
+    // reference eagerly even if tests never exercise that code path.
+    // ctx_index = 0 is safe for unit tests that never call upstream helpers.
+    #[no_mangle]
+    pub static mut ngx_http_upstream_module: nginx_sys::ngx_module_t =
+        nginx_sys::ngx_module_t::default();
+
     // ── Phase 1.3.3 stubs — otel_status_endpoint content handler ─────────────
     //
     // Referenced in the #[cfg(any(test, feature = "test-support"))] content

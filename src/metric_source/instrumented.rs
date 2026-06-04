@@ -20,15 +20,14 @@ use core::sync::atomic::Ordering;
 
 use ngx::core::Status;
 use ngx::http::{
-    HttpModuleLocationConf, HttpModuleMainConf, HttpPhase, HttpRequestHandler,
-    NgxHttpCoreModule, Request,
+    HttpModuleLocationConf, HttpModuleMainConf, HttpPhase, HttpRequestHandler, NgxHttpCoreModule,
+    Request,
 };
 
-use crate::logs::{WorkerRingProducer, access::emit_access_record};
+use crate::logs::{access::emit_access_record, WorkerRingProducer};
 use crate::shm::{
-    HttpMethod, ProtoVersion, StatusClass, combo_index,
-    logs_access_ring, worker_slots, BYTES_BOUNDS, DURATION_BOUNDS_MS, N_BYTES_BUCKETS,
-    N_DURATION_BUCKETS, UPSTREAM_IDX_OTHER,
+    combo_index, logs_access_ring, worker_slots, HttpMethod, ProtoVersion, StatusClass,
+    BYTES_BOUNDS, DURATION_BOUNDS_MS, N_BYTES_BUCKETS, N_DURATION_BUCKETS, UPSTREAM_IDX_OTHER,
 };
 use crate::HttpOtelModule;
 
@@ -93,8 +92,7 @@ impl HttpRequestHandler for LogPhaseHandler {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_micros() as u64)
                 .unwrap_or(0);
-            let start_us = (r.start_sec as u64) * 1_000_000
-                + (r.start_msec as u64) * 1_000;
+            let start_us = (r.start_sec as u64) * 1_000_000 + (r.start_msec as u64) * 1_000;
             end_us.saturating_sub(start_us)
         };
         // Keep a ms version for the is_interesting tail-latency gate (still ms-threshold).
@@ -113,9 +111,8 @@ impl HttpRequestHandler for LogPhaseHandler {
 
         // 2. Per-route table: http.route = location name.
         let route_idx = {
-            let clcf_ptr = NgxHttpCoreModule::location_conf(r)
-                .map(|c| c as *const _ as usize)
-                .unwrap_or(0);
+            let clcf_ptr =
+                NgxHttpCoreModule::location_conf(r).map(|c| c as *const _ as usize).unwrap_or(0);
             amcf.route_idx_for_clcf(clcf_ptr)
         };
         slot.route_duration_combos[route_idx].record(duration_us);
@@ -126,9 +123,17 @@ impl HttpRequestHandler for LogPhaseHandler {
             let us = unsafe { (*upstream).upstream };
             if !us.is_null() {
                 let zone = unsafe { (*us).shm_zone };
-                if !zone.is_null() { zone as usize } else { 0 }
-            } else { 0 }
-        } else { 0 };
+                if !zone.is_null() {
+                    zone as usize
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        } else {
+            0
+        };
         let upstream_idx = amcf.upstream_idx_for_zone(upstream_zone_ptr);
         // Only bump upstream histogram when request actually went through an upstream.
         if upstream_zone_ptr != 0 && upstream_idx < UPSTREAM_IDX_OTHER {
@@ -259,7 +264,7 @@ impl HttpRequestHandler for LogPhaseHandler {
                     trace_id_opt,
                     span_id_opt,
                     ts_unix_nano,
-                    url_path,      // url.path — on exemplar filtered_attrs only
+                    url_path,       // url.path — on exemplar filtered_attrs only
                     user_agent_raw, // user_agent.original — on exemplar filtered_attrs only
                 );
             }
@@ -317,14 +322,13 @@ unsafe impl Send for InstrumentedSource {}
 unsafe impl Sync for InstrumentedSource {}
 
 impl crate::metric_source::MetricSource for InstrumentedSource {
+    #[allow(clippy::needless_range_loop)]
     fn collect(&self) -> std::vec::Vec<crate::data_model::Metric> {
         use crate::data_model::{AggregationTemporality, AnyValue, Exemplar, KeyValue};
         use crate::shm::{
-            HttpMethod, N_HTTP_METHODS, ProtoVersion, N_PROTO_VERSIONS,
-            StatusClass, N_STATUS_CLASSES, N_COMBOS, N_ROUTE_SLOTS, N_UPSTREAM_SLOTS,
-            ROUTE_CAP, UPSTREAM_IDX_OTHER,
-            BYTES_BOUNDS, DURATION_BOUNDS_MS, combo_index,
-            N_EXP_BUCKETS, EXP_HISTOGRAM_SCALE, EXP_HISTOGRAM_BUCKET_OFFSET,
+            combo_index, HttpMethod, ProtoVersion, StatusClass, BYTES_BOUNDS, DURATION_BOUNDS_MS,
+            EXP_HISTOGRAM_BUCKET_OFFSET, EXP_HISTOGRAM_SCALE, N_COMBOS, N_EXP_BUCKETS,
+            N_HTTP_METHODS, N_PROTO_VERSIONS, N_ROUTE_SLOTS, N_STATUS_CLASSES, N_UPSTREAM_SLOTS,
         };
 
         let start = self.start_time_unix_nano;
@@ -348,12 +352,9 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
         let mut up_bytes_sent = ([0u64; N_BYTES_BUCKETS], 0u64, 0u64);
 
         // amcf needed before the worker loop for effective_size.
-        let amcf_ref_early: Option<&crate::config::MainConfig> =
-            unsafe { self.amcf.as_ref() };
+        let amcf_ref_early: Option<&crate::config::MainConfig> = unsafe { self.amcf.as_ref() };
         // Effective exemplar reservoir size (from otel_access_log_sample directive).
-        let effective_size = amcf_ref_early
-            .map(|c| c.access_sample_size().max(1))
-            .unwrap_or(1);
+        let effective_size = amcf_ref_early.map(|c| c.access_sample_size().max(1)).unwrap_or(1);
 
         // Collect exemplars from all workers: Vec<(combo_idx, Exemplar)>
         let mut all_exemplars: std::vec::Vec<(u32, Exemplar)> = std::vec::Vec::new();
@@ -365,7 +366,9 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
             for idx in 0..N_COMBOS {
                 let (bc, zc, bs, bcount) = slot.request_duration_combos[idx].snapshot();
                 let agg = &mut combo_agg[idx];
-                for (a, b) in agg.0.iter_mut().zip(bc.iter()) { *a += b; }
+                for (a, b) in agg.0.iter_mut().zip(bc.iter()) {
+                    *a += b;
+                }
                 agg.1 += zc;
                 agg.2 += bs;
                 agg.3 += bcount;
@@ -374,15 +377,23 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
             for idx in 0..N_ROUTE_SLOTS {
                 let (bc, zc, bs, bcount) = slot.route_duration_combos[idx].snapshot();
                 let agg = &mut route_agg[idx];
-                for (a, b) in agg.0.iter_mut().zip(bc.iter()) { *a += b; }
-                agg.1 += zc; agg.2 += bs; agg.3 += bcount;
+                for (a, b) in agg.0.iter_mut().zip(bc.iter()) {
+                    *a += b;
+                }
+                agg.1 += zc;
+                agg.2 += bs;
+                agg.3 += bcount;
             }
             // FU1: sum per-upstream histograms.
             for idx in 0..N_UPSTREAM_SLOTS {
                 let (bc, zc, bs, bcount) = slot.upstream_duration_combos[idx].snapshot();
                 let agg = &mut upstream_agg[idx];
-                for (a, b) in agg.0.iter_mut().zip(bc.iter()) { *a += b; }
-                agg.1 += zc; agg.2 += bs; agg.3 += bcount;
+                for (a, b) in agg.0.iter_mut().zip(bc.iter()) {
+                    *a += b;
+                }
+                agg.1 += zc;
+                agg.2 += bs;
+                agg.3 += bcount;
             }
 
             let (bc, bs, bcount) = slot.request_body_bytes.snapshot();
@@ -409,7 +420,9 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                 // NEVER as metric dimensions (plan §DP-E, §2.2.5 guard).
                 let mut filtered_attrs: std::vec::Vec<KeyValue> = std::vec::Vec::new();
                 if snap.url_path_len > 0 {
-                    if let Ok(s) = core::str::from_utf8(&snap.url_path[..snap.url_path_len as usize]) {
+                    if let Ok(s) =
+                        core::str::from_utf8(&snap.url_path[..snap.url_path_len as usize])
+                    {
                         filtered_attrs.push(KeyValue {
                             key: "url.path".into(),
                             value: AnyValue::String(std::string::String::from(s)),
@@ -417,21 +430,26 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                     }
                 }
                 if snap.user_agent_len > 0 {
-                    if let Ok(s) = core::str::from_utf8(&snap.user_agent[..snap.user_agent_len as usize]) {
+                    if let Ok(s) =
+                        core::str::from_utf8(&snap.user_agent[..snap.user_agent_len as usize])
+                    {
                         filtered_attrs.push(KeyValue {
                             key: "user_agent.original".into(),
                             value: AnyValue::String(std::string::String::from(s)),
                         });
                     }
                 }
-                all_exemplars.push((snap.combo_idx, Exemplar {
-                    value: snap.value_ms as f64,
-                    time_unix_nano: snap.ts_unix_nano,
-                    trace_id: snap.trace_id,
-                    span_id: snap.span_id,
-                    has_trace: snap.has_trace,
-                    filtered_attributes: filtered_attrs,
-                }));
+                all_exemplars.push((
+                    snap.combo_idx,
+                    Exemplar {
+                        value: snap.value_ms as f64,
+                        time_unix_nano: snap.ts_unix_nano,
+                        trace_id: snap.trace_id,
+                        span_id: snap.span_id,
+                        has_trace: snap.has_trace,
+                        filtered_attributes: filtered_attrs,
+                    },
+                ));
             }
         }
 
@@ -447,7 +465,9 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
         //  1. http.server.request.duration (base: method × sc × proto)
         //  2. http.server.request.duration.by_route (per http.route location)
         //  3. http.server.request.duration.by_upstream (per nginx.upstream.zone)
-        use crate::data_model::{ExponentialHistogramData, ExponentialHistogramDataPoint, Metric, MetricData};
+        use crate::data_model::{
+            ExponentialHistogramData, ExponentialHistogramDataPoint, Metric, MetricData,
+        };
 
         // Helper to emit one exp-histogram data point from aggregated buckets.
         let make_dp = |agg: &([u64; N_EXP_BUCKETS], u64, u64, u64),
@@ -455,7 +475,9 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                        exemplars: std::vec::Vec<Exemplar>|
          -> Option<ExponentialHistogramDataPoint> {
             let (bc, zc, bs, bcount) = *agg;
-            if bcount == 0 { return None; }
+            if bcount == 0 {
+                return None;
+            }
             Some(ExponentialHistogramDataPoint {
                 attributes: attrs,
                 start_time_unix_nano: start,
@@ -472,41 +494,58 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
 
         let duration_metric = if self.status_code_class_enabled {
             // Base series: method × status_class × protocol (160 combos).
-            let mut data_points: std::vec::Vec<ExponentialHistogramDataPoint> = std::vec::Vec::new();
+            let mut data_points: std::vec::Vec<ExponentialHistogramDataPoint> =
+                std::vec::Vec::new();
             for m_idx in 0..N_HTTP_METHODS {
                 for sc_idx in 0..N_STATUS_CLASSES {
                     for p_idx in 0..N_PROTO_VERSIONS {
                         let combo = combo_index(
                             match m_idx {
-                                0 => HttpMethod::Get, 1 => HttpMethod::Head,
-                                2 => HttpMethod::Post, 3 => HttpMethod::Put,
-                                4 => HttpMethod::Delete, 5 => HttpMethod::Patch,
-                                6 => HttpMethod::Options, _ => HttpMethod::Other,
+                                0 => HttpMethod::Get,
+                                1 => HttpMethod::Head,
+                                2 => HttpMethod::Post,
+                                3 => HttpMethod::Put,
+                                4 => HttpMethod::Delete,
+                                5 => HttpMethod::Patch,
+                                6 => HttpMethod::Options,
+                                _ => HttpMethod::Other,
                             },
                             match sc_idx {
-                                0 => StatusClass::S1xx, 1 => StatusClass::S2xx,
-                                2 => StatusClass::S3xx, 3 => StatusClass::S4xx,
+                                0 => StatusClass::S1xx,
+                                1 => StatusClass::S2xx,
+                                2 => StatusClass::S3xx,
+                                3 => StatusClass::S4xx,
                                 _ => StatusClass::S5xx,
                             },
                             match p_idx {
-                                0 => ProtoVersion::Http10, 1 => ProtoVersion::Http11,
-                                2 => ProtoVersion::Http2, _ => ProtoVersion::Http3,
+                                0 => ProtoVersion::Http10,
+                                1 => ProtoVersion::Http11,
+                                2 => ProtoVersion::Http2,
+                                _ => ProtoVersion::Http3,
                             },
                         );
                         let method = match m_idx {
-                            0 => HttpMethod::Get, 1 => HttpMethod::Head,
-                            2 => HttpMethod::Post, 3 => HttpMethod::Put,
-                            4 => HttpMethod::Delete, 5 => HttpMethod::Patch,
-                            6 => HttpMethod::Options, _ => HttpMethod::Other,
+                            0 => HttpMethod::Get,
+                            1 => HttpMethod::Head,
+                            2 => HttpMethod::Post,
+                            3 => HttpMethod::Put,
+                            4 => HttpMethod::Delete,
+                            5 => HttpMethod::Patch,
+                            6 => HttpMethod::Options,
+                            _ => HttpMethod::Other,
                         };
                         let status_class = match sc_idx {
-                            0 => StatusClass::S1xx, 1 => StatusClass::S2xx,
-                            2 => StatusClass::S3xx, 3 => StatusClass::S4xx,
+                            0 => StatusClass::S1xx,
+                            1 => StatusClass::S2xx,
+                            2 => StatusClass::S3xx,
+                            3 => StatusClass::S4xx,
                             _ => StatusClass::S5xx,
                         };
                         let proto = match p_idx {
-                            0 => ProtoVersion::Http10, 1 => ProtoVersion::Http11,
-                            2 => ProtoVersion::Http2, _ => ProtoVersion::Http3,
+                            0 => ProtoVersion::Http10,
+                            1 => ProtoVersion::Http11,
+                            2 => ProtoVersion::Http2,
+                            _ => ProtoVersion::Http3,
                         };
                         let combo_exemplars: std::vec::Vec<Exemplar> = all_exemplars
                             .iter()
@@ -514,12 +553,18 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                             .map(|(_, e)| e.clone())
                             .collect();
                         let attrs = std::vec![
-                            KeyValue { key: "http.request.method".into(),
-                                       value: AnyValue::String(method.as_str().into()) },
-                            KeyValue { key: "http.response.status_code".into(),
-                                       value: AnyValue::Int(status_class.representative_status()) },
-                            KeyValue { key: "network.protocol.version".into(),
-                                       value: AnyValue::String(proto.as_str().into()) },
+                            KeyValue {
+                                key: "http.request.method".into(),
+                                value: AnyValue::String(method.as_str().into())
+                            },
+                            KeyValue {
+                                key: "http.response.status_code".into(),
+                                value: AnyValue::Int(status_class.representative_status())
+                            },
+                            KeyValue {
+                                key: "network.protocol.version".into(),
+                                value: AnyValue::String(proto.as_str().into())
+                            },
                         ];
                         if let Some(dp) = make_dp(&combo_agg[combo], attrs, combo_exemplars) {
                             data_points.push(dp);
@@ -541,8 +586,12 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
             let mut all_buckets = [0u64; N_EXP_BUCKETS];
             let (mut all_zero, mut all_sum, mut all_count) = (0u64, 0u64, 0u64);
             for agg in &combo_agg {
-                for (a, b) in all_buckets.iter_mut().zip(agg.0.iter()) { *a += b; }
-                all_zero += agg.1; all_sum += agg.2; all_count += agg.3;
+                for (a, b) in all_buckets.iter_mut().zip(agg.0.iter()) {
+                    *a += b;
+                }
+                all_zero += agg.1;
+                all_sum += agg.2;
+                all_count += agg.3;
             }
             Metric {
                 name: "http.server.request.duration".into(),
@@ -552,9 +601,12 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                     aggregation_temporality: AggregationTemporality::Cumulative,
                     data_points: std::vec![ExponentialHistogramDataPoint {
                         attributes: std::vec![],
-                        start_time_unix_nano: start, time_unix_nano: now,
-                        count: all_count, sum: all_sum as f64,
-                        scale: EXP_HISTOGRAM_SCALE, zero_count: all_zero,
+                        start_time_unix_nano: start,
+                        time_unix_nano: now,
+                        count: all_count,
+                        sum: all_sum as f64,
+                        scale: EXP_HISTOGRAM_SCALE,
+                        zero_count: all_zero,
                         positive_offset: EXP_HISTOGRAM_BUCKET_OFFSET,
                         positive_bucket_counts: all_buckets.to_vec(),
                         exemplars: std::vec![],
@@ -565,13 +617,16 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
 
         // FU1: per-route series (http.server.request.duration.by_route).
         let route_metric = {
-            let mut data_points: std::vec::Vec<ExponentialHistogramDataPoint> = std::vec::Vec::new();
+            let mut data_points: std::vec::Vec<ExponentialHistogramDataPoint> =
+                std::vec::Vec::new();
             for r_idx in 0..N_ROUTE_SLOTS {
                 let route_name: std::string::String = amcf_ref
                     .map(|c| std::string::String::from(c.route_name(r_idx)))
                     .unwrap_or_else(|| std::format!("route_{}", r_idx));
-                let attrs = std::vec![KeyValue { key: "http.route".into(),
-                                                 value: AnyValue::String(route_name) }];
+                let attrs = std::vec![KeyValue {
+                    key: "http.route".into(),
+                    value: AnyValue::String(route_name)
+                }];
                 if let Some(dp) = make_dp(&route_agg[r_idx], attrs, std::vec![]) {
                     data_points.push(dp);
                 }
@@ -589,20 +644,24 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
 
         // FU1: per-upstream series (http.server.request.duration.by_upstream).
         let upstream_metric = {
-            let mut data_points: std::vec::Vec<ExponentialHistogramDataPoint> = std::vec::Vec::new();
+            let mut data_points: std::vec::Vec<ExponentialHistogramDataPoint> =
+                std::vec::Vec::new();
             for u_idx in 0..N_UPSTREAM_SLOTS {
                 let uname: std::string::String = amcf_ref
                     .map(|c| std::string::String::from(c.upstream_zone_name(u_idx)))
                     .unwrap_or_else(|| std::format!("upstream_{}", u_idx));
-                let attrs = std::vec![KeyValue { key: "nginx.upstream.zone".into(),
-                                                 value: AnyValue::String(uname) }];
+                let attrs = std::vec![KeyValue {
+                    key: "nginx.upstream.zone".into(),
+                    value: AnyValue::String(uname)
+                }];
                 if let Some(dp) = make_dp(&upstream_agg[u_idx], attrs, std::vec![]) {
                     data_points.push(dp);
                 }
             }
             Metric {
                 name: "http.server.request.duration.by_upstream".into(),
-                description: "HTTP server request duration by upstream zone (nginx.upstream.zone)".into(),
+                description: "HTTP server request duration by upstream zone (nginx.upstream.zone)"
+                    .into(),
                 unit: "us".into(),
                 data: MetricData::ExponentialHistogram(ExponentialHistogramData {
                     aggregation_temporality: AggregationTemporality::Cumulative,
@@ -748,8 +807,8 @@ fn now_unix_nano() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use crate::logs::{WorkerRingProducer, access::emit_access_record};
     use crate::logs::ring::tests::make_ring_with_cap;
+    use crate::logs::{access::emit_access_record, WorkerRingProducer};
 
     /// With `is_access_sample_enabled() = false` (the default), the exception-tail
     /// gate is closed: no ring operations occur even for interesting requests.
@@ -766,10 +825,7 @@ mod tests {
 
         // Ring must be empty — no record pushed.
         let mut out = std::vec::Vec::new();
-        assert!(
-            !ring.pop_into(&mut out),
-            "ring must be empty when access sample is disabled"
-        );
+        assert!(!ring.pop_into(&mut out), "ring must be empty when access sample is disabled");
         assert_eq!(ring.drop_count(), 0, "no drops expected");
     }
 
