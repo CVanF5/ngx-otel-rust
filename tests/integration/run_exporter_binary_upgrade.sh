@@ -279,13 +279,23 @@ info "Pre-test logs.json size:    ${PRE_LOGS_SIZE} bytes"
 # ─── Phase 1: start M1 and verify initial state ───────────────────────────────
 
 info "Starting M1 nginx (daemon off + subshell-exit, port=${NGINX_PORT})..."
-# Launch nginx from a subshell that exits immediately.  After the subshell
-# exits, nginx is reparented to init (getppid()==1) so USR2 is honoured.
-# With 'daemon off' the exporter is a direct child of the master process,
-# ensuring correct SIGCHLD routing for graceful shutdown.
-( "${NGINX_BINARY}" -p "${PREFIX}" -c "${PREFIX}/nginx.conf" & )
-# Give the subshell a moment to exit and nginx to start.
-sleep 0.5
+# Launch nginx from a subshell that:
+#   1. Starts nginx in the background so the subshell stays alive long enough
+#      for nginx to record ngx_parent = subshell_PID (via ngx_parent=getppid()
+#      near the start of main()).  The subshell then sleeps 0.5s.
+#   2. Exits after the sleep → nginx gets reparented to init (getppid()==1).
+#
+# nginx's USR2 guard: "ignore if getppid() == ngx_parent OR ngx_new_binary>0".
+# After subshell exit:
+#   - getppid()  = 1       (nginx reparented to init)
+#   - ngx_parent = subshell_PID   (recorded BEFORE subshell exited)
+#   - 1 != subshell_PID   → guard is FALSE → USR2 is honoured ✓
+#
+# Without the sleep 0.5 the subshell could exit BEFORE nginx stores
+# ngx_parent, leaving ngx_parent=1 and making getppid()==ngx_parent → ignored.
+( "${NGINX_BINARY}" -p "${PREFIX}" -c "${PREFIX}/nginx.conf" & sleep 0.5 )
+# Wait briefly after the subshell exits for nginx to be reparented to init.
+sleep 0.2
 
 # In daemon off mode, nginx writes the PID file from the master process.
 wait_for 5 "nginx.pid file to appear" \
