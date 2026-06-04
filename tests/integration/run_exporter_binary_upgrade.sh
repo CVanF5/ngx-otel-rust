@@ -229,12 +229,17 @@ trap cleanup EXIT
 mkdir -p "${PREFIX}/logs" "${PREFIX}/client_body_temp"
 
 # nginx configuration for the binary-upgrade test.
-# NOTE: daemon mode is the DEFAULT (no 'daemon off') — this is REQUIRED for
-# USR2 live binary upgrade to work.  With 'daemon off', nginx checks
-# getppid() > 1 as a "mid-upgrade" guard and ignores the USR2 signal.
-# In daemon mode nginx re-parents to PID 1 so getppid() == 1 and the guard
-# does not fire.  We read M1_PID from the PID file after nginx starts.
+# Use 'daemon off' (no double-fork) so:
+#   1. The exporter is always a direct child of the nginx master — SIGCHLD
+#      goes to the master, so graceful shutdown works correctly.
+#   2. We can track all processes via PPID.
+#
+# USR2 requires getppid()==1 (nginx guard). We achieve this by launching
+# nginx from a subshell that exits immediately: ( nginx & ). After the
+# subshell exits nginx gets reparented to init (PID 1). By the time USR2
+# arrives, getppid()==1 and the guard does not fire.
 cat > "${PREFIX}/nginx.conf" <<CONF
+daemon off;
 master_process on;
 worker_processes 2;
 error_log ${PREFIX}/logs/error.log debug;
@@ -273,13 +278,20 @@ info "Pre-test logs.json size:    ${PRE_LOGS_SIZE} bytes"
 
 # ─── Phase 1: start M1 and verify initial state ───────────────────────────────
 
-info "Starting M1 nginx (daemon mode, interval=${METRIC_INTERVAL_S}s, port=${NGINX_PORT})..."
-"${NGINX_BINARY}" -p "${PREFIX}" -c "${PREFIX}/nginx.conf"
+info "Starting M1 nginx (daemon off + subshell-exit, port=${NGINX_PORT})..."
+# Launch nginx from a subshell that exits immediately.  After the subshell
+# exits, nginx is reparented to init (getppid()==1) so USR2 is honoured.
+# With 'daemon off' the exporter is a direct child of the master process,
+# ensuring correct SIGCHLD routing for graceful shutdown.
+( "${NGINX_BINARY}" -p "${PREFIX}" -c "${PREFIX}/nginx.conf" & )
+# Give the subshell a moment to exit and nginx to start.
+sleep 0.5
 
-# In daemon mode nginx writes the PID file and exits the launcher; read M1_PID.
+# In daemon off mode, nginx writes the PID file from the master process.
 wait_for 5 "nginx.pid file to appear" \
     '[[ -s "${PREFIX}/logs/nginx.pid" ]]'
 M1_PID="$(cat "${PREFIX}/logs/nginx.pid")"
+sleep 1  # Let nginx fully initialise and reparent to init.
 
 if ! kill -0 "${M1_PID}" 2>/dev/null; then
     fail "M1 nginx (PID ${M1_PID}) not alive after start"
@@ -287,8 +299,8 @@ fi
 pass "M1 master started, PID=${M1_PID}"
 
 # Assertion 1a: exactly one otel exporter running.
-# In daemon mode the exporter's PPID is 1 after the double-fork, so we
-# detect it from the error.log ("start otel exporter <PID>").
+# With daemon off the exporter IS a direct child of M1; also detectable
+# from error.log ("start otel exporter <PID>").
 wait_for 5 "otel exporter log entry" \
     '[[ -n "$(exporter_pid_from_log 1)" ]]'
 EXP1_PID="$(exporter_pid_from_log 1)"
