@@ -15,7 +15,7 @@ use ngx::core::{Status, NGX_CONF_ERROR, NGX_CONF_OK};
 use ngx::http::{HttpModuleMainConf, NgxHttpCoreModule};
 use ngx::{ngx_conf_log_error, ngx_string};
 
-use crate::shm::{ROUTE_CAP, UPSTREAM_CAP, UPSTREAM_IDX_NONE, UPSTREAM_IDX_OTHER};
+use crate::shm::{ROUTE_CAP, UPSTREAM_CAP, UPSTREAM_IDX_OTHER};
 
 use crate::shm;
 use crate::HttpOtelModule;
@@ -639,12 +639,14 @@ impl MainConfig {
     ///
     /// Returns:
     /// - `0..UPSTREAM_CAP-1` for a registered zone
-    /// - `UPSTREAM_IDX_NONE` (`UPSTREAM_CAP`) when `shm_zone_ptr == 0`
-    /// - `UPSTREAM_IDX_OTHER` (`UPSTREAM_CAP+1`) when the zone is over cap
+    /// - `UPSTREAM_IDX_OTHER` (`UPSTREAM_CAP`) when `shm_zone_ptr == 0` (no upstream)
+    ///   or when the zone is over cap.
+    ///
+    /// The hot path skips bumping the upstream histogram when `shm_zone_ptr == 0`.
     #[inline]
     pub fn upstream_idx_for_zone(&self, shm_zone_ptr: usize) -> usize {
         if shm_zone_ptr == 0 {
-            return UPSTREAM_IDX_NONE;
+            return UPSTREAM_IDX_OTHER; // no upstream → "other" / skip
         }
         for i in 0..self.n_upstreams {
             if self.upstream_table[i].shm_zone_ptr == shm_zone_ptr {
@@ -671,9 +673,6 @@ impl MainConfig {
 
     /// Upstream zone name string for slot `upstream_idx` (for encoder attrs).
     pub fn upstream_zone_name(&self, upstream_idx: usize) -> &str {
-        if upstream_idx == UPSTREAM_IDX_NONE {
-            return "(none)";
-        }
         if upstream_idx == UPSTREAM_IDX_OTHER {
             return "(other)";
         }
@@ -1729,14 +1728,14 @@ mod tests {
         assert_eq!(full_cfg.route_idx_for_clcf(over_cap_clcf), ROUTE_CAP, "over-cap → other");
     }
 
-    /// Upstream index returns UPSTREAM_IDX_NONE for no-upstream and
-    /// UPSTREAM_IDX_OTHER for over-cap zones.
+    /// Upstream index: no-upstream and over-cap both return UPSTREAM_IDX_OTHER.
+    /// FU1: no "(none)" slot — requests without upstream skip the upstream histogram.
     #[test]
     fn upstream_idx_matches_registered_zones() {
         let mut cfg = MainConfig::default();
 
-        // No upstream (zone_ptr = 0) → UPSTREAM_IDX_NONE.
-        assert_eq!(cfg.upstream_idx_for_zone(0), UPSTREAM_IDX_NONE);
+        // No upstream (zone_ptr = 0) → UPSTREAM_IDX_OTHER (hot path will skip bump).
+        assert_eq!(cfg.upstream_idx_for_zone(0), UPSTREAM_IDX_OTHER);
         // Unregistered zone → UPSTREAM_IDX_OTHER.
         assert_eq!(cfg.upstream_idx_for_zone(0x5000), UPSTREAM_IDX_OTHER);
 
@@ -1746,7 +1745,7 @@ mod tests {
         cfg.upstream_table[0].name[..7].copy_from_slice(b"backend");
         cfg.n_upstreams = 1;
         assert_eq!(cfg.upstream_idx_for_zone(0x5000), 0);
-        assert_eq!(cfg.upstream_idx_for_zone(0), UPSTREAM_IDX_NONE, "no upstream stays none");
+        assert_eq!(cfg.upstream_idx_for_zone(0), UPSTREAM_IDX_OTHER, "no upstream → other (skip)");
         assert_eq!(cfg.upstream_idx_for_zone(0x6000), UPSTREAM_IDX_OTHER, "unregistered → other");
     }
 
