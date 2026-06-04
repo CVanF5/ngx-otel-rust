@@ -1,0 +1,45 @@
+TSAN evidence — Phase 2.2 re-review (decompose + µs + tail trace_id/url.path)
+================================================================================
+Host:   debian-vm (Linux aarch64) — `make tsan-test` (ThreadSanitizer, Docker)
+HEAD:   f7e76d6  phase2_2-rr: close Defect 4 — tail LogRecord carries trace_id + url.path
+Date:   2026-06-04
+Result: TSAN_EXIT=0 · ThreadSanitizer data races = 0 · [FAIL] = 0 · [PASS] = 40
+Build:  clean — `cargo clean -p ngx-otel-rust` before the run. (The first attempt
+        reused a pre-fix compiled unit of our crate — build-flavor cache
+        staleness, the documented `cargo clean` gotcha — and failed the two new
+        tail assertions; a clean rebuild compiles the fix and they pass.)
+Raw log retained on the VM at /tmp/tsan-rr2.log; this is the curated summary.
+
+Scripts exercised under TSAN (build/tsan-run.sh):
+  - run_grpc_smoke.sh
+  - run_grpc_bidi_smoke.sh
+  - run_grpc_export.sh           (production gRPC export path)
+  - run_access_log.sh            (Phase 2.2 §6.6.1 rebalanced path — exercises the
+                                  exemplar reservoir, the exponential-histogram
+                                  `record`, the decomposed route/upstream tables,
+                                  AND the exporter-side trace_id/url.path decode)
+
+run_access_log.sh assertions under TSAN (§6.6.1):
+  [PASS] metrics.json: service.name = ngx-otel-access-log-test present (metrics not regressed)
+  [PASS] metrics.json: http.server.request.duration present
+  [PASS] metrics.json: http.server.request.duration is exponentialHistogram (DP-F)
+  [PASS] metrics.json: http.route dimension present (DP-E)
+  [PASS] metrics.json: nginx.upstream.zone dimension present (DP-E, FU4)
+  [PASS] metrics.json: >= 2 distinct http.route data points (different locations)
+  [PASS] metrics.json: '(other)' route bucket present (regex/unregistered -> overflow, DP-E)
+  [PASS] logs.json: 200 flood blocked, interesting requests produced tail records (count=9)
+  [PASS] logs.json: at least 1 tail LogRecord present from error requests (got 9)
+  [PASS] logs.json: http.request.method attribute present
+  [PASS] logs.json: http.response.status_code attribute present
+  [PASS] logs.json: client.address attribute present
+  [PASS] logs.json: severity_number = 9 (INFO) present
+  [PASS] logs.json: event_name = http.access present
+  [PASS] metrics.json: trace_id 4bf92f3577b34da6a3ce929d0e0e4736 carried in exemplar (FU4a traceparent)
+  [PASS] logs.json: trace_id 4bf92f3577b34da6a3ce929d0e0e4736 carried on tail LogRecord (traceparent -> LogRecord)
+  [PASS] logs.json: url.path attribute present on tail records (FU4b)
+  [PASS] All assertions passed.
+
+Gate markers:
+  ThreadSanitizer warnings / data races: 0
+  [FAIL] count:                          0
+  TSAN_EXIT=0
