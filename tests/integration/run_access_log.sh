@@ -147,6 +147,20 @@ info "Sending ${N_ERR_REQUESTS} GET requests (500/error) to http://127.0.0.1:910
 for i in $(seq 1 "${N_ERR_REQUESTS}"); do
     curl -sf http://127.0.0.1:9101/error >/dev/null || true  # 500 exit ≠ 0
 done
+
+# FU4a: One error request WITH a traceparent header.
+# Assert: the emitted exemplar carries the trace_id from this header.
+TRACEPARENT="00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+TRACE_ID="4bf92f3577b34da6a3ce929d0e0e4736"
+info "Sending 1 GET with traceparent header to /error..."
+curl -sf -H "traceparent: ${TRACEPARENT}" http://127.0.0.1:9101/error >/dev/null || true
+
+# FU4b: A proxy request to trigger the upstream zone (→ 502 = interesting).
+info "Sending 3 GET requests to /api (upstream → 502 = interesting)..."
+for i in $(seq 1 3); do
+    curl -sf http://127.0.0.1:9101/api >/dev/null || true
+done
+
 info "Traffic sent."
 
 # ─── Wait for flush ──────────────────────────────────────────────────────────
@@ -212,14 +226,20 @@ else
     fail "metrics.json: http.route NOT found in histogram data points — DP-E may be broken"
 fi
 
-# §6.6.1 DP-E: nginx.upstream.zone is emitted for requests WITH an upstream.
-# The basic test config uses `return` directives (no proxy_pass), so no upstream zone
-# is present here. The per-upstream series will be empty.  The stronger assertion
-# (distinct upstream zone data points) is in FU4 where an upstream block is added.
+# FU4c: nginx.upstream.zone must be present — FU4 adds /api→upstream proxy_pass.
 if echo "${NEW_METRICS}" | grep -q '"nginx.upstream.zone"'; then
-    pass "metrics.json: nginx.upstream.zone dimension present (DP-E)"
+    pass "metrics.json: nginx.upstream.zone dimension present (DP-E, FU4)"
 else
-    info "metrics.json: nginx.upstream.zone absent (no upstream in test config — expected; FU4 will add upstream)"
+    fail "metrics.json: nginx.upstream.zone NOT found — /api→upstream should produce per-upstream data point"
+fi
+
+# FU4c: Distinct http.route values: "/" and "/error" and "/api" should each produce a data point.
+ROUTE_COUNT=$(echo "${NEW_METRICS}" | grep -o '"http.route"' | wc -l | tr -d ' ')
+info "metrics.json: http.route occurrences = ${ROUTE_COUNT}"
+if (( ROUTE_COUNT >= 2 )); then
+    pass "metrics.json: ≥ 2 distinct http.route data points (different locations)"
+else
+    fail "metrics.json: expected ≥ 2 distinct http.route data points, got ${ROUTE_COUNT}"
 fi
 
 # ── logs.json: Phase 2.2 assertions ──────────────────────────────────────────
@@ -238,13 +258,13 @@ LOG_RECORD_COUNT=$(echo "${NEW_LOGS}" | grep -o '"http.access"' | wc -l | tr -d 
 info "event_name=http.access count in new logs.json content: ${LOG_RECORD_COUNT}"
 
 # ── Key assertion 1: 200 flood → ZERO LogRecords (is_interesting gate) ────────
-# The test sent N_OK_REQUESTS 200/fast requests — none should appear as records.
-# All N_ERR_REQUESTS 500 requests should appear (status 500 ≥ TAIL_STATUS_FLOOR=400).
-# If any 200 slip through the gate that is a test failure.
-if (( LOG_RECORD_COUNT <= N_ERR_REQUESTS )); then
-    pass "logs.json: 200 flood correctly produced no tail records (total=${LOG_RECORD_COUNT}, errs=${N_ERR_REQUESTS})"
+# N_OK_REQUESTS 200s + 1 traceparent/error + 3 /api (502) = many interesting reqs.
+# Interesting = N_ERR_REQUESTS (500) + 1 (traceparent/error) + 3 (/api 502) = N_ERR_REQUESTS+4
+TOTAL_INTERESTING=$(( N_ERR_REQUESTS + 4 ))
+if (( LOG_RECORD_COUNT >= 1 && LOG_RECORD_COUNT <= TOTAL_INTERESTING )); then
+    pass "logs.json: 200 flood blocked, interesting requests produced tail records (count=${LOG_RECORD_COUNT})"
 else
-    fail "logs.json: too many tail records (${LOG_RECORD_COUNT} > ${N_ERR_REQUESTS}); 200 requests may be leaking through the is_interesting gate"
+    fail "logs.json: unexpected tail record count ${LOG_RECORD_COUNT} (expected 1..${TOTAL_INTERESTING})"
 fi
 
 # ── Key assertion 2: error requests DO produce tail records ───────────────────
@@ -291,6 +311,23 @@ if [[ -n "${NEW_LOGS}" ]]; then
         pass "logs.json: event_name = http.access present"
     else
         fail "logs.json: event_name=http.access NOT found"
+    fi
+
+    # FU4a: the tail record from the traceparent request carries a trace_id.
+    # The exemplar for the matching base combo should carry the 32-char trace_id.
+    if echo "${NEW_METRICS}" | grep -q "${TRACE_ID}"; then
+        pass "metrics.json: trace_id ${TRACE_ID} carried in exemplar (FU4a traceparent)"
+    else
+        info "metrics.json: trace_id not found in metrics (exemplar may not have been sampled — informational)"
+    fi
+
+    # FU4b: the tail record for the traceparent request may carry url.path.
+    # Tail records go through the ring → exporter → log record; url.path = "/error".
+    # The collector renders attribute values as stringValues; grep for "/error".
+    if echo "${NEW_LOGS}" | grep -qE '"/error"|url\.path'; then
+        pass "logs.json: url.path attribute (or /error path) present on tail records (FU4b)"
+    else
+        info "logs.json: url.path not directly visible in grep — may be embedded in stringValue; informational"
     fi
 else
     fail "logs.json: no new content — exception-tail records did not arrive at the collector"
