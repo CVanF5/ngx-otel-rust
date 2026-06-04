@@ -570,3 +570,24 @@ delivered here, not the reported 0.1%); trust `dropped_records` + the p99 gate.
 
 Host: C6CQ3045N2; nginx: tests/bench/zero_cost_logs.sh: line 226: "/Users/c.vandesande/project-nginx-otel/ngx-otel-rust/objs-release/nginx": No such file or directory
 INFORMATIONAL — ±1% gate requires N≥50 on isolated hardware (host-1 / c7a EPYC).
+
+## Phase 2.2 access-log rebalancing — zero-cost gate (2026-06-04, dedicated hardware)
+
+Host: host-1, AWS c7a.xlarge (EPYC 9R14, 4 real cores / no SMT, non-burstable, dedicated).
+HEAD: 01ec9a8 (decompose route/upstream tables + µs exponential histogram + tail trace_id/url.path).
+Bench: `tests/bench/zero_cost_logs.sh`, BENCH_ITERATIONS=50, native otelcol-contrib collector.
+
+| Config | median req/s |
+|---|---|
+| BL — module loaded, `otel_access_log_sample` OFF | 257,131 |
+| TA — `otel_access_log_sample` ON | 255,080 |
+| TB — sample ON, 2× connections (informational) | 262,834 |
+
+- **BL vs TA regression: 0.8%** (gate < 2%) → **PASS**
+- BL vs TB regression: −2.2% (informational; TB faster than BL = run-to-run noise)
+
+The rebalanced enabled access-log path (is-interesting gate + exemplar reservoir +
+per-route/per-upstream exponential histogram) costs ~0.8% vs loaded-disabled at N=50 —
+within the gate and effectively noise. It replaces the Phase 2.1 per-request transcript
+(a LogRecord built on every request), so the enabled path is materially lighter than the
+path it supersedes. Raw per-iteration log retained on host-1 at /tmp/zc50.log.
