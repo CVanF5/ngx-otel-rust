@@ -1474,17 +1474,16 @@ mod tests {
     /// guards against that.
     #[test]
     fn retry_buffer_stays_bounded_and_drops_are_counted() {
-        // Snapshot the counter before; other tests run concurrently so we use
-        // a relative delta rather than an absolute value.
-        let before = DROPPED_RECORDS.load(Ordering::SeqCst);
-
         let depth: usize = 4;
         let mut queue: VecDeque<(std::vec::Vec<u8>, u64)> = VecDeque::new();
 
-        // Enqueue depth + 2 items with distinct data-point counts
-        // (n_pts = i + 1 so we can verify which items were dropped).
+        // Sum the helper's RETURN value (dropped data-point count) instead of
+        // reading the process-global DROPPED_RECORDS: other tests mutate that
+        // global concurrently, so an absolute read — or even a before/after
+        // delta — is racy. The return value is fully test-local.
+        let mut dropped: u64 = 0;
         for i in 0..(depth + 2) as u64 {
-            enqueue_with_eviction(
+            dropped += enqueue_with_eviction(
                 &mut queue,
                 std::vec![i as u8],
                 i + 1,
@@ -1493,17 +1492,13 @@ mod tests {
             );
         }
 
-        let after = DROPPED_RECORDS.load(Ordering::SeqCst);
-
         // Queue must be bounded at depth.
         assert_eq!(queue.len(), depth, "retry queue must not exceed configured depth = {}", depth);
 
         // The two evicted items had n_pts = 1 and n_pts = 2.
-        let expected_dropped: u64 = 1 + 2;
         assert_eq!(
-            after - before,
-            expected_dropped,
-            "DROPPED_RECORDS must increase by the sum of evicted data-point counts"
+            dropped, 1 + 2,
+            "evicted data-point counts (helper return) must sum to 3"
         );
     }
 
@@ -1564,16 +1559,18 @@ mod tests {
     #[test]
     fn logs_retry_eviction_increments_counter() {
         // Verify the logs retry queue is bounded with the same
-        // enqueue_with_eviction helper.
-        let before = DROPPED_RECORDS.load(Ordering::SeqCst);
+        // enqueue_with_eviction helper. Assert on the helper's RETURN value
+        // (dropped count), not the process-global DROPPED_RECORDS, which other
+        // parallel tests mutate (test isolation).
         let depth: usize = 2;
         let mut queue: VecDeque<(std::vec::Vec<u8>, u64)> = VecDeque::new();
+        let mut dropped = 0u64;
         for i in 0..4u64 {
-            enqueue_with_eviction(&mut queue, std::vec![0u8], i + 1, depth, core::ptr::null_mut());
+            dropped +=
+                enqueue_with_eviction(&mut queue, std::vec![0u8], i + 1, depth, core::ptr::null_mut());
         }
-        let after = DROPPED_RECORDS.load(Ordering::SeqCst);
         assert_eq!(queue.len(), depth);
         // Evicted items had n=1, n=2 → dropped 3
-        assert_eq!(after - before, 1 + 2);
+        assert_eq!(dropped, 1 + 2);
     }
 }
