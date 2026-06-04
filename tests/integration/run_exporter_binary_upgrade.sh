@@ -574,9 +574,11 @@ pass "Exactly 1 otel exporter remaining (PID=${EXP2_PID}, M2's)"
 
 # Assertion 4c: collector continues to receive M2's instance id and stops
 # receiving M1's.
-# Snapshot the file AFTER all M1 activity is done (M1's final-drain batch
-# has already been written to metrics.json at this point; we start the
-# post-M1 window AFTER that batch to avoid a false positive).
+# Snapshot the file AFTER all M1 activity is done.  Sleep 2s first so the
+# collector has time to flush M1's final-drain batch to the file before we
+# mark the window boundary — otherwise M1's last batch ends up in the post
+# window and the "M1 id absent" assertion fires as a false positive.
+sleep 2
 AFTER_M1_SIZE=0
 [[ -f "${METRICS_LOG}" ]] && AFTER_M1_SIZE=$(wc -c < "${METRICS_LOG}")
 # Wait 4s for M2's exporter to ship at least one fresh batch.
