@@ -209,6 +209,21 @@ impl HttpRequestHandler for LogPhaseHandler {
                 };
                 let _ = nginx_sys::ngx_timeofday(); // suppress unused-import warning if any
 
+                // W3C trace correlation (Phase 2.2.3): read `traceparent` header.
+                // Hot-path budget: one header-list scan (O(n), small n) + 16-byte
+                // hex parse + 24-byte copy.  No alloc, no lock, no syscall.
+                let trace_context: Option<([u8; 16], [u8; 8])> = {
+                    use crate::logs::access::parse_traceparent;
+                    let mut found = None;
+                    for (key, value) in request.headers_in_iterator() {
+                        if key.as_bytes().eq_ignore_ascii_case(b"traceparent") {
+                            found = parse_traceparent(value.as_bytes());
+                            break;
+                        }
+                    }
+                    found
+                };
+
                 emit_access_record(
                     &producer,
                     method,
@@ -217,6 +232,7 @@ impl HttpRequestHandler for LogPhaseHandler {
                     resp_bytes_acc,
                     client_addr,
                     ts_unix_nano,
+                    trace_context,
                 );
             }
         }
@@ -637,7 +653,7 @@ mod tests {
         let access_sample_enabled = false;
         if access_sample_enabled && super::is_interesting(503, 0) {
             let producer = WorkerRingProducer { ring };
-            emit_access_record(&producer, b"GET", 503, 0, 512, b"127.0.0.1", 0);
+            emit_access_record(&producer, b"GET", 503, 0, 512, b"127.0.0.1", 0, None);
         }
 
         // Ring must be empty — no record pushed.
@@ -659,7 +675,7 @@ mod tests {
         // 200, 0ms — not interesting, no push.
         if access_sample_enabled && super::is_interesting(200, 0) {
             let producer = WorkerRingProducer { ring };
-            emit_access_record(&producer, b"GET", 200, 0, 512, b"127.0.0.1", 0);
+            emit_access_record(&producer, b"GET", 200, 0, 512, b"127.0.0.1", 0, None);
         }
         let mut out = std::vec::Vec::new();
         assert!(!ring.pop_into(&mut out), "200/fast must NOT reach the tail ring");
@@ -667,14 +683,14 @@ mod tests {
         // 503, 0ms — interesting (error), push expected.
         if access_sample_enabled && super::is_interesting(503, 0) {
             let producer = WorkerRingProducer { ring };
-            emit_access_record(&producer, b"GET", 503, 0, 0, b"127.0.0.1", 0);
+            emit_access_record(&producer, b"GET", 503, 0, 0, b"127.0.0.1", 0, None);
         }
         assert!(ring.pop_into(&mut out), "503 must reach the tail ring");
 
         // 200, 2000ms — interesting (latency outlier), push expected.
         if access_sample_enabled && super::is_interesting(200, 2000) {
             let producer = WorkerRingProducer { ring };
-            emit_access_record(&producer, b"GET", 200, 0, 0, b"127.0.0.1", 0);
+            emit_access_record(&producer, b"GET", 200, 0, 0, b"127.0.0.1", 0, None);
         }
         out.clear();
         assert!(ring.pop_into(&mut out), "slow 200 must reach the tail ring");
@@ -699,6 +715,7 @@ mod tests {
                 256,
                 b"10.0.0.1",
                 1_700_000_000_000_000_000,
+                None,
             );
         }
 
