@@ -192,6 +192,33 @@ else
     fail "metrics.json: http.server.request.duration NOT found"
 fi
 
+# §6.6.1: histogram must be exponential (EXP_HISTOGRAM_DATA_POINTS / exponentialHistogram)
+if echo "${NEW_METRICS}" | grep -qE '"exponentialHistogram"|"exponential_histogram"|EXP_HISTOGRAM'; then
+    pass "metrics.json: http.server.request.duration is exponentialHistogram (DP-F)"
+else
+    # Collector may format with different capitalization; check the attribute marker instead.
+    # All exp histograms have a "scale" field.
+    if echo "${NEW_METRICS}" | grep -q '"scale"'; then
+        pass "metrics.json: exponential histogram scale field present (DP-F)"
+    else
+        fail "metrics.json: exponentialHistogram NOT found — DP-F may be broken"
+    fi
+fi
+
+# §6.6.1 DP-E: http.route attribute must be present in the histogram data points
+if echo "${NEW_METRICS}" | grep -q '"http.route"'; then
+    pass "metrics.json: http.route dimension present (DP-E)"
+else
+    fail "metrics.json: http.route NOT found in histogram data points — DP-E may be broken"
+fi
+
+# §6.6.1 DP-E: nginx.upstream.zone attribute must be present
+if echo "${NEW_METRICS}" | grep -q '"nginx.upstream.zone"'; then
+    pass "metrics.json: nginx.upstream.zone dimension present (DP-E)"
+else
+    fail "metrics.json: nginx.upstream.zone NOT found in histogram data points"
+fi
+
 # ── logs.json: Phase 2.2 assertions ──────────────────────────────────────────
 NEW_LOGS=""
 if [[ -f "${LOGS_LOG}" ]]; then

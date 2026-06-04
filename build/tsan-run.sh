@@ -168,11 +168,14 @@ echo "[tsan-run] === Running run_grpc_export.sh under TSAN (production gRPC expo
 bash tests/integration/run_grpc_export.sh
 
 echo ""
-echo "[tsan-run] === Running run_access_log.sh under TSAN (Phase 2.1 access-log path) ==="
-# Exercises the SPSC logs ring (workers write, exporter reads) and the new
-# multi-dim WorkerSlots (request_duration_combos array) under TSAN.
-# This covers the Phase 2.1 shared-state additions that the Phase 2.1 loop
-# was obligated to verify (RALPH_PHASE_2_1_FOLLOWUP.md FU6).
+echo "[tsan-run] === Running run_access_log.sh under TSAN (Phase 2.2 §6.6.1 rebalanced path) ==="
+# Exercises the new Phase 2.2 shared state under TSAN:
+#   - ExpHistogramSlot::record() — Relaxed fetch_add on exp-histogram buckets
+#   - ExemplarReservoir::write() — Relaxed stores on exemplar entry fields
+#   - route/upstream dimension writes (combo_index extended to 5 dims)
+#   - SPSC logs ring (workers write is_interesting tail records)
+#   - run_access_log.sh now sends 200 (histogram only) + 500 (ring + reservoir)
+# All new shared-state paths from RALPH_PHASE_2_2.md steps 2.2.1–2.2.5.
 bash tests/integration/run_access_log.sh
 
 # ── Step 5: Belt-and-suspenders ThreadSanitizer warning scan ─────────────────
