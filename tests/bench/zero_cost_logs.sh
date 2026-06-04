@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
-# tests/bench/zero_cost_logs.sh — Phase 2.1 zero-cost-when-disabled benchmark
+# tests/bench/zero_cost_logs.sh — Phase 2.2 zero-cost-when-disabled + rebalanced benchmark
 #
 # Runs three NGINX configs back-to-back under wrk to measure the per-request
-# overhead of access-log emission.
+# overhead of the §6.6.1 rebalanced access-log path.
 #
 # Config layout:
-#   BL (Baseline):   module loaded + otel_exporter + access log OFF
+#   BL (Baseline):   module loaded + otel_exporter + access sample OFF
 #                    → every request goes through log-phase handler but
-#                      is_access_log_enabled() is false, branch not taken
-#   TA (Treatment A): BL + otel_access_log on
-#                    → every request emits a record into the per-worker ring
+#                      is_access_sample_enabled() is false, branch not taken
+#   TA (Treatment A): BL + otel_access_log_sample 16
+#                    → histogram always-on; only interesting requests push a
+#                      tail record (is_interesting gate, common 200/fast skipped)
 #   TB (Treatment B): TA with 2× wrk connections (higher RPS, informational)
 #
 # Gate (INFORMATIONAL on dev hardware — ±1% is invalid on a laptop):
-#   BL vs TA < 2%  critical zero-cost claim for the access-log path
+#   BL vs TA < 2%  critical zero-cost claim for the rebalanced access-log path
 #   BL vs TB < 20% informational (active path cost)
 #
 # Results are written to tests/bench/results/ and appended to RESULTS.md.

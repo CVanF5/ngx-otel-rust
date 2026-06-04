@@ -11,8 +11,10 @@
 //! - No syscalls beyond what the nginx log phase already incurs.
 //! - No locks; only atomic increments (`Ordering::Relaxed` on writes).
 //! - The handler is registered **only** when `otel_exporter` is configured.
-//! - Access-log emission is gated by `amcf.is_access_log_enabled()`; with
-//!   access log OFF the path is byte-equivalent to the metrics-only path.
+//! - Exception-tail / exemplar emission is gated by
+//!   `amcf.is_access_sample_enabled() && is_interesting(status, duration_ms)`;
+//!   with the sample directive absent the path is byte-equivalent to the
+//!   metrics-only path (zero cost beyond one cheap branch + the histogram bump).
 
 use core::sync::atomic::Ordering;
 
@@ -130,10 +132,13 @@ impl HttpRequestHandler for LogPhaseHandler {
             }
         }
 
-        // ── Phase 2.1: access log ─────────────────────────────────────────
-        // Gate: no work at all if access log is disabled (zero-cost invariant).
-        // Only the branch check runs; the ring is never touched.
-        if amcf.is_access_log_enabled() {
+        // ── Phase 2.2: exception-tail / exemplar sampling ─────────────────
+        // Gate 1 (cheap config check): absent directive → is_access_sample_enabled()
+        //   = false, this entire block is skipped.
+        // Gate 2 (is_interesting predicate): the common 200/fast case falls through
+        //   with no ring push.  Only errors and latency outliers reach emit_access_record.
+        // The histogram bump above is always-on and is NOT gated here.
+        if amcf.is_access_sample_enabled() && is_interesting(status, duration_ms) {
             if let Some(logs_base) = amcf.logs_shm_base() {
                 let cap = amcf.log_ring_cap();
                 // Safety: zone was sized for ≥ worker_id slots at registration.
@@ -187,6 +192,29 @@ impl HttpRequestHandler for LogPhaseHandler {
 
         Status::NGX_OK
     }
+}
+
+/// Default tail status floor: requests with HTTP status ≥ this value are
+/// "interesting" and qualify for the exception-tail / exemplar ring.
+/// 400 catches 4xx (client errors) and 5xx (server errors).
+pub const TAIL_STATUS_FLOOR: u16 = 400;
+
+/// Default tail latency floor in milliseconds: requests taking ≥ this long
+/// are "interesting" regardless of status.  1000 ms = 1 s (latency outlier).
+pub const TAIL_LATENCY_MS: u64 = 1000;
+
+/// Predicate for the exception-tail / exemplar gate (Phase 2.2 Step 2.2.1).
+///
+/// Returns `true` when the request is "interesting" — an error status or a
+/// latency outlier.  The common 200/fast case returns `false` and skips the
+/// ring push entirely.
+///
+/// # Hot-path note
+/// This function is `#[inline]`, branch-only (no alloc, no lock, no syscall).
+/// It is only ever called when `is_access_sample_enabled()` is true.
+#[inline]
+pub fn is_interesting(status: u16, duration_ms: u64) -> bool {
+    status >= TAIL_STATUS_FLOOR || duration_ms >= TAIL_LATENCY_MS
 }
 
 /// A `MetricSource` that reads all per-worker shm slots and produces
@@ -494,42 +522,74 @@ mod tests {
     use crate::logs::{WorkerRingProducer, access::emit_access_record};
     use crate::logs::ring::tests::make_ring_with_cap;
 
-    /// With `access_log_enabled = false` (the default), the access-log
-    /// emission gate is closed: no ring operations occur.
+    /// With `is_access_sample_enabled() = false` (the default), the exception-tail
+    /// gate is closed: no ring operations occur even for interesting requests.
     #[test]
     fn access_emission_off_no_ring_touch() {
         let (_buf, ring) = make_ring_with_cap(4096);
 
-        // Gate check: access_log_enabled = false → skip emit.
-        let access_log_enabled = false;
-        if access_log_enabled {
+        // Gate check: access_sample_enabled = false → skip emit entirely.
+        let access_sample_enabled = false;
+        if access_sample_enabled && super::is_interesting(503, 0) {
             let producer = WorkerRingProducer { ring };
-            emit_access_record(&producer, b"GET", 200, 0, 512, b"127.0.0.1", 0);
+            emit_access_record(&producer, b"GET", 503, 0, 512, b"127.0.0.1", 0);
         }
 
         // Ring must be empty — no record pushed.
         let mut out = std::vec::Vec::new();
         assert!(
             !ring.pop_into(&mut out),
-            "ring must be empty when access log is disabled"
+            "ring must be empty when access sample is disabled"
         );
         assert_eq!(ring.drop_count(), 0, "no drops expected");
     }
 
-    /// With `access_log_enabled = true`, the log-phase handler pushes one
-    /// access record into the ring with the expected fields.
+    /// With `is_access_sample_enabled() = true`, a 200/fast request is NOT
+    /// interesting and must NOT reach the ring.
+    #[test]
+    fn tail_predicate_selects_only_interesting() {
+        let (_buf, ring) = make_ring_with_cap(4096);
+        let access_sample_enabled = true;
+
+        // 200, 0ms — not interesting, no push.
+        if access_sample_enabled && super::is_interesting(200, 0) {
+            let producer = WorkerRingProducer { ring };
+            emit_access_record(&producer, b"GET", 200, 0, 512, b"127.0.0.1", 0);
+        }
+        let mut out = std::vec::Vec::new();
+        assert!(!ring.pop_into(&mut out), "200/fast must NOT reach the tail ring");
+
+        // 503, 0ms — interesting (error), push expected.
+        if access_sample_enabled && super::is_interesting(503, 0) {
+            let producer = WorkerRingProducer { ring };
+            emit_access_record(&producer, b"GET", 503, 0, 0, b"127.0.0.1", 0);
+        }
+        assert!(ring.pop_into(&mut out), "503 must reach the tail ring");
+
+        // 200, 2000ms — interesting (latency outlier), push expected.
+        if access_sample_enabled && super::is_interesting(200, 2000) {
+            let producer = WorkerRingProducer { ring };
+            emit_access_record(&producer, b"GET", 200, 0, 0, b"127.0.0.1", 0);
+        }
+        out.clear();
+        assert!(ring.pop_into(&mut out), "slow 200 must reach the tail ring");
+    }
+
+    /// With `is_access_sample_enabled() = true` and an interesting request, the
+    /// log-phase handler pushes one access record into the ring with the expected
+    /// fields.
     #[test]
     fn access_emission_on_pushes_record() {
         let (_buf, ring) = make_ring_with_cap(4096);
 
-        // Gate check: access_log_enabled = true → emit.
-        let access_log_enabled = true;
-        if access_log_enabled {
+        // Gate check: access_sample_enabled = true + interesting (503 ≥ 400) → emit.
+        let access_sample_enabled = true;
+        if access_sample_enabled && super::is_interesting(503, 0) {
             let producer = WorkerRingProducer { ring };
             emit_access_record(
                 &producer,
                 b"POST",
-                201,
+                503,
                 128,
                 256,
                 b"10.0.0.1",
@@ -540,7 +600,7 @@ mod tests {
         // Ring must have one record.
         let mut out = std::vec::Vec::new();
         let ok = ring.pop_into(&mut out);
-        assert!(ok, "ring must have a record when access log is enabled");
+        assert!(ok, "ring must have a record for an interesting request");
         assert!(!out.is_empty(), "record must be non-empty");
 
         // Check kind byte = 0x00 (access).
@@ -551,10 +611,10 @@ mod tests {
         assert_eq!(method_len, 4, "method length must be 4 for POST");
         assert_eq!(&out[12..12 + method_len], b"POST");
 
-        // Check status code = 201.
+        // Check status code = 503.
         let sc_off = 12 + method_len;
         let status = u16::from_be_bytes([out[sc_off], out[sc_off + 1]]);
-        assert_eq!(status, 201, "status code must be 201");
+        assert_eq!(status, 503, "status code must be 503");
 
         // No more records.
         let mut out2 = std::vec::Vec::new();

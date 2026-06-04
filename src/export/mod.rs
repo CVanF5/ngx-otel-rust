@@ -477,7 +477,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             }
 
             // Drain fresh log records from all workers' rings and ship them.
-            if amcf.is_access_log_enabled() {
+            if amcf.is_access_sample_enabled() {
                 if let Some(logs_base) = amcf.logs_shm_base() {
                     let n_workers = unsafe {
                         let zone = &*amcf.logs_shm_zone;
@@ -799,7 +799,7 @@ async fn graceful_drain(
     }
 
     // Final freshly-collected logs batch.
-    if amcf.is_access_log_enabled() {
+    if amcf.is_access_sample_enabled() {
         if let Some(logs_base) = amcf.logs_shm_base() {
             let n_workers = unsafe {
                 let zone = &*amcf.logs_shm_zone;
@@ -1003,8 +1003,9 @@ fn collect_all_sources(amcf: &MainConfig, worker_start_ns: u64) -> Batch {
 
 /// Drain all worker access-log rings and assemble a [`LogsBatch`].
 ///
-/// Called once per export tick when `access_log_enabled` is true.
-/// Does NOT drain error rings (Phase 2.2).
+/// Called once per export tick when `is_access_sample_enabled()` is true.
+/// Drains tail records written by `is_interesting()` requests.
+/// Does NOT drain error rings (Phase 2.3).
 ///
 /// Also updates the `ACCESS_LOGS_DROPPED` self-metric by reading each ring's
 /// `drop_count()` and computing the delta vs the previous cycle.
@@ -1333,9 +1334,9 @@ pub fn exit_process_flush(amcf: &MainConfig) {
         }
     }
 
-    // ── Sync flush of pending logs (Phase 2.1, HTTP only) ────────────────────
-    // Only flush logs if access_log is enabled and the logs shm zone is mapped.
-    if amcf.is_access_log_enabled() {
+    // ── Sync flush of pending tail logs (Phase 2.2, HTTP only) ──────────────
+    // Only flush logs if access_sample is enabled and the logs shm zone is mapped.
+    if amcf.is_access_sample_enabled() {
         if let Some(logs_base) = amcf.logs_shm_base() {
             let n_workers = unsafe {
                 let zone = &*amcf.logs_shm_zone;

@@ -145,16 +145,17 @@ pub struct MainConfig {
     /// load (Phase 1.3.3). Phase 5 wires the bidi control channel to it.
     pub control_shm_zone: *mut nginx_sys::ngx_shm_zone_t,
     /// The registered logs shm zone (set during postconfiguration when
-    /// `access_log_enabled || error_log_enabled`).  Per-worker layout:
+    /// `is_access_sample_enabled() || error_log_enabled`).  Per-worker layout:
     /// two rings per slot (access + error), each of `log_ring_cap` bytes.
     /// Memory = `log_ring_cap × 2 × N` + slab-pool header overhead.
     pub logs_shm_zone: *mut nginx_sys::ngx_shm_zone_t,
-    /// `otel_access_log on | off` — whether to push access records into the
-    /// per-worker logs ring on every request.  Defaults to false (off).
+    /// `otel_access_log_sample <size>` — reservoir size for the exception-tail
+    /// exemplar reservoir.  `0` = not configured (default off).
+    /// Presence ⇒ exception tail + exemplar sampling on; absent ⇒ off.
+    /// The histogram is always-on regardless of this field.
     ///
-    /// Using `ngx_flag_t` (i64) to match `ngx_conf_set_flag_slot` semantics;
-    /// read via [`is_access_log_enabled`].
-    pub access_log_enabled: nginx_sys::ngx_flag_t,
+    /// Read via [`is_access_sample_enabled`] / [`access_sample_size`].
+    pub access_sample_size: usize,
     /// `otel_log_ring_size <size>` — per-worker ring capacity in bytes.
     /// `0` = not configured (uses `DEFAULT_LOG_RING_CAP`).
     pub log_ring_size: usize,
@@ -180,10 +181,8 @@ impl Default for MainConfig {
             shm_zone: ptr::null_mut(),
             control_shm_zone: ptr::null_mut(),
             logs_shm_zone: ptr::null_mut(),
-            // UNSET_FLAG (-1): nginx's ngx_conf_set_flag_slot checks for this sentinel
-            // to detect duplicate directives.  Using 0 would incorrectly trigger the
-            // duplicate guard on the first set.
-            access_log_enabled: UNSET_FLAG,
+            // 0 = not configured (off by default).
+            access_sample_size: 0,
             log_ring_size: 0,
         }
     }
@@ -341,10 +340,10 @@ impl MainConfig {
         // both are mapped before workers fork.
         self.register_control_shm_zone(cf, module)?;
 
-        // Register the per-worker logs shm zone when access log is enabled
-        // (Phase 2.1).  Error-log enablement (Phase 2.2) will extend this gate
-        // to `self.is_access_log_enabled() || self.error_log_enabled`.
-        if self.is_access_log_enabled() {
+        // Register the per-worker logs shm zone when the exception tail / exemplar
+        // reservoir is enabled (Phase 2.2).  Phase 2.3 will extend this gate to
+        // `self.is_access_sample_enabled() || self.error_log_enabled`.
+        if self.is_access_sample_enabled() {
             self.register_logs_zone(cf, module)?;
         }
 
@@ -446,8 +445,9 @@ impl MainConfig {
 
     /// Register the per-worker logs shm zone with nginx.
     ///
-    /// Must be called from `postconfiguration` when `access_log_enabled ||
-    /// error_log_enabled`.  Sizes the zone for `n_workers` workers.
+    /// Must be called from `postconfiguration` when
+    /// `is_access_sample_enabled() || error_log_enabled`.
+    /// Sizes the zone for `n_workers` workers.
     /// Parallels [`register_shm_zone`].
     pub fn register_logs_zone(
         &mut self,
@@ -503,14 +503,24 @@ impl MainConfig {
         Some(unsafe { addr.cast::<u8>().add(crate::shm::data_offset()) })
     }
 
-    /// Returns `true` when `otel_access_log on;` was explicitly set to on.
+    /// Returns `true` when `otel_access_log_sample <size>` was configured.
     ///
-    /// UNSET_FLAG (-1) = not configured → off.
-    /// 0 = explicitly `off` → off.
-    /// 1 = explicitly `on` → on.
+    /// `access_sample_size == 0` = not configured → off (default).
+    /// `access_sample_size > 0` = configured → exception tail + exemplar sampling on.
+    ///
+    /// The histogram is always-on regardless; this gate controls only the tail ring
+    /// and exemplar reservoir.
     #[inline]
-    pub fn is_access_log_enabled(&self) -> bool {
-        self.access_log_enabled == 1
+    pub fn is_access_sample_enabled(&self) -> bool {
+        self.access_sample_size > 0
+    }
+
+    /// Effective exemplar reservoir size (from `otel_access_log_sample <size>`).
+    ///
+    /// Returns 0 when the directive was not configured.
+    #[inline]
+    pub fn access_sample_size(&self) -> usize {
+        self.access_sample_size
     }
 
     /// Effective per-worker log ring capacity in bytes.
@@ -804,15 +814,16 @@ macro_rules! production_commands {
                 offset: 0,
                 post: ptr::null_mut(),
             },
-            // otel_access_log on | off;  (Phase 2.1)
-            // When on, the log-phase handler pushes one access record per
-            // request into the per-worker logs ring.  Default: off.
+            // otel_access_log_sample <size>;  (Phase 2.2 DP-D)
+            // Enables the exception tail + exemplar reservoir and sizes the
+            // per-worker exemplar reservoir to <size> entries.  Absent ⇒ off.
+            // The histogram is always-on regardless of this directive.
             ngx_command_t {
-                name: ngx_string!("otel_access_log"),
-                type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_FLAG) as ngx_uint_t,
-                set: Some(nginx_sys::ngx_conf_set_flag_slot),
+                name: ngx_string!("otel_access_log_sample"),
+                type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+                set: Some(cmd_set_access_sample),
                 conf: NGX_HTTP_MAIN_CONF_OFFSET,
-                offset: mem::offset_of!(MainConfig, access_log_enabled),
+                offset: 0,
                 post: ptr::null_mut(),
             },
             // otel_log_ring_size <size>;  (Phase 2.1 FU3)
@@ -1125,6 +1136,43 @@ extern "C" fn cmd_set_log_ring_size(
     }
 }
 
+/// Directive callback for `otel_access_log_sample <size>;` (Phase 2.2 DP-D).
+///
+/// Enables the exception-tail ring + exemplar reservoir and sizes the per-worker
+/// reservoir to `<size>` entries.  Must be ≥ 1.  Parsed as a plain integer
+/// (e.g. `16` or `32`).
+extern "C" fn cmd_set_access_sample(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    let amcf = unsafe { conf.cast::<MainConfig>().as_mut().expect("main config") };
+
+    if amcf.access_sample_size > 0 {
+        return c"is duplicate".as_ptr().cast_mut();
+    }
+
+    let args = unsafe { cf_args(cf) };
+    let raw = args[1].as_bytes();
+
+    match parse_size_bytes(raw) {
+        Some(n) if n > 0 => {
+            amcf.access_sample_size = n;
+            NGX_CONF_OK
+        }
+        _ => {
+            unsafe {
+                ngx_conf_log_error!(
+                    NGX_LOG_EMERG,
+                    &mut *cf,
+                    "otel_access_log_sample: invalid size; must be a positive integer (e.g. \"16\")"
+                );
+            }
+            NGX_CONF_ERROR
+        }
+    }
+}
+
 /// Directive callback for `otel_status_endpoint;` (location-level, no args).
 ///
 /// Sets the content handler for the location to
@@ -1263,25 +1311,28 @@ mod tests {
         assert_eq!(cfg.interval_ms(), DEFAULT_INTERVAL_MS);
         assert_eq!(cfg.batch_size(), DEFAULT_BATCH_SIZE);
         assert!(cfg.status_code_class_enabled()); // UNSET treated as on
-        // access log is off by default (Phase 2.1)
-        assert!(!cfg.is_access_log_enabled(), "access log must default to off");
+        // exception-tail / exemplar sampling is off by default (Phase 2.2)
+        assert!(!cfg.is_access_sample_enabled(), "access sample must default to off");
     }
 
-    /// Verify that the otel_access_log directive flips is_access_log_enabled().
+    /// Verify that `otel_access_log_sample` toggles `is_access_sample_enabled()`
+    /// and records the reservoir size.
     ///
     /// This is a unit test of the accessor and field — the directive handler
-    /// (`ngx_conf_set_flag_slot`) is tested implicitly by the integration tests
-    /// that send a real nginx.conf containing `otel_access_log on;`.
+    /// (`cmd_set_access_sample`) is exercised implicitly by integration tests that
+    /// send a real nginx.conf containing `otel_access_log_sample 16;`.
     #[test]
-    fn test_access_log_directive() {
+    fn access_sample_directive_toggles_enablement() {
         let mut cfg = MainConfig::default();
-        // Default: off.
-        assert!(!cfg.is_access_log_enabled());
-        // Set via the raw ngx_flag_t field (mirrors what ngx_conf_set_flag_slot does).
-        cfg.access_log_enabled = 1; // on
-        assert!(cfg.is_access_log_enabled());
-        cfg.access_log_enabled = 0; // off
-        assert!(!cfg.is_access_log_enabled());
+        // Default: off (0).
+        assert!(!cfg.is_access_sample_enabled());
+        assert_eq!(cfg.access_sample_size(), 0);
+        // Set directly (mirrors what cmd_set_access_sample does).
+        cfg.access_sample_size = 16;
+        assert!(cfg.is_access_sample_enabled());
+        assert_eq!(cfg.access_sample_size(), 16);
+        cfg.access_sample_size = 0;
+        assert!(!cfg.is_access_sample_enabled());
     }
 
     /// Zero-cost-when-disabled invariant: the boolean gate relied upon by both

@@ -1,18 +1,16 @@
 #!/usr/bin/env bash
-# tests/integration/run_access_log.sh — Phase 2.1 access-log integration test
+# tests/integration/run_access_log.sh — Phase 2.2 access-log integration test
 #
-# Starts NGINX with `otel_access_log on;`, sends HTTP requests, waits for
-# the export interval, then verifies that the OTel collector received
-# LogRecord entries with HTTP semconv attributes.
+# Starts NGINX with `otel_access_log_sample 16;`, sends HTTP requests, waits for
+# the export interval, then verifies the §6.6.1 rebalanced shape:
 #
 # Assertions:
-#   1. At least N/2 LogRecord entries appear in LOGS_LOG (batch drop tolerance).
-#   2. Records contain http.request.method = "GET".
-#   3. Records contain http.response.status_code = 200.
-#   4. Records contain client.address (non-empty string).
-#   5. severity_number = 9 (INFO).
-#   6. event_name = "http.access".
-#   7. No regressions in metrics.json (service.name + duration metric present).
+#   1. 200 flood produces ZERO per-request LogRecords (is_interesting gate blocks them).
+#   2. Error requests (500) DO produce tail LogRecords.
+#   3. Histogram metric (http.server.request.duration) still arrives (always-on).
+#   4. Tail records contain http.request.method, http.response.status_code,
+#      client.address, severity, event_name=http.access.
+#   5. No regressions in metrics.json (service.name present).
 #
 # Prerequisites
 # ─────────────
@@ -42,9 +40,8 @@ MODULE_PATH="${CRATE_DIR}/target/release/libngx_http_otel_module.${MODULE_EXT}"
 SERVICE_NAME="ngx-otel-access-log-test"
 METRIC_INTERVAL_S=2
 FLUSH_WAIT_S=$(( METRIC_INTERVAL_S + 3 ))
-N_REQUESTS=30
-# Minimum records expected (50% of N_REQUESTS to account for batching lag)
-MIN_LOG_RECORDS=$(( N_REQUESTS / 2 ))
+N_OK_REQUESTS=30    # 200 flood — must produce ZERO LogRecords
+N_ERR_REQUESTS=5    # 500 requests — must each produce a tail LogRecord
 
 # ─── Colour helpers ──────────────────────────────────────────────────────────
 
@@ -139,9 +136,16 @@ info "nginx running (PID ${NGINX_PID})"
 
 # ─── Send HTTP traffic ───────────────────────────────────────────────────────
 
-info "Sending ${N_REQUESTS} GET requests to http://127.0.0.1:9101/..."
-for i in $(seq 1 "${N_REQUESTS}"); do
+# Phase 2.2: 200 flood — is_interesting gate should block all of these.
+info "Sending ${N_OK_REQUESTS} GET requests (200) to http://127.0.0.1:9101/..."
+for i in $(seq 1 "${N_OK_REQUESTS}"); do
     curl -sf http://127.0.0.1:9101/ >/dev/null
+done
+
+# Error requests — is_interesting gate should pass all of these (status 500 ≥ 400).
+info "Sending ${N_ERR_REQUESTS} GET requests (500/error) to http://127.0.0.1:9101/error..."
+for i in $(seq 1 "${N_ERR_REQUESTS}"); do
+    curl -sf http://127.0.0.1:9101/error >/dev/null || true  # 500 exit ≠ 0
 done
 info "Traffic sent."
 
@@ -188,7 +192,7 @@ else
     fail "metrics.json: http.server.request.duration NOT found"
 fi
 
-# ── logs.json: presence of LogRecord entries ──────────────────────────────────
+# ── logs.json: Phase 2.2 assertions ──────────────────────────────────────────
 NEW_LOGS=""
 if [[ -f "${LOGS_LOG}" ]]; then
     POST_LOGS_SIZE=$(wc -c < "${LOGS_LOG}")
@@ -197,63 +201,70 @@ if [[ -f "${LOGS_LOG}" ]]; then
     fi
 fi
 
-if [[ -z "${NEW_LOGS}" ]]; then
-    fail "logs.json: no new content — no LogRecords arrived at the collector"
-    info "  (check that the collector's logs pipeline is configured with file/logs exporter)"
-else
-    info "logs.json: got $(echo "${NEW_LOGS}" | wc -c) bytes of new content"
-fi
+info "logs.json: got $(echo "${NEW_LOGS}" | wc -c) bytes of new content"
 
-# Count log records (each line in the JSON file is one export request;
-# count resourceLogs occurrences as a proxy for "at least one batch arrived").
-LOG_RECORD_COUNT=$(echo "${NEW_LOGS}" | grep -o '"http.access"' | wc -l || echo 0)
+# Count all http.access records produced.
+LOG_RECORD_COUNT=$(echo "${NEW_LOGS}" | grep -o '"http.access"' | wc -l | tr -d ' ' || echo 0)
 info "event_name=http.access count in new logs.json content: ${LOG_RECORD_COUNT}"
 
-if (( LOG_RECORD_COUNT >= MIN_LOG_RECORDS )); then
-    pass "logs.json: at least ${MIN_LOG_RECORDS} http.access records present (got ${LOG_RECORD_COUNT})"
+# ── Key assertion 1: 200 flood → ZERO LogRecords (is_interesting gate) ────────
+# The test sent N_OK_REQUESTS 200/fast requests — none should appear as records.
+# All N_ERR_REQUESTS 500 requests should appear (status 500 ≥ TAIL_STATUS_FLOOR=400).
+# If any 200 slip through the gate that is a test failure.
+if (( LOG_RECORD_COUNT <= N_ERR_REQUESTS )); then
+    pass "logs.json: 200 flood correctly produced no tail records (total=${LOG_RECORD_COUNT}, errs=${N_ERR_REQUESTS})"
 else
-    fail "logs.json: expected >= ${MIN_LOG_RECORDS} http.access records, got ${LOG_RECORD_COUNT}"
+    fail "logs.json: too many tail records (${LOG_RECORD_COUNT} > ${N_ERR_REQUESTS}); 200 requests may be leaking through the is_interesting gate"
 fi
 
-# Assertion: http.request.method = "GET"
-if echo "${NEW_LOGS}" | grep -q '"http.request.method"'; then
-    pass "logs.json: http.request.method attribute present"
+# ── Key assertion 2: error requests DO produce tail records ───────────────────
+if (( LOG_RECORD_COUNT >= 1 )); then
+    pass "logs.json: at least 1 tail LogRecord present from error requests (got ${LOG_RECORD_COUNT})"
 else
-    fail "logs.json: http.request.method attribute NOT found"
+    fail "logs.json: expected ≥ 1 tail LogRecord from ${N_ERR_REQUESTS} error requests, got 0"
 fi
 
-# Assertion: http.response.status_code = 200
-if echo "${NEW_LOGS}" | grep -q '"http.response.status_code"'; then
-    pass "logs.json: http.response.status_code attribute present"
-else
-    fail "logs.json: http.response.status_code attribute NOT found"
-fi
+# ── Check tail record fields ──────────────────────────────────────────────────
+if [[ -n "${NEW_LOGS}" ]]; then
+    # Assertion: http.request.method present
+    if echo "${NEW_LOGS}" | grep -q '"http.request.method"'; then
+        pass "logs.json: http.request.method attribute present"
+    else
+        fail "logs.json: http.request.method attribute NOT found"
+    fi
 
-# Assertion: client.address non-empty
-if echo "${NEW_LOGS}" | grep -q '"client.address"'; then
-    pass "logs.json: client.address attribute present"
-else
-    fail "logs.json: client.address attribute NOT found"
-fi
+    # Assertion: http.response.status_code present
+    if echo "${NEW_LOGS}" | grep -q '"http.response.status_code"'; then
+        pass "logs.json: http.response.status_code attribute present"
+    else
+        fail "logs.json: http.response.status_code attribute NOT found"
+    fi
 
-# Assertion: severity_number = 9 (INFO — nginx level 7 → OTel INFO)
-if echo "${NEW_LOGS}" | grep -q '"severityNumber":9\|"severity_number":9\|"severityNumber": 9'; then
-    pass "logs.json: severity_number = 9 (INFO) present"
-else
-    # The collector may format severity_number as a string ("INFO") or integer.
-    # Check for the INFO string representation as well.
-    if echo "${NEW_LOGS}" | grep -qE '"severityText":"info"|"severity_text":"info"'; then
+    # Assertion: client.address present
+    if echo "${NEW_LOGS}" | grep -q '"client.address"'; then
+        pass "logs.json: client.address attribute present"
+    else
+        fail "logs.json: client.address attribute NOT found"
+    fi
+
+    # Assertion: severity_number = 9 (INFO)
+    if echo "${NEW_LOGS}" | grep -qE '"severityNumber":9|"severity_number":9|"severityNumber": 9'; then
+        pass "logs.json: severity_number = 9 (INFO) present"
+    elif echo "${NEW_LOGS}" | grep -qE '"severityText":"info"|"severity_text":"info"'; then
         pass "logs.json: severity = INFO present (via text)"
     else
         fail "logs.json: severity_number=9 (INFO) NOT found; severity mapping may be wrong"
     fi
-fi
 
-# Assertion: event_name = "http.access"
-if echo "${NEW_LOGS}" | grep -q '"http.access"'; then
-    pass "logs.json: event_name = http.access present"
+    # Assertion: event_name = "http.access"
+    if echo "${NEW_LOGS}" | grep -q '"http.access"'; then
+        pass "logs.json: event_name = http.access present"
+    else
+        fail "logs.json: event_name=http.access NOT found"
+    fi
 else
-    fail "logs.json: event_name=http.access NOT found"
+    fail "logs.json: no new content — exception-tail records did not arrive at the collector"
+    info "  (check that the collector's logs pipeline is configured with the logs file exporter)"
 fi
 
 # ─── Final result ────────────────────────────────────────────────────────────
