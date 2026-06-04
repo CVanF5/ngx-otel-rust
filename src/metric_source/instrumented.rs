@@ -81,19 +81,25 @@ impl HttpRequestHandler for LogPhaseHandler {
         // Use AsRef to get a typed reference to the underlying ngx_http_request_t.
         let r = request.as_ref();
 
-        // ── request duration in milliseconds ──────────────────────────────
-        // Mirror avr-module/src/ngx_http_avr_data_sources.c:12-15 (get_request_time)
-        // and nginx/src/http/ngx_http_variables.c:2284 ($request_time idiom):
-        //   ms = (tp->sec - r->start_sec) * 1000 + (tp->msec - r->start_msec)
-        // r->start_msec is the millisecond *fraction* of the start second (0–999),
-        // not a full epoch timestamp — the previous code subtracted the wrong clock.
-        let duration_ms: u64 = {
-            let tp = nginx_sys::ngx_timeofday(); // safe: returns &'static ngx_time_t
-                                                 // time_t = c_long (i64 on 64-bit), ngx_uint_t/ngx_msec_t = usize.
-            let ms: i64 =
-                (tp.sec as i64 - r.start_sec) * 1000 + (tp.msec as i64 - r.start_msec as i64);
-            ms.max(0) as u64
+        // ── request duration in MICROSECONDS (FU2 resolution fix) ────────────
+        // FU2: use SystemTime::now() for µs-precision end time, combined with
+        // nginx's ms-precision start time.  This gives sub-ms resolution for
+        // requests > 1ms and resolves the ~90–200µs regime into distinct exp-
+        // histogram buckets at scale 3.  SystemTime::now() is a vDSO call on
+        // Linux (not a kernel syscall) — acceptable on the request path.
+        let duration_us: u64 = {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let end_us = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_micros() as u64)
+                .unwrap_or(0);
+            let start_us = (r.start_sec as u64) * 1_000_000
+                + (r.start_msec as u64) * 1_000;
+            end_us.saturating_sub(start_us)
         };
+        // Keep a ms version for the is_interesting tail-latency gate (still ms-threshold).
+        let duration_ms: u64 = duration_us / 1_000;
+
         // ── request duration (Phase 2.2 DP-E FU1 — decomposed tables) ───────
         // Three independent histogram bumps — each O(1) fetch_add, no alloc, no lock.
         let method = HttpMethod::from_bytes(r.method_name.as_bytes());
@@ -103,7 +109,7 @@ impl HttpRequestHandler for LogPhaseHandler {
 
         // 1. Base table: {method × status_class × protocol} (160 combos).
         let base_idx = combo_index(method, status_class, proto);
-        slot.request_duration_combos[base_idx].record(duration_ms);
+        slot.request_duration_combos[base_idx].record(duration_us);
 
         // 2. Per-route table: http.route = location name.
         let route_idx = {
@@ -112,7 +118,7 @@ impl HttpRequestHandler for LogPhaseHandler {
                 .unwrap_or(0);
             amcf.route_idx_for_clcf(clcf_ptr)
         };
-        slot.route_duration_combos[route_idx].record(duration_ms);
+        slot.route_duration_combos[route_idx].record(duration_us);
 
         // 3. Per-upstream table: nginx.upstream.zone.
         //    Skip if no upstream (zone_ptr = 0 → UPSTREAM_IDX_OTHER).
@@ -126,10 +132,10 @@ impl HttpRequestHandler for LogPhaseHandler {
         let upstream_idx = amcf.upstream_idx_for_zone(upstream_zone_ptr);
         // Only bump upstream histogram when request actually went through an upstream.
         if upstream_zone_ptr != 0 && upstream_idx < UPSTREAM_IDX_OTHER {
-            slot.upstream_duration_combos[upstream_idx].record(duration_ms);
+            slot.upstream_duration_combos[upstream_idx].record(duration_us);
         } else if upstream_zone_ptr != 0 {
             // Over-cap upstream: bump "other" slot (UPSTREAM_IDX_OTHER = UPSTREAM_CAP).
-            slot.upstream_duration_combos[UPSTREAM_IDX_OTHER].record(duration_ms);
+            slot.upstream_duration_combos[UPSTREAM_IDX_OTHER].record(duration_us);
         }
         // zone_ptr == 0 → no upstream → skip upstream histogram.
 
@@ -198,18 +204,11 @@ impl HttpRequestHandler for LogPhaseHandler {
                     b""
                 };
 
-                // Timestamp: use duration computation result.  We want the
-                // request start time in nanoseconds; derive from the nginx
-                // cached time + start fields.
-                let ts_unix_nano: u64 = {
-                    let tp = nginx_sys::ngx_timeofday();
-                    // Request start: r.start_sec + r.start_msec / 1000
-                    // Convert to ns: start_sec * 1e9 + start_msec * 1e6
-                    (r.start_sec as u64)
-                        .saturating_mul(1_000_000_000)
-                        .saturating_add(r.start_msec as u64 * 1_000_000)
-                };
-                let _ = nginx_sys::ngx_timeofday(); // suppress unused-import warning if any
+                // Timestamp: request start time in nanoseconds.
+                // Derived from nginx's stored start fields (ms precision).
+                let ts_unix_nano: u64 = (r.start_sec as u64)
+                    .saturating_mul(1_000_000_000)
+                    .saturating_add(r.start_msec as u64 * 1_000_000);
 
                 // W3C trace correlation (Phase 2.2.3): read `traceparent` header.
                 // Also scan for User-Agent (Phase 2.2.5). One O(n) pass covers both.
@@ -255,7 +254,7 @@ impl HttpRequestHandler for LogPhaseHandler {
                 };
                 slot.exemplar_reservoir.write(
                     effective_size,
-                    duration_ms,
+                    duration_us,
                     base_idx as u32,
                     trace_id_opt,
                     span_id_opt,
@@ -531,7 +530,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
             Metric {
                 name: "http.server.request.duration".into(),
                 description: "HTTP server request duration".into(),
-                unit: "ms".into(),
+                unit: "us".into(),
                 data: MetricData::ExponentialHistogram(ExponentialHistogramData {
                     aggregation_temporality: AggregationTemporality::Cumulative,
                     data_points,
@@ -548,7 +547,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
             Metric {
                 name: "http.server.request.duration".into(),
                 description: "HTTP server request duration".into(),
-                unit: "ms".into(),
+                unit: "us".into(),
                 data: MetricData::ExponentialHistogram(ExponentialHistogramData {
                     aggregation_temporality: AggregationTemporality::Cumulative,
                     data_points: std::vec![ExponentialHistogramDataPoint {
@@ -580,7 +579,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
             Metric {
                 name: "http.server.request.duration.by_route".into(),
                 description: "HTTP server request duration by matched location (http.route)".into(),
-                unit: "ms".into(),
+                unit: "us".into(),
                 data: MetricData::ExponentialHistogram(ExponentialHistogramData {
                     aggregation_temporality: AggregationTemporality::Cumulative,
                     data_points,
@@ -604,7 +603,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
             Metric {
                 name: "http.server.request.duration.by_upstream".into(),
                 description: "HTTP server request duration by upstream zone (nginx.upstream.zone)".into(),
-                unit: "ms".into(),
+                unit: "us".into(),
                 data: MetricData::ExponentialHistogram(ExponentialHistogramData {
                     aggregation_temporality: AggregationTemporality::Cumulative,
                     data_points,

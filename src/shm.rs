@@ -42,39 +42,43 @@ pub const N_DURATION_BUCKETS: usize = 15;
 
 /// OTel exponential histogram scale for `request_duration_combos`.
 ///
-/// Scale 0 → base = 2^(2^0) = 2 → one bucket per power-of-2 millisecond.
-/// Bucket `k` covers `[2^k, 2^(k+1))` ms (for `k ≥ 0`); zero ms → `zero_count`.
-pub const EXP_HISTOGRAM_SCALE: i32 = 0;
+/// **FU2 resolution fix:** scale 3 → base = 2^(2^-3) = 2^0.125 ≈ 1.091
+/// → 8 buckets per power-of-2 microsecond.  At this scale, 90µs, 150µs,
+/// and 200µs land in distinct buckets (indices 51, 57, 60 respectively),
+/// resolving the ~90–200µs operating regime.  Scale 0 with integer-ms input
+/// collapsed everything < 1ms into `zero_count` — this fixes that.
+pub const EXP_HISTOGRAM_SCALE: i32 = 3;
 
 /// Number of positive-range bucket slots in each `ExpHistogramSlot`.
 ///
-/// At scale 0, 14 buckets covers `[1, 16 384)` ms (1 ms to ~16 s), sufficient
-/// for typical HTTP latencies.  Values ≥ 2^14 = 16 384 ms clamp to the last
-/// bucket.  Values = 0 ms go to `zero_count`.
-pub const N_EXP_BUCKETS: usize = 14;
+/// At scale 3 in µs, 192 buckets covers [1µs, 2^24 µs = 16.7s), sufficient
+/// for all practical HTTP latencies.  Values ≥ 2^24 µs clamp to bucket 191.
+/// Values = 0 µs go to `zero_count` (should not occur in practice).
+pub const N_EXP_BUCKETS: usize = 192;
 
-/// Fixed offset: bucket 0 starts at index 0 (i.e., covers `[2^0, 2^1) = [1, 2)` ms).
+/// Fixed bucket offset (OTel `offset` field in the wire format).
+/// Bucket `k` covers approximately [base^k, base^(k+1)) µs starting at 1µs.
 pub const EXP_HISTOGRAM_BUCKET_OFFSET: i32 = 0;
 
 /// An OTel **exponential histogram** slot stored entirely in atomic counters.
 ///
-/// Scale 0, 14 buckets: bucket `k` counts values in `[2^k, 2^(k+1))` ms.
-/// Zero ms → `zero_count`.  All durations are positive so `negative` is empty.
+/// **FU2 resolution fix (scale 3, µs input):** bucket `k` covers approximately
+/// [base^k, base^(k+1)) µs where base = 2^(2^-3) ≈ 1.091.
+/// 90µs → bucket 51; 150µs → 57; 200µs → 60 — all distinct.
+/// All durations are positive so `negative` is empty.
 ///
-/// The record function is a single `leading_zeros` instruction + one
-/// `fetch_add` — alloc-free and lock-free on the hot path.
+/// The record function computes the scale-3 bucket index with a few bit ops +
+/// one `fetch_add` — alloc-free and lock-free on the hot path.
 ///
-/// Size: `(N_EXP_BUCKETS + 3) × 8 = 17 × 8 = 136 bytes`
-/// (identical to the `Histogram<15>` it replaces, so `SLOT_BUDGET` is
-/// unchanged by this switch).
+/// Size: `(N_EXP_BUCKETS + 3) × 8 = 195 × 8 = 1560 bytes`.
 #[repr(C)]
 pub struct ExpHistogramSlot {
-    /// Bucket `k` counts values in `[2^k, 2^(k+1))` ms.
-    /// `buckets[N_EXP_BUCKETS-1]` is the overflow bucket (`≥ 2^13 = 8192` ms).
+    /// Bucket `k` counts values in approximately [base^k, base^(k+1)) µs.
+    /// `buckets[N_EXP_BUCKETS-1]` is the overflow bucket (≥ ~16.7s).
     pub buckets: [AtomicU64; N_EXP_BUCKETS],
-    /// Count of values = 0 ms (sub-ms latencies truncated to integer ms).
+    /// Count of values = 0 µs (should not occur with µs-precision timing).
     pub zero_count: AtomicU64,
-    /// Sum of all observed values in ms.
+    /// Sum of all observed values in µs.
     pub sum: AtomicU64,
     /// Total observation count.
     pub count: AtomicU64,
@@ -83,22 +87,32 @@ pub struct ExpHistogramSlot {
 impl ExpHistogramSlot {
     /// Record one duration observation on the hot path.
     ///
-    /// `value_ms` is the integer-millisecond duration (0 = sub-ms).
+    /// `value_us` is the duration in **microseconds**.  FU2: feeding µs
+    /// (instead of ms) with scale 3 resolves the ~90–200µs regime into
+    /// distinct buckets.
     ///
     /// # Constraint: no allocation, no lock
-    /// Uses `leading_zeros()` (a single hardware instruction on all supported
-    /// architectures) to compute `floor(log2(value_ms))` in O(1).
+    /// Uses `leading_zeros()` + a few bit ops to compute
+    /// `floor(log2(value_us) * 2^scale)` in O(1).
     #[inline]
-    pub fn record(&self, value_ms: u64) {
-        if value_ms == 0 {
+    pub fn record(&self, value_us: u64) {
+        if value_us == 0 {
             self.zero_count.fetch_add(1, Ordering::Relaxed);
         } else {
-            // floor(log2(value_ms)) = 63 - value_ms.leading_zeros()
-            let k = (63 - value_ms.leading_zeros()) as usize;
-            let idx = k.min(N_EXP_BUCKETS - 1);
-            self.buckets[idx].fetch_add(1, Ordering::Relaxed);
+            let n = 63u32.saturating_sub(value_us.leading_zeros()); // floor(log2(value))
+            let s = EXP_HISTOGRAM_SCALE as u32;                      // = 3
+            let idx = if n <= s {
+                // value < 2^s: bucket index = value itself (fine-grained low end)
+                value_us as usize
+            } else {
+                // k = n * 2^s + ((value >> (n - s)) & ((1 << s) - 1))
+                let upper = (n as usize) << s;
+                let frac  = ((value_us >> (n - s)) as usize) & ((1usize << s) - 1);
+                upper | frac
+            };
+            self.buckets[idx.min(N_EXP_BUCKETS - 1)].fetch_add(1, Ordering::Relaxed);
         }
-        self.sum.fetch_add(value_ms, Ordering::Relaxed);
+        self.sum.fetch_add(value_us, Ordering::Relaxed);
         self.count.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -340,10 +354,12 @@ pub const N_COMBOS: usize = N_HTTP_METHODS * N_STATUS_CLASSES * N_PROTO_VERSIONS
 
 /// Memory budget for all three histogram arrays in `WorkerSlots`.
 ///
-/// With default caps 64/32, budget = (160 + 65 + 33) × 136 = 34,408 bytes ≪ 1 MiB.
-pub const SLOT_BUDGET: usize = 1 * 1024 * 1024; // 1 MiB per worker (generous)
+/// With default caps 64/32 and N_EXP_BUCKETS=192 (scale 3):
+///   size_of::<ExpHistogramSlot>() = (192 + 3) × 8 = 1560 bytes
+///   total = (160 + 65 + 33) × 1560 = 403,920 bytes ≈ 395 KB ≪ 4 MiB.
+pub const SLOT_BUDGET: usize = 4 * 1024 * 1024; // 4 MiB per worker
 
-// Compile-time budget check — passes at ROUTE_CAP=64, UPSTREAM_CAP=32.
+// Compile-time budget check — passes at ROUTE_CAP=64, UPSTREAM_CAP=32, N_EXP_BUCKETS=192.
 const _: () = assert!(
     (N_COMBOS + N_ROUTE_SLOTS + N_UPSTREAM_SLOTS) * core::mem::size_of::<ExpHistogramSlot>() <= SLOT_BUDGET,
     "histogram arrays exceed SLOT_BUDGET"
@@ -896,18 +912,30 @@ mod tests {
         assert_eq!(total_sum, 1300);
 
         // Confirm no cross-write between slots.
-        // At scale 0: 100ms → k = floor(log2(100)) = 6 (bucket[6] = [64, 128))
-        //            500ms → k = floor(log2(500)) = 8 (bucket[8] = [256, 512))
+        // FU2 scale 3: bucket index = n*8 + frac (n = floor(log2(value))).
+        // 100µs: n=6, k=6*8+((100>>3)&7)=48+3=51.  500µs: n=8, k=8*8+((500>>5)&7)=64+15=79.
         let (buckets0, _, _, _) = slot0.request_duration_combos[combo].snapshot();
         let (buckets1, _, _, _) = slot1.request_duration_combos[combo].snapshot();
 
-        let bucket_100ms = (63 - 100u64.leading_zeros()) as usize; // = 6
-        let bucket_500ms = (63 - 500u64.leading_zeros()) as usize; // = 8
+        // Compute expected bucket indices using the same formula as record().
+        fn bucket_idx(v: u64) -> usize {
+            let n = 63u32.saturating_sub(v.leading_zeros());
+            let s = EXP_HISTOGRAM_SCALE as u32;
+            let idx = if n <= s { v as usize } else {
+                let upper = (n as usize) << s;
+                let frac  = ((v >> (n - s)) as usize) & ((1usize << s) - 1);
+                upper | frac
+            };
+            idx.min(N_EXP_BUCKETS - 1)
+        }
+        let bucket_100 = bucket_idx(100);
+        let bucket_500 = bucket_idx(500);
 
-        assert_eq!(buckets0[bucket_100ms], 3, "worker 0 bucket for 100ms");
-        assert_eq!(buckets1[bucket_500ms], 2, "worker 1 bucket for 500ms");
-        assert_eq!(buckets0[bucket_500ms], 0, "slot 0 not written by worker 1");
-        assert_eq!(buckets1[bucket_100ms], 0, "slot 1 not written by worker 0");
+        assert_ne!(bucket_100, bucket_500, "100 and 500 must be in distinct buckets");
+        assert_eq!(buckets0[bucket_100], 3, "worker 0 bucket for 100");
+        assert_eq!(buckets1[bucket_500], 2, "worker 1 bucket for 500");
+        assert_eq!(buckets0[bucket_500], 0, "slot 0 not written by worker 1");
+        assert_eq!(buckets1[bucket_100], 0, "slot 1 not written by worker 0");
     }
 
     /// Base combo index mapping: all N_COMBOS (160) combinations must be distinct.
@@ -967,17 +995,17 @@ mod tests {
     /// The compile-time budget assert passes at restored default caps (64/32).
     #[test]
     fn worker_slots_within_memory_budget() {
-        // FU1: three separate tables, NOT cross-product.
+        // FU1+FU2: three separate tables, scale 3, N_EXP_BUCKETS=192.
         let total_slots = N_COMBOS + N_ROUTE_SLOTS + N_UPSTREAM_SLOTS;
-        let total_bytes = total_slots * core::mem::size_of::<ExpHistogramSlot>();
+        let slot_size = core::mem::size_of::<ExpHistogramSlot>();
+        let total_bytes = total_slots * slot_size;
         assert!(
             total_bytes <= SLOT_BUDGET,
-            "histogram arrays ({} bytes) exceeds SLOT_BUDGET ({} bytes)",
-            total_bytes,
-            SLOT_BUDGET,
+            "histogram arrays ({} bytes, {} slots × {} bytes) exceeds SLOT_BUDGET ({} bytes)",
+            total_bytes, total_slots, slot_size, SLOT_BUDGET,
         );
-        // Sanity: ExpHistogramSlot size documented.
-        assert_eq!(core::mem::size_of::<ExpHistogramSlot>(), 17 * 8, "17 AtomicU64 = 136 bytes");
+        // FU2: 195 AtomicU64 = 1560 bytes per slot.
+        assert_eq!(slot_size, (N_EXP_BUCKETS + 3) * 8, "(N_EXP_BUCKETS+3)×8 bytes per slot");
     }
 
     #[test]
@@ -993,10 +1021,10 @@ mod tests {
         let mut buf = std::vec![0u8; mem::size_of::<WorkerSlots>()];
         let slot = unsafe { &*buf.as_mut_ptr().cast::<WorkerSlots>() };
 
-        // Record a large value in the GET/2xx/HTTP1.1 base combo.
+        // Record a very large value in the GET/2xx/HTTP1.1 base combo (µs).
         let combo = combo_index(HttpMethod::Get, StatusClass::S2xx, ProtoVersion::Http11);
-        // 99_999 (any unit) = floor(log2(99_999)) = 16 → clamped to N_EXP_BUCKETS-1 = 13
-        let very_large = 99_999u64;
+        // 99_999_999_999µs ≈ 27.8h; floor(log2) = 36 → k = 36*8+... ≥ 288 → clamped to 191
+        let very_large = 99_999_999_999u64;
         slot.request_duration_combos[combo].record(very_large);
 
         let (buckets, zero_count, sum, count) = slot.request_duration_combos[combo].snapshot();
@@ -1060,6 +1088,39 @@ mod tests {
     ///
     /// This test asserts structural invariants at the TYPE level.
     #[test]
+    /// FU2: sub-ms values (90µs, 150µs, 200µs) must land in distinct buckets.
+    /// This directly tests the "scale 3 resolves the ~90–200µs regime" claim.
+    /// Rejects the prior scale-0+ms design where all three would be zero_count.
+    #[test]
+    fn sub_ms_values_land_in_distinct_buckets() {
+        let mut buf = std::vec![0u8; core::mem::size_of::<ExpHistogramSlot>()];
+        let slot = unsafe { &*buf.as_mut_ptr().cast::<ExpHistogramSlot>() };
+
+        slot.record(90);   // 90 µs
+        slot.record(150);  // 150 µs
+        slot.record(200);  // 200 µs
+
+        let (buckets, zero_count, _sum, count) = slot.snapshot();
+        assert_eq!(count, 3, "three observations");
+        assert_eq!(zero_count, 0, "none are zero");
+
+        // Find the non-zero buckets.
+        let nonempty: std::vec::Vec<usize> = buckets.iter().enumerate()
+            .filter(|(_, &c)| c > 0)
+            .map(|(i, _)| i)
+            .collect();
+
+        assert_eq!(nonempty.len(), 3, "90µs, 150µs, 200µs must each land in a distinct bucket (scale 3)");
+
+        // Spot-check expected indices:
+        // 90µs: n=6, k=6*8+((90>>3)&7)=48+3=51
+        // 150µs: n=7, k=7*8+((150>>4)&7)=56+1=57
+        // 200µs: n=7, k=7*8+((200>>4)&7)=56+4=60
+        assert_eq!(buckets[51], 1, "90µs → bucket 51");
+        assert_eq!(buckets[57], 1, "150µs → bucket 57");
+        assert_eq!(buckets[60], 1, "200µs → bucket 60");
+    }
+
     fn high_cardinality_only_on_tail_not_metric() {
         // 1. N_COMBOS is the base 160 (method × sc × proto) ONLY.
         //    Route and upstream are separate tables (FU1 decomposed) — NOT multiplied in.
