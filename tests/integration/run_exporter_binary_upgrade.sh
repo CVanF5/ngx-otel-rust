@@ -112,11 +112,11 @@ exporter_pid_from_log() {
         | sed -n "${n}p"
 }
 
-# Count ALL nginx master processes matching our binary.
+# Count ALL nginx master processes visible in ps.
+# ps -eo pid,args: $1=pid, $2=first-word-of-args="nginx:", $3="master", $4="process"
 nginx_master_count() {
     ps -eo pid,args 2>/dev/null \
-        | awk -v binary="${NGINX_BINARY}" \
-            '$2 == binary && $3 == "master" && $4 == "process" {print $1}' \
+        | awk '$2 == "nginx:" && $3 == "master" && $4 == "process" {print $1}' \
         | wc -l | tr -d ' '
 }
 
@@ -124,8 +124,8 @@ nginx_master_count() {
 second_master_pid() {
     local m1_pid=$1
     ps -eo pid,args 2>/dev/null \
-        | awk -v binary="${NGINX_BINARY}" -v exclude="${m1_pid}" \
-            '$2 == binary && $3 == "master" && $4 == "process" && $1 != exclude {print $1}' \
+        | awk -v exclude="${m1_pid}" \
+            '$2 == "nginx:" && $3 == "master" && $4 == "process" && $1 != exclude {print $1}' \
         | head -1
 }
 
