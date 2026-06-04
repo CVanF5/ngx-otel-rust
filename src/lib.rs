@@ -179,6 +179,18 @@ fn spawn_exporter_for_cycle(
 /// `init_master` is NOT called on SIGHUP — it fires once per master process
 /// lifetime at the start of `ngx_master_process_cycle`.
 extern "C" fn ngx_otel_init_master(log: *mut nginx_sys::ngx_log_t) -> nginx_sys::ngx_int_t {
+    // Visible sentinel: confirms init_master is actually called by nginx.
+    // If this line does NOT appear in error.log, nginx is not calling this hook.
+    if !log.is_null() {
+        ngx::ngx_log_error!(
+            nginx_sys::NGX_LOG_NOTICE,
+            log,
+            "otel: init_master: entered (pid={}, ppid={})",
+            unsafe { nginx_sys::ngx_pid },
+            unsafe { nginx_sys::ngx_parent },
+        );
+    }
+
     // init_master is only called in the master process in daemon mode.
     // Safety: ngx_cycle is a nginx global pointing at the current cycle;
     // valid for the entire master process lifetime.
