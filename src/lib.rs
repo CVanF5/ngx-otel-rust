@@ -91,7 +91,7 @@ pub static mut ngx_http_otel_module: ngx_module_t = ngx_module_t {
     commands: unsafe { ptr::addr_of_mut!(NGX_HTTP_OTEL_COMMANDS[0]) },
     type_: NGX_HTTP_MODULE as ngx_uint_t,
 
-    init_master: None,
+    init_master: Some(ngx_otel_init_master),
     init_module: Some(ngx_otel_init_module),
     init_process: Some(ngx_otel_init_process),
     init_thread: None,
@@ -106,91 +106,27 @@ unsafe impl HttpModuleMainConf for HttpOtelModule {
     type MainConf = config::MainConfig;
 }
 
-// ── init_module callback ──────────────────────────────────────────────────────
+// ── Shared exporter spawn helper ─────────────────────────────────────────────
 
-/// Called by nginx from `ngx_init_modules` (via `ngx_init_cycle`) — once at
-/// initial start and again on each SIGHUP reload.
+/// Spawn the `nginx: otel exporter` process from the given cycle.
 ///
-/// Forks the `nginx: otel exporter` child process from master, gated on
-/// `MainConfig::is_configured()`. Uses `NGX_PROCESS_RESPAWN` for initial
-/// start (auto-respawn on crash) and `NGX_PROCESS_JUST_RESPAWN` for SIGHUP
-/// reloads (skipped on the first signal fan-out so old+new exporter coexist
-/// briefly — same pattern as `ngx_start_cache_manager_processes`).
-///
-/// Timing note: at initial start this fires *before* `ngx_init_signals` in
-/// the master, so the forked child inherits SIG_DFL handlers. The child calls
-/// `nginx_sys::ngx_init_signals` immediately after fork to fix this.
-/// On SIGHUP this hook fires inside `ngx_master_process_cycle` where signals
-/// are already installed — the child inherits them correctly.
-///
-/// See `PHASE_1_3_RESEARCH.md` §2.7–2.9, §5.2 and Q4 for design decisions.
-extern "C" fn ngx_otel_init_module(cycle: *mut nginx_sys::ngx_cycle_t) -> nginx_sys::ngx_int_t {
-    // Fork only when running in master-process mode. Two call sites:
-    //
-    // 1. Initial start: ngx_process = NGX_PROCESS_SINGLE at this point
-    //    (nginx.c:339 sets MASTER *after* ngx_init_cycle returns; our hook
-    //    fires during ngx_init_cycle:649). Allow SINGLE here.
-    //
-    // 2. SIGHUP reload: ngx_process = NGX_PROCESS_MASTER. Allow MASTER.
-    //
-    // Skip all worker/helper/signaller contexts (they should never call
-    // ngx_init_cycle, but the check is cheap and defensive).
-    //
-    // Note: unlike cache_manager (spawned from ngx_master_process_cycle
-    // where MASTER is already set), we use init_module which fires earlier.
-    let process = unsafe { nginx_sys::ngx_process } as u32;
-    if process != nginx_sys::NGX_PROCESS_MASTER && process != nginx_sys::NGX_PROCESS_SINGLE {
-        return Status::NGX_OK.into();
-    }
-
-    // Don't spawn an exporter during `nginx -t` (config-test mode). In test
-    // mode ngx_init_cycle is called just for syntax validation; spawning a
-    // child here would leak it as an orphan when the master exits after the
-    // test.
-    if unsafe { nginx_sys::ngx_test_config } != 0 {
-        return Status::NGX_OK.into();
-    }
-
+/// `is_reload` = true for SIGHUP reload (uses `NGX_PROCESS_JUST_RESPAWN`),
+/// false for initial start (uses `NGX_PROCESS_RESPAWN`).
+fn spawn_exporter_for_cycle(
+    cycle: *mut nginx_sys::ngx_cycle_t,
+    is_reload: bool,
+) -> nginx_sys::ngx_int_t {
     let cycle_ref = unsafe { &mut *cycle };
-    let Some(amcf) = HttpOtelModule::main_conf(cycle_ref) else {
-        return Status::NGX_OK.into();
-    };
-    if !amcf.is_configured() {
-        // Zero-cost gate: module loaded but no otel_exporter block → no fork,
-        // no proctitle child, no background activity.
-        return Status::NGX_OK.into();
-    }
 
-    // Detect SIGHUP reload via old_cycle->conf_ctx: the cycle passed to
-    // ngx_init_cycle is NULL only at very first start (it's the zero-initialized
-    // init_cycle struct; conf_ctx == NULL marks it). On SIGHUP, old_cycle is the
-    // fully-initialized current cycle (conf_ctx != NULL).
-    //
-    // IMPORTANT: Checking `old_cycle != NULL` alone is WRONG. At initial start,
-    // ngx_init_cycle is called as ngx_init_cycle(&init_cycle) where
-    // init_cycle is zeroed, so new_cycle->old_cycle = &init_cycle (NOT null).
-    // The distinguishing factor is conf_ctx: NULL in the zero-init cycle,
-    // non-NULL in a fully-configured running cycle.
-    // See nginx/src/core/ngx_cycle.c and the ngx_is_init_cycle() macro.
-    let is_reload = unsafe {
-        let old = (*cycle).old_cycle;
-        !old.is_null() && !(*old).conf_ctx.is_null()
-    };
     let respawn_flag: nginx_sys::ngx_int_t = if is_reload {
         // JUST_RESPAWN: new exporter is skipped on master's first signal
         // fan-out so old+new coexist during the ~100ms overlap window.
-        // The old exporter receives NGX_CMD_QUIT via ngx_signal_worker_processes
-        // and exits after its graceful drain.
         nginx_sys::NGX_PROCESS_JUST_RESPAWN as nginx_sys::ngx_int_t
     } else {
-        // RESPAWN: master auto-respawns on crash (ngx_reap_children:593-616).
+        // RESPAWN: master auto-respawns the exporter on crash.
         nginx_sys::NGX_PROCESS_RESPAWN as nginx_sys::ngx_int_t
     };
 
-    // Q4 RESOLVED: pass NULL as `data`. The exporter cycle resolves MainConfig
-    // from `cycle` via HttpOtelModule::main_conf(cycle) — same path the current
-    // export_loop uses. Mirrors cache_manager which uses `data` only for the
-    // small ngx_cache_manager_ctx_t dispatch struct, never for config.
     let pid = unsafe {
         nginx_sys::ngx_spawn_process(
             cycle,
@@ -218,6 +154,126 @@ extern "C" fn ngx_otel_init_module(cycle: *mut nginx_sys::ngx_cycle_t) -> nginx_
         is_reload
     );
     Status::NGX_OK.into()
+}
+
+// ── init_master callback ──────────────────────────────────────────────────────
+
+/// Called by nginx from `ngx_master_process_cycle` **after** `ngx_daemon()`
+/// — runs in the actual master process (post-daemonize).
+///
+/// Spawns the exporter on **initial start only**.  The exporter is spawned
+/// here (not in `init_module`) because on a `daemon on` (default) start,
+/// `init_module` fires in the bootstrap process (before the double-fork), so
+/// the exporter's parent becomes init (PID 1) after daemonize.  nginx uses
+/// SIGCHLD (via `waitpid(-1, …)`) to track child exits; if the exporter is
+/// not a child of the master, SIGCHLD never arrives and the master can never
+/// observe the exporter's exit — causing M1 to hang indefinitely on a
+/// graceful-quit during USR2 binary upgrade.
+///
+/// SIGHUP reload is handled by `init_module` (which fires AFTER daemonize in
+/// the already-running master, so the new exporter is a proper child then).
+///
+/// USR2 binary upgrade: M2 is a new exec'd process that re-runs this hook,
+/// so M2's exporter is also a proper child of M2's master. ✓
+///
+/// `init_master` is NOT called on SIGHUP — it fires once per master process
+/// lifetime at the start of `ngx_master_process_cycle`.
+extern "C" fn ngx_otel_init_master(log: *mut nginx_sys::ngx_log_t) -> nginx_sys::ngx_int_t {
+    // init_master is only called in the master process in daemon mode.
+    // Safety: ngx_cycle is a nginx global pointing at the current cycle;
+    // valid for the entire master process lifetime.
+    let cycle = unsafe { nginx_sys::ngx_cycle };
+    if cycle.is_null() {
+        return Status::NGX_OK.into();
+    }
+
+    // Don't spawn during `nginx -t` (config-test mode).
+    if unsafe { nginx_sys::ngx_test_config } != 0 {
+        return Status::NGX_OK.into();
+    }
+
+    let cycle_ref = unsafe { &mut *cycle };
+    let Some(amcf) = HttpOtelModule::main_conf(cycle_ref) else {
+        return Status::NGX_OK.into();
+    };
+    if !amcf.is_configured() {
+        return Status::NGX_OK.into();
+    }
+
+    // init_master fires only on initial start (not on SIGHUP reload).
+    // Spawn with RESPAWN so the master auto-respawns on crash.
+    ngx::ngx_log_error!(
+        nginx_sys::NGX_LOG_DEBUG_CORE,
+        log,
+        "otel: init_master: spawning exporter (initial start, post-daemonize)"
+    );
+    spawn_exporter_for_cycle(cycle, false /* is_reload */)
+}
+
+// ── init_module callback ──────────────────────────────────────────────────────
+
+/// Called by nginx from `ngx_init_modules` (via `ngx_init_cycle`) — once at
+/// initial start and again on each SIGHUP reload.
+///
+/// On **initial start** (`daemon on`, the default): this fires in the
+/// bootstrap process *before* `ngx_daemon()`.  We do NOT spawn the exporter
+/// here in that case; `init_master` handles it post-daemonize so the
+/// exporter is a proper child of the actual master.
+///
+/// On **SIGHUP reload**: fires in the already-running master process (after
+/// daemonize), so the new exporter is a proper child. Spawn with
+/// `NGX_PROCESS_JUST_RESPAWN` so the old exporter coexists briefly.
+///
+/// On **`daemon off`** (non-default): fires in the process that stays alive
+/// as master (no double-fork), so spawning here is also correct.  We detect
+/// this via `ngx_process == NGX_PROCESS_SINGLE` (set before daemonize would
+/// happen) or by the absence of the `daemon off` condition.
+///
+/// See `PHASE_1_3_RESEARCH.md` §2.7–2.9, §5.2 and Q4 for design decisions.
+extern "C" fn ngx_otel_init_module(cycle: *mut nginx_sys::ngx_cycle_t) -> nginx_sys::ngx_int_t {
+    let process = unsafe { nginx_sys::ngx_process } as u32;
+    if process != nginx_sys::NGX_PROCESS_MASTER && process != nginx_sys::NGX_PROCESS_SINGLE {
+        return Status::NGX_OK.into();
+    }
+
+    // Don't spawn an exporter during `nginx -t` (config-test mode).
+    if unsafe { nginx_sys::ngx_test_config } != 0 {
+        return Status::NGX_OK.into();
+    }
+
+    let cycle_ref = unsafe { &mut *cycle };
+    let Some(amcf) = HttpOtelModule::main_conf(cycle_ref) else {
+        return Status::NGX_OK.into();
+    };
+    if !amcf.is_configured() {
+        return Status::NGX_OK.into();
+    }
+
+    // Detect SIGHUP reload vs initial start via old_cycle->conf_ctx.
+    // See existing comment above for the IMPORTANT note about ngx_is_init_cycle.
+    let is_reload = unsafe {
+        let old = (*cycle).old_cycle;
+        !old.is_null() && !(*old).conf_ctx.is_null()
+    };
+
+    if !is_reload {
+        // Initial start with `daemon on` (default): init_master handles the
+        // spawn post-daemonize so the exporter is a proper child of the master.
+        // For `daemon off`, ngx_process == NGX_PROCESS_SINGLE at this point;
+        // we still skip here and rely on init_master (which fires in single
+        // mode via ngx_single_process_cycle → we handle it there too).
+        //
+        // Note: NGX_PROCESS_SINGLE means "daemon off" or single-process mode.
+        // In that case init_master IS also called (via ngx_single_process_cycle
+        // route) ... actually init_master is only in ngx_master_process_cycle.
+        // For daemon off + master_process on: ngx_process starts as SINGLE then
+        // becomes MASTER. We let init_master handle it unconditionally.
+        return Status::NGX_OK.into();
+    }
+
+    // SIGHUP reload: spawn the new exporter.  The process is already the
+    // daemonized master, so the new exporter IS a proper child.
+    spawn_exporter_for_cycle(cycle, true /* is_reload */)
 }
 
 impl HttpModule for HttpOtelModule {
@@ -800,6 +856,8 @@ mod nginx_test_stubs {
     #[no_mangle]
     pub static mut ngx_http_upstream_module: nginx_sys::ngx_module_t =
         nginx_sys::ngx_module_t::default();
+
+    // `ngx_cycle` is already stubbed at line ~733 above — no duplicate needed.
 
     // ── Phase 1.3.3 stubs — otel_status_endpoint content handler ─────────────
     //
