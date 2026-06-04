@@ -190,14 +190,16 @@ CURL_PID=""
 
 cleanup() {
     [[ -n "${CURL_PID:-}" ]] && kill "${CURL_PID}" 2>/dev/null || true
-    # Kill both master processes if they are still alive.
-    [[ -n "${M1_PID:-}" ]]  && kill "${M1_PID}"  2>/dev/null || true
-    [[ -n "${M2_PID:-}" ]]  && kill "${M2_PID}"  2>/dev/null || true
-    # Wait briefly for children to exit.
+    # Kill both master processes if still alive.
+    # Use SIGQUIT for graceful shutdown; fall back to SIGTERM.
+    [[ -n "${M1_PID:-}" ]] && kill -0 "${M1_PID}" 2>/dev/null \
+        && (kill -QUIT "${M1_PID}" 2>/dev/null; sleep 1; kill -TERM "${M1_PID}" 2>/dev/null || true) || true
+    [[ -n "${M2_PID:-}" ]] && kill -0 "${M2_PID}" 2>/dev/null \
+        && (kill -QUIT "${M2_PID}" 2>/dev/null; sleep 1; kill -TERM "${M2_PID}" 2>/dev/null || true) || true
     sleep 1
     echo ""
     echo "=== error.log (last 50 lines) ==="
-    tail -50 "${PREFIX}/logs/error.log" 2>/dev/null || echo "(not found)"
+    grep -v '\[debug\]' "${PREFIX}/logs/error.log" 2>/dev/null | tail -50 || echo "(not found)"
     rm -rf "${PREFIX}"
 }
 trap cleanup EXIT
@@ -205,8 +207,12 @@ trap cleanup EXIT
 mkdir -p "${PREFIX}/logs" "${PREFIX}/client_body_temp"
 
 # nginx configuration for the binary-upgrade test.
+# NOTE: daemon mode is the DEFAULT (no 'daemon off') — this is REQUIRED for
+# USR2 live binary upgrade to work.  With 'daemon off', nginx checks
+# getppid() > 1 as a "mid-upgrade" guard and ignores the USR2 signal.
+# In daemon mode nginx re-parents to PID 1 so getppid() == 1 and the guard
+# does not fire.  We read M1_PID from the PID file after nginx starts.
 cat > "${PREFIX}/nginx.conf" <<CONF
-daemon off;
 master_process on;
 worker_processes 2;
 error_log ${PREFIX}/logs/error.log debug;
@@ -245,13 +251,16 @@ info "Pre-test logs.json size:    ${PRE_LOGS_SIZE} bytes"
 
 # ─── Phase 1: start M1 and verify initial state ───────────────────────────────
 
-info "Starting M1 nginx (interval=${METRIC_INTERVAL_S}s, port=${NGINX_PORT})..."
-"${NGINX_BINARY}" -p "${PREFIX}" -c "${PREFIX}/nginx.conf" &
-M1_PID=$!
-sleep 2
+info "Starting M1 nginx (daemon mode, interval=${METRIC_INTERVAL_S}s, port=${NGINX_PORT})..."
+"${NGINX_BINARY}" -p "${PREFIX}" -c "${PREFIX}/nginx.conf"
+
+# In daemon mode nginx writes the PID file and exits the launcher; read M1_PID.
+wait_for 5 "nginx.pid file to appear" \
+    '[[ -s "${PREFIX}/logs/nginx.pid" ]]'
+M1_PID="$(cat "${PREFIX}/logs/nginx.pid")"
 
 if ! kill -0 "${M1_PID}" 2>/dev/null; then
-    fail "M1 nginx exited immediately"
+    fail "M1 nginx (PID ${M1_PID}) not alive after start"
 fi
 pass "M1 master started, PID=${M1_PID}"
 
