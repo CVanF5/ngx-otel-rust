@@ -1,0 +1,58 @@
+USR2 binary-upgrade gate — R2 (RALPH_INSTANCE_ID_USR2.md)
+================================================================================
+Host:   debian-vm (Linux aarch64, Debian 13 trixie, kernel 6.12.90+deb13.1-arm64)
+Date:   2026-06-05
+Result: [FAIL] = 0 · [PASS] = all — USR2 test + 3 regression tests ALL PASS
+
+Scripts exercised:
+  run_exporter_binary_upgrade.sh   ← NEW (R2 gate)
+  run_exporter_lifecycle.sh        ← regression
+  run_exporter_crash_respawn.sh    ← regression
+  run_exporter_reload_overlap.sh   ← regression
+
+--------------------------------------------------------------------------------
+R2 gate (run_exporter_binary_upgrade.sh)
+--------------------------------------------------------------------------------
+M1 master PID:          67008 (exited cleanly)
+M1 exporter PID:        67010 (exited cleanly, graceful drain)
+M1 service.instance.id: 67008
+M2 master PID:          67094 (kept running)
+M2 exporter PID:        67099 (kept running)
+M2 service.instance.id: 67094
+
+Assertions:
+  [PASS] M1 starts with exactly 1 exporter (PID=67010)
+  [PASS] M1 service.instance.id = M1 master PID (67008)
+  [PASS] USR2 triggers binary upgrade: M2 (PID=67094) appears
+  [PASS] Two nginx masters during overlap (M1=67008, M2=67094)
+  [PASS] Two otel exporters during overlap (67010 + 67099)
+  [PASS] M2 service.instance.id = 67094 (distinct from M1's 67008)
+  [PASS] Both service.instance.id values in overlap window (2 distinct ids)
+  [PASS] M1 exits cleanly after WINCH + QUIT
+  [PASS] M1's exporter gracefully drains and exits
+  [PASS] M2 master (67094) still running after M1 exits
+  [PASS] M2's exporter (67099) still running after M1 exits
+  [PASS] error.log clean: no panic/abort/SIGSEGV
+  [PASS] No orphaned exporter from M1
+  [PASS] Steady-state: exactly 1 master (M2) + 1 exporter (M2's)
+  [PASS] Collector receiving M2's service.instance.id post-M1-exit
+  [PASS] M1's service.instance.id absent in post-M1 telemetry
+
+Regression tests:
+  [PASS] run_exporter_lifecycle.sh   — all assertions passed
+  [PASS] run_exporter_crash_respawn.sh — all assertions passed
+  [PASS] run_exporter_reload_overlap.sh — all assertions passed
+
+--------------------------------------------------------------------------------
+Key implementation notes
+--------------------------------------------------------------------------------
+USR2 launch pattern: nginx is started from a subshell with a 0.5s sleep:
+  ( nginx -p PREFIX -c PREFIX/nginx.conf & sleep 0.5 )
+This ensures nginx records ngx_parent=subshell_PID before the subshell exits,
+then gets reparented to init (getppid()==1). nginx's USR2 guard checks
+"ignore if getppid()==ngx_parent", which evaluates to "1 == subshell_PID"
+= false → USR2 is honoured.
+
+With daemon off the exporter is a direct child of the master (SIGCHLD works
+correctly for graceful-quit tracking).
+
