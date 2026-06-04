@@ -38,10 +38,23 @@ REPO_ROOT="$(cd "${CRATE_DIR}/.." && pwd)"
 RESULTS_DIR="${SCRIPT_DIR}/results"
 
 NGINX_SOURCE_DIR="${NGINX_SOURCE_DIR:-${REPO_ROOT}/nginx}"
-NGINX_BUILD_DIR="${NGINX_BUILD_DIR:-${REPO_ROOT}/nginx/objs}"
+# FU5: bench must use the RELEASE binary (for accurate throughput measurement).
+# Prefer objs-release/nginx; fall back to objs-debug only if release is absent.
+if [[ -x "${CRATE_DIR}/objs-release/nginx" ]]; then
+    NGINX_BUILD_DIR="${NGINX_BUILD_DIR:-${CRATE_DIR}/objs-release}"
+    NGINX_BINARY="${NGINX_BINARY:-${CRATE_DIR}/objs-release/nginx}"
+else
+    NGINX_BUILD_DIR="${NGINX_BUILD_DIR:-${REPO_ROOT}/nginx/objs}"
+fi
 
 . "${CRATE_DIR}/test-harness/lib.sh"
 resolve_nginx_binary || true
+
+# Confirm we're using a real executable (not a stale path).
+if [[ ! -x "${NGINX_BINARY}" ]]; then
+    echo "ERROR: NGINX_BINARY not executable: ${NGINX_BINARY}" >&2
+    exit 1
+fi
 
 BENCH_ITERATIONS="${BENCH_ITERATIONS:-5}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
