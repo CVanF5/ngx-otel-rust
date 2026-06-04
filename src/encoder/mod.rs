@@ -224,6 +224,12 @@ fn convert_metric(m: &crate::data_model::Metric) -> metrics_proto::Metric {
             data_points: h.data_points.iter().map(convert_hdp).collect(),
             aggregation_temporality: proto_temporality(h.aggregation_temporality),
         }),
+        MetricData::ExponentialHistogram(h) => {
+            PD::ExponentialHistogram(metrics_proto::ExponentialHistogram {
+                data_points: h.data_points.iter().map(convert_exp_hdp).collect(),
+                aggregation_temporality: proto_temporality(h.aggregation_temporality),
+            })
+        }
         MetricData::Sum(s) => PD::Sum(metrics_proto::Sum {
             data_points: s.data_points.iter().map(convert_ndp).collect(),
             aggregation_temporality: proto_temporality(s.aggregation_temporality),
@@ -272,6 +278,42 @@ fn convert_hdp(dp: &crate::data_model::HistogramDataPoint) -> metrics_proto::His
         flags: 0,
         min: None,
         max: None,
+    }
+}
+
+fn convert_exp_hdp(
+    dp: &crate::data_model::ExponentialHistogramDataPoint,
+) -> metrics_proto::ExponentialHistogramDataPoint {
+    use metrics_proto::exponential_histogram_data_point::Buckets;
+
+    // Trim trailing zeros from the positive bucket counts — the proto spec
+    // does not require trailing zeros, and they inflate the payload.
+    let mut positive_counts = dp.positive_bucket_counts.clone();
+    while positive_counts.last() == Some(&0) {
+        positive_counts.pop();
+    }
+
+    metrics_proto::ExponentialHistogramDataPoint {
+        attributes: dp.attributes.iter().map(convert_kv).collect(),
+        start_time_unix_nano: dp.start_time_unix_nano,
+        time_unix_nano: dp.time_unix_nano,
+        count: dp.count,
+        sum: if dp.count > 0 { Some(dp.sum) } else { None },
+        scale: dp.scale,
+        zero_count: dp.zero_count,
+        positive: Some(Buckets {
+            offset: dp.positive_offset,
+            bucket_counts: positive_counts,
+        }),
+        negative: Some(Buckets {
+            offset: 0,
+            bucket_counts: std::vec![],
+        }),
+        exemplars: std::vec![],
+        flags: 0,
+        min: None,
+        max: None,
+        zero_threshold: 0.0,
     }
 }
 
@@ -459,6 +501,99 @@ mod tests {
                 assert_eq!(s, "upstream connect failed");
             }
             other => panic!("expected StringValue body, got {other:?}"),
+        }
+    }
+
+    /// Encode a Batch carrying an ExponentialHistogram data point, decode it,
+    /// and verify scale / zero_count / positive buckets round-trip correctly.
+    /// This is the Phase 2.2 DP-F verification gate.
+    #[test]
+    fn exp_histogram_roundtrips() {
+        use crate::data_model::{
+            ExponentialHistogramData, ExponentialHistogramDataPoint, MetricData,
+        };
+        use crate::shm::{EXP_HISTOGRAM_SCALE, EXP_HISTOGRAM_BUCKET_OFFSET, N_EXP_BUCKETS};
+
+        // Bucket counts: simulate some observations.
+        // bucket[6] = [64, 128)ms — 5 observations
+        // bucket[8] = [256, 512)ms — 2 observations
+        // zero_count = 3 (sub-ms latencies)
+        let mut buckets = [0u64; N_EXP_BUCKETS];
+        buckets[6] = 5;
+        buckets[8] = 2;
+        let dp = ExponentialHistogramDataPoint {
+            attributes: std::vec![
+                KeyValue {
+                    key: "http.request.method".into(),
+                    value: AnyValue::String("GET".into()),
+                },
+                KeyValue {
+                    key: "http.route".into(),
+                    value: AnyValue::String("/api".into()),
+                },
+            ],
+            start_time_unix_nano: 1_700_000_000_000_000_000,
+            time_unix_nano: 1_700_000_010_000_000_000,
+            count: 10,   // 5 + 2 + 3 zero
+            sum: 810.0,  // 5×96 + 2×384 + 3×0 = 480 + 768 = ... approximate
+            scale: EXP_HISTOGRAM_SCALE,
+            zero_count: 3,
+            positive_offset: EXP_HISTOGRAM_BUCKET_OFFSET,
+            positive_bucket_counts: buckets.to_vec(),
+        };
+
+        let batch = Batch {
+            resource: Resource::default(),
+            scope: Scope { name: "test".into(), version: "0".into() },
+            metrics: std::vec![Metric {
+                name: "http.server.request.duration".into(),
+                description: "test".into(),
+                unit: "ms".into(),
+                data: MetricData::ExponentialHistogram(ExponentialHistogramData {
+                    aggregation_temporality: AggregationTemporality::Cumulative,
+                    data_points: std::vec![dp],
+                }),
+            }],
+        };
+
+        let enc = OtlpHttpEncoder;
+        let bytes = enc.encode(&batch);
+        assert!(!bytes.is_empty(), "encoded bytes non-empty");
+
+        let decoded = ExportMetricsServiceRequest::decode(bytes.as_slice())
+            .expect("decode without error");
+
+        assert_eq!(decoded.resource_metrics.len(), 1);
+        let rm = &decoded.resource_metrics[0];
+        assert_eq!(rm.scope_metrics.len(), 1);
+        let metrics = &rm.scope_metrics[0].metrics;
+        assert_eq!(metrics.len(), 1);
+
+        // Must decode as ExponentialHistogram, not plain Histogram.
+        let data = metrics[0].data.as_ref().expect("data present");
+        match data {
+            super::metrics_proto::metric::Data::ExponentialHistogram(eh) => {
+                assert_eq!(eh.data_points.len(), 1);
+                let ehdp = &eh.data_points[0];
+
+                assert_eq!(ehdp.count, 10, "count round-trips");
+                assert_eq!(ehdp.zero_count, 3, "zero_count round-trips");
+                assert_eq!(ehdp.scale, EXP_HISTOGRAM_SCALE, "scale round-trips");
+                assert!(ehdp.sum.is_some(), "sum present for non-zero count");
+
+                let pos = ehdp.positive.as_ref().expect("positive buckets present");
+                assert_eq!(pos.offset, EXP_HISTOGRAM_BUCKET_OFFSET, "offset round-trips");
+                // After trailing-zero trim: buckets up to and including index 8 = [5, 0, 2]
+                assert!(pos.bucket_counts.len() >= 9, "at least 9 positive buckets after trim");
+                assert_eq!(pos.bucket_counts[6], 5, "bucket[6] = 5");
+                assert_eq!(pos.bucket_counts[8], 2, "bucket[8] = 2");
+
+                // Attributes round-trip.
+                assert_eq!(ehdp.attributes.len(), 2);
+                assert_eq!(ehdp.attributes[0].key, "http.request.method");
+                assert_eq!(ehdp.attributes[1].key, "http.route");
+            }
+            other => panic!("expected ExponentialHistogram data, got {other:?}"),
         }
     }
 }

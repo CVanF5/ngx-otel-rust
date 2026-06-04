@@ -929,6 +929,7 @@ fn count_data_points(batch: &Batch) -> u64 {
         .iter()
         .map(|m| match &m.data {
             MetricData::Histogram(h) => h.data_points.len() as u64,
+            MetricData::ExponentialHistogram(h) => h.data_points.len() as u64,
             MetricData::Sum(s) => s.data_points.len() as u64,
             MetricData::Gauge(g) => g.data_points.len() as u64,
         })

@@ -70,9 +70,12 @@ pub struct Metric {
 /// readings (`ngx_otel.export_interval_seconds`).  Per OTLP semantics these
 /// must be distinct variants — emitting a counter as a single-bucket histogram
 /// causes downstream backends to misclassify the metric type.
+///
+/// Phase 2.2 DP-F adds `ExponentialHistogram` for the request-duration metric.
 #[derive(Debug, Clone)]
 pub enum MetricData {
     Histogram(HistogramData),
+    ExponentialHistogram(ExponentialHistogramData),
     Sum(SumData),
     Gauge(GaugeData),
 }
@@ -142,6 +145,42 @@ pub struct HistogramDataPoint {
     pub bucket_counts: std::vec::Vec<u64>,
     /// Sorted bucket boundaries (length = `bucket_counts.len() - 1`).
     pub explicit_bounds: std::vec::Vec<f64>,
+}
+
+/// An OTel exponential histogram metric aggregation (Phase 2.2 DP-F).
+#[derive(Debug, Clone)]
+pub struct ExponentialHistogramData {
+    pub aggregation_temporality: AggregationTemporality,
+    pub data_points: std::vec::Vec<ExponentialHistogramDataPoint>,
+}
+
+/// One data point in an OTel exponential histogram metric.
+///
+/// The internal representation uses scale 0 (`EXP_HISTOGRAM_SCALE`), meaning
+/// bucket `k` covers `[2^k, 2^(k+1))` ms.  All durations are non-negative so
+/// `negative` is always empty.  Values 0 ms are counted in `zero_count`.
+#[derive(Debug, Clone)]
+pub struct ExponentialHistogramDataPoint {
+    /// Attributes for this data point (method, status class, protocol, route, upstream zone).
+    pub attributes: std::vec::Vec<KeyValue>,
+    /// Start of the measurement window (Unix epoch, nanoseconds).
+    pub start_time_unix_nano: u64,
+    /// End of the measurement window (Unix epoch, nanoseconds).
+    pub time_unix_nano: u64,
+    /// Total observation count (= sum of all bucket counts + zero_count).
+    pub count: u64,
+    /// Sum of all observed values (in ms).
+    pub sum: f64,
+    /// OTel exponential histogram scale (EXP_HISTOGRAM_SCALE = 0).
+    pub scale: i32,
+    /// Count of values exactly 0 ms (or truncated to 0 from sub-ms latencies).
+    pub zero_count: u64,
+    /// Positive-range bucket counts.  Bucket k covers [2^k, 2^(k+1)) ms.
+    /// `offset` is the index of the first entry (always 0 for scale 0 with our
+    /// fixed-offset storage).
+    pub positive_offset: i32,
+    pub positive_bucket_counts: std::vec::Vec<u64>,
+    // `negative` is always empty for request durations (non-negative).
 }
 
 // ────────────────────────────────────────────────────────────────

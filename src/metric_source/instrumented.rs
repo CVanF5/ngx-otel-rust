@@ -129,7 +129,7 @@ impl HttpRequestHandler for LogPhaseHandler {
         };
 
         let idx = combo_index(method, status_class, proto, route_idx, upstream_idx);
-        slot.request_duration_combos[idx].record(duration_ms, &DURATION_BOUNDS_MS);
+        slot.request_duration_combos[idx].record(duration_ms);
 
         // ── request body bytes ────────────────────────────────────────────
         slot.request_body_bytes.record(r.request_length as u64, &BYTES_BOUNDS);
@@ -274,21 +274,22 @@ unsafe impl Sync for InstrumentedSource {}
 
 impl crate::metric_source::MetricSource for InstrumentedSource {
     fn collect(&self) -> std::vec::Vec<crate::data_model::Metric> {
-        use crate::data_model::{AggregationTemporality, AnyValue, HistogramDataPoint, KeyValue};
+        use crate::data_model::{AggregationTemporality, AnyValue, KeyValue};
         use crate::shm::{
             HttpMethod, N_HTTP_METHODS, ProtoVersion, N_PROTO_VERSIONS,
             StatusClass, N_STATUS_CLASSES, N_COMBOS, N_ROUTES, N_UPSTREAMS,
             ROUTE_CAP, UPSTREAM_IDX_NONE, UPSTREAM_IDX_OTHER,
             BYTES_BOUNDS, DURATION_BOUNDS_MS, combo_index,
+            N_EXP_BUCKETS, EXP_HISTOGRAM_SCALE, EXP_HISTOGRAM_BUCKET_OFFSET,
         };
 
         let start = self.start_time_unix_nano;
         let now = now_unix_nano();
 
-        // Aggregate per-combination duration histograms over all workers.
-        // combo_agg[idx] = (bucket_counts, sum, count) for combination idx.
-        let mut combo_agg: std::vec::Vec<([u64; N_DURATION_BUCKETS], u64, u64)> =
-            std::vec![(([0u64; N_DURATION_BUCKETS], 0u64, 0u64)); N_COMBOS];
+        // Aggregate per-combination exp-histogram slots over all workers.
+        // combo_agg[idx] = ([bucket_counts; N_EXP_BUCKETS], zero_count, sum, count)
+        let mut combo_agg: std::vec::Vec<([u64; N_EXP_BUCKETS], u64, u64, u64)> =
+            std::vec![([0u64; N_EXP_BUCKETS], 0u64, 0u64, 0u64); N_COMBOS];
         let mut req_bytes = ([0u64; N_BYTES_BUCKETS], 0u64, 0u64);
         let mut resp_bytes = ([0u64; N_BYTES_BUCKETS], 0u64, 0u64);
         let mut up_resp = ([0u64; N_DURATION_BUCKETS], 0u64, 0u64);
@@ -302,8 +303,12 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
 
             // Sum per-combination duration histograms.
             for idx in 0..N_COMBOS {
-                let (bc, bs, bcount) = slot.request_duration_combos[idx].snapshot();
-                add_histogram(&mut combo_agg[idx], &bc, bs, bcount);
+                let (bc, zc, bs, bcount) = slot.request_duration_combos[idx].snapshot();
+                let agg = &mut combo_agg[idx];
+                for (a, b) in agg.0.iter_mut().zip(bc.iter()) { *a += b; }
+                agg.1 += zc;
+                agg.2 += bs;
+                agg.3 += bcount;
             }
 
             let (bc, bs, bcount) = slot.request_body_bytes.snapshot();
@@ -334,11 +339,12 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
             unsafe { self.amcf.as_ref() };
 
         let duration_metric = if self.status_code_class_enabled {
-            // Emit one data point per non-empty combination with bounded semconv
-            // attributes (method, status_class, protocol, http.route,
-            // nginx.upstream.zone).  Only OTel-semconv attributes are emitted;
-            // no free-form / unbounded keys.
-            let mut data_points: std::vec::Vec<HistogramDataPoint> = std::vec::Vec::new();
+            // Emit one exp-histogram data point per non-empty combination with
+            // bounded semconv attributes (method, status_class, protocol,
+            // http.route, nginx.upstream.zone).  Only OTel-semconv attributes
+            // are emitted; no free-form / unbounded keys.
+            use crate::data_model::ExponentialHistogramDataPoint;
+            let mut data_points: std::vec::Vec<ExponentialHistogramDataPoint> = std::vec::Vec::new();
             for m_idx in 0..N_HTTP_METHODS {
                 for sc_idx in 0..N_STATUS_CLASSES {
                     for p_idx in 0..N_PROTO_VERSIONS {
@@ -364,11 +370,6 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                                     },
                                     r_idx, u_idx,
                                 );
-                                let (bc, bs, bcount) = combo_agg[combo];
-                                if bcount == 0 {
-                                    continue; // skip empty combinations
-                                }
-
                                 // Derive attribute string values.
                                 let method = match m_idx {
                                     0 => HttpMethod::Get, 1 => HttpMethod::Head,
@@ -403,7 +404,11 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                                         else { std::format!("upstream_{}", u_idx) }
                                     });
 
-                                data_points.push(HistogramDataPoint {
+                                let (bc, zc, bs, bcount) = combo_agg[combo];
+                                if bcount == 0 {
+                                    continue; // skip empty combinations
+                                }
+                                data_points.push(ExponentialHistogramDataPoint {
                                     attributes: std::vec![
                                         KeyValue {
                                             key: "http.request.method".into(),
@@ -430,40 +435,58 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                                     time_unix_nano: now,
                                     count: bcount,
                                     sum: bs as f64,
-                                    bucket_counts: bc.to_vec(),
-                                    explicit_bounds: dur_bounds.clone(),
+                                    scale: EXP_HISTOGRAM_SCALE,
+                                    zero_count: zc,
+                                    positive_offset: EXP_HISTOGRAM_BUCKET_OFFSET,
+                                    positive_bucket_counts: bc.to_vec(),
                                 });
                             }
                         }
                     }
                 }
             }
-            use crate::data_model::{HistogramData, Metric, MetricData};
+            use crate::data_model::{ExponentialHistogramData, Metric, MetricData};
             Metric {
                 name: "http.server.request.duration".into(),
                 description: "HTTP server request duration".into(),
                 unit: "ms".into(),
-                data: MetricData::Histogram(HistogramData {
+                data: MetricData::ExponentialHistogram(ExponentialHistogramData {
                     aggregation_temporality: AggregationTemporality::Cumulative,
                     data_points,
                 }),
             }
         } else {
-            // Aggregate across all combinations → single data point (backward compat).
-            let mut dur = ([0u64; N_DURATION_BUCKETS], 0u64, 0u64);
+            // Aggregate across all combinations → single exp-histogram data point.
+            let mut all_buckets = [0u64; N_EXP_BUCKETS];
+            let mut all_zero_count = 0u64;
+            let mut all_sum = 0u64;
+            let mut all_count = 0u64;
             for agg in &combo_agg {
-                add_histogram(&mut dur, &agg.0, agg.1, agg.2);
+                for (a, b) in all_buckets.iter_mut().zip(agg.0.iter()) { *a += b; }
+                all_zero_count += agg.1;
+                all_sum += agg.2;
+                all_count += agg.3;
             }
-            hist_metric(
-                "http.server.request.duration",
-                "HTTP server request duration",
-                "ms",
-                dur,
-                dur_bounds.clone(),
-                start,
-                now,
-                AggregationTemporality::Cumulative,
-            )
+            use crate::data_model::{ExponentialHistogramData, ExponentialHistogramDataPoint, Metric, MetricData};
+            Metric {
+                name: "http.server.request.duration".into(),
+                description: "HTTP server request duration".into(),
+                unit: "ms".into(),
+                data: MetricData::ExponentialHistogram(ExponentialHistogramData {
+                    aggregation_temporality: AggregationTemporality::Cumulative,
+                    data_points: std::vec![ExponentialHistogramDataPoint {
+                        attributes: std::vec![],
+                        start_time_unix_nano: start,
+                        time_unix_nano: now,
+                        count: all_count,
+                        sum: all_sum as f64,
+                        scale: EXP_HISTOGRAM_SCALE,
+                        zero_count: all_zero_count,
+                        positive_offset: EXP_HISTOGRAM_BUCKET_OFFSET,
+                        positive_bucket_counts: all_buckets.to_vec(),
+                    }],
+                }),
+            }
         };
 
         std::vec![

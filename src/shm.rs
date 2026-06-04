@@ -29,11 +29,93 @@ use ngx::core::Status;
 /// Duration histogram bucket boundaries in **milliseconds**.
 ///
 /// These match the default OTel HTTP server latency boundaries (seconds × 1000).
+/// Retained for the byte-size histograms (request/response body, upstream
+/// bytes), which keep the explicit-boundary shape.
 pub const DURATION_BOUNDS_MS: [u64; 14] =
     [5, 10, 25, 50, 75, 100, 250, 500, 750, 1000, 2500, 5000, 7500, 10000];
 
 /// Number of duration histogram buckets (14 boundaries + 1 overflow).
+/// Used by the byte-size histograms.
 pub const N_DURATION_BUCKETS: usize = 15;
+
+// ── Exponential-histogram constants (Phase 2.2 DP-F) ─────────────────────────
+
+/// OTel exponential histogram scale for `request_duration_combos`.
+///
+/// Scale 0 → base = 2^(2^0) = 2 → one bucket per power-of-2 millisecond.
+/// Bucket `k` covers `[2^k, 2^(k+1))` ms (for `k ≥ 0`); zero ms → `zero_count`.
+pub const EXP_HISTOGRAM_SCALE: i32 = 0;
+
+/// Number of positive-range bucket slots in each `ExpHistogramSlot`.
+///
+/// At scale 0, 14 buckets covers `[1, 16 384)` ms (1 ms to ~16 s), sufficient
+/// for typical HTTP latencies.  Values ≥ 2^14 = 16 384 ms clamp to the last
+/// bucket.  Values = 0 ms go to `zero_count`.
+pub const N_EXP_BUCKETS: usize = 14;
+
+/// Fixed offset: bucket 0 starts at index 0 (i.e., covers `[2^0, 2^1) = [1, 2)` ms).
+pub const EXP_HISTOGRAM_BUCKET_OFFSET: i32 = 0;
+
+/// An OTel **exponential histogram** slot stored entirely in atomic counters.
+///
+/// Scale 0, 14 buckets: bucket `k` counts values in `[2^k, 2^(k+1))` ms.
+/// Zero ms → `zero_count`.  All durations are positive so `negative` is empty.
+///
+/// The record function is a single `leading_zeros` instruction + one
+/// `fetch_add` — alloc-free and lock-free on the hot path.
+///
+/// Size: `(N_EXP_BUCKETS + 3) × 8 = 17 × 8 = 136 bytes`
+/// (identical to the `Histogram<15>` it replaces, so `SLOT_BUDGET` is
+/// unchanged by this switch).
+#[repr(C)]
+pub struct ExpHistogramSlot {
+    /// Bucket `k` counts values in `[2^k, 2^(k+1))` ms.
+    /// `buckets[N_EXP_BUCKETS-1]` is the overflow bucket (`≥ 2^13 = 8192` ms).
+    pub buckets: [AtomicU64; N_EXP_BUCKETS],
+    /// Count of values = 0 ms (sub-ms latencies truncated to integer ms).
+    pub zero_count: AtomicU64,
+    /// Sum of all observed values in ms.
+    pub sum: AtomicU64,
+    /// Total observation count.
+    pub count: AtomicU64,
+}
+
+impl ExpHistogramSlot {
+    /// Record one duration observation on the hot path.
+    ///
+    /// `value_ms` is the integer-millisecond duration (0 = sub-ms).
+    ///
+    /// # Constraint: no allocation, no lock
+    /// Uses `leading_zeros()` (a single hardware instruction on all supported
+    /// architectures) to compute `floor(log2(value_ms))` in O(1).
+    #[inline]
+    pub fn record(&self, value_ms: u64) {
+        if value_ms == 0 {
+            self.zero_count.fetch_add(1, Ordering::Relaxed);
+        } else {
+            // floor(log2(value_ms)) = 63 - value_ms.leading_zeros()
+            let k = (63 - value_ms.leading_zeros()) as usize;
+            let idx = k.min(N_EXP_BUCKETS - 1);
+            self.buckets[idx].fetch_add(1, Ordering::Relaxed);
+        }
+        self.sum.fetch_add(value_ms, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Snapshot all bucket counts, zero_count, sum, and count for export.
+    ///
+    /// Uses `Ordering::Acquire` to synchronise with worker writes.
+    pub fn snapshot(&self) -> ([u64; N_EXP_BUCKETS], u64, u64, u64) {
+        let mut buckets = [0u64; N_EXP_BUCKETS];
+        for (i, b) in self.buckets.iter().enumerate() {
+            buckets[i] = b.load(Ordering::Acquire);
+        }
+        let zero_count = self.zero_count.load(Ordering::Acquire);
+        let sum = self.sum.load(Ordering::Acquire);
+        let count = self.count.load(Ordering::Acquire);
+        (buckets, zero_count, sum, count)
+    }
+}
 
 /// Byte-count histogram bucket boundaries.
 pub const BYTES_BOUNDS: [u64; 6] = [128, 512, 4096, 65536, 524288, 4194304];
@@ -263,7 +345,7 @@ pub const UPSTREAM_IDX_OTHER: usize = UPSTREAM_CAP + 1;
 
 /// Total number of `{method × status_class × protocol × route × upstream}` combinations.
 ///
-/// Each combination maps to one [`Histogram`] slot in `WorkerSlots::request_duration_combos`.
+/// Each combination maps to one [`ExpHistogramSlot`] in `WorkerSlots::request_duration_combos`.
 /// Default: 8 × 5 × 4 × 17 × 10 = 27,200.
 pub const N_COMBOS: usize = N_HTTP_METHODS * N_STATUS_CLASSES * N_PROTO_VERSIONS
     * N_ROUTES * N_UPSTREAMS;
@@ -276,9 +358,9 @@ pub const N_COMBOS: usize = N_HTTP_METHODS * N_STATUS_CLASSES * N_PROTO_VERSIONS
 pub const SLOT_BUDGET: usize = 4 * 1024 * 1024; // 4 MiB per worker
 
 // Compile-time budget check.  With defaults ROUTE_CAP=16 / UPSTREAM_CAP=8,
-// 27,200 combos × 136 bytes/Histogram<15> = 3,699,200 bytes < 4 MiB.
+// 27,200 combos × 136 bytes/ExpHistogramSlot = 3,699,200 bytes < 4 MiB.
 const _: () = assert!(
-    N_COMBOS * core::mem::size_of::<Histogram<N_DURATION_BUCKETS>>() <= SLOT_BUDGET,
+    N_COMBOS * core::mem::size_of::<ExpHistogramSlot>() <= SLOT_BUDGET,
     "request_duration_combos exceeds SLOT_BUDGET — reduce ROUTE_CAP / UPSTREAM_CAP or raise SLOT_BUDGET"
 );
 
@@ -335,9 +417,11 @@ pub fn combo_index(
 #[repr(C)]
 pub struct WorkerSlots {
     /// `http.server.request.duration` (ms), broken down by
-    /// `{method × status_class × protocol}` — `N_COMBOS` slots total.
+    /// `{method × status_class × protocol × http.route × upstream-zone}` — `N_COMBOS` slots.
     /// Index with [`combo_index`].
-    pub request_duration_combos: [Histogram<N_DURATION_BUCKETS>; N_COMBOS],
+    /// Phase 2.2 DP-F: each slot is an OTel exponential histogram (scale 0,
+    /// N_EXP_BUCKETS buckets).
+    pub request_duration_combos: [ExpHistogramSlot; N_COMBOS],
     /// `http.server.request.body.size` (bytes)
     pub request_body_bytes: Histogram<N_BYTES_BUCKETS>,
     /// `http.server.response.body.size` (bytes)
@@ -612,19 +696,19 @@ mod tests {
 
         let slot0 = unsafe { &*worker_slots(base, 0) };
         for _ in 0..3 {
-            slot0.request_duration_combos[combo].record(100, &DURATION_BOUNDS_MS);
+            slot0.request_duration_combos[combo].record(100);
         }
 
         let slot1 = unsafe { &*worker_slots(base, 1) };
         for _ in 0..2 {
-            slot1.request_duration_combos[combo].record(500, &DURATION_BOUNDS_MS);
+            slot1.request_duration_combos[combo].record(500);
         }
 
-        let (_, sum0, count0) = slot0.request_duration_combos[combo].snapshot();
+        let (_, _, sum0, count0) = slot0.request_duration_combos[combo].snapshot();
         assert_eq!(count0, 3, "worker 0 count");
         assert_eq!(sum0, 300, "worker 0 sum");
 
-        let (_, sum1, count1) = slot1.request_duration_combos[combo].snapshot();
+        let (_, _, sum1, count1) = slot1.request_duration_combos[combo].snapshot();
         assert_eq!(count1, 2, "worker 1 count");
         assert_eq!(sum1, 1000, "worker 1 sum");
 
@@ -634,11 +718,13 @@ mod tests {
         assert_eq!(total_sum, 1300);
 
         // Confirm no cross-write between slots.
-        let (buckets0, _, _) = slot0.request_duration_combos[combo].snapshot();
-        let (buckets1, _, _) = slot1.request_duration_combos[combo].snapshot();
+        // At scale 0: 100ms → k = floor(log2(100)) = 6 (bucket[6] = [64, 128))
+        //            500ms → k = floor(log2(500)) = 8 (bucket[8] = [256, 512))
+        let (buckets0, _, _, _) = slot0.request_duration_combos[combo].snapshot();
+        let (buckets1, _, _, _) = slot1.request_duration_combos[combo].snapshot();
 
-        let bucket_100ms = DURATION_BOUNDS_MS.partition_point(|&b| 100 > b);
-        let bucket_500ms = DURATION_BOUNDS_MS.partition_point(|&b| 500 > b);
+        let bucket_100ms = (63 - 100u64.leading_zeros()) as usize; // = 6
+        let bucket_500ms = (63 - 500u64.leading_zeros()) as usize; // = 8
 
         assert_eq!(buckets0[bucket_100ms], 3, "worker 0 bucket for 100ms");
         assert_eq!(buckets1[bucket_500ms], 2, "worker 1 bucket for 500ms");
@@ -711,12 +797,19 @@ mod tests {
     /// lower the caps.  The real check is the `const _: ()` assert above.
     #[test]
     fn worker_slots_within_memory_budget() {
-        let combos_bytes = N_COMBOS * core::mem::size_of::<Histogram<N_DURATION_BUCKETS>>();
+        // Phase 2.2 DP-F: using ExpHistogramSlot (same 136 bytes as Histogram<15>).
+        let combos_bytes = N_COMBOS * core::mem::size_of::<ExpHistogramSlot>();
         assert!(
             combos_bytes <= SLOT_BUDGET,
             "request_duration_combos ({} bytes) exceeds SLOT_BUDGET ({} bytes)",
             combos_bytes,
             SLOT_BUDGET,
+        );
+        // Sanity: ExpHistogramSlot size must equal Histogram<15> size (no size regression).
+        assert_eq!(
+            core::mem::size_of::<ExpHistogramSlot>(),
+            core::mem::size_of::<Histogram<N_DURATION_BUCKETS>>(),
+            "ExpHistogramSlot and Histogram<15> must be the same size"
         );
     }
 
@@ -735,15 +828,17 @@ mod tests {
 
         // Record a large value in the GET/2xx/HTTP1.1 combo (other route, no upstream).
         let combo = combo_index(HttpMethod::Get, StatusClass::S2xx, ProtoVersion::Http11, ROUTE_CAP, UPSTREAM_IDX_NONE);
+        // 99_999ms = floor(log2(99_999)) = 16 → clamped to N_EXP_BUCKETS-1 = 13
         let very_large = 99_999u64;
-        slot.request_duration_combos[combo].record(very_large, &DURATION_BOUNDS_MS);
+        slot.request_duration_combos[combo].record(very_large);
 
-        let (buckets, sum, count) = slot.request_duration_combos[combo].snapshot();
+        let (buckets, zero_count, sum, count) = slot.request_duration_combos[combo].snapshot();
         assert_eq!(count, 1);
         assert_eq!(sum, very_large);
-        assert_eq!(buckets[N_DURATION_BUCKETS - 1], 1);
-        for b in &buckets[..N_DURATION_BUCKETS - 1] {
-            assert_eq!(*b, 0);
+        assert_eq!(zero_count, 0);
+        assert_eq!(buckets[N_EXP_BUCKETS - 1], 1, "large value lands in overflow bucket");
+        for b in &buckets[..N_EXP_BUCKETS - 1] {
+            assert_eq!(*b, 0, "non-overflow bucket must be zero");
         }
     }
 }

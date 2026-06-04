@@ -696,7 +696,7 @@ impl MainConfig {
     unsafe fn build_route_table(&mut self, cf: *mut ngx_conf_t) {
         use nginx_sys::{
             ngx_http_core_main_conf_t, ngx_http_core_srv_conf_t,
-            ngx_http_core_loc_conf_t, ngx_http_location_tree_node_t,
+            ngx_http_core_loc_conf_t,
         };
         // Get HTTP core main conf → servers array.
         let cf_ref = unsafe { &*cf };
