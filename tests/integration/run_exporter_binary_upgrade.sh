@@ -92,17 +92,24 @@ wait_for() {
     fail "Timed out waiting for: ${desc}"
 }
 
-# Return all exporter PIDs that are children of a given master PID.
-exporters_of() {
-    local master_pid=$1
-    ps -eo pid,ppid,args 2>/dev/null \
-        | awk -v mpid="${master_pid}" \
-            '$2 == mpid && $3 == "nginx:" && $4 == "otel" && $5 == "exporter" {print $1}'
+# Count ALL live "nginx: otel exporter" processes (any parent).
+# In daemon mode the exporter is spawned before the double-fork daemonize
+# step, so its PPID becomes 1 (init) rather than the final master PID.
+# PPID-based filtering is therefore unreliable; we just count by title.
+count_all_exporters() {
+    ps -eo pid,args 2>/dev/null \
+        | awk '$2 == "nginx:" && $3 == "otel" && $4 == "exporter" {print $1}' \
+        | wc -l | tr -d ' '
 }
 
-# Count exporter PIDs that are children of a given master PID.
-exporter_count_of() {
-    exporters_of "$1" | wc -l | tr -d ' '
+# Return the PID of the Nth exporter logged in the error.log since the
+# beginning of the test (1-indexed).  nginx logs "start otel exporter <PID>"
+# every time it spawns one.  This is more reliable than PPID in daemon mode.
+exporter_pid_from_log() {
+    local n="${1:-1}"
+    grep "start otel exporter" "${PREFIX}/logs/error.log" 2>/dev/null \
+        | awk '{print $NF}' \
+        | sed -n "${n}p"
 }
 
 # Count ALL nginx master processes matching our binary.
@@ -264,12 +271,19 @@ if ! kill -0 "${M1_PID}" 2>/dev/null; then
 fi
 pass "M1 master started, PID=${M1_PID}"
 
-# Assertion 1a: exactly one otel exporter (child of M1).
-EXP1_COUNT="$(exporter_count_of "${M1_PID}")"
+# Assertion 1a: exactly one otel exporter running.
+# In daemon mode the exporter's PPID is 1 after the double-fork, so we
+# detect it from the error.log ("start otel exporter <PID>").
+wait_for 5 "otel exporter log entry" \
+    '[[ -n "$(exporter_pid_from_log 1)" ]]'
+EXP1_PID="$(exporter_pid_from_log 1)"
+EXP1_COUNT="$(count_all_exporters)"
 if [[ "${EXP1_COUNT}" -ne 1 ]]; then
-    fail "Expected exactly 1 exporter child of M1 (${M1_PID}), got ${EXP1_COUNT}"
+    fail "Expected exactly 1 otel exporter after start, got ${EXP1_COUNT}"
 fi
-EXP1_PID="$(exporters_of "${M1_PID}" | head -1)"
+if ! kill -0 "${EXP1_PID}" 2>/dev/null; then
+    fail "Exporter PID ${EXP1_PID} (from log) is not alive"
+fi
 pass "M1 has exactly 1 otel exporter, PID=${EXP1_PID}"
 
 # Drive HTTP load to produce telemetry.
@@ -329,15 +343,18 @@ if [[ "${MASTER_COUNT}" -lt 2 ]]; then
 fi
 pass "Two nginx masters running (M1=${M1_PID}, M2=${M2_PID})"
 
-# Assertion 2b: M2 has its own exporter.
+# Assertion 2b: M2 has its own exporter (second log entry after USR2).
 info "Waiting for M2's exporter to start..."
-wait_for 10 "otel exporter child of M2 (${M2_PID})" \
-    '[[ "$(exporter_count_of ${M2_PID})" -ge 1 ]]'
-EXP2_PID="$(exporters_of "${M2_PID}" | head -1)"
+wait_for 10 "second otel exporter log entry" \
+    '[[ -n "$(exporter_pid_from_log 2)" ]]'
+EXP2_PID="$(exporter_pid_from_log 2)"
+if ! kill -0 "${EXP2_PID}" 2>/dev/null; then
+    fail "M2 exporter PID ${EXP2_PID} (from log) is not alive"
+fi
 pass "M2 has otel exporter, PID=${EXP2_PID}"
 
 # Assertion 2c: two total otel exporter processes (one per master).
-ALL_EXP_COUNT="$(( $(exporter_count_of "${M1_PID}") + $(exporter_count_of "${M2_PID}") ))"
+ALL_EXP_COUNT="$(count_all_exporters)"
 if [[ "${ALL_EXP_COUNT}" -ne 2 ]]; then
     fail "Expected exactly 2 otel exporters during overlap, found ${ALL_EXP_COUNT}"
 fi
@@ -462,13 +479,19 @@ if grep -qE "panic|abort|SIGSEGV|SIGABRT|Segmentation fault" "${PREFIX}/logs/err
 fi
 pass "error.log clean: no panic/abort/SIGSEGV"
 
-# Assertion 3e: exactly 0 exporters remain from M1 (no orphan).
-LEFTOVER_M1_EXPORTERS="$(exporter_count_of "${M1_PID}")"
-if [[ "${LEFTOVER_M1_EXPORTERS}" -ne 0 ]]; then
-    fail "STOP-AND-ASK [R2-HANDOFF-BUG]: ${LEFTOVER_M1_EXPORTERS} orphaned exporter(s) still
-       associated with M1 (PID ${M1_PID}).  These are children of a dead master."
+# Assertion 3e: exactly 1 exporter remains total (M2's only; M1's must be gone).
+# EXP1_PID must be dead and EXP2_PID must be alive.
+if kill -0 "${EXP1_PID}" 2>/dev/null; then
+    fail "STOP-AND-ASK [R2-HANDOFF-BUG]: M1's exporter (PID ${EXP1_PID}) is still alive
+       after M1 quit.  Orphaned exporter — this is a lifecycle bug."
 fi
-pass "No orphaned exporters from M1"
+pass "M1's exporter (PID ${EXP1_PID}) is gone (no orphan)"
+REMAINING_EXP_COUNT="$(count_all_exporters)"
+if [[ "${REMAINING_EXP_COUNT}" -ne 1 ]]; then
+    fail "STOP-AND-ASK [R2-HANDOFF-BUG]: Expected exactly 1 exporter after M1 exit,
+       found ${REMAINING_EXP_COUNT}."
+fi
+pass "Exactly 1 exporter remaining (no orphans from M1)"
 
 # ─── Phase 4: steady-state assertions ────────────────────────────────────────
 
@@ -481,12 +504,15 @@ if [[ "${FINAL_MASTER_COUNT}" -ne 1 ]]; then
 fi
 pass "Exactly 1 nginx master remaining (M2=${M2_PID})"
 
-# Assertion 4b: exactly 1 exporter remaining (M2's).
-FINAL_EXP_COUNT="$(exporter_count_of "${M2_PID}")"
+# Assertion 4b: exactly 1 exporter remaining (M2's) and it is alive.
+FINAL_EXP_COUNT="$(count_all_exporters)"
 if [[ "${FINAL_EXP_COUNT}" -ne 1 ]]; then
-    fail "Expected exactly 1 otel exporter after M1 exit, found ${FINAL_EXP_COUNT} (children of M2)"
+    fail "Expected exactly 1 otel exporter after M1 exit, found ${FINAL_EXP_COUNT}"
 fi
-pass "Exactly 1 otel exporter remaining (PID=${EXP2_PID}, child of M2)"
+if ! kill -0 "${EXP2_PID}" 2>/dev/null; then
+    fail "M2's exporter (PID ${EXP2_PID}) is not alive in steady state"
+fi
+pass "Exactly 1 otel exporter remaining (PID=${EXP2_PID}, M2's)"
 
 # Assertion 4c: collector continues to receive M2's instance id and stops
 # receiving M1's.  Wait 4s for M2's exporter to ship at least one batch.
