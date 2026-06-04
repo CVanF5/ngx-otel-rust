@@ -222,20 +222,95 @@ impl ProtoVersion {
     }
 }
 
-/// Total number of `{method × status_class × protocol}` combinations.
+// ── Route and upstream-zone dimensions (DP-E, Phase 2.2.2a) ─────────────────
+//
+// These cap the `http.route` (matched location name) and
+// `nginx.upstream.zone` (upstream zone name) dimensions.  Slots beyond the
+// cap land in a fixed `"other"` overflow bucket.  The caps are compile-time
+// constants; they determine the `WorkerSlots` size and are checked by the
+// compile-time `const_assert!` below.
+//
+// `otel_metric_route_cap` / `otel_metric_upstream_cap` directives are
+// reserved for a future phase where operator-visible memory trade-offs are
+// exposed; for now the defaults are used and documented here.
+
+/// Maximum number of named `http.route` slots (matched location blocks).
+/// Named routes receive indices 0..ROUTE_CAP-1; anything beyond → ROUTE_CAP.
+///
+/// Default 16: covers the vast majority of production nginx deployments.
+/// TODO(phase-N): expose as `otel_metric_route_cap` directive; raise the
+/// compile-time constant when a larger default is needed.
+pub const ROUTE_CAP: usize = 16;
+
+/// Total route slots: `0..ROUTE_CAP-1` = named, `ROUTE_CAP` = `"other"`.
+pub const N_ROUTES: usize = ROUTE_CAP + 1;
+
+/// Maximum number of named upstream-zone slots.
+/// Indices 0..UPSTREAM_CAP-1 = named zones; UPSTREAM_CAP = `"(none)"` (no
+/// upstream); UPSTREAM_CAP+1 = `"other"` (over cap).
+///
+/// Default 8: covers the vast majority of production nginx deployments.
+pub const UPSTREAM_CAP: usize = 8;
+
+/// Total upstream slots: named + `"(none)"` + `"other"`.
+pub const N_UPSTREAMS: usize = UPSTREAM_CAP + 2;
+
+/// Reserved upstream slot index for requests with **no upstream**.
+pub const UPSTREAM_IDX_NONE: usize = UPSTREAM_CAP;
+
+/// Reserved upstream slot index for requests whose upstream zone is **over cap**.
+pub const UPSTREAM_IDX_OTHER: usize = UPSTREAM_CAP + 1;
+
+/// Total number of `{method × status_class × protocol × route × upstream}` combinations.
 ///
 /// Each combination maps to one [`Histogram`] slot in `WorkerSlots::request_duration_combos`.
-pub const N_COMBOS: usize = N_HTTP_METHODS * N_STATUS_CLASSES * N_PROTO_VERSIONS;
+/// Default: 8 × 5 × 4 × 17 × 10 = 27,200.
+pub const N_COMBOS: usize = N_HTTP_METHODS * N_STATUS_CLASSES * N_PROTO_VERSIONS
+    * N_ROUTES * N_UPSTREAMS;
 
-/// Compute the combination index from the three bounded dimensions.
+/// Memory budget for `request_duration_combos` in `WorkerSlots`.
+///
+/// The compile-time assert below guarantees the combined combo array fits
+/// within this budget at the default caps.  Raising ROUTE_CAP / UPSTREAM_CAP
+/// beyond what the budget permits is an explicit, memory-visible decision.
+pub const SLOT_BUDGET: usize = 4 * 1024 * 1024; // 4 MiB per worker
+
+// Compile-time budget check.  With defaults ROUTE_CAP=16 / UPSTREAM_CAP=8,
+// 27,200 combos × 136 bytes/Histogram<15> = 3,699,200 bytes < 4 MiB.
+const _: () = assert!(
+    N_COMBOS * core::mem::size_of::<Histogram<N_DURATION_BUCKETS>>() <= SLOT_BUDGET,
+    "request_duration_combos exceeds SLOT_BUDGET — reduce ROUTE_CAP / UPSTREAM_CAP or raise SLOT_BUDGET"
+);
+
+/// Compute the combination index from all five bounded dimensions.
 ///
 /// Returns a value in `0 .. N_COMBOS`.  The mapping is:
-/// `method * N_STATUS_CLASSES * N_PROTO_VERSIONS + status_class * N_PROTO_VERSIONS + proto`
+/// ```
+/// idx = method   × N_STATUS_CLASSES × N_PROTO_VERSIONS × N_ROUTES × N_UPSTREAMS
+///     + sc        × N_PROTO_VERSIONS × N_ROUTES × N_UPSTREAMS
+///     + proto     × N_ROUTES × N_UPSTREAMS
+///     + route_idx × N_UPSTREAMS
+///     + upstream_idx
+/// ```
+///
+/// `route_idx` must be in `0..N_ROUTES` (ROUTE_CAP = "other");
+/// `upstream_idx` must be in `0..N_UPSTREAMS` (UPSTREAM_CAP = "(none)",
+/// UPSTREAM_CAP+1 = "other").
 #[inline]
-pub fn combo_index(method: HttpMethod, status_class: StatusClass, proto: ProtoVersion) -> usize {
-    (method as usize) * N_STATUS_CLASSES * N_PROTO_VERSIONS
-        + (status_class as usize) * N_PROTO_VERSIONS
-        + proto as usize
+pub fn combo_index(
+    method: HttpMethod,
+    status_class: StatusClass,
+    proto: ProtoVersion,
+    route_idx: usize,
+    upstream_idx: usize,
+) -> usize {
+    debug_assert!(route_idx < N_ROUTES);
+    debug_assert!(upstream_idx < N_UPSTREAMS);
+    (method as usize) * (N_STATUS_CLASSES * N_PROTO_VERSIONS * N_ROUTES * N_UPSTREAMS)
+        + (status_class as usize) * (N_PROTO_VERSIONS * N_ROUTES * N_UPSTREAMS)
+        + (proto as usize) * (N_ROUTES * N_UPSTREAMS)
+        + route_idx * N_UPSTREAMS
+        + upstream_idx
 }
 
 /// Per-worker slot block.
@@ -244,13 +319,16 @@ pub fn combo_index(method: HttpMethod, status_class: StatusClass, proto: ProtoVe
 /// the shared memory zone. A worker only ever writes to its own slot
 /// (`ngx_worker`-indexed); the export worker reads from all slots.
 ///
-/// **fix3b (FU4)**: `request_duration_ms` is now multi-dimensional — one
-/// `Histogram` per `{http.request.method × status_class × network.protocol.version}`
-/// combination (`N_COMBOS` = 160 total).  The flat array is indexed via
-/// [`combo_index`].  When `otel_metric_status_code_class` is ON, the exporter
-/// emits each non-empty combination as a separate data point with bounded
-/// semconv attributes.  When OFF, it sums across all combinations and emits
-/// a single aggregate data point (same behaviour as before fix3b).
+/// **Phase 2.2 DP-E**: `request_duration_ms` is now multi-dimensional — one
+/// `Histogram` per `{method × status_class × protocol × http.route × upstream-zone}`
+/// combination (`N_COMBOS` = 27,200 with default caps).  The flat array is
+/// indexed via [`combo_index`].  Route and upstream-zone indices are resolved
+/// at config time (`MainConfig::route_table` / `upstream_table`) via a linear
+/// scan of at most `ROUTE_CAP` / `UPSTREAM_CAP` entries — O(cap) but branchless
+/// and cache-hot for realistic configs.
+///
+/// Phase 2.2 DP-F switches the per-combo store from `Histogram<15>` to
+/// `ExpHistogramSlot` (exponential histogram, native OTAP type).
 ///
 /// The five `status_Nxx` counters have been removed — their information is
 /// captured by the per-combination histograms.
@@ -529,8 +607,8 @@ mod tests {
             unsafe { WorkerSlots::init_at(worker_slots(base, i)) };
         }
 
-        // Use GET/2xx/HTTP1.1 combo for the test.
-        let combo = combo_index(HttpMethod::Get, StatusClass::S2xx, ProtoVersion::Http11);
+        // Use GET/2xx/HTTP1.1 combo, route_idx=0 ("other"), upstream_idx=UPSTREAM_IDX_NONE.
+        let combo = combo_index(HttpMethod::Get, StatusClass::S2xx, ProtoVersion::Http11, ROUTE_CAP, UPSTREAM_IDX_NONE);
 
         let slot0 = unsafe { &*worker_slots(base, 0) };
         for _ in 0..3 {
@@ -575,25 +653,71 @@ mod tests {
         for m in 0..N_HTTP_METHODS {
             for sc in 0..N_STATUS_CLASSES {
                 for p in 0..N_PROTO_VERSIONS {
-                    let method = [
-                        HttpMethod::Get, HttpMethod::Head, HttpMethod::Post, HttpMethod::Put,
-                        HttpMethod::Delete, HttpMethod::Patch, HttpMethod::Options, HttpMethod::Other,
-                    ][m];
-                    let status = [
-                        StatusClass::S1xx, StatusClass::S2xx, StatusClass::S3xx,
-                        StatusClass::S4xx, StatusClass::S5xx,
-                    ][sc];
-                    let proto = [
-                        ProtoVersion::Http10, ProtoVersion::Http11,
-                        ProtoVersion::Http2, ProtoVersion::Http3,
-                    ][p];
-                    let idx = combo_index(method, status, proto);
-                    assert!(!seen[idx], "duplicate combo index {}", idx);
-                    seen[idx] = true;
+                    for r in 0..N_ROUTES {
+                        for u in 0..N_UPSTREAMS {
+                            let method = [
+                                HttpMethod::Get, HttpMethod::Head, HttpMethod::Post, HttpMethod::Put,
+                                HttpMethod::Delete, HttpMethod::Patch, HttpMethod::Options, HttpMethod::Other,
+                            ][m];
+                            let status = [
+                                StatusClass::S1xx, StatusClass::S2xx, StatusClass::S3xx,
+                                StatusClass::S4xx, StatusClass::S5xx,
+                            ][sc];
+                            let proto = [
+                                ProtoVersion::Http10, ProtoVersion::Http11,
+                                ProtoVersion::Http2, ProtoVersion::Http3,
+                            ][p];
+                            let idx = combo_index(method, status, proto, r, u);
+                            assert!(!seen[idx], "duplicate combo index {}", idx);
+                            seen[idx] = true;
+                        }
+                    }
                 }
             }
         }
         assert!(seen.iter().all(|&v| v), "all N_COMBOS combinations must be reachable");
+    }
+
+    /// Route and upstream dimensions are included and distinct.
+    #[test]
+    fn combo_index_includes_route_and_upstream() {
+        let m = HttpMethod::Get;
+        let sc = StatusClass::S2xx;
+        let p = ProtoVersion::Http11;
+
+        let base_idx = combo_index(m, sc, p, 0, 0);
+        let route1_idx = combo_index(m, sc, p, 1, 0);
+        let upstream1_idx = combo_index(m, sc, p, 0, 1);
+        let other_route = combo_index(m, sc, p, ROUTE_CAP, 0);  // "other" route slot
+        let none_upstream = combo_index(m, sc, p, 0, UPSTREAM_IDX_NONE);  // "(none)" upstream
+        let other_upstream = combo_index(m, sc, p, 0, UPSTREAM_IDX_OTHER);  // "other" upstream
+
+        assert_ne!(base_idx, route1_idx, "different routes must have different indices");
+        assert_ne!(base_idx, upstream1_idx, "different upstreams must have different indices");
+        assert_ne!(route1_idx, upstream1_idx);
+        assert_ne!(base_idx, other_route, "over-cap route must have distinct index");
+        assert_ne!(base_idx, none_upstream, "no-upstream must have distinct index");
+        assert_ne!(none_upstream, other_upstream, "(none) vs other must differ");
+
+        // All must be within range.
+        for &idx in &[base_idx, route1_idx, upstream1_idx, other_route, none_upstream, other_upstream] {
+            assert!(idx < N_COMBOS, "combo index {} out of range [0, {})", idx, N_COMBOS);
+        }
+    }
+
+    /// The compile-time budget assert passes at default caps.
+    ///
+    /// This test documents the expected size; if it fails, raise SLOT_BUDGET or
+    /// lower the caps.  The real check is the `const _: ()` assert above.
+    #[test]
+    fn worker_slots_within_memory_budget() {
+        let combos_bytes = N_COMBOS * core::mem::size_of::<Histogram<N_DURATION_BUCKETS>>();
+        assert!(
+            combos_bytes <= SLOT_BUDGET,
+            "request_duration_combos ({} bytes) exceeds SLOT_BUDGET ({} bytes)",
+            combos_bytes,
+            SLOT_BUDGET,
+        );
     }
 
     #[test]
@@ -609,8 +733,8 @@ mod tests {
         let mut buf = std::vec![0u8; mem::size_of::<WorkerSlots>()];
         let slot = unsafe { &*buf.as_mut_ptr().cast::<WorkerSlots>() };
 
-        // Record a large value in the GET/2xx/HTTP1.1 combo.
-        let combo = combo_index(HttpMethod::Get, StatusClass::S2xx, ProtoVersion::Http11);
+        // Record a large value in the GET/2xx/HTTP1.1 combo (other route, no upstream).
+        let combo = combo_index(HttpMethod::Get, StatusClass::S2xx, ProtoVersion::Http11, ROUTE_CAP, UPSTREAM_IDX_NONE);
         let very_large = 99_999u64;
         slot.request_duration_combos[combo].record(very_large, &DURATION_BOUNDS_MS);
 

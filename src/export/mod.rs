@@ -962,6 +962,7 @@ fn collect_all_sources(amcf: &MainConfig, worker_start_ns: u64) -> Batch {
                 n_workers,
                 start_time_unix_nano: worker_start_ns,
                 status_code_class_enabled: amcf.status_code_class_enabled(),
+                amcf: amcf as *const crate::config::MainConfig,
             }
             .collect(),
         );

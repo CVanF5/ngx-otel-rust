@@ -19,7 +19,10 @@
 use core::sync::atomic::Ordering;
 
 use ngx::core::Status;
-use ngx::http::{HttpModuleMainConf, HttpPhase, HttpRequestHandler, Request};
+use ngx::http::{
+    HttpModuleLocationConf, HttpModuleMainConf, HttpPhase, HttpRequestHandler,
+    NgxHttpCoreModule, Request,
+};
 
 use crate::logs::{WorkerRingProducer, access::emit_access_record};
 use crate::shm::{
@@ -91,13 +94,41 @@ impl HttpRequestHandler for LogPhaseHandler {
                 (tp.sec as i64 - r.start_sec) * 1000 + (tp.msec as i64 - r.start_msec as i64);
             ms.max(0) as u64
         };
-        // ── request duration (multi-dim, fix3b FU4b) ──────────────────────
-        // Compute combination index from bounded dimensions (no alloc, no lock).
+        // ── request duration (multi-dim, Phase 2.2 DP-E) ──────────────────
+        // Compute combination index from all five bounded dimensions (no alloc,
+        // no lock, no syscall beyond what nginx already provides).
         let method = HttpMethod::from_bytes(r.method_name.as_bytes());
         let status = r.headers_out.status as u16;
         let status_class = StatusClass::from_status(status);
         let proto = ProtoVersion::from_ngx(r.http_version as core::ffi::c_uint);
-        let idx = combo_index(method, status_class, proto);
+
+        // Route dimension: matched location name (clcf->name), resolved to a
+        // pre-assigned index.  O(ROUTE_CAP) linear scan — cheap and cache-hot.
+        let route_idx = {
+            let clcf_ptr = NgxHttpCoreModule::location_conf(r)
+                .map(|c| c as *const _ as usize)
+                .unwrap_or(0);
+            amcf.route_idx_for_clcf(clcf_ptr)
+        };
+
+        // Upstream-zone dimension: shm_zone pointer for the matched upstream.
+        // r->upstream->upstream->shm_zone — all of these might be null.
+        let upstream_idx = {
+            let zone_ptr: usize = if let Some(upstream) = request.upstream() {
+                let us = unsafe { (*upstream).upstream };
+                if !us.is_null() {
+                    let zone = unsafe { (*us).shm_zone };
+                    if !zone.is_null() { zone as usize } else { 0 }
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            amcf.upstream_idx_for_zone(zone_ptr)
+        };
+
+        let idx = combo_index(method, status_class, proto, route_idx, upstream_idx);
         slot.request_duration_combos[idx].record(duration_ms, &DURATION_BOUNDS_MS);
 
         // ── request body bytes ────────────────────────────────────────────
@@ -231,6 +262,10 @@ pub struct InstrumentedSource {
     /// attributes per combination (`otel_metric_status_code_class on`).
     /// When `false`, emit a single aggregated data point.
     pub status_code_class_enabled: bool,
+    /// Pointer to the main config — used for route/upstream name lookups when
+    /// emitting per-combination data points.  Null-safe: falls back to index
+    /// strings if null (should never be null in production).
+    pub amcf: *const crate::config::MainConfig,
 }
 
 // Safety: InstrumentedSource is only used on Worker 0's export loop.
@@ -242,7 +277,9 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
         use crate::data_model::{AggregationTemporality, AnyValue, HistogramDataPoint, KeyValue};
         use crate::shm::{
             HttpMethod, N_HTTP_METHODS, ProtoVersion, N_PROTO_VERSIONS,
-            StatusClass, N_STATUS_CLASSES, N_COMBOS, BYTES_BOUNDS, DURATION_BOUNDS_MS,
+            StatusClass, N_STATUS_CLASSES, N_COMBOS, N_ROUTES, N_UPSTREAMS,
+            ROUTE_CAP, UPSTREAM_IDX_NONE, UPSTREAM_IDX_OTHER,
+            BYTES_BOUNDS, DURATION_BOUNDS_MS, combo_index,
         };
 
         let start = self.start_time_unix_nano;
@@ -290,69 +327,114 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
         let dur_bounds: std::vec::Vec<f64> = DURATION_BOUNDS_MS.iter().map(|&b| b as f64).collect();
         let byte_bounds: std::vec::Vec<f64> = BYTES_BOUNDS.iter().map(|&b| b as f64).collect();
 
-        // ── Build http.server.request.duration (fix3b FU4c) ──────────────
+        // ── Build http.server.request.duration (Phase 2.2 DP-E) ─────────
         // All histograms are cumulative running totals.
+        // amcf provides route/upstream name strings for the attribute values.
+        let amcf_ref: Option<&crate::config::MainConfig> =
+            unsafe { self.amcf.as_ref() };
+
         let duration_metric = if self.status_code_class_enabled {
             // Emit one data point per non-empty combination with bounded semconv
-            // attributes (method, status_class, protocol).  Only OTel-semconv
-            // attributes are emitted; no free-form / unbounded keys.
+            // attributes (method, status_class, protocol, http.route,
+            // nginx.upstream.zone).  Only OTel-semconv attributes are emitted;
+            // no free-form / unbounded keys.
             let mut data_points: std::vec::Vec<HistogramDataPoint> = std::vec::Vec::new();
             for m_idx in 0..N_HTTP_METHODS {
                 for sc_idx in 0..N_STATUS_CLASSES {
                     for p_idx in 0..N_PROTO_VERSIONS {
-                        let combo = m_idx * N_STATUS_CLASSES * N_PROTO_VERSIONS
-                            + sc_idx * N_PROTO_VERSIONS
-                            + p_idx;
-                        let (bc, bs, bcount) = combo_agg[combo];
-                        if bcount == 0 {
-                            continue; // skip empty combinations
+                        for r_idx in 0..N_ROUTES {
+                            for u_idx in 0..N_UPSTREAMS {
+                                let combo = combo_index(
+                                    // Re-derive enums from numeric indices (safe since
+                                    // the loops are bounded by the enum constants).
+                                    match m_idx {
+                                        0 => HttpMethod::Get, 1 => HttpMethod::Head,
+                                        2 => HttpMethod::Post, 3 => HttpMethod::Put,
+                                        4 => HttpMethod::Delete, 5 => HttpMethod::Patch,
+                                        6 => HttpMethod::Options, _ => HttpMethod::Other,
+                                    },
+                                    match sc_idx {
+                                        0 => StatusClass::S1xx, 1 => StatusClass::S2xx,
+                                        2 => StatusClass::S3xx, 3 => StatusClass::S4xx,
+                                        _ => StatusClass::S5xx,
+                                    },
+                                    match p_idx {
+                                        0 => ProtoVersion::Http10, 1 => ProtoVersion::Http11,
+                                        2 => ProtoVersion::Http2, _ => ProtoVersion::Http3,
+                                    },
+                                    r_idx, u_idx,
+                                );
+                                let (bc, bs, bcount) = combo_agg[combo];
+                                if bcount == 0 {
+                                    continue; // skip empty combinations
+                                }
+
+                                // Derive attribute string values.
+                                let method = match m_idx {
+                                    0 => HttpMethod::Get, 1 => HttpMethod::Head,
+                                    2 => HttpMethod::Post, 3 => HttpMethod::Put,
+                                    4 => HttpMethod::Delete, 5 => HttpMethod::Patch,
+                                    6 => HttpMethod::Options, _ => HttpMethod::Other,
+                                };
+                                let status_class = match sc_idx {
+                                    0 => StatusClass::S1xx, 1 => StatusClass::S2xx,
+                                    2 => StatusClass::S3xx, 3 => StatusClass::S4xx,
+                                    _ => StatusClass::S5xx,
+                                };
+                                let proto = match p_idx {
+                                    0 => ProtoVersion::Http10, 1 => ProtoVersion::Http11,
+                                    2 => ProtoVersion::Http2, _ => ProtoVersion::Http3,
+                                };
+
+                                // Route name: from amcf table or fallback.
+                                let route_name: std::string::String = amcf_ref
+                                    .map(|c| std::string::String::from(c.route_name(r_idx)))
+                                    .unwrap_or_else(|| {
+                                        if r_idx == ROUTE_CAP { std::string::String::from("(other)") }
+                                        else { std::format!("route_{}", r_idx) }
+                                    });
+
+                                // Upstream zone name: from amcf table or fallback.
+                                let upstream_name: std::string::String = amcf_ref
+                                    .map(|c| std::string::String::from(c.upstream_zone_name(u_idx)))
+                                    .unwrap_or_else(|| {
+                                        if u_idx == UPSTREAM_IDX_NONE { std::string::String::from("(none)") }
+                                        else if u_idx == UPSTREAM_IDX_OTHER { std::string::String::from("(other)") }
+                                        else { std::format!("upstream_{}", u_idx) }
+                                    });
+
+                                data_points.push(HistogramDataPoint {
+                                    attributes: std::vec![
+                                        KeyValue {
+                                            key: "http.request.method".into(),
+                                            value: AnyValue::String(method.as_str().into()),
+                                        },
+                                        KeyValue {
+                                            key: "http.response.status_code".into(),
+                                            value: AnyValue::Int(status_class.representative_status()),
+                                        },
+                                        KeyValue {
+                                            key: "network.protocol.version".into(),
+                                            value: AnyValue::String(proto.as_str().into()),
+                                        },
+                                        KeyValue {
+                                            key: "http.route".into(),
+                                            value: AnyValue::String(route_name),
+                                        },
+                                        KeyValue {
+                                            key: "nginx.upstream.zone".into(),
+                                            value: AnyValue::String(upstream_name),
+                                        },
+                                    ],
+                                    start_time_unix_nano: start,
+                                    time_unix_nano: now,
+                                    count: bcount,
+                                    sum: bs as f64,
+                                    bucket_counts: bc.to_vec(),
+                                    explicit_bounds: dur_bounds.clone(),
+                                });
+                            }
                         }
-                        // SAFETY: enum values are fully covered by the index ranges.
-                        let method = match m_idx {
-                            0 => HttpMethod::Get,
-                            1 => HttpMethod::Head,
-                            2 => HttpMethod::Post,
-                            3 => HttpMethod::Put,
-                            4 => HttpMethod::Delete,
-                            5 => HttpMethod::Patch,
-                            6 => HttpMethod::Options,
-                            _ => HttpMethod::Other,
-                        };
-                        let status_class = match sc_idx {
-                            0 => StatusClass::S1xx,
-                            1 => StatusClass::S2xx,
-                            2 => StatusClass::S3xx,
-                            3 => StatusClass::S4xx,
-                            _ => StatusClass::S5xx,
-                        };
-                        let proto = match p_idx {
-                            0 => ProtoVersion::Http10,
-                            1 => ProtoVersion::Http11,
-                            2 => ProtoVersion::Http2,
-                            _ => ProtoVersion::Http3,
-                        };
-                        data_points.push(HistogramDataPoint {
-                            attributes: std::vec![
-                                KeyValue {
-                                    key: "http.request.method".into(),
-                                    value: AnyValue::String(method.as_str().into()),
-                                },
-                                KeyValue {
-                                    key: "http.response.status_code".into(),
-                                    value: AnyValue::Int(status_class.representative_status()),
-                                },
-                                KeyValue {
-                                    key: "network.protocol.version".into(),
-                                    value: AnyValue::String(proto.as_str().into()),
-                                },
-                            ],
-                            start_time_unix_nano: start,
-                            time_unix_nano: now,
-                            count: bcount,
-                            sum: bs as f64,
-                            bucket_counts: bc.to_vec(),
-                            explicit_bounds: dur_bounds.clone(),
-                        });
                     }
                 }
             }

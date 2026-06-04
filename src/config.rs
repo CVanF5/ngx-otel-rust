@@ -12,8 +12,10 @@ use nginx_sys::{
     NGX_HTTP_MAIN_CONF, NGX_HTTP_MAIN_CONF_OFFSET, NGX_LOG_DEBUG, NGX_LOG_EMERG,
 };
 use ngx::core::{Status, NGX_CONF_ERROR, NGX_CONF_OK};
-use ngx::http::HttpModuleMainConf;
+use ngx::http::{HttpModuleMainConf, NgxHttpCoreModule};
 use ngx::{ngx_conf_log_error, ngx_string};
+
+use crate::shm::{ROUTE_CAP, UPSTREAM_CAP, UPSTREAM_IDX_NONE, UPSTREAM_IDX_OTHER};
 
 use crate::shm;
 use crate::HttpOtelModule;
@@ -80,6 +82,56 @@ pub struct ExporterConfig {
 impl ExporterConfig {
     pub fn is_set(&self) -> bool {
         !self.endpoint.is_empty()
+    }
+}
+
+// ── Route and upstream tables (Phase 2.2 DP-E) ──────────────────────────────
+
+/// Maximum bytes stored per route name in the lookup table.
+pub const ROUTE_NAME_MAX: usize = 64;
+
+/// Maximum bytes stored per upstream zone name in the lookup table.
+pub const UPSTREAM_NAME_MAX: usize = 32;
+
+/// One entry in the per-`MainConfig` route lookup table.
+///
+/// Populated at `postconfiguration` time by walking the location tree.
+/// Hot-path lookup: `clcf_ptr` = `ngx_http_core_loc_conf_t *` as `usize`.
+#[derive(Copy, Clone)]
+pub struct RouteEntry {
+    /// The `ngx_http_core_loc_conf_t *` pointer value for this location,
+    /// cast to `usize`.  `0` = empty slot.
+    pub clcf_ptr: usize,
+    /// Location name bytes (e.g. `"/api"`, `"/"`, `"= /health"`).
+    pub name: [u8; ROUTE_NAME_MAX],
+    /// Length of the name in bytes (0 = empty/unnamed).
+    pub name_len: u8,
+}
+
+impl RouteEntry {
+    /// Returns the route name as a `&str` slice (UTF-8 best-effort; caller
+    /// is responsible for validity).
+    pub fn name_str(&self) -> &str {
+        core::str::from_utf8(&self.name[..self.name_len as usize]).unwrap_or("(invalid)")
+    }
+}
+
+/// One entry in the per-`MainConfig` upstream-zone lookup table.
+#[derive(Copy, Clone)]
+pub struct UpstreamEntry {
+    /// The `ngx_shm_zone_t *` pointer value for this upstream zone, cast to
+    /// `usize`.  `0` = empty slot.
+    pub shm_zone_ptr: usize,
+    /// Upstream zone name bytes.
+    pub name: [u8; UPSTREAM_NAME_MAX],
+    /// Length of the name in bytes.
+    pub name_len: u8,
+}
+
+impl UpstreamEntry {
+    /// Returns the zone name as a `&str` slice.
+    pub fn name_str(&self) -> &str {
+        core::str::from_utf8(&self.name[..self.name_len as usize]).unwrap_or("(invalid)")
     }
 }
 
@@ -159,6 +211,25 @@ pub struct MainConfig {
     /// `otel_log_ring_size <size>` — per-worker ring capacity in bytes.
     /// `0` = not configured (uses `DEFAULT_LOG_RING_CAP`).
     pub log_ring_size: usize,
+
+    // ── Phase 2.2 DP-E: route and upstream-zone dimension tables ─────────────
+    //
+    // Populated once at `postconfiguration` time (before workers fork) by
+    // walking the nginx location tree and upstream list.  Workers inherit the
+    // tables via fork and read them lock-free on the hot path (linear scan of
+    // at most ROUTE_CAP / UPSTREAM_CAP entries — O(cap), no alloc).
+
+    /// Route lookup table: one entry per named `location {}` block, capped at
+    /// `ROUTE_CAP`.  Entries beyond the cap land in `ROUTE_CAP` ("other").
+    pub route_table: [RouteEntry; ROUTE_CAP],
+    /// Number of filled entries in `route_table` (0..=ROUTE_CAP).
+    pub n_routes: usize,
+
+    /// Upstream-zone lookup table: one entry per `upstream { zone ...; }`,
+    /// capped at `UPSTREAM_CAP`.
+    pub upstream_table: [UpstreamEntry; UPSTREAM_CAP],
+    /// Number of filled entries in `upstream_table` (0..=UPSTREAM_CAP).
+    pub n_upstreams: usize,
 }
 
 impl Default for MainConfig {
@@ -184,6 +255,11 @@ impl Default for MainConfig {
             // 0 = not configured (off by default).
             access_sample_size: 0,
             log_ring_size: 0,
+            // Route and upstream tables start empty; populated at postconfiguration.
+            route_table: [RouteEntry { clcf_ptr: 0, name: [0u8; ROUTE_NAME_MAX], name_len: 0 }; ROUTE_CAP],
+            n_routes: 0,
+            upstream_table: [UpstreamEntry { shm_zone_ptr: 0, name: [0u8; UPSTREAM_NAME_MAX], name_len: 0 }; UPSTREAM_CAP],
+            n_upstreams: 0,
         }
     }
 }
@@ -346,6 +422,14 @@ impl MainConfig {
         if self.is_access_sample_enabled() {
             self.register_logs_zone(cf, module)?;
         }
+
+        // Build the route and upstream-zone lookup tables (Phase 2.2 DP-E).
+        // This walks the nginx location tree and upstream list ONCE before
+        // workers fork, so all workers see identical tables.
+        // Safety: cf is valid; nginx guarantees postconfiguration runs after
+        // all location and upstream configs are parsed and merged.
+        unsafe { self.build_route_table(cf) };
+        unsafe { self.build_upstream_table(cf) };
 
         Ok(())
     }
@@ -521,6 +605,270 @@ impl MainConfig {
     #[inline]
     pub fn access_sample_size(&self) -> usize {
         self.access_sample_size
+    }
+
+    /// Resolve the `http.route` slot index for a request's matched location.
+    ///
+    /// `clcf_ptr` = the `ngx_http_core_loc_conf_t *` cast to `usize` for the
+    /// request's matched location (read via `NgxHttpCoreModule::location_conf`).
+    ///
+    /// Returns a value in `0..ROUTE_CAP` for a registered location, or
+    /// `ROUTE_CAP` (`"other"`) if the location is unknown or the table is full.
+    ///
+    /// # Hot-path note
+    /// Linear scan of at most `ROUTE_CAP` entries (≤ 16 by default).  No alloc,
+    /// no lock, no syscall.
+    #[inline]
+    pub fn route_idx_for_clcf(&self, clcf_ptr: usize) -> usize {
+        if clcf_ptr == 0 {
+            return ROUTE_CAP; // null → "other"
+        }
+        for i in 0..self.n_routes {
+            if self.route_table[i].clcf_ptr == clcf_ptr {
+                return i;
+            }
+        }
+        ROUTE_CAP // not registered → "other"
+    }
+
+    /// Resolve the upstream-zone slot index for a request's upstream.
+    ///
+    /// `shm_zone_ptr` = the `ngx_shm_zone_t *` cast to `usize` for the
+    /// upstream's shared-memory zone (from `r->upstream->upstream->shm_zone`).
+    /// Pass `0` for requests with no upstream.
+    ///
+    /// Returns:
+    /// - `0..UPSTREAM_CAP-1` for a registered zone
+    /// - `UPSTREAM_IDX_NONE` (`UPSTREAM_CAP`) when `shm_zone_ptr == 0`
+    /// - `UPSTREAM_IDX_OTHER` (`UPSTREAM_CAP+1`) when the zone is over cap
+    #[inline]
+    pub fn upstream_idx_for_zone(&self, shm_zone_ptr: usize) -> usize {
+        if shm_zone_ptr == 0 {
+            return UPSTREAM_IDX_NONE;
+        }
+        for i in 0..self.n_upstreams {
+            if self.upstream_table[i].shm_zone_ptr == shm_zone_ptr {
+                return i;
+            }
+        }
+        UPSTREAM_IDX_OTHER // not registered → "other"
+    }
+
+    /// Route name string for slot `route_idx` (for encoder attribute values).
+    ///
+    /// Returns the registered location name (e.g. `"/api"`), or special
+    /// sentinel strings `"(other)"` for the overflow slot and `"(none)"` for
+    /// the no-upstream slot.
+    pub fn route_name(&self, route_idx: usize) -> &str {
+        if route_idx == ROUTE_CAP {
+            return "(other)";
+        }
+        if route_idx < self.n_routes {
+            return self.route_table[route_idx].name_str();
+        }
+        "(other)"
+    }
+
+    /// Upstream zone name string for slot `upstream_idx` (for encoder attrs).
+    pub fn upstream_zone_name(&self, upstream_idx: usize) -> &str {
+        if upstream_idx == UPSTREAM_IDX_NONE {
+            return "(none)";
+        }
+        if upstream_idx == UPSTREAM_IDX_OTHER {
+            return "(other)";
+        }
+        if upstream_idx < self.n_upstreams {
+            return self.upstream_table[upstream_idx].name_str();
+        }
+        "(other)"
+    }
+
+    // ── Config-time table population (called once from postconfiguration) ────
+
+    /// Walk the nginx static-location tree and register each location conf
+    /// pointer in `route_table`.
+    ///
+    /// Called ONCE at `postconfiguration` time, before workers fork.  Workers
+    /// inherit the populated table read-only.
+    ///
+    /// # Safety
+    /// `cf` must be a valid, non-null `ngx_conf_t` pointer at postconfiguration.
+    unsafe fn build_route_table(&mut self, cf: *mut ngx_conf_t) {
+        use nginx_sys::{
+            ngx_http_core_main_conf_t, ngx_http_core_srv_conf_t,
+            ngx_http_core_loc_conf_t, ngx_http_location_tree_node_t,
+        };
+        // Get HTTP core main conf → servers array.
+        let cf_ref = unsafe { &*cf };
+        let cmcf: Option<&ngx_http_core_main_conf_t> = NgxHttpCoreModule::main_conf(cf_ref);
+        let cmcf = match cmcf {
+            Some(c) => c,
+            None => return, // no HTTP core — very unusual, skip gracefully
+        };
+
+        // Walk each server's location tree.
+        let n_servers = cmcf.servers.nelts;
+        let srv_ptr = cmcf.servers.elts.cast::<*mut ngx_http_core_srv_conf_t>();
+        for i in 0..n_servers {
+            let cscf: *mut ngx_http_core_srv_conf_t = unsafe { *srv_ptr.add(i) };
+            if cscf.is_null() {
+                continue;
+            }
+            // Get the server block's root location conf.
+            let ctx = unsafe { (*cscf).ctx };
+            if ctx.is_null() {
+                continue;
+            }
+            let core_ctx_idx = unsafe { nginx_sys::ngx_http_core_module.ctx_index };
+            let loc_conf_arr = unsafe { (*ctx).loc_conf };
+            if loc_conf_arr.is_null() {
+                continue;
+            }
+            let root_clcf: *mut ngx_http_core_loc_conf_t =
+                unsafe { (*loc_conf_arr.add(core_ctx_idx)).cast() };
+            if root_clcf.is_null() {
+                continue;
+            }
+            // Walk the static location tree rooted here.
+            let static_locs = unsafe { (*root_clcf).static_locations };
+            unsafe { self.walk_location_tree(static_locs) };
+        }
+    }
+
+    /// Recursively walk a `ngx_http_location_tree_node_t` tree and register
+    /// all reachable location confs.
+    ///
+    /// # Safety
+    /// `node` must be null or a valid pointer within nginx config memory.
+    unsafe fn walk_location_tree(
+        &mut self,
+        node: *mut nginx_sys::ngx_http_location_tree_node_t,
+    ) {
+        if node.is_null() {
+            return;
+        }
+        let n = unsafe { &*node };
+
+        // Register the exact-match location at this node (if any).
+        if !n.exact.is_null() {
+            unsafe { self.try_register_route(n.exact) };
+        }
+        // Register the inclusive (prefix-match) location if different from exact.
+        if !n.inclusive.is_null() && n.inclusive != n.exact {
+            unsafe { self.try_register_route(n.inclusive) };
+        }
+
+        // Recurse into sub-locations (the `tree` subtree = inner `location {}` blocks
+        // that share the current prefix).
+        unsafe { self.walk_location_tree(n.tree) };
+        // Recurse into sibling nodes.
+        unsafe { self.walk_location_tree(n.left) };
+        unsafe { self.walk_location_tree(n.right) };
+    }
+
+    /// Register one location conf in the route table.  No-op if already
+    /// registered or if the table is full (over-cap locations map to "other").
+    ///
+    /// # Safety
+    /// `clcf_ptr` must be a valid non-null `ngx_http_core_loc_conf_t *`.
+    unsafe fn try_register_route(
+        &mut self,
+        clcf_ptr: *mut nginx_sys::ngx_http_core_loc_conf_t,
+    ) {
+        let ptr_val = clcf_ptr as usize;
+
+        // Deduplicate: skip if already registered.
+        for i in 0..self.n_routes {
+            if self.route_table[i].clcf_ptr == ptr_val {
+                return;
+            }
+        }
+
+        // Over cap → "other" bucket (no registration needed; the lookup will
+        // return ROUTE_CAP by default).
+        if self.n_routes >= ROUTE_CAP {
+            return;
+        }
+
+        let clcf = unsafe { &*clcf_ptr };
+        let name = clcf.name; // ngx_str_t
+        let len = (name.len as usize).min(ROUTE_NAME_MAX);
+
+        let idx = self.n_routes;
+        self.route_table[idx].clcf_ptr = ptr_val;
+        self.route_table[idx].name_len = len as u8;
+        if len > 0 && !name.data.is_null() {
+            let src = unsafe { core::slice::from_raw_parts(name.data, len) };
+            self.route_table[idx].name[..len].copy_from_slice(src);
+        }
+        self.n_routes += 1;
+    }
+
+    /// Walk the upstream list and register each upstream zone in `upstream_table`.
+    ///
+    /// # Safety
+    /// `cf` must be a valid, non-null `ngx_conf_t` pointer at postconfiguration.
+    unsafe fn build_upstream_table(&mut self, cf: *mut ngx_conf_t) {
+        use nginx_sys::ngx_http_upstream_srv_conf_t;
+
+        let cf_ref = unsafe { &*cf };
+
+        // Access the upstream module's main conf via its ctx_index.
+        // `ngx_http_upstream_module.ctx_index` is the position in the HTTP
+        // main_conf array.  We navigate the same way as for the core module.
+        let ctx_index = unsafe { nginx_sys::ngx_http_upstream_module.ctx_index };
+
+        // Get the HTTP conf ctx from cf (same approach used by NgxHttpCoreModule).
+        let http_conf_ctx = unsafe {
+            let cf_inner = &*(cf as *const nginx_sys::ngx_conf_t);
+            // cf->cycle->conf_ctx[ngx_http_module.index] → ngx_http_conf_ctx_t *
+            let cycle = match cf_inner.cycle.as_ref() {
+                Some(c) => c,
+                None => return,
+            };
+            let http_module_idx = nginx_sys::ngx_http_module.index;
+            let raw: *const *mut core::ffi::c_void = *cycle.conf_ctx.add(http_module_idx) as *const *mut core::ffi::c_void;
+            if raw.is_null() { return; }
+            raw as *const nginx_sys::ngx_http_conf_ctx_t
+        };
+        let main_conf_arr = unsafe { (*http_conf_ctx).main_conf };
+        if main_conf_arr.is_null() { return; }
+
+        let umcf_ptr = unsafe { *main_conf_arr.add(ctx_index) };
+        if umcf_ptr.is_null() { return; }
+        let umcf: *const nginx_sys::ngx_http_upstream_main_conf_t = umcf_ptr.cast();
+
+        let n_upstreams = unsafe { (*umcf).upstreams.nelts };
+        let up_ptr = unsafe { (*umcf).upstreams.elts.cast::<*mut ngx_http_upstream_srv_conf_t>() };
+        for i in 0..n_upstreams {
+            let uscf: *mut ngx_http_upstream_srv_conf_t = unsafe { *up_ptr.add(i) };
+            if uscf.is_null() { continue; }
+            let shm_zone = unsafe { (*uscf).shm_zone };
+            if shm_zone.is_null() { continue; } // no zone declared
+            let zone_ptr = shm_zone as usize;
+
+            // Skip if already registered.
+            let mut found = false;
+            for j in 0..self.n_upstreams {
+                if self.upstream_table[j].shm_zone_ptr == zone_ptr {
+                    found = true;
+                    break;
+                }
+            }
+            if found { continue; }
+            if self.n_upstreams >= UPSTREAM_CAP { break; } // over cap
+
+            let name = unsafe { (*shm_zone).shm.name }; // ngx_str_t
+            let len = (name.len as usize).min(UPSTREAM_NAME_MAX);
+            let idx = self.n_upstreams;
+            self.upstream_table[idx].shm_zone_ptr = zone_ptr;
+            self.upstream_table[idx].name_len = len as u8;
+            if len > 0 && !name.data.is_null() {
+                let src = unsafe { core::slice::from_raw_parts(name.data, len) };
+                self.upstream_table[idx].name[..len].copy_from_slice(src);
+            }
+            self.n_upstreams += 1;
+        }
     }
 
     /// Effective per-worker log ring capacity in bytes.
@@ -1333,6 +1681,73 @@ mod tests {
         assert_eq!(cfg.access_sample_size(), 16);
         cfg.access_sample_size = 0;
         assert!(!cfg.is_access_sample_enabled());
+    }
+
+    /// Route index lookup returns the correct index for registered locations
+    /// and ROUTE_CAP ("other") for unregistered ones.
+    ///
+    /// Two different URIs hitting the same location → same clcf* → same
+    /// route_idx (this is the core invariant tested here in unit-test form).
+    #[test]
+    fn route_is_location_name_not_uri() {
+        let mut cfg = MainConfig::default();
+
+        // No routes registered → all clcf* map to ROUTE_CAP ("other").
+        assert_eq!(cfg.route_idx_for_clcf(0x1000), ROUTE_CAP, "unregistered → other");
+        assert_eq!(cfg.route_idx_for_clcf(0), ROUTE_CAP, "null → other");
+
+        // Register a fake clcf* → gets index 0.
+        cfg.route_table[0].clcf_ptr = 0x1000;
+        cfg.route_table[0].name_len = 4;
+        cfg.route_table[0].name[..4].copy_from_slice(b"/api");
+        cfg.n_routes = 1;
+
+        // Same clcf* value from two different URIs → same route_idx (0).
+        let uri1_clcf = 0x1000usize; // e.g. GET /api/users
+        let uri2_clcf = 0x1000usize; // e.g. GET /api/products
+        assert_eq!(cfg.route_idx_for_clcf(uri1_clcf), 0, "/api/users → route_idx 0");
+        assert_eq!(cfg.route_idx_for_clcf(uri2_clcf), 0, "/api/products → route_idx 0 (same location)");
+
+        // A different clcf* (different location block) → "other".
+        let other_clcf = 0x2000usize;
+        assert_eq!(cfg.route_idx_for_clcf(other_clcf), ROUTE_CAP, "different location → other");
+
+        // Register a second route.
+        cfg.route_table[1].clcf_ptr = 0x2000;
+        cfg.route_table[1].name_len = 8;
+        cfg.route_table[1].name[..8].copy_from_slice(b"/health/");
+        cfg.n_routes = 2;
+        assert_eq!(cfg.route_idx_for_clcf(0x2000), 1, "/health/ registered at idx 1");
+
+        // Over-cap routes map to ROUTE_CAP.
+        let mut full_cfg = MainConfig::default();
+        for i in 0..ROUTE_CAP {
+            full_cfg.route_table[i].clcf_ptr = (0x1000 + i * 0x100) as usize;
+            full_cfg.n_routes += 1;
+        }
+        let over_cap_clcf = 0x9999usize;
+        assert_eq!(full_cfg.route_idx_for_clcf(over_cap_clcf), ROUTE_CAP, "over-cap → other");
+    }
+
+    /// Upstream index returns UPSTREAM_IDX_NONE for no-upstream and
+    /// UPSTREAM_IDX_OTHER for over-cap zones.
+    #[test]
+    fn upstream_idx_matches_registered_zones() {
+        let mut cfg = MainConfig::default();
+
+        // No upstream (zone_ptr = 0) → UPSTREAM_IDX_NONE.
+        assert_eq!(cfg.upstream_idx_for_zone(0), UPSTREAM_IDX_NONE);
+        // Unregistered zone → UPSTREAM_IDX_OTHER.
+        assert_eq!(cfg.upstream_idx_for_zone(0x5000), UPSTREAM_IDX_OTHER);
+
+        // Register a zone.
+        cfg.upstream_table[0].shm_zone_ptr = 0x5000;
+        cfg.upstream_table[0].name_len = 7;
+        cfg.upstream_table[0].name[..7].copy_from_slice(b"backend");
+        cfg.n_upstreams = 1;
+        assert_eq!(cfg.upstream_idx_for_zone(0x5000), 0);
+        assert_eq!(cfg.upstream_idx_for_zone(0), UPSTREAM_IDX_NONE, "no upstream stays none");
+        assert_eq!(cfg.upstream_idx_for_zone(0x6000), UPSTREAM_IDX_OTHER, "unregistered → other");
     }
 
     /// Zero-cost-when-disabled invariant: the boolean gate relied upon by both
