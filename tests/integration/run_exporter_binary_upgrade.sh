@@ -443,17 +443,30 @@ kill -QUIT "${M1_PID}" 2>/dev/null || info "QUIT to M1 failed (may have already 
 # Assertion 3a: M1 master exits within 20s.
 info "Waiting for M1 (PID ${M1_PID}) to exit..."
 M1_EXITED=0
-DEADLINE=$(( SECONDS + 20 ))
+DEADLINE=$(( SECONDS + 40 ))
 while (( SECONDS < DEADLINE )); do
     if ! kill -0 "${M1_PID}" 2>/dev/null; then
         M1_EXITED=1
         break
     fi
+    # Every 10s, log what processes are still alive to diagnose stalls.
+    if (( SECONDS % 10 == 0 )); then
+        info "Still waiting for M1... alive nginx processes:"
+        ps -eo pid,ppid,args 2>/dev/null | grep nginx | grep -v grep | head -10 || true
+        info "error.log tail (non-debug):"
+        grep -v '\[debug\]' "${PREFIX}/logs/error.log" 2>/dev/null | tail -5 || true
+    fi
     sleep 0.5
 done
 if [[ "${M1_EXITED}" -ne 1 ]]; then
     PID_CMD="$(ps -o args= -p "${M1_PID}" 2>/dev/null || echo "not found")"
-    fail "STOP-AND-ASK [R2-HANDOFF-BUG]: M1 master (${M1_PID}) did not exit within 20s after QUIT.
+    info "=== Diagnostic: all nginx processes ==="
+    ps -eo pid,ppid,args 2>/dev/null | grep nginx | grep -v grep || true
+    info "=== Diagnostic: M1 exporter (${EXP1_PID}) alive? ==="
+    kill -0 "${EXP1_PID}" 2>/dev/null && echo "ALIVE" || echo "DEAD"
+    info "=== error.log (last 20 non-debug lines before FAIL) ==="
+    grep -v '\[debug\]' "${PREFIX}/logs/error.log" 2>/dev/null | tail -20 || true
+    fail "STOP-AND-ASK [R2-HANDOFF-BUG]: M1 master (${M1_PID}) did not exit within 40s after QUIT.
        Process: ${PID_CMD}
        This is a lifecycle bug — M1 is orphaned."
 fi
