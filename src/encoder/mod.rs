@@ -181,8 +181,8 @@ fn convert_log_record(lr: &LogRecord) -> logs_proto::LogRecord {
         attributes: lr.attributes.iter().map(convert_kv).collect(),
         dropped_attributes_count: 0,
         flags: 0,
-        trace_id: std::vec![],
-        span_id: std::vec![],
+        trace_id: lr.trace_id.clone(),
+        span_id: lr.span_id.clone(),
         event_name: lr.event_name.clone(),
     }
 }
@@ -454,6 +454,8 @@ mod tests {
                         },
                     ],
                     event_name: "http.access".into(),
+                    trace_id: std::vec![],
+                    span_id: std::vec![],
                 },
                 LogRecord {
                     time_unix_nano: 1_700_000_001_000_000_000,
@@ -463,6 +465,8 @@ mod tests {
                     body: AnyValue::String("upstream connect failed".into()),
                     attributes: std::vec![],
                     event_name: "nginx.error".into(),
+                    trace_id: std::vec![],
+                    span_id: std::vec![],
                 },
             ],
         };

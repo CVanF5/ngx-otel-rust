@@ -161,6 +161,14 @@ for i in $(seq 1 3); do
     curl -sf http://127.0.0.1:9101/api >/dev/null || true
 done
 
+# Re-review FU: a regex location is NOT registered in the route table, so its
+# requests map to the "(other)" route bucket. 200 → only the always-on per-route
+# histogram records it (the tail gate blocks 200s).
+info "Sending 2 GET requests to /regex-unmapped (regex → '(other)' route bucket)..."
+for i in $(seq 1 2); do
+    curl -sf http://127.0.0.1:9101/regex-unmapped >/dev/null || true
+done
+
 info "Traffic sent."
 
 # ─── Wait for flush ──────────────────────────────────────────────────────────
@@ -242,6 +250,14 @@ else
     fail "metrics.json: expected ≥ 2 distinct http.route data points, got ${ROUTE_COUNT}"
 fi
 
+# Re-review FU (DP-E "other"): the regex location is unregistered → its requests
+# land in the "(other)" route bucket, which must surface as an http.route value.
+if echo "${NEW_METRICS}" | grep -qF '(other)'; then
+    pass "metrics.json: '(other)' route bucket present (regex/unregistered → overflow, DP-E)"
+else
+    fail "metrics.json: '(other)' route bucket NOT found — unregistered-route overflow path broken"
+fi
+
 # ── logs.json: Phase 2.2 assertions ──────────────────────────────────────────
 NEW_LOGS=""
 if [[ -f "${LOGS_LOG}" ]]; then
@@ -313,21 +329,30 @@ if [[ -n "${NEW_LOGS}" ]]; then
         fail "logs.json: event_name=http.access NOT found"
     fi
 
-    # FU4a: the tail record from the traceparent request carries a trace_id.
-    # The exemplar for the matching base combo should carry the 32-char trace_id.
+    # FU4a (HARD): the exemplar on the matching base combo carries the 32-char
+    # trace_id from the traceparent request. With sample size 16 and only a
+    # handful of 5xx requests in the combo, the reservoir keeps them all, so this
+    # is deterministic — absence is a real failure.
     if echo "${NEW_METRICS}" | grep -q "${TRACE_ID}"; then
         pass "metrics.json: trace_id ${TRACE_ID} carried in exemplar (FU4a traceparent)"
     else
-        info "metrics.json: trace_id not found in metrics (exemplar may not have been sampled — informational)"
+        fail "metrics.json: trace_id ${TRACE_ID} NOT carried in any exemplar — traceparent→exemplar broken"
     fi
 
-    # FU4b: the tail record for the traceparent request may carry url.path.
-    # Tail records go through the ring → exporter → log record; url.path = "/error".
-    # The collector renders attribute values as stringValues; grep for "/error".
-    if echo "${NEW_LOGS}" | grep -qE '"/error"|url\.path'; then
-        pass "logs.json: url.path attribute (or /error path) present on tail records (FU4b)"
+    # FU4a (HARD): the tail LogRecord for the traceparent request must also carry
+    # the trace_id natively (LogRecord trace context, decision #4).
+    if echo "${NEW_LOGS}" | grep -q "${TRACE_ID}"; then
+        pass "logs.json: trace_id ${TRACE_ID} carried on tail LogRecord (traceparent → LogRecord)"
     else
-        info "logs.json: url.path not directly visible in grep — may be embedded in stringValue; informational"
+        fail "logs.json: trace_id ${TRACE_ID} NOT on any tail LogRecord — traceparent not propagated to the tail"
+    fi
+
+    # FU4b (HARD): tail records carry url.path. The /error tail records have
+    # url.path="/error"; assert the attribute key is present.
+    if echo "${NEW_LOGS}" | grep -q '"url.path"'; then
+        pass "logs.json: url.path attribute present on tail records (FU4b)"
+    else
+        fail "logs.json: url.path attribute NOT found on tail records — high-cardinality detail missing"
     fi
 else
     fail "logs.json: no new content — exception-tail records did not arrive at the collector"

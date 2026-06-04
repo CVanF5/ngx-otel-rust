@@ -283,6 +283,12 @@ pub struct LogRecord {
     pub attributes: std::vec::Vec<KeyValue>,
     /// Event name (e.g. `"http.access"` or `"nginx.error"`).
     pub event_name: std::string::String,
+    /// W3C trace context (16 bytes), empty when absent. Carried natively on the
+    /// `LogRecord` (not as an attribute) so the management plane can pivot to the
+    /// trace. Populated from an inbound `traceparent` (Phase 2.2.3).
+    pub trace_id: std::vec::Vec<u8>,
+    /// W3C span id (8 bytes), empty when absent.
+    pub span_id: std::vec::Vec<u8>,
 }
 
 /// A batch of log records ready for export.
@@ -389,6 +395,8 @@ pub(crate) mod tests {
                 },
             ],
             event_name: "http.access".into(),
+            trace_id: std::vec![],
+            span_id: std::vec![],
         };
 
         let record2 = LogRecord {
@@ -399,6 +407,8 @@ pub(crate) mod tests {
             body: AnyValue::String("upstream connect failed".into()),
             attributes: std::vec![],
             event_name: "nginx.error".into(),
+            trace_id: std::vec![],
+            span_id: std::vec![],
         };
 
         let batch = LogsBatch { resource, scope, logs: std::vec![record1, record2] };

@@ -616,7 +616,7 @@ impl MainConfig {
     /// `ROUTE_CAP` (`"other"`) if the location is unknown or the table is full.
     ///
     /// # Hot-path note
-    /// Linear scan of at most `ROUTE_CAP` entries (≤ 16 by default).  No alloc,
+    /// Linear scan of at most `ROUTE_CAP` entries (≤ 64 by default).  No alloc,
     /// no lock, no syscall.
     #[inline]
     pub fn route_idx_for_clcf(&self, clcf_ptr: usize) -> usize {

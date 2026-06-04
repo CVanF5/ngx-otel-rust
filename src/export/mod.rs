@@ -1153,10 +1153,69 @@ fn parse_access_record(buf: &[u8], observed_now_ns: u64) -> Option<LogRecord> {
     let addr_len = u16::from_be_bytes([buf[pos], buf[pos + 1]]) as usize;
     pos += 2;
     let client_addr = if pos + addr_len <= buf.len() {
-        std::string::String::from_utf8_lossy(&buf[pos..pos + addr_len]).into_owned()
+        let s = std::string::String::from_utf8_lossy(&buf[pos..pos + addr_len]).into_owned();
+        pos += addr_len;
+        s
     } else {
         std::string::String::new()
     };
+
+    // ── Phase 2.2.3 / 2.2.5: trace context + high-cardinality tail detail ─────
+    // These follow client_addr in the wire format (see `emit_access_record`).
+    // Decode defensively — a truncated/legacy record simply omits them.
+    let mut trace_id: std::vec::Vec<u8> = std::vec::Vec::new();
+    let mut span_id: std::vec::Vec<u8> = std::vec::Vec::new();
+    if pos < buf.len() {
+        let has_trace = buf[pos];
+        pos += 1;
+        if has_trace == 1 && pos + 24 <= buf.len() {
+            trace_id = buf[pos..pos + 16].to_vec();
+            pos += 16;
+            span_id = buf[pos..pos + 8].to_vec();
+            pos += 8;
+        }
+    }
+    // url.path then user_agent.original (each: u16 len + bytes). Tail-only,
+    // high-cardinality — never promoted to a metric dimension.
+    let url_path = read_u16_prefixed(buf, &mut pos);
+    let user_agent = read_u16_prefixed(buf, &mut pos);
+
+    let mut attributes = std::vec![
+        KeyValue {
+            key: "http.request.method".into(),
+            value: AnyValue::String(method),
+        },
+        KeyValue {
+            key: "http.response.status_code".into(),
+            value: AnyValue::Int(status as i64),
+        },
+        KeyValue {
+            key: "http.server.request.body.size".into(),
+            value: AnyValue::Int(req_len as i64),
+        },
+        KeyValue {
+            key: "http.server.response.body.size".into(),
+            value: AnyValue::Int(resp_bytes as i64),
+        },
+        KeyValue {
+            key: "client.address".into(),
+            value: AnyValue::String(client_addr),
+        },
+    ];
+    if !url_path.is_empty() {
+        attributes.push(KeyValue {
+            key: "url.path".into(),
+            value: AnyValue::String(std::string::String::from_utf8_lossy(&url_path).into_owned()),
+        });
+    }
+    if !user_agent.is_empty() {
+        attributes.push(KeyValue {
+            key: "user_agent.original".into(),
+            value: AnyValue::String(
+                std::string::String::from_utf8_lossy(&user_agent).into_owned(),
+            ),
+        });
+    }
 
     Some(LogRecord {
         time_unix_nano: ts,
@@ -1164,30 +1223,27 @@ fn parse_access_record(buf: &[u8], observed_now_ns: u64) -> Option<LogRecord> {
         severity_number,
         severity_text: std::string::String::from(severity_text),
         body: AnyValue::String(std::string::String::new()), // body empty for access logs
-        attributes: std::vec![
-            KeyValue {
-                key: "http.request.method".into(),
-                value: AnyValue::String(method),
-            },
-            KeyValue {
-                key: "http.response.status_code".into(),
-                value: AnyValue::Int(status as i64),
-            },
-            KeyValue {
-                key: "http.server.request.body.size".into(),
-                value: AnyValue::Int(req_len as i64),
-            },
-            KeyValue {
-                key: "http.server.response.body.size".into(),
-                value: AnyValue::Int(resp_bytes as i64),
-            },
-            KeyValue {
-                key: "client.address".into(),
-                value: AnyValue::String(client_addr),
-            },
-        ],
+        attributes,
         event_name: "http.access".into(),
+        trace_id,
+        span_id,
     })
+}
+
+/// Read a `u16`-length-prefixed byte run at `*pos`, advancing `*pos` past it.
+/// Returns empty (and leaves `*pos` unmoved past a partial header) on truncation.
+fn read_u16_prefixed(buf: &[u8], pos: &mut usize) -> std::vec::Vec<u8> {
+    if *pos + 2 > buf.len() {
+        return std::vec::Vec::new();
+    }
+    let len = u16::from_be_bytes([buf[*pos], buf[*pos + 1]]) as usize;
+    *pos += 2;
+    if *pos + len > buf.len() {
+        return std::vec::Vec::new();
+    }
+    let v = buf[*pos..*pos + len].to_vec();
+    *pos += len;
+    v
 }
 
 fn now_unix_nano() -> u64 {
