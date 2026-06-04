@@ -196,13 +196,28 @@ M1_PID=""
 CURL_PID=""
 
 cleanup() {
+    # Stop curl first — active keep-alive connections prevent worker graceful drain.
     [[ -n "${CURL_PID:-}" ]] && kill "${CURL_PID}" 2>/dev/null || true
-    # Kill both master processes if still alive.
-    # Use SIGQUIT for graceful shutdown; fall back to SIGTERM.
-    [[ -n "${M1_PID:-}" ]] && kill -0 "${M1_PID}" 2>/dev/null \
-        && (kill -QUIT "${M1_PID}" 2>/dev/null; sleep 1; kill -TERM "${M1_PID}" 2>/dev/null || true) || true
-    [[ -n "${M2_PID:-}" ]] && kill -0 "${M2_PID}" 2>/dev/null \
-        && (kill -QUIT "${M2_PID}" 2>/dev/null; sleep 1; kill -TERM "${M2_PID}" 2>/dev/null || true) || true
+    CURL_PID=""
+    # Shut down M1 first.  CRITICAL: M2 must NOT exit before M1 finishes its
+    # graceful shutdown.  If M2 exits while M1 is draining, nginx's old master
+    # sees "new binary process exited" and reverts to active mode (never exits).
+    if [[ -n "${M1_PID:-}" ]] && kill -0 "${M1_PID}" 2>/dev/null; then
+        kill -QUIT "${M1_PID}" 2>/dev/null || true
+        local deadline=$(( SECONDS + 15 ))
+        while (( SECONDS < deadline )) && kill -0 "${M1_PID}" 2>/dev/null; do
+            sleep 0.5
+        done
+        kill -TERM "${M1_PID}" 2>/dev/null || true
+        sleep 1
+        kill -KILL "${M1_PID}" 2>/dev/null || true
+    fi
+    # Only then shut down M2.
+    if [[ -n "${M2_PID:-}" ]] && kill -0 "${M2_PID}" 2>/dev/null; then
+        kill -QUIT "${M2_PID}" 2>/dev/null || true
+        sleep 2
+        kill -TERM "${M2_PID}" 2>/dev/null || true
+    fi
     sleep 1
     echo ""
     echo "=== error.log (last 50 lines) ==="
@@ -409,6 +424,14 @@ pass "M2 service.instance.id = ${M2_INSTANCE_ID} (distinct from M1's ${M1_INSTAN
 pass "Both service.instance.id values present in overlap window (${OVERLAP_ID_COUNT} distinct ids)"
 
 # ─── Phase 3: shut down M1 gracefully (WINCH then QUIT) ──────────────────────
+
+# Stop the curl load BEFORE sending WINCH/QUIT.  Active keep-alive connections
+# on M1's workers prevent graceful drain; stopping curl lets workers drain and
+# exit promptly.
+info "Stopping curl load before M1 shutdown..."
+[[ -n "${CURL_PID:-}" ]] && kill "${CURL_PID}" 2>/dev/null || true
+CURL_PID=""
+sleep 1
 
 info "Sending SIGWINCH to M1 (${M1_PID}) to stop accepting new connections..."
 kill -WINCH "${M1_PID}" 2>/dev/null || info "WINCH to M1 failed (may have already exited)"
