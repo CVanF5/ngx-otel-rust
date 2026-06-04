@@ -573,14 +573,20 @@ fi
 pass "Exactly 1 otel exporter remaining (PID=${EXP2_PID}, M2's)"
 
 # Assertion 4c: collector continues to receive M2's instance id and stops
-# receiving M1's.  Wait 4s for M2's exporter to ship at least one batch.
+# receiving M1's.
+# Snapshot the file AFTER all M1 activity is done (M1's final-drain batch
+# has already been written to metrics.json at this point; we start the
+# post-M1 window AFTER that batch to avoid a false positive).
+AFTER_M1_SIZE=0
+[[ -f "${METRICS_LOG}" ]] && AFTER_M1_SIZE=$(wc -c < "${METRICS_LOG}")
+# Wait 4s for M2's exporter to ship at least one fresh batch.
 sleep 4
 
 POST_METRICS_SIZE=0
 [[ -f "${METRICS_LOG}" ]] && POST_METRICS_SIZE=$(wc -c < "${METRICS_LOG}")
 POST_CONTENT=""
-if (( POST_METRICS_SIZE > OVERLAP_METRICS_SIZE )); then
-    POST_CONTENT=$(tail -c "+$(( OVERLAP_METRICS_SIZE + 1 ))" "${METRICS_LOG}")
+if (( POST_METRICS_SIZE > AFTER_M1_SIZE )); then
+    POST_CONTENT=$(tail -c "+$(( AFTER_M1_SIZE + 1 ))" "${METRICS_LOG}")
 fi
 
 POST_IDS="$(instance_ids_from_metrics "${POST_CONTENT}")"
