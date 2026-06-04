@@ -1,0 +1,6 @@
+# Phase 2.1 zero-cost-logs bench — Thu  4 Jun 2026 14:13:16 IST
+# nginx: /Users/c.vandesande/project-nginx-otel/ngx-otel-rust/objs-debug/nginx
+# iterations: 1, duration: 30s, threads: 4
+BL median=57948.95 p95=57948.95
+TA median=58162.91 p95=58162.91
+TB median=58350.28 p95=58350.28

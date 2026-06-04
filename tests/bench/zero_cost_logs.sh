@@ -167,7 +167,7 @@ run_config() {
 # ─── Run all three configs ────────────────────────────────────────────────────
 
 {
-    echo "# Phase 2.1 zero-cost-logs bench — $(date)"
+    echo "# Phase 2.2 zero-cost-logs bench — $(date)"
     echo "# nginx: ${NGINX_BINARY}"
     echo "# iterations: ${BENCH_ITERATIONS}, duration: ${WRK_DURATION}s, threads: ${WRK_THREADS}"
 } >> "${LOGFILE}"
@@ -197,16 +197,21 @@ echo "BL vs TB regression: ${REG_TB}% (informational)"
 # Append summary to RESULTS.md
 {
     echo ""
-    echo "## Phase 2.1 Zero-cost logs bench — $(date +%Y-%m-%d)"
+    echo "## Phase 2.2 Zero-cost logs bench — $(date +%Y-%m-%d)"
+    echo ""
+    echo "> ⚠️ **DEV-BOX SMOKE ONLY** — these numbers are INFORMATIONAL."
+    echo "> The ±1% zero-cost gate and the 'enabled path is cheaper' proof"
+    echo "> run **only on host-1** (the dedicated c7a EPYC), N≥50."
+    echo "> See RALPH_PHASE_2_2.md Step 2.2.6."
     echo ""
     echo "| Config | Median (req/s) | p95 (req/s) | Regression vs BL |"
     echo "|--------|---------------|-------------|-----------------|"
-    echo "| BL (access_log OFF) | ${MEDIAN_BL} | ${P95_BL} | — |"
-    echo "| TA (access_log ON)  | ${MEDIAN_TA} | ${P95_TA} | ${REG_TA}% |"
-    echo "| TB (access_log ON, high RPS) | ${MEDIAN_TB} | ${P95_TB} | ${REG_TB}% (informational) |"
+    echo "| BL (sample OFF, histogram always-on) | ${MEDIAN_BL} | ${P95_BL} | — |"
+    echo "| TA (otel_access_log_sample 16) | ${MEDIAN_TA} | ${P95_TA} | ${REG_TA}% |"
+    echo "| TB (otel_access_log_sample 16, high RPS) | ${MEDIAN_TB} | ${P95_TB} | ${REG_TB}% (informational) |"
     echo ""
     echo "Host: $(hostname); nginx: $(\"${NGINX_BINARY}\" -v 2>&1 | head -1)"
-    echo "INFORMATIONAL — ±1% gate requires N≥50 on isolated hardware."
+    echo "INFORMATIONAL — ±1% gate requires N≥50 on isolated hardware (host-1 / c7a EPYC)."
 } >> "${SCRIPT_DIR}/RESULTS.md"
 
 section "Gate checks (INFORMATIONAL on dev hardware)"

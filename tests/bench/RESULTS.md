@@ -546,3 +546,14 @@ delivery is covered by `run_access_log.sh` (30/30). ⚠️ The test's file-based
 coverage % is unreliable at extreme volume — the collector's `logs.json` rotates
 at 10 MB so the delta undercounts delivered records (counter math implies ~6%
 delivered here, not the reported 0.1%); trust `dropped_records` + the p99 gate.
+
+## Phase 2.1 Zero-cost logs bench — 2026-06-04
+
+| Config | Median (req/s) | p95 (req/s) | Regression vs BL |
+|--------|---------------|-------------|-----------------|
+| BL (access_log OFF) | 57948.95 | 57948.95 | — |
+| TA (access_log ON)  | 58162.91 | 58162.91 | -0.4% |
+| TB (access_log ON, high RPS) | 58350.28 | 58350.28 | -0.7% (informational) |
+
+Host: C6CQ3045N2; nginx: tests/bench/zero_cost_logs.sh: line 208: "/Users/c.vandesande/project-nginx-otel/ngx-otel-rust/objs-debug/nginx": No such file or directory
+INFORMATIONAL — ±1% gate requires N≥50 on isolated hardware.
