@@ -210,19 +210,25 @@ impl HttpRequestHandler for LogPhaseHandler {
                 let _ = nginx_sys::ngx_timeofday(); // suppress unused-import warning if any
 
                 // W3C trace correlation (Phase 2.2.3): read `traceparent` header.
-                // Hot-path budget: one header-list scan (O(n), small n) + 16-byte
-                // hex parse + 24-byte copy.  No alloc, no lock, no syscall.
-                let trace_context: Option<([u8; 16], [u8; 8])> = {
+                // Also scan for User-Agent (Phase 2.2.5). One O(n) pass covers both.
+                // Hot-path budget: one header-list scan (O(n), small n) + parsing.
+                // No alloc, no lock, no syscall.
+                let mut trace_context: Option<([u8; 16], [u8; 8])> = None;
+                let mut user_agent_raw: &[u8] = b"";
+                {
                     use crate::logs::access::parse_traceparent;
-                    let mut found = None;
                     for (key, value) in request.headers_in_iterator() {
                         if key.as_bytes().eq_ignore_ascii_case(b"traceparent") {
-                            found = parse_traceparent(value.as_bytes());
-                            break;
+                            trace_context = parse_traceparent(value.as_bytes());
+                        } else if key.as_bytes().eq_ignore_ascii_case(b"user-agent") {
+                            user_agent_raw = value.as_bytes();
                         }
                     }
-                    found
-                };
+                }
+
+                // url.path: r.unparsed_uri (full path without query string).
+                // High-cardinality — stays on the tail record ONLY, never a metric dim.
+                let url_path: &[u8] = r.unparsed_uri.as_bytes();
 
                 emit_access_record(
                     &producer,
@@ -233,11 +239,12 @@ impl HttpRequestHandler for LogPhaseHandler {
                     client_addr,
                     ts_unix_nano,
                     trace_context,
+                    url_path,
+                    user_agent_raw,
                 );
 
-                // Write to the exemplar reservoir (Phase 2.2 Step 2.2.4).
-                // One fetch_add + ≤ 6 Relaxed stores = within the hot-path
-                // budget of "one exemplar reservoir write."
+                // Write to the exemplar reservoir (Phase 2.2 Steps 2.2.4 + 2.2.5).
+                // One fetch_add + ≤ 9 Relaxed stores + 2 memcpy = within budget.
                 let effective_size = amcf.access_sample_size().max(1);
                 let (trace_id_opt, span_id_opt) = if let Some((t, s)) = trace_context {
                     (Some(t), Some(s))
@@ -251,6 +258,8 @@ impl HttpRequestHandler for LogPhaseHandler {
                     trace_id_opt,
                     span_id_opt,
                     ts_unix_nano,
+                    url_path,      // url.path — on exemplar filtered_attrs only
+                    user_agent_raw, // user_agent.original — on exemplar filtered_attrs only
                 );
             }
         }
@@ -374,16 +383,34 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
             add_histogram(&mut up_bytes_sent, &bc, bs, bcount);
 
             // Collect exemplars from this worker's reservoir.
-            for (value_ms, combo_idx, has_trace, trace_id, span_id, ts_ns) in
-                slot.exemplar_reservoir.snapshot(effective_size)
-            {
-                all_exemplars.push((combo_idx, Exemplar {
-                    value: value_ms as f64,
-                    time_unix_nano: ts_ns,
-                    trace_id,
-                    span_id,
-                    has_trace,
-                    filtered_attributes: std::vec![],
+            for snap in slot.exemplar_reservoir.snapshot(effective_size) {
+                // Build filtered_attributes: url.path + user_agent.original.
+                // These are HIGH-CARDINALITY fields — they appear on exemplars ONLY,
+                // NEVER as metric dimensions (plan §DP-E, §2.2.5 guard).
+                let mut filtered_attrs: std::vec::Vec<KeyValue> = std::vec::Vec::new();
+                if snap.url_path_len > 0 {
+                    if let Ok(s) = core::str::from_utf8(&snap.url_path[..snap.url_path_len as usize]) {
+                        filtered_attrs.push(KeyValue {
+                            key: "url.path".into(),
+                            value: AnyValue::String(std::string::String::from(s)),
+                        });
+                    }
+                }
+                if snap.user_agent_len > 0 {
+                    if let Ok(s) = core::str::from_utf8(&snap.user_agent[..snap.user_agent_len as usize]) {
+                        filtered_attrs.push(KeyValue {
+                            key: "user_agent.original".into(),
+                            value: AnyValue::String(std::string::String::from(s)),
+                        });
+                    }
+                }
+                all_exemplars.push((snap.combo_idx, Exemplar {
+                    value: snap.value_ms as f64,
+                    time_unix_nano: snap.ts_unix_nano,
+                    trace_id: snap.trace_id,
+                    span_id: snap.span_id,
+                    has_trace: snap.has_trace,
+                    filtered_attributes: filtered_attrs,
                 }));
             }
         }
@@ -705,7 +732,7 @@ mod tests {
         let access_sample_enabled = false;
         if access_sample_enabled && super::is_interesting(503, 0) {
             let producer = WorkerRingProducer { ring };
-            emit_access_record(&producer, b"GET", 503, 0, 512, b"127.0.0.1", 0, None);
+            emit_access_record(&producer, b"GET", 503, 0, 512, b"127.0.0.1", 0, None, b"", b"");
         }
 
         // Ring must be empty — no record pushed.
@@ -727,7 +754,7 @@ mod tests {
         // 200, 0ms — not interesting, no push.
         if access_sample_enabled && super::is_interesting(200, 0) {
             let producer = WorkerRingProducer { ring };
-            emit_access_record(&producer, b"GET", 200, 0, 512, b"127.0.0.1", 0, None);
+            emit_access_record(&producer, b"GET", 200, 0, 512, b"127.0.0.1", 0, None, b"", b"");
         }
         let mut out = std::vec::Vec::new();
         assert!(!ring.pop_into(&mut out), "200/fast must NOT reach the tail ring");
@@ -735,14 +762,14 @@ mod tests {
         // 503, 0ms — interesting (error), push expected.
         if access_sample_enabled && super::is_interesting(503, 0) {
             let producer = WorkerRingProducer { ring };
-            emit_access_record(&producer, b"GET", 503, 0, 0, b"127.0.0.1", 0, None);
+            emit_access_record(&producer, b"GET", 503, 0, 0, b"127.0.0.1", 0, None, b"", b"");
         }
         assert!(ring.pop_into(&mut out), "503 must reach the tail ring");
 
         // 200, 2000ms — interesting (latency outlier), push expected.
         if access_sample_enabled && super::is_interesting(200, 2000) {
             let producer = WorkerRingProducer { ring };
-            emit_access_record(&producer, b"GET", 200, 0, 0, b"127.0.0.1", 0, None);
+            emit_access_record(&producer, b"GET", 200, 0, 0, b"127.0.0.1", 0, None, b"", b"");
         }
         out.clear();
         assert!(ring.pop_into(&mut out), "slow 200 must reach the tail ring");
@@ -768,6 +795,8 @@ mod tests {
                 b"10.0.0.1",
                 1_700_000_000_000_000_000,
                 None,
+                b"/api/test",
+                b"TestAgent/1.0",
             );
         }
 

@@ -448,17 +448,31 @@ pub struct WorkerSlots {
 /// Maximum per-worker exemplar reservoir size.
 ///
 /// Operators set the effective size via `otel_access_log_sample <size>`
-/// (capped at this value).  At 48 bytes per entry × 64 = 3072 bytes — a
-/// negligible addition to `WorkerSlots`.
+/// (capped at this value).  At ~256 bytes per entry × 64 ≈ 16 KB per
+/// worker — a negligible addition to `WorkerSlots`.
 pub const MAX_EXEMPLAR_RESERVOIR: usize = 64;
+
+/// Maximum `url.path` bytes stored in an exemplar entry.
+/// Matches `crate::logs::access::MAX_URL_PATH`.
+pub const EXEMPLAR_URL_PATH_MAX: usize = 64;
+
+/// Maximum `user_agent.original` bytes stored in an exemplar entry.
+/// Matches `crate::logs::access::MAX_USER_AGENT`.
+pub const EXEMPLAR_USER_AGENT_MAX: usize = 128;
 
 /// A single exemplar entry in the per-worker reservoir.
 ///
-/// Written on the hot path with `Ordering::Relaxed` — field-level tearing is
-/// acceptable for exemplars (they are hints, not accounting primitives).
-/// The `has_trace` flag distinguishes "empty" from "present".
+/// Written on the hot path with `Ordering::Relaxed` on the atomic fields;
+/// the plain byte buffers (`url_path_buf`, `user_agent_buf`) are written
+/// with direct pointer writes — tearing is acceptable for exemplar hints.
 ///
-/// Size: 5 × AtomicU64 + AtomicU32 + AtomicU8 + 3-byte pad = 48 bytes.
+/// The `has_trace` flag and `combo_idx` use `Relaxed` ordering.
+/// The reader should only access entries for which `count > slot_index`
+/// (see [`ExemplarReservoir::snapshot`]).
+///
+/// Size: 5 × AtomicU64 + AtomicU32 + AtomicU8 + AtomicU8 + 2 pad
+///       + EXEMPLAR_URL_PATH_MAX + EXEMPLAR_USER_AGENT_MAX
+///     = 40 + 4 + 1 + 1 + 2 + 64 + 128 = 240 bytes.
 #[repr(C)]
 pub struct ExemplarEntry {
     /// Observed request duration in ms.
@@ -475,7 +489,17 @@ pub struct ExemplarEntry {
     pub combo_idx: core::sync::atomic::AtomicU32,
     /// 1 if `trace_id` / `span_id` are valid; 0 if absent.
     pub has_trace: core::sync::atomic::AtomicU8,
-    _pad: [u8; 3],
+    /// Length of `url_path_buf` that is valid.
+    pub url_path_len: core::sync::atomic::AtomicU8,
+    /// Length of `user_agent_buf` that is valid.
+    pub user_agent_len: core::sync::atomic::AtomicU8,
+    _pad: [u8; 1],
+    /// `url.path` bytes — high-cardinality, exemplar filtered_attribute ONLY.
+    /// NEVER a metric dimension.
+    pub url_path_buf: [u8; EXEMPLAR_URL_PATH_MAX],
+    /// `user_agent.original` bytes — high-cardinality, exemplar filtered_attribute ONLY.
+    /// NEVER a metric dimension.
+    pub user_agent_buf: [u8; EXEMPLAR_USER_AGENT_MAX],
 }
 
 /// Per-worker exemplar reservoir — a fixed-capacity circular buffer of
@@ -499,10 +523,15 @@ impl ExemplarReservoir {
     /// Write one exemplar entry on the hot path.
     ///
     /// `effective_size` must be in `1..=MAX_EXEMPLAR_RESERVOIR`; values outside
-    /// this range are clamped.  Returns the slot index written.
+    /// this range are clamped.
     ///
     /// # Hot-path note
-    /// One `fetch_add` + ≤ 6 `Relaxed` atomic stores.  No alloc, no lock.
+    /// One `fetch_add` + ≤ 9 `Relaxed` stores + 2 memcpy ≤ 192 bytes.
+    /// All within the budget of "one exemplar reservoir write."
+    ///
+    /// # High-cardinality fields
+    /// `url_path` and `user_agent` are stored in the entry as filtered_attributes;
+    /// they are **never** used as metric dimensions.
     #[inline]
     pub fn write(
         &self,
@@ -512,6 +541,8 @@ impl ExemplarReservoir {
         trace_id: Option<[u8; 16]>,
         span_id: Option<[u8; 8]>,
         ts_unix_nano: u64,
+        url_path: &[u8],
+        user_agent: &[u8],
     ) {
         let k = effective_size.min(MAX_EXEMPLAR_RESERVOIR).max(1);
         let n = self.count.fetch_add(1, Ordering::Relaxed) as usize;
@@ -533,17 +564,30 @@ impl ExemplarReservoir {
         } else {
             e.has_trace.store(0, Ordering::Relaxed);
         }
+        // High-cardinality fields: copy bytes into the fixed-size buffers.
+        // Tearing acceptable (exemplar is a hint; uses non-atomic byte writes).
+        let url_len = url_path.len().min(EXEMPLAR_URL_PATH_MAX) as u8;
+        let ua_len = user_agent.len().min(EXEMPLAR_USER_AGENT_MAX) as u8;
+        // Safety: all indices are within array bounds (len ≤ max).
+        unsafe {
+            let dst = e.url_path_buf.as_ptr() as *mut u8;
+            core::ptr::copy_nonoverlapping(url_path.as_ptr(), dst, url_len as usize);
+            let dst = e.user_agent_buf.as_ptr() as *mut u8;
+            core::ptr::copy_nonoverlapping(user_agent.as_ptr(), dst, ua_len as usize);
+        }
+        e.url_path_len.store(url_len, Ordering::Relaxed);
+        e.user_agent_len.store(ua_len, Ordering::Relaxed);
     }
 
     /// Snapshot all active entries.
     ///
-    /// Returns a Vec of (value_ms, combo_idx, has_trace, trace_id[16], span_id[8], ts_ns).
-    /// Entries whose combo_idx is 0 AND count == 0 are uninitialised; callers should
-    /// skip entries where combo_idx == 0 and count <= slot_index.
+    /// Returns a Vec of `ExemplarSnapshot` items (one per filled slot).
+    /// Callers should skip entries where `combo_idx == 0` and `ts_unix_nano == 0`
+    /// (uninitialised slots).
     pub fn snapshot(
         &self,
         effective_size: usize,
-    ) -> std::vec::Vec<(u64, u32, bool, [u8; 16], [u8; 8], u64)> {
+    ) -> std::vec::Vec<ExemplarSnapshot> {
         let k = effective_size.min(MAX_EXEMPLAR_RESERVOIR).max(1);
         let count = self.count.load(Ordering::Acquire) as usize;
         let filled = count.min(k);
@@ -561,10 +605,39 @@ impl ExemplarReservoir {
             trace_id[0..8].copy_from_slice(&lo);
             trace_id[8..16].copy_from_slice(&hi);
             let span_id = e.span_id.load(Ordering::Acquire).to_be_bytes();
-            out.push((value_ms, combo_idx, has_trace, trace_id, span_id, ts_ns));
+            let url_path_len = e.url_path_len.load(Ordering::Acquire);
+            let user_agent_len = e.user_agent_len.load(Ordering::Acquire);
+            let url_path = e.url_path_buf;
+            let user_agent = e.user_agent_buf;
+            out.push(ExemplarSnapshot {
+                value_ms,
+                combo_idx,
+                has_trace,
+                trace_id,
+                span_id,
+                ts_unix_nano: ts_ns,
+                url_path,
+                url_path_len,
+                user_agent,
+                user_agent_len,
+            });
         }
         out
     }
+}
+
+/// Snapshot result from `ExemplarReservoir::snapshot`.
+pub struct ExemplarSnapshot {
+    pub value_ms: u64,
+    pub combo_idx: u32,
+    pub has_trace: bool,
+    pub trace_id: [u8; 16],
+    pub span_id: [u8; 8],
+    pub ts_unix_nano: u64,
+    pub url_path: [u8; EXEMPLAR_URL_PATH_MAX],
+    pub url_path_len: u8,
+    pub user_agent: [u8; EXEMPLAR_USER_AGENT_MAX],
+    pub user_agent_len: u8,
 }
 
 impl WorkerSlots {
@@ -984,9 +1057,9 @@ mod tests {
                               0xa3, 0xce, 0x92, 0x9d, 0x0e, 0x0e, 0x47, 0x36]);
         let span_id  = Some([0x00u8, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7]);
 
-        reservoir.write(2, 100, 5, trace_id, span_id, 1_000_000_000);  // slot 0
-        reservoir.write(2, 200, 6, None, None,        2_000_000_000);  // slot 1
-        reservoir.write(2, 300, 7, trace_id, span_id, 3_000_000_000);  // slot 0 overwritten
+        reservoir.write(2, 100, 5, trace_id, span_id, 1_000_000_000, b"/api", b"curl/7");  // slot 0
+        reservoir.write(2, 200, 6, None, None,        2_000_000_000, b"", b"");  // slot 1
+        reservoir.write(2, 300, 7, trace_id, span_id, 3_000_000_000, b"/v2", b"Go-http");  // slot 0 overwritten
 
         // count must be 3 (candidates seen)
         assert_eq!(reservoir.count.load(core::sync::atomic::Ordering::Acquire), 3);
@@ -995,20 +1068,55 @@ mod tests {
         let snapshot = reservoir.snapshot(2);
         assert_eq!(snapshot.len(), 2, "snapshot should return min(count, k) entries");
 
-        // Slot 0 was overwritten by write #3 (value=300, combo=7)
-        let (v0, c0, ht0, _, _, _) = snapshot[0];
-        assert_eq!(v0, 300, "slot 0 has latest value");
-        assert_eq!(c0, 7, "slot 0 has latest combo_idx");
-        assert!(ht0, "slot 0 has trace context");
+        // Slot 0 was overwritten by write #3 (value=300, combo=7, url=/v2, ua=Go-http)
+        let s0 = &snapshot[0];
+        assert_eq!(s0.value_ms, 300, "slot 0 has latest value");
+        assert_eq!(s0.combo_idx, 7, "slot 0 has latest combo_idx");
+        assert!(s0.has_trace, "slot 0 has trace context");
+        assert_eq!(s0.url_path_len, 3); // "/v2"
+        assert_eq!(&s0.url_path[..3], b"/v2");
 
-        // Slot 1 was written by write #2 (value=200, combo=6)
-        let (v1, c1, ht1, _, _, _) = snapshot[1];
-        assert_eq!(v1, 200, "slot 1 has its value");
-        assert_eq!(c1, 6, "slot 1 has its combo_idx");
-        assert!(!ht1, "slot 1 has no trace context");
+        // Slot 1 was written by write #2 (value=200, combo=6, no trace, no url)
+        let s1 = &snapshot[1];
+        assert_eq!(s1.value_ms, 200, "slot 1 has its value");
+        assert_eq!(s1.combo_idx, 6, "slot 1 has its combo_idx");
+        assert!(!s1.has_trace, "slot 1 has no trace context");
+        assert_eq!(s1.url_path_len, 0);
 
         // snapshot with larger effective_size than count → only min(count, k) slots
         let snap2 = reservoir.snapshot(10);
         assert_eq!(snap2.len(), 3, "snapshot with k>count returns count entries");
+    }
+
+    /// Guard (Phase 2.2 Step 2.2.5): verify that the histogram combo set remains
+    /// `method × status_class × protocol × route × upstream` and that url.path,
+    /// user_agent, and client.address appear ONLY on tail/exemplar records —
+    /// NOT as metric dimensions.
+    ///
+    /// This test asserts structural invariants at the TYPE level.
+    #[test]
+    fn high_cardinality_only_on_tail_not_metric() {
+        // 1. N_COMBOS is computed from the five BOUNDED dimensions only.
+        //    It must NOT include url_path, user_agent, or client.address.
+        assert_eq!(
+            N_COMBOS,
+            N_HTTP_METHODS * N_STATUS_CLASSES * N_PROTO_VERSIONS * N_ROUTES * N_UPSTREAMS,
+            "N_COMBOS must be method × sc × proto × route × upstream (no url/ua/addr)"
+        );
+
+        // 2. WorkerSlots contains request_duration_combos but no url/ua/addr fields.
+        //    (Absence is a compile-time property — checked at the size level.)
+        //    The exemplar reservoir holds url/ua in ExemplarEntry, NOT in the histograms.
+        //    We check that ExemplarEntry has url_path_buf and user_agent_buf but
+        //    that these are NOT factors in N_COMBOS.
+        let _url_max: usize = EXEMPLAR_URL_PATH_MAX;  // present in ExemplarEntry
+        let _ua_max: usize = EXEMPLAR_USER_AGENT_MAX; // present in ExemplarEntry
+        // N_COMBOS must equal the 5-dimension product (no url/ua expansion).
+        assert_eq!(N_COMBOS, 8 * 5 * 4 * N_ROUTES * N_UPSTREAMS);
+
+        // 3. Combo index does NOT take url_path or user_agent as arguments.
+        //    Confirm the function signature by calling it — if it accepted url/ua
+        //    this would fail to compile with 5 args.
+        let _ = combo_index(HttpMethod::Get, StatusClass::S2xx, ProtoVersion::Http11, 0, 0);
     }
 }

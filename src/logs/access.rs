@@ -54,9 +54,17 @@ use super::LogProducer;
 /// - 1  (has_trace)
 /// - 16 (trace_id, only when has_trace = 1)
 /// - 8  (span_id,  only when has_trace = 1)
+/// --- Phase 2.2 Step 2.2.5: high-cardinality detail ---
+/// - 2  (url_path_len) + 64 (url.path, truncated to 64 bytes)
+/// - 2  (user_agent_len) + 128 (user_agent.original, truncated to 128 bytes)
 ///
-/// Total worst case: 1+8+1+2+8+2+2+46+1+16+8 = 95 bytes, rounded to 128.
-pub const MAX_ACCESS_RECORD: usize = 128;
+/// Total worst case: 95 + 2+64 + 2+128 = 291 bytes → round to 320.
+pub const MAX_ACCESS_RECORD: usize = 320;
+
+/// Maximum `url.path` bytes stored in the record.
+pub const MAX_URL_PATH: usize = 64;
+/// Maximum `user_agent.original` bytes stored in the record.
+pub const MAX_USER_AGENT: usize = 128;
 
 /// HTTP access record kind byte.
 const KIND_ACCESS: u8 = 0x00;
@@ -76,12 +84,18 @@ const NGX_LEVEL_INFO: u8 = 7;
 /// - `ts_unix_nano`   — timestamp of the request (Unix epoch, nanoseconds).
 /// - `trace_context`  — optional W3C trace context: `Some((trace_id[16], span_id[8]))`.
 ///   `None` ⇒ `has_trace = 0` (one byte overhead).
+/// - `url_path`       — `url.path` (truncated to `MAX_URL_PATH` bytes).
+/// - `user_agent`     — `user_agent.original` (truncated to `MAX_USER_AGENT` bytes).
 ///
 /// Returns `true` if the record was pushed; `false` if the ring was full.
 ///
 /// # No allocation
 /// All formatting is done into a fixed-size stack buffer.  This function
 /// never calls `Vec::new`, `Box::new`, or any heap allocator.
+///
+/// # High-cardinality fields stay OFF the metric
+/// `url_path`, `user_agent`, and `client_addr` appear ONLY in this tail record
+/// and in exemplar `filtered_attributes`; they are NEVER used as metric dimensions.
 #[inline]
 pub fn emit_access_record(
     producer: &dyn LogProducer,
@@ -92,6 +106,8 @@ pub fn emit_access_record(
     client_addr: &[u8],
     ts_unix_nano: u64,
     trace_context: Option<([u8; 16], [u8; 8])>,
+    url_path: &[u8],
+    user_agent: &[u8],
 ) -> bool {
     let mut buf = [0u8; MAX_ACCESS_RECORD];
     let mut pos = 0usize;
@@ -156,6 +172,11 @@ pub fn emit_access_record(
             write_u8!(0u8); // has_trace = 0
         }
     }
+
+    // High-cardinality detail (Phase 2.2.5) — on tail/exemplar records ONLY.
+    // NEVER promoted to metric dimensions (plan §DP-E; keeps combo index WithinU8).
+    write_bytes_with_u16_len!(url_path, MAX_URL_PATH);
+    write_bytes_with_u16_len!(user_agent, MAX_USER_AGENT);
 
     producer.push(&buf[..pos])
 }
@@ -261,6 +282,8 @@ mod tests {
             b"127.0.0.1",
             1_700_000_000_000_000_000,
             None,
+            b"/health",
+            b"curl/7.0",
         );
         assert!(pushed, "push must succeed on an empty ring");
 
@@ -301,7 +324,7 @@ mod tests {
         // Emit record with trace context → has_trace = 1 in the byte stream.
         let (_buf, ring) = make_ring_with_cap(4096);
         let producer = WorkerRingProducer { ring };
-        emit_access_record(&producer, b"GET", 200, 0, 0, b"127.0.0.1", 0, Some((trace_id, span_id)));
+        emit_access_record(&producer, b"GET", 200, 0, 0, b"127.0.0.1", 0, Some((trace_id, span_id)), b"/api/v1", b"Mozilla/5.0");
         let mut rec = std::vec::Vec::new();
         assert!(ring.pop_into(&mut rec));
         // Find the has_trace byte: after kind(1)+ts(8)+level(1)+method_len(2)+method(3)+status(2)+reqlen(8)+respbytes(8)+addrlen(2)+addr(9)
@@ -318,7 +341,7 @@ mod tests {
         // Emit record without trace context → has_trace = 0.
         let (_buf2, ring2) = make_ring_with_cap(4096);
         let producer2 = WorkerRingProducer { ring: ring2 };
-        emit_access_record(&producer2, b"GET", 200, 0, 0, b"127.0.0.1", 0, None);
+        emit_access_record(&producer2, b"GET", 200, 0, 0, b"127.0.0.1", 0, None, b"", b"");
         let mut rec2 = std::vec::Vec::new();
         assert!(ring2.pop_into(&mut rec2));
         let m2 = u16::from_be_bytes([rec2[10], rec2[11]]) as usize;
@@ -340,7 +363,7 @@ mod tests {
         let producer = WorkerRingProducer { ring };
         // Method longer than 16 bytes should be truncated.
         let long_method = b"VERYLONGMETHODNAME_EXCEEDS_LIMIT";
-        emit_access_record(&producer, long_method, 200, 0, 0, b"127.0.0.1", 0, None);
+        emit_access_record(&producer, long_method, 200, 0, 0, b"127.0.0.1", 0, None, b"", b"");
         let mut record = std::vec::Vec::new();
         assert!(ring.pop_into(&mut record));
         let method_len = u16::from_be_bytes([record[10], record[11]]) as usize;
