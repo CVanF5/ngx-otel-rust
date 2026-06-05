@@ -146,7 +146,21 @@ case rests on.
 
 ### Requirements
 
-- NGINX sources, 1.22.0 or later (1.26.x recommended).
+- NGINX sources, 1.22.0 or later (1.26.x recommended), as a sibling checkout
+  at `../nginx` (override with `NGINX_SOURCE_DIR`).
+- The **patched `ngx-rust` fork** as a sibling checkout at `../ngx-rust`:
+  ```sh
+  git clone -b ngx-otel-rust-deadlock-fix git@github.com:CVanF5/ngx-rust.git
+  ```
+  `Cargo.toml` path-pins `../ngx-rust` (it does **not** use the upstream
+  `nginx/ngx-rust` crate). That branch carries changes this module needs and
+  that are not yet upstream, so building against stock `ngx-rust` will fail with
+  missing symbols: the `ngx_post_event` deadlock/Waker fix, and the `nginx-sys`
+  bindgen additions the dedicated exporter relies on — the `ngx_channel.h`
+  inter-process-channel bindings (`ngx_channel_t`, `ngx_add_channel_event`,
+  `NGX_CMD_QUIT`/`TERMINATE`/`REOPEN`) and the `NGX_RS_READ_EVENT` /
+  `NGX_RS_WRITE_EVENT` constants. (Tracking upstream via `ngx-rust` PR #295; drop
+  the fork once it lands.)
 - Regular NGINX build dependencies: C compiler, `make`, PCRE2, Zlib.
 - System-wide installation of OpenSSL 1.1.1 or later.
 - Rust toolchain (1.85.0 or later — the `ngx-rust` dependency is
@@ -222,7 +236,8 @@ review and what the project's automated test targets drive.
 #### Canonical path (recommended): NGINX autoconf via Makefile
 
 ```sh
-# Sibling NGINX checkout at ../nginx (override via NGINX_SOURCE_DIR).
+# Requires sibling checkouts: ../nginx (override via NGINX_SOURCE_DIR) and
+# ../ngx-rust on branch ngx-otel-rust-deadlock-fix (the patched fork; see Requirements).
 cd ngx-otel-rust
 make build              # debug (default); produces objs-debug/
 # or
