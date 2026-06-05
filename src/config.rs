@@ -224,7 +224,9 @@ pub struct MainConfig {
     /// Effective severity floor for the OTel error-log writer.
     ///
     /// Set by `cmd_set_error_log`:
-    /// - NOARGS: mirrors `cf->cycle->log->log_level` (the core `error_log` level).
+    /// - NOARGS: fixed default `NGX_LOG_ERR` (= 4). Intentionally decoupled
+    ///   from the core `error_log` level — mirroring couples the OTel floor to
+    ///   on-box debug verbosity and is directive-order dependent.
     /// - TAKE1: parsed from the level arg (e.g. `"warn"` → `NGX_LOG_WARN`).
     ///
     /// Writer drops messages where `level > error_log_level` (nginx levels are
@@ -286,7 +288,9 @@ impl Default for MainConfig {
             log_ring_size: 0,
             // Phase 2.3 error-log defaults.
             error_log_enabled: false,
-            error_log_level: 0,   // overwritten by cmd_set_error_log
+            // Fixed NGX_LOG_ERR default; overwritten by cmd_set_error_log only when
+            // error_log_enabled is set (otherwise the field is never read by the writer).
+            error_log_level: nginx_sys::NGX_LOG_ERR as ngx_uint_t,
             error_log_coalesce: true,
             // Route and upstream tables start empty; populated at postconfiguration.
             route_table: [RouteEntry { clcf_ptr: 0, name: [0u8; ROUTE_NAME_MAX], name_len: 0 };
@@ -1235,7 +1239,8 @@ macro_rules! production_commands {
             },
             // otel_error_log [<level>];  (Phase 2.3 §6.6.2)
             // Enables OTel error-log export via a ngx_log_writer_pt writer node.
-            // NOARGS ⇒ mirror the core error_log level; TAKE1 ⇒ explicit override.
+            // NOARGS ⇒ fixed floor NGX_LOG_ERR (decoupled from core error_log);
+            // TAKE1 ⇒ explicit level override.
             // The writer filters messages by severity floor (cheapest filter first),
             // then coalesces repeated messages using a bounded exact-hash table.
             // Context-to-destination matrix:
@@ -1610,9 +1615,10 @@ extern "C" fn cmd_set_access_sample(
 /// `otel_log_insert`.  The node calls `ngx_otel_error_writer` for every error
 /// that passes the severity floor.
 ///
-/// - **NOARGS** (bare `otel_error_log;`) — mirrors the core `error_log` level
-///   (`cf->cycle->new_log.log_level`, the effective level at config time).  The
-///   OTel stream and the file stream match by default.
+/// - **NOARGS** (bare `otel_error_log;`) — fixed default floor `NGX_LOG_ERR`
+///   (error severity = 4).  Intentionally decoupled from the core `error_log`
+///   level: mirroring couples the OTel floor to on-box debug verbosity and the
+///   parse-time read of `cycle->new_log` is directive-order dependent.
 /// - **TAKE1** (e.g. `otel_error_log warn;`) — explicit level override.
 ///   Accepted values: `emerg`, `alert`, `crit`, `error`, `warn`, `notice`,
 ///   `info`, `debug`.
@@ -1653,15 +1659,12 @@ extern "C" fn cmd_set_error_log(
                 }
             }
         } else {
-            // NOARGS: mirror the core error_log level.
-            // `cycle->new_log` is the current chain head at config time;
-            // its log_level is the effective core error_log level.
-            let cycle = (*cf).cycle;
-            if cycle.is_null() {
-                ngx_conf_log_error!(NGX_LOG_EMERG, &mut *cf, "otel_error_log: null cycle");
-                return NGX_CONF_ERROR;
-            }
-            (*cycle).new_log.log_level
+            // NOARGS: fixed default floor = NGX_LOG_ERR (error severity).
+            // This is intentionally DECOUPLED from the core `error_log` level:
+            // mirroring couples the OTel floor to on-box debug verbosity
+            // (against orthogonality) and a parse-time read of cycle->new_log
+            // is directive-order dependent.
+            nginx_sys::NGX_LOG_ERR as ngx_uint_t
         }
     };
 
@@ -1893,6 +1896,24 @@ mod tests {
         assert!(cfg.error_log_coalesce, "error_log_coalesce must default to true (on)");
     }
 
+    /// Verify that `error_log_level` defaults to `NGX_LOG_ERR` (fixed floor,
+    /// decoupled from core `error_log`).  The NOARGS directive handler sets the
+    /// same constant; the "does not mirror" property is proven by the Stage E
+    /// integration test in `run_error_log.sh` (bare `otel_error_log;` with core
+    /// `error_log notice` — below-ERR messages do NOT appear in LOGS_LOG).
+    #[test]
+    fn error_log_default_floor_is_ngx_log_err() {
+        let cfg = MainConfig::default();
+        assert_eq!(
+            cfg.error_log_level,
+            nginx_sys::NGX_LOG_ERR as ngx_uint_t,
+            "error_log_level default must be NGX_LOG_ERR (4), not mirrored from core log"
+        );
+        // Explicitly check the numeric value matches nginx's documented constant.
+        // NGX_LOG_ERR = 4; lower = more severe (emerg=1 … debug=8).
+        assert_eq!(nginx_sys::NGX_LOG_ERR, 4, "sanity: NGX_LOG_ERR must equal 4");
+    }
+
     /// Verify that setting `error_log_enabled` and `error_log_coalesce` toggles
     /// the fields correctly.  The directive handler (`cmd_set_error_log`) is
     /// exercised by integration tests that use a real nginx.conf.
@@ -1901,7 +1922,7 @@ mod tests {
         let mut cfg = MainConfig::default();
         assert!(!cfg.error_log_enabled);
         assert!(cfg.error_log_coalesce); // default on
-        // Simulate cmd_set_error_log setting fields (mirrors what the handler does).
+        // Simulate cmd_set_error_log TAKE1 setting an explicit level.
         cfg.error_log_enabled = true;
         cfg.error_log_level = nginx_sys::NGX_LOG_WARN as ngx_uint_t;
         assert!(cfg.error_log_enabled);
