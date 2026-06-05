@@ -754,10 +754,8 @@ impl Connector for SpinConnector {
 /// Production connector.  Uses `ngx_event_connect_peer` to open a TCP
 /// connection via NGINX's event machinery.  Requires a running NGINX worker.
 ///
-/// Phase 1.1 limitations:
-/// - Only IPv4 addresses (not hostnames).  DNS via `ngx::async_::resolver`
-///   is Phase 1.2.
-/// - Only TCP; Unix socket support for `NgxConnIo` is Phase 1.2.
+/// Supports IPv4 and IPv6 literal addresses (Phase 1.2 / Item 2).
+/// DNS-name endpoints are resolved in Item 3 (transport_dns).
 pub struct NgxConnector {
     log: core::ptr::NonNull<ngx_log_t>,
 }
@@ -783,8 +781,40 @@ impl Connector for NgxConnector {
             ParsedEndpoint::Http { host, port, .. } => {
                 let mut io = Box::pin(NgxConnIo::new(self.log)?);
 
-                // Build and install the sockaddr into pc before connecting.
-                let sockaddr_ptr = build_ipv4_sockaddr(&io.pool, host, *port)?;
+                // Strip IPv6 bracket notation ("[::1]" → "::1") before parsing.
+                // `ParsedEndpoint::parse` stores the bracket form for IPv6 URLs
+                // such as `http://[::1]:4317/`, so we must strip here.
+                let host_str = if host.starts_with('[') && host.ends_with(']') {
+                    &host[1..host.len() - 1]
+                } else {
+                    host.as_str()
+                };
+
+                // Branch on address family.  DNS names fall through to the
+                // error arm below; resolution is wired in Item 3 (transport_dns).
+                let (sockaddr_ptr, socklen) =
+                    match host_str.parse::<std::net::IpAddr>() {
+                        Ok(std::net::IpAddr::V4(v4)) => (
+                            build_ipv4_sockaddr(&io.pool, v4, *port)?,
+                            core::mem::size_of::<libc::sockaddr_in>()
+                                as nginx_sys::socklen_t,
+                        ),
+                        Ok(std::net::IpAddr::V6(v6)) => (
+                            // ⚠️ socklen MUST match the family — sockaddr_in6 (28)
+                            // ≠ sockaddr_in (16); mismatch corrupts the connect.
+                            build_ipv6_sockaddr(&io.pool, v6, *port)?,
+                            core::mem::size_of::<libc::sockaddr_in6>()
+                                as nginx_sys::socklen_t,
+                        ),
+                        Err(_) => {
+                            // DNS name — resolver path wired in Item 3.
+                            return Err(TransportError::InvalidEndpoint {
+                                input: host.clone(),
+                                reason: "DNS resolution not yet available; \
+                                         configure a literal IPv4 or IPv6 address",
+                            });
+                        }
+                    };
 
                 // Build and install pc.name.  REQUIRED under `--with-debug`:
                 // `ngx_event_connect_peer` logs `"connect to %V, fd:%d #%uA"`
@@ -799,8 +829,7 @@ impl Connector for NgxConnector {
                 {
                     let this = io.as_mut().get_mut();
                     this.pc.sockaddr = sockaddr_ptr;
-                    this.pc.socklen =
-                        core::mem::size_of::<libc::sockaddr_in>() as nginx_sys::socklen_t;
+                    this.pc.socklen = socklen;
                     this.pc.name = name_ptr;
                 }
 
@@ -872,27 +901,21 @@ fn build_pc_name(
     Ok(name_ptr)
 }
 
-/// Allocate a `sockaddr_in` in `pool` for the given host:port.
-/// Returns a stable pointer valid for the pool's lifetime.
+/// Allocate a `sockaddr_in` in `pool` for the given IPv4 address and port.
+///
+/// The returned pointer is stable for the pool's lifetime.  The socklen
+/// for this address family is `size_of::<sockaddr_in>()` = 16; the caller
+/// is responsible for setting `pc.socklen` to this value.
+///
+/// Uses `from_ne_bytes` (not `from_be_bytes`) on `v4.octets()`:
+/// `octets()` returns bytes in network (big-endian) order; reinterpreting
+/// them as native-endian preserves the wire layout so the kernel sees the
+/// correct address regardless of host byte order.
 fn build_ipv4_sockaddr(
     pool: &Pool,
-    host: &str,
+    v4: std::net::Ipv4Addr,
     port: u16,
 ) -> Result<*mut nginx_sys::sockaddr, TransportError> {
-    use std::net::IpAddr;
-
-    let ip: IpAddr = host.parse().map_err(|_| TransportError::InvalidEndpoint {
-        input: std::string::String::from(host),
-        reason: "only IPv4 addresses supported in Phase 1.1; DNS is Phase 1.2",
-    })?;
-
-    let IpAddr::V4(v4) = ip else {
-        return Err(TransportError::InvalidEndpoint {
-            input: std::string::String::from(host),
-            reason: "IPv6 not yet supported in Phase 1.1",
-        });
-    };
-
     let size = core::mem::size_of::<libc::sockaddr_in>();
     let ptr = unsafe { ngx_palloc(pool.as_ptr(), size) } as *mut libc::sockaddr_in;
 
@@ -907,13 +930,47 @@ fn build_ipv4_sockaddr(
         let sa = &mut *ptr;
         sa.sin_family = libc::AF_INET as libc::sa_family_t;
         sa.sin_port = port.to_be();
-        // v4.octets() gives the four address bytes in network (big-endian) order.
-        // `from_ne_bytes` reinterprets those bytes in the machine's native order
-        // so that when the u32 is later read byte-by-byte by the kernel it sees
-        // the original network-order bytes — i.e. 127.0.0.1 stays 127.0.0.1.
-        // Using `from_be_bytes` would produce the WRONG layout on little-endian
-        // hosts (the bytes would be reversed, mapping 127.0.0.1 → 1.0.0.127).
         sa.sin_addr.s_addr = u32::from_ne_bytes(v4.octets());
+    }
+
+    Ok(ptr.cast::<nginx_sys::sockaddr>())
+}
+
+/// Allocate a `sockaddr_in6` in `pool` for the given IPv6 address and port.
+///
+/// The returned pointer is stable for the pool's lifetime.  The socklen
+/// for this address family is `size_of::<sockaddr_in6>()` = 28; the caller
+/// **must** set `pc.socklen` to this value — a mismatch with the family
+/// corrupts the connect call.
+///
+/// `sin6_flowinfo` and `sin6_scope_id` are zeroed (collector endpoints are
+/// global addresses; link-local scope-id handling is out of scope).
+///
+/// Precedent: `nginx-acme/src/net/peer_conn.rs:547` (`AF_INET6` branch).
+fn build_ipv6_sockaddr(
+    pool: &Pool,
+    v6: std::net::Ipv6Addr,
+    port: u16,
+) -> Result<*mut nginx_sys::sockaddr, TransportError> {
+    let size = core::mem::size_of::<libc::sockaddr_in6>();
+    let ptr = unsafe { ngx_palloc(pool.as_ptr(), size) } as *mut libc::sockaddr_in6;
+
+    if ptr.is_null() {
+        return Err(TransportError::Connection {
+            cause: std::string::String::from("pool alloc for sockaddr_in6 failed"),
+        });
+    }
+
+    unsafe {
+        core::ptr::write_bytes(ptr, 0u8, 1);
+        let sa = &mut *ptr;
+        sa.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+        sa.sin6_port = port.to_be();
+        // sin6_flowinfo = 0 (already zeroed above).
+        // sin6_addr.s6_addr is a [u8; 16] in network byte order — octets()
+        // already returns bytes in network order, so no byte-order conversion.
+        sa.sin6_addr.s6_addr = v6.octets();
+        // sin6_scope_id = 0 (global; link-local scope-id out of scope).
     }
 
     Ok(ptr.cast::<nginx_sys::sockaddr>())
@@ -1106,5 +1163,121 @@ where
             code: status.as_u16(),
             message: std::string::String::from(status.canonical_reason().unwrap_or("unknown")),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Item 2: IPv6 sockaddr + dual-stack literal branch ─────────────────────
+
+    /// socklen_t values for the two address families must match the plan spec
+    /// (sockaddr_in = 16, sockaddr_in6 = 28) and must agree with libc's sizes.
+    /// A mismatch here would corrupt ngx_event_connect_peer's socklen check.
+    #[test]
+    fn socklen_sizes_match_expected_values() {
+        assert_eq!(
+            core::mem::size_of::<libc::sockaddr_in>(),
+            16,
+            "sockaddr_in must be 16 bytes (IPv4 socklen)"
+        );
+        assert_eq!(
+            core::mem::size_of::<libc::sockaddr_in6>(),
+            28,
+            "sockaddr_in6 must be 28 bytes (IPv6 socklen)"
+        );
+    }
+
+    /// An IPv4 sockaddr built from known octets must have the correct family,
+    /// port in network byte order, and address bytes in network byte order.
+    ///
+    /// This mirrors what `build_ipv4_sockaddr` does; we verify the struct layout
+    /// directly (without a pool, which is stubbed to null in unit-test mode).
+    #[test]
+    fn ipv4_sockaddr_layout_correct() {
+        let v4: std::net::Ipv4Addr = "127.0.0.1".parse().unwrap();
+        let port: u16 = 4317;
+
+        // Reproduce the layout build_ipv4_sockaddr would produce.
+        let mut sa: libc::sockaddr_in = unsafe { core::mem::zeroed() };
+        sa.sin_family = libc::AF_INET as libc::sa_family_t;
+        sa.sin_port = port.to_be();
+        sa.sin_addr.s_addr = u32::from_ne_bytes(v4.octets());
+
+        assert_eq!(sa.sin_family as libc::c_int, libc::AF_INET, "family must be AF_INET");
+        assert_eq!(sa.sin_port, port.to_be(), "port must be in network byte order");
+        // Address bytes in network order: 127.0.0.1 → [127, 0, 0, 1].
+        // from_ne_bytes on [127,0,0,1] gives 0x0100007f on little-endian;
+        // the kernel reads it byte-by-byte → 127.0.0.1. Verify the s_addr
+        // bytes round-trip through to_ne_bytes back to octets.
+        assert_eq!(sa.sin_addr.s_addr.to_ne_bytes(), v4.octets());
+    }
+
+    /// An IPv6 sockaddr built from known octets must have the correct family,
+    /// port in network byte order, address bytes in network byte order,
+    /// and zeroed flowinfo / scope_id.
+    ///
+    /// This mirrors what `build_ipv6_sockaddr` does.
+    #[test]
+    fn ipv6_sockaddr_layout_correct() {
+        let v6: std::net::Ipv6Addr = "::1".parse().unwrap();
+        let port: u16 = 4317;
+
+        let mut sa: libc::sockaddr_in6 = unsafe { core::mem::zeroed() };
+        sa.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+        sa.sin6_port = port.to_be();
+        sa.sin6_addr.s6_addr = v6.octets();
+        // sin6_flowinfo and sin6_scope_id remain 0 (zeroed above).
+
+        assert_eq!(sa.sin6_family as libc::c_int, libc::AF_INET6, "family must be AF_INET6");
+        assert_eq!(sa.sin6_port, port.to_be(), "port must be in network byte order");
+        // ::1 → all-zero except last byte = 1.
+        let expected: [u8; 16] =
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        assert_eq!(sa.sin6_addr.s6_addr, expected, "IPv6 address bytes must be in network order");
+        assert_eq!(sa.sin6_flowinfo, 0, "flowinfo must be 0");
+        assert_eq!(sa.sin6_scope_id, 0, "scope_id must be 0 (global addresses)");
+    }
+
+    /// `ParsedEndpoint::parse` with a bracketed IPv6 URL stores the host with
+    /// brackets.  `NgxConnector::connect` strips them before parsing as IpAddr.
+    #[test]
+    fn parsed_endpoint_ipv6_bracket_form_preserved() {
+        let ep = ParsedEndpoint::parse("http://[::1]:4317/v1/metrics").unwrap();
+        match ep {
+            ParsedEndpoint::Http { host, port, .. } => {
+                assert_eq!(host, "[::1]", "host must retain brackets from URL");
+                assert_eq!(port, 4317, "port must be parsed correctly");
+                // Simulate the bracket-stripping in NgxConnector::connect.
+                let host_str = if host.starts_with('[') && host.ends_with(']') {
+                    host[1..host.len() - 1].to_string()
+                } else {
+                    host.clone()
+                };
+                let ip: std::net::IpAddr = host_str.parse().unwrap();
+                assert!(ip.is_ipv6(), "stripped host must parse as IPv6");
+            }
+            _ => panic!("expected Http endpoint"),
+        }
+    }
+
+    /// A literal IPv6 endpoint's socklen must be 28 (sockaddr_in6).
+    /// A literal IPv4 endpoint's socklen must be 16 (sockaddr_in).
+    /// These are the values NgxConnector::connect must install into pc.socklen.
+    #[test]
+    fn socklen_is_family_matched() {
+        // IPv4 → 16
+        let v4_socklen =
+            core::mem::size_of::<libc::sockaddr_in>() as nginx_sys::socklen_t;
+        assert_eq!(v4_socklen, 16, "IPv4 pc.socklen must be 16");
+
+        // IPv6 → 28
+        let v6_socklen =
+            core::mem::size_of::<libc::sockaddr_in6>() as nginx_sys::socklen_t;
+        assert_eq!(v6_socklen, 28, "IPv6 pc.socklen must be 28");
+
+        // Confirm they differ (the key invariant — mismatch corrupts connect).
+        assert_ne!(v4_socklen, v6_socklen, "IPv4 and IPv6 socklens must differ");
     }
 }
