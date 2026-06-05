@@ -4,6 +4,7 @@
 // LICENSE file in the root directory of this source tree.
 
 use core::ffi::{c_char, c_void};
+use core::ptr::NonNull;
 use core::{mem, ptr};
 
 use nginx_sys::{
@@ -15,7 +16,7 @@ use crate::logs::error_writer::{
     ngx_otel_error_writer, otel_log_insert, parse_error_log_level, OtelErrorWriterState,
 };
 use ngx::core::{Status, NGX_CONF_ERROR, NGX_CONF_OK};
-use ngx::http::{HttpModuleMainConf, NgxHttpCoreModule};
+use ngx::http::{HttpModuleLocationConf, HttpModuleMainConf, NgxHttpCoreModule};
 use ngx::{ngx_conf_log_error, ngx_string};
 
 use crate::shm::{ROUTE_CAP, UPSTREAM_CAP, UPSTREAM_IDX_OTHER};
@@ -261,6 +262,29 @@ pub struct MainConfig {
     pub upstream_table: [UpstreamEntry; UPSTREAM_CAP],
     /// Number of filled entries in `upstream_table` (0..=UPSTREAM_CAP).
     pub n_upstreams: usize,
+
+    // ── DNS resolver (transport DNS/dual-stack) ──────────────────────────────
+    //
+    /// Nginx resolver pulled from `clcf->resolver` at postconfiguration time.
+    ///
+    /// `None` when the endpoint is a literal IP address or a `unix:` path —
+    /// no resolver is needed in those cases.  `Some` when the endpoint host is
+    /// a DNS name and the operator has configured nginx's `resolver` directive.
+    ///
+    /// The pointer is valid for the lifetime of the nginx cycle (it lives in
+    /// the conf pool).  The exporter process reads it after fork — safe because
+    /// the conf pool is inherited copy-on-write.  Worker processes do not
+    /// access this field.
+    ///
+    /// # Safety
+    /// Raw pointer wrapped in `NonNull`.  Must not be accessed from multiple
+    /// threads; safe because the exporter is single-threaded.
+    pub resolver: Option<NonNull<nginx_sys::ngx_resolver_t>>,
+    /// Resolver timeout in milliseconds, from `clcf->resolver_timeout`.
+    ///
+    /// `0` when `resolver` is `None`.  Falls back to 5000 ms when the core
+    /// http conf has no explicit `resolver_timeout` (matching nginx-acme).
+    pub resolver_timeout: nginx_sys::ngx_msec_t,
 }
 
 impl Default for MainConfig {
@@ -302,6 +326,9 @@ impl Default for MainConfig {
                 name_len: 0,
             }; UPSTREAM_CAP],
             n_upstreams: 0,
+            // DNS resolver: None until postconfiguration wires it for DNS endpoints.
+            resolver: None,
+            resolver_timeout: 0,
         }
     }
 }
@@ -395,6 +422,51 @@ impl MainConfig {
         HttpOtelModule::main_conf(old_cycle)
     }
 
+    /// Returns `true` if the endpoint URL requires DNS resolution.
+    ///
+    /// A DNS-name endpoint (e.g. `http://otel.example.com:4317/`) returns
+    /// `true`; a literal-IP endpoint (`http://127.0.0.1:4317/`) and any
+    /// `unix:` endpoint return `false`.
+    ///
+    /// IPv6 literals in bracket notation (`http://[::1]:4317/`) are handled
+    /// by stripping the brackets before the `IpAddr::parse` probe, so they
+    /// correctly return `false`.
+    ///
+    /// This is a pure function (no nginx calls) — safe to call from unit tests.
+    pub fn endpoint_needs_resolver(endpoint_str: &str) -> bool {
+        // unix: paths never need DNS.
+        if endpoint_str.starts_with("unix:") {
+            return false;
+        }
+        // Strip http:// or https:// to get the authority part.
+        let rest = if let Some(r) = endpoint_str.strip_prefix("http://") {
+            r
+        } else if let Some(r) = endpoint_str.strip_prefix("https://") {
+            r
+        } else {
+            // Unknown scheme — leave it to existing validation; no resolver needed.
+            return false;
+        };
+        // Authority = everything before the first '/'.
+        let authority = rest.split('/').next().unwrap_or(rest);
+        // Extract the host, handling IPv6 bracket notation.
+        let host = if let Some(inner) = authority.strip_prefix('[') {
+            // [::1]:4317 — host is between '[' and ']'.
+            inner.split(']').next().unwrap_or(inner)
+        } else {
+            // host:port or bare host — strip the trailing :port if present and
+            // the remaining part is a valid port number.
+            match authority.rfind(':') {
+                Some(i) if authority[i + 1..].chars().all(|c| c.is_ascii_digit()) => {
+                    &authority[..i]
+                }
+                _ => authority,
+            }
+        };
+        // If the host parses as a literal IP address it needs no resolver.
+        host.parse::<std::net::IpAddr>().is_err()
+    }
+
     /// Validate and finalise the configuration after all directives have been parsed.
     ///
     /// Takes `&mut self` to store the shm zone pointer.
@@ -447,6 +519,64 @@ impl MainConfig {
                 );
             }
             return Err(Status::NGX_ERROR);
+        }
+
+        // Wire the nginx resolver when the endpoint host is a DNS name.
+        //
+        // Follows the nginx-acme pattern (`nginx-acme/src/conf/issuer.rs:202–226`):
+        // pull `clcf->resolver` and `clcf->resolver_timeout` from the http core
+        // location conf.  A DNS-name endpoint with no configured `resolver` is a
+        // hard config error — the operator must add a `resolver` directive in the
+        // http block.  Literal IPv4/IPv6 and unix: endpoints skip this block.
+        if let Ok(ep_str) = core::str::from_utf8(ep) {
+            if Self::endpoint_needs_resolver(ep_str) {
+                // NGX_CONF_UNSET cast to ngx_msec_t (usize) — matches acme's
+                // `const NGX_CONF_UNSET_MSEC: ngx_msec_t = nginx_sys::NGX_CONF_UNSET as _`.
+                const NGX_CONF_UNSET_MSEC: nginx_sys::ngx_msec_t =
+                    nginx_sys::NGX_CONF_UNSET as nginx_sys::ngx_msec_t;
+                const DEFAULT_RESOLVER_TIMEOUT_MS: nginx_sys::ngx_msec_t = 5_000;
+
+                let cf_ref = unsafe { &*cf };
+                // Collect resolver pointer and timeout from clcf, dropping the
+                // borrow on clcf before we potentially use `&mut *cf` for logging.
+                let resolver_info =
+                    NgxHttpCoreModule::location_conf(cf_ref).and_then(|clcf| {
+                        let nn = NonNull::new(clcf.resolver)?;
+                        // A resolver with zero connections means it was not
+                        // properly configured (matches acme's connections.nelts
+                        // guard, `issuer.rs:212-216`).
+                        if unsafe { nn.as_ref() }.connections.nelts == 0 {
+                            return None;
+                        }
+                        let timeout = if clcf.resolver_timeout != NGX_CONF_UNSET_MSEC {
+                            clcf.resolver_timeout
+                        } else {
+                            DEFAULT_RESOLVER_TIMEOUT_MS
+                        };
+                        Some((nn, timeout))
+                    });
+
+                match resolver_info {
+                    Some((resolver, timeout)) => {
+                        self.resolver = Some(resolver);
+                        self.resolver_timeout = timeout;
+                    }
+                    None => {
+                        unsafe {
+                            ngx_conf_log_error!(
+                                NGX_LOG_EMERG,
+                                &mut *cf,
+                                "otel_exporter: endpoint \"{}\" is a DNS name but nginx's \
+                                 \"resolver\" directive is not configured; add \"resolver \
+                                 <nameserver>;\" to the http block to use a DNS name in \
+                                 otel_exporter",
+                                ep_str
+                            );
+                        }
+                        return Err(Status::NGX_ERROR);
+                    }
+                }
+            }
         }
 
         // Register the metrics shared memory zone.
@@ -2055,5 +2185,108 @@ mod tests {
             configured.is_configured(),
             "is_configured() must be true when otel_exporter endpoint is set"
         );
+    }
+
+    // ── DNS resolver wiring (transport DNS/dual-stack, Item 1) ────────────────
+
+    /// `endpoint_needs_resolver` correctly classifies every endpoint form.
+    ///
+    /// Literal IPv4, literal IPv6 (bracket notation), and unix: sockets must
+    /// return `false` — no resolver needed.  DNS names must return `true`.
+    #[test]
+    fn endpoint_needs_resolver_classifies_correctly() {
+        // Literal IPv4 — no resolver.
+        assert!(
+            !MainConfig::endpoint_needs_resolver("http://127.0.0.1:4317/v1/metrics"),
+            "literal IPv4 must not need resolver"
+        );
+        assert!(
+            !MainConfig::endpoint_needs_resolver("http://10.0.0.1/v1/metrics"),
+            "literal IPv4 (no port) must not need resolver"
+        );
+        // Literal IPv6 in bracket notation — no resolver.
+        assert!(
+            !MainConfig::endpoint_needs_resolver("http://[::1]:4317/v1/metrics"),
+            "literal IPv6 [::1] must not need resolver"
+        );
+        assert!(
+            !MainConfig::endpoint_needs_resolver("http://[2001:db8::1]:4317/"),
+            "literal IPv6 global address must not need resolver"
+        );
+        // unix: socket — no resolver.
+        assert!(
+            !MainConfig::endpoint_needs_resolver("unix:/var/run/otel.sock"),
+            "unix: socket must not need resolver"
+        );
+        assert!(
+            !MainConfig::endpoint_needs_resolver("unix:///var/run/otel.sock"),
+            "unix:/// socket must not need resolver"
+        );
+        // DNS hostnames — resolver required.
+        assert!(
+            MainConfig::endpoint_needs_resolver("http://otel-collector:4317/v1/metrics"),
+            "hostname must need resolver"
+        );
+        assert!(
+            MainConfig::endpoint_needs_resolver("http://otel.example.com:4317/v1/metrics"),
+            "FQDN must need resolver"
+        );
+        assert!(
+            MainConfig::endpoint_needs_resolver("http://otel.example.com/v1/metrics"),
+            "FQDN without explicit port must need resolver"
+        );
+        assert!(
+            MainConfig::endpoint_needs_resolver("http://localhost:4317/v1/metrics"),
+            "localhost must need resolver (DNS)"
+        );
+    }
+
+    /// `MainConfig::default()` has `resolver = None` and `resolver_timeout = 0`.
+    /// The resolver fields start unset; postconfiguration wires them only for
+    /// DNS endpoints.
+    #[test]
+    fn resolver_fields_default_to_none() {
+        let cfg = MainConfig::default();
+        assert!(
+            cfg.resolver.is_none(),
+            "resolver must default to None (wired only for DNS endpoints at postconfiguration)"
+        );
+        assert_eq!(
+            cfg.resolver_timeout,
+            0,
+            "resolver_timeout must default to 0 (set only when resolver is wired)"
+        );
+    }
+
+    /// Direct field simulation: a DNS endpoint postconfiguration stores the
+    /// resolver pointer and a non-zero timeout in `MainConfig`.
+    ///
+    /// This does not call the real `postconfiguration` (which requires a live
+    /// `ngx_conf_t`); instead it manually sets the fields the way
+    /// `postconfiguration` would and verifies the accessors are consistent.
+    /// The real wiring is exercised by the integration tests in
+    /// `tests/integration/run_dns_dualstack.sh` (Item 6).
+    #[test]
+    fn resolver_field_simulation_dns_endpoint() {
+        let mut cfg = MainConfig::default();
+        // Simulate postconfiguration wiring a DNS endpoint.
+        // Use a non-null sentinel (0x1000) to stand in for a real ngx_resolver_t*.
+        let fake_ptr = 0x1000usize as *mut nginx_sys::ngx_resolver_t;
+        cfg.resolver = NonNull::new(fake_ptr);
+        cfg.resolver_timeout = 5_000;
+
+        assert!(cfg.resolver.is_some(), "resolver must be Some after wiring");
+        assert_eq!(
+            cfg.resolver.unwrap().as_ptr() as usize,
+            0x1000,
+            "resolver pointer must be stored verbatim"
+        );
+        assert_eq!(cfg.resolver_timeout, 5_000, "timeout must be stored");
+
+        // Clearing the resolver (e.g. for a literal-IP endpoint) resets to defaults.
+        cfg.resolver = None;
+        cfg.resolver_timeout = 0;
+        assert!(cfg.resolver.is_none());
+        assert_eq!(cfg.resolver_timeout, 0);
     }
 }
