@@ -33,7 +33,7 @@
 //! (accounted in `dropped_records`).  The guaranteed full-fidelity transcript
 //! is nginx's own (untouched) `error_log` file.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use nginx_sys::{ngx_shm_zone_t, ngx_uint_t};
 
@@ -97,6 +97,16 @@ pub struct OtelErrorWriterState {
     /// `ring_size_bytes(cap)` bytes in the logs shm zone and lives at least as
     /// long as the worker process.
     pub error_ring_ptr: *mut u8,
+    /// Pre-computed pointer to `WorkerSlots::error_rate_counters[0]` for this worker
+    /// in the metrics shm zone (Phase 2.3 DP-B).  Set by `init_process` (Step 2.3.5);
+    /// null until then — the metric bump is a no-op.
+    ///
+    /// The array has `N_SEVERITY_CLASSES` elements; index with
+    /// `crate::shm::severity_class_index(ngx_level as u8)`.
+    ///
+    /// SAFETY invariant: non-null ⇒ valid for `N_SEVERITY_CLASSES × 8` bytes,
+    /// aligned to 8 bytes, in the metrics shm zone.
+    pub error_rate_ptr: *mut AtomicU64,
 }
 
 // SAFETY: OtelErrorWriterState lives in nginx-managed pool memory and is
@@ -158,6 +168,18 @@ pub unsafe extern "C" fn ngx_otel_error_writer(
     //    `exporter::ngx_process() == NgxProcess::Worker(_)` AND
     //    logs_zone is mapped (non-null). Return early for master/exporter/
     //    config-load contexts (structural fall-through to core error_log).
+
+    // 4a. Companion error-rate metric bump (Step 2.3.4, DP-B).
+    //     Fires for EVERY floor-passing event, independent of coalescing — counts
+    //     the true event volume, not just the verbatim samples.
+    //     error_rate_ptr is null until init_process (Step 2.3.5); no-op until then.
+    let error_rate = (*state).error_rate_ptr;
+    if !error_rate.is_null() {
+        let idx = crate::shm::severity_class_index(level as u8);
+        // Relaxed: no ordering needed with respect to the ring push; the exporter
+        // reads this counter independently with Acquire.
+        (*error_rate.add(idx)).fetch_add(1, Ordering::Relaxed);
+    }
 
     // 5. Coalescer (Step 2.3.2): exact-hash dedup with verbatim exception tail.
     //    coalesce_table is null until init_process (Step 2.3.5) populates it.
@@ -377,6 +399,9 @@ mod tests {
             // error_ring_ptr null: ring-push path is dormant in unit tests
             // (no logs shm available; init_process wires this at Step 2.3.5).
             error_ring_ptr: core::ptr::null_mut(),
+            // error_rate_ptr null: metric-bump path is dormant in unit tests
+            // (no metrics shm available; init_process wires this at Step 2.3.5).
+            error_rate_ptr: core::ptr::null_mut(),
         });
         let mut log: nginx_sys::ngx_log_t = unsafe { core::mem::zeroed() };
         log.writer = Some(ngx_otel_error_writer);

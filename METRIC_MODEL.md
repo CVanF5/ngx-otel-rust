@@ -6,12 +6,13 @@ producer-side contract: metric names, instruments, units, temporality, and
 the attribute set the OTAP collector dictionary-encodes downstream
 (proposal §6.4, "Producer-side cardinality discipline").
 
-> **Currency.** Reflects the shipped module through **Phase 2.2** (access-log
-> rebalancing, June 2026): the request-duration histogram is now an OTel
-> **exponential histogram in microseconds**, the `fix3b` dimensions are **live**
-> (no longer "planned"), per-route / per-upstream series were added, and the
-> temporality mislabel is **fixed (Cumulative)**. The Phase 2.3 error-rate metric
-> is listed as *planned* at the end (not yet emitted).
+> **Currency.** Reflects the shipped module through **Phase 2.3** (error-log
+> §6.6.2, June 2026): the request-duration histogram is an OTel
+> **exponential histogram in microseconds**, the `fix3b` dimensions are **live**,
+> per-route / per-upstream series were added, the temporality mislabel is
+> **fixed (Cumulative)**, and the Phase 2.3 companion error-rate metric
+> (`ngx_otel.error_log.events`) is now **implemented** (Step 2.3.4 — pointer
+> wired to init_process in Step 2.3.5).
 
 ## Provenance — read this first
 
@@ -176,22 +177,33 @@ closed-cardinality enums live in `src/shm.rs` (`HttpMethod`, `StatusClass`,
 
 ---
 
-## Planned — Phase 2.3 error-rate metric (not yet emitted)
+## Phase 2.3 error-rate metric (`ngx_otel.error_log.events`) — **implemented**
 
-The error-log work (proposal §6.6.2) adds a **companion error-rate metric**
-alongside the coalesced `LogRecord`s. Per the ratified design
-(`PHASE_2_IMPLEMENTATION_PLAN.md` Step 2.3.4):
+The companion error-rate metric emitted alongside the coalesced error `LogRecord`s.
+Implemented in Step 2.3.4; wire to init_process in Step 2.3.5 (pointer set null until then).
 
 | Metric | Instrument | Unit | Temporality | Attributes |
 |---|---|---|---|---|
-| error-rate counter (name TBD by the loop) | Counter (Sum, monotonic) | `{error}` | Cumulative | `severity_class` only |
+| `ngx_otel.error_log.events` | Counter (Sum, monotonic) | `{error}` | Cumulative | `severity_class` only |
 
-> **Scope boundary (decided 2026-06-05).** The error metric is keyed on
+Severity classes (5 values, WithinU8 cardinality):
+
+| `severity_class` | nginx levels | level names |
+|---|---|---|
+| `"fatal"` | 1–3 | emerg, alert, crit |
+| `"error"` | 4 | error |
+| `"warn"` | 5 | warn |
+| `"info"` | 6–7 | notice, info |
+| `"debug"` | 8 | debug |
+
+> **Scope boundary (decided 2026-06-05 — DP-B).** The error metric is keyed on
 > `severity_class` **only** — no `http.route` / `nginx.upstream.zone` and no
 > `trace_id`. The `ngx_log_writer_pt` seam hands the writer its own log node,
 > not the connection's `c->log`, so the request context is structurally
 > unreachable on the error path (the access path is unaffected). "Which
 > upstream/route" remains readable in the error sample's **body text**.
+> Per-template counts ride on the `LogRecord`'s `nginx.error.coalesced_count`
+> attribute, never on the metric.
 
 ## avr-module signals not yet ported
 

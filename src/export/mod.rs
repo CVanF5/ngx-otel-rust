@@ -1071,6 +1071,19 @@ fn collect_all_sources(amcf: &MainConfig, worker_start_ns: u64) -> Batch {
         .collect(),
     );
 
+    // 4. Error-log event rate metric (Phase 2.3 DP-B).
+    //    Collected from metrics shm when error_log is enabled and shm is mapped.
+    if amcf.error_log_enabled {
+        if let Some(base) = amcf.shm_base() {
+            let n_workers = unsafe {
+                let zone = &*amcf.shm_zone;
+                let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
+                (avail / core::mem::size_of::<crate::shm::WorkerSlots>()).max(1)
+            };
+            metrics.push(collect_error_rate_metric(base, n_workers, worker_start_ns));
+        }
+    }
+
     Batch {
         resource: Resource { attributes: build_resource_attrs(amcf) },
         scope: Scope { name: "ngx-otel-rust".into(), version: env!("CARGO_PKG_VERSION").into() },
@@ -1458,6 +1471,61 @@ fn gauge_metric(name: &str, desc: &str, unit: &str, value: i64, time_ns: u64) ->
                 time_unix_nano: time_ns,
                 value: NumberValue::AsInt(value),
             }],
+        }),
+    }
+}
+
+/// Build the `ngx_otel.error_log.events` Sum metric (Phase 2.3 DP-B).
+///
+/// Sums `WorkerSlots::error_rate_counters` across all workers, producing one
+/// data point per severity class with attribute `severity_class = "fatal"|"error"|…`.
+///
+/// The counter is monotonically increasing and Cumulative — once started, it
+/// always reflects total events since worker startup, not a rate per interval.
+///
+/// # Safety
+/// `base` must point to the start of the metrics shm zone (past the slab header).
+/// `n_workers` must be ≤ number of slots the zone was sized for.
+fn collect_error_rate_metric(
+    base: *mut u8,
+    n_workers: usize,
+    start_time_ns: u64,
+) -> Metric {
+    use crate::shm::{worker_slots, N_SEVERITY_CLASSES, SEVERITY_CLASS_NAMES};
+    use core::sync::atomic::Ordering;
+
+    let now = now_unix_nano();
+
+    // Sum each severity class across all workers.
+    let mut totals = [0i64; N_SEVERITY_CLASSES];
+    for w in 0..n_workers {
+        let slots = unsafe { &*worker_slots(base, w) };
+        for (i, cnt) in slots.error_rate_counters.iter().enumerate() {
+            totals[i] = totals[i].saturating_add(cnt.load(Ordering::Acquire) as i64);
+        }
+    }
+
+    // Build one data point per severity class.
+    let data_points: std::vec::Vec<NumberDataPoint> = (0..N_SEVERITY_CLASSES)
+        .map(|i| NumberDataPoint {
+            attributes: std::vec![KeyValue {
+                key: "severity_class".into(),
+                value: AnyValue::String(SEVERITY_CLASS_NAMES[i].into()),
+            }],
+            start_time_unix_nano: start_time_ns,
+            time_unix_nano: now,
+            value: NumberValue::AsInt(totals[i]),
+        })
+        .collect();
+
+    Metric {
+        name: "ngx_otel.error_log.events".into(),
+        description: "Error log events counted by severity class (DP-B)".into(),
+        unit: "{error}".into(),
+        data: MetricData::Sum(SumData {
+            aggregation_temporality: AggregationTemporality::Cumulative,
+            is_monotonic: true,
+            data_points,
         }),
     }
 }
@@ -2027,6 +2095,119 @@ mod tests {
                 !slot.sample_emitted.load(core::sync::atomic::Ordering::Acquire),
                 "sample_emitted must be reset to false after drain"
             );
+        }
+    }
+
+    // ── Step 2.3.4 error-rate metric tests ───────────────────────────────────
+
+    /// Error-rate metric has exactly N_SEVERITY_CLASSES data points, each with a
+    /// distinct `severity_class` attribute, and no other attributes.
+    #[test]
+    fn error_rate_metric_shape() {
+        use crate::data_model::MetricData;
+        use crate::shm::{N_SEVERITY_CLASSES, SEVERITY_CLASS_NAMES};
+
+        let n_workers = 2usize;
+        let zone_sz = crate::shm::zone_size_for(n_workers);
+        let mut buf = std::vec![0u8; zone_sz];
+        let base = buf.as_mut_ptr();
+
+        // Zero-init the WorkerSlots area.
+        let off = crate::shm::data_offset();
+        unsafe { core::ptr::write_bytes(base.add(off), 0, zone_sz - off) };
+
+        let metric = collect_error_rate_metric(unsafe { base.add(off) }, n_workers, 0);
+
+        assert_eq!(metric.name, "ngx_otel.error_log.events");
+
+        let MetricData::Sum(sum) = &metric.data else {
+            panic!("error-rate metric must be a Sum");
+        };
+        assert!(sum.is_monotonic, "error-rate must be monotonic");
+        assert_eq!(
+            sum.data_points.len(),
+            N_SEVERITY_CLASSES,
+            "must have one data point per severity class"
+        );
+
+        // Each data point has exactly one attribute `severity_class` with a valid name.
+        let mut seen_classes = std::collections::HashSet::new();
+        for dp in &sum.data_points {
+            assert_eq!(dp.attributes.len(), 1, "each dp must have exactly one attribute");
+            assert_eq!(dp.attributes[0].key, "severity_class");
+            let class_name = match &dp.attributes[0].value {
+                AnyValue::String(s) => s.as_str(),
+                _ => panic!("severity_class must be a string"),
+            };
+            assert!(
+                SEVERITY_CLASS_NAMES.contains(&class_name),
+                "severity_class '{class_name}' must be in SEVERITY_CLASS_NAMES"
+            );
+            assert!(seen_classes.insert(std::string::String::from(class_name)), "duplicate severity_class");
+
+            // All zero on fresh-start shm.
+            assert_eq!(dp.value, crate::data_model::NumberValue::AsInt(0));
+        }
+        assert_eq!(seen_classes.len(), N_SEVERITY_CLASSES, "all classes must appear");
+    }
+
+    /// Error-rate counters accumulate across workers: two workers each bump
+    /// separate severity classes; the metric sums them correctly.
+    #[test]
+    fn error_rate_counter_increments_per_severity_class() {
+        use crate::shm::{severity_class_index, worker_slots};
+
+        let n_workers = 2usize;
+        let zone_sz = crate::shm::zone_size_for(n_workers);
+        let mut buf = std::vec![0u8; zone_sz];
+        let base = buf.as_mut_ptr();
+
+        let off = crate::shm::data_offset();
+        let data_base = unsafe { base.add(off) };
+        unsafe { core::ptr::write_bytes(data_base, 0, zone_sz - off) };
+
+        // Worker 0 bumps: 10 × error (level 4), 5 × warn (level 5)
+        unsafe {
+            let slots = &*worker_slots(data_base, 0);
+            for _ in 0..10 {
+                slots.error_rate_counters[severity_class_index(4)].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            for _ in 0..5 {
+                slots.error_rate_counters[severity_class_index(5)].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        // Worker 1 bumps: 3 × fatal (level 1), 10 × error (level 4)
+        unsafe {
+            let slots = &*worker_slots(data_base, 1);
+            for _ in 0..3 {
+                slots.error_rate_counters[severity_class_index(1)].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            for _ in 0..10 {
+                slots.error_rate_counters[severity_class_index(4)].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        let metric = collect_error_rate_metric(data_base, n_workers, 0);
+        let crate::data_model::MetricData::Sum(sum) = &metric.data else { panic!() };
+
+        let find_class = |name: &str| -> i64 {
+            sum.data_points.iter().find(|dp| {
+                matches!(&dp.attributes[0].value, AnyValue::String(s) if s.as_str() == name)
+            })
+            .map(|dp| match dp.value { crate::data_model::NumberValue::AsInt(v) => v, _ => 0 })
+            .unwrap_or(0)
+        };
+
+        assert_eq!(find_class("fatal"), 3, "fatal: 3 from worker 1");
+        assert_eq!(find_class("error"), 20, "error: 10 from w0 + 10 from w1 = 20");
+        assert_eq!(find_class("warn"), 5, "warn: 5 from worker 0");
+        assert_eq!(find_class("info"), 0, "info: no bumps");
+        assert_eq!(find_class("debug"), 0, "debug: no bumps");
+
+        // Only severity_class is a metric dimension (DP-B: no route/zone/trace_id).
+        for dp in &sum.data_points {
+            assert_eq!(dp.attributes.len(), 1, "only severity_class dim; count={}", dp.attributes.len());
         }
     }
 }

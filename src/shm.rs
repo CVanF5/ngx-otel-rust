@@ -382,6 +382,44 @@ pub fn combo_index(method: HttpMethod, status_class: StatusClass, proto: ProtoVe
 /// Upstream slot index for over-cap or no-upstream requests (the "other" bucket).
 pub const UPSTREAM_IDX_OTHER: usize = UPSTREAM_CAP;
 
+// ── Error-rate severity classes (Phase 2.3 DP-B) ────────────────────────────
+
+/// Number of severity classes for the companion error-rate metric (DP-B).
+///
+/// WithinU8 cardinality — 5 classes map nginx levels 1–8 to coarse buckets:
+/// `fatal` (1–3), `error` (4), `warn` (5), `info` (6–7), `debug` (8).
+pub const N_SEVERITY_CLASSES: usize = 5;
+
+/// Human-readable name for each severity class (used as the `severity_class`
+/// attribute value in the error-rate metric data points).
+///
+/// Index with `severity_class_index(ngx_level)`.
+pub const SEVERITY_CLASS_NAMES: [&str; N_SEVERITY_CLASSES] =
+    ["fatal", "error", "warn", "info", "debug"];
+
+/// Map a nginx log level (1–8) to a severity-class index (0-based).
+///
+/// | Class | Index | nginx levels | meaning              |
+/// |-------|-------|-------------|----------------------|
+/// | fatal |   0   | 1-3          | emerg, alert, crit   |
+/// | error |   1   | 4            | error                |
+/// | warn  |   2   | 5            | warn                 |
+/// | info  |   3   | 6-7          | notice, info         |
+/// | debug |   4   | 8            | debug                |
+///
+/// Out-of-range levels clamp to 0 (`fatal`) — conservative, never out-of-bounds.
+#[inline]
+pub fn severity_class_index(ngx_level: u8) -> usize {
+    match ngx_level {
+        1 | 2 | 3 => 0, // fatal: emerg / alert / crit
+        4 => 1,          // error
+        5 => 2,          // warn
+        6 | 7 => 3,      // info: notice / info
+        8 => 4,          // debug
+        _ => 0,          // clamp unknown to fatal (conservative; never OOB)
+    }
+}
+
 /// Per-worker slot block.
 ///
 /// One of these exists per nginx worker process, mapped at a fixed offset in
@@ -430,6 +468,18 @@ pub struct WorkerSlots {
     /// The runtime `access_sample_size` directive caps the effective reservoir
     /// size to ≤ `MAX_EXEMPLAR_RESERVOIR`.
     pub exemplar_reservoir: ExemplarReservoir,
+    /// Per-severity-class error-log event counters (Phase 2.3 DP-B).
+    ///
+    /// `error_rate_counters[severity_class_index(ngx_level)]` is bumped by the
+    /// worker's error-log writer on EVERY floor-passing event (independent of
+    /// coalescing — counts the true event volume, not just verbatim samples).
+    ///
+    /// Written with `Relaxed` by the writer; read with `Acquire` by the exporter,
+    /// which sums across all `WorkerSlots[0..n_workers]`.
+    ///
+    /// Zeroed on fresh start by `otel_shm_zone_init` (all-zeros = valid initial state
+    /// for `AtomicU64`). Size = `N_SEVERITY_CLASSES × 8 = 40 bytes` per worker.
+    pub error_rate_counters: [AtomicU64; N_SEVERITY_CLASSES],
 }
 
 // ── Exemplar reservoir (Phase 2.2 Step 2.2.4) ─────────────────────────────
