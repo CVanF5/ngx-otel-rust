@@ -30,6 +30,7 @@
 //! or a lock-free MPSC ring; that complexity is deferred.
 
 pub mod access;
+pub mod coalesce;
 pub mod error_writer;
 pub mod ring;
 pub mod severity;

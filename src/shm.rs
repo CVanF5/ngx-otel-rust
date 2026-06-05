@@ -736,14 +736,21 @@ pub unsafe extern "C" fn otel_shm_zone_init(
 
 use crate::logs::ring::{ring_size_bytes, LogsWorkerRing, LogsWorkerRingHeader};
 
-/// Bytes occupied by one worker's logs slot (access ring + error ring).
+/// Bytes occupied by one worker's logs slot (access ring + error ring + coalescer table).
 ///
-/// Both rings use the same `cap` for Phase 2.1.
-/// Memory per worker = `cap × 2 + 2 × RING_HEADER_SIZE`.
+/// Layout within a slot:
+/// ```text
+/// offset 0:                    access ring header + payload  (ring_size_bytes(cap))
+/// offset ring_size_bytes(cap): error ring header + payload   (ring_size_bytes(cap))
+/// offset 2*ring_size_bytes(cap): coalescer table             (coalesce_table_bytes())
+/// ```
+///
+/// Memory per worker = `cap × 2 + 2 × RING_HEADER_SIZE + COALESCE_CAPACITY × 24`.
+/// At default ring_cap=4096: 2×4128 + 6144 = 14400 bytes/worker — negligible.
 /// Total logs shm = `slab_pool_header + n_workers × logs_slot_size(cap)`.
 #[inline]
 pub fn logs_slot_size(cap: usize) -> usize {
-    2 * ring_size_bytes(cap)
+    2 * ring_size_bytes(cap) + crate::logs::coalesce::coalesce_table_bytes()
 }
 
 /// Minimum logs zone size for `n_workers` worker processes with ring `cap`.
@@ -767,10 +774,11 @@ pub fn logs_n_workers_from_zone(zone_data_bytes: usize, cap: usize) -> usize {
 /// Layout per slot (base = `shm.addr + data_offset()`):
 /// ```text
 /// slot_i = base + i × logs_slot_size(cap)
-/// access_ring_header = slot_i + 0
-/// access_ring_payload = slot_i + RING_HEADER_SIZE
-/// error_ring_header   = slot_i + ring_size_bytes(cap)
-/// error_ring_payload  = slot_i + ring_size_bytes(cap) + RING_HEADER_SIZE
+/// access_ring_header   = slot_i + 0
+/// access_ring_payload  = slot_i + RING_HEADER_SIZE
+/// error_ring_header    = slot_i + ring_size_bytes(cap)
+/// error_ring_payload   = slot_i + ring_size_bytes(cap) + RING_HEADER_SIZE
+/// coalescer_table      = slot_i + 2 * ring_size_bytes(cap)
 /// ```
 ///
 /// # Safety
@@ -792,6 +800,33 @@ pub unsafe fn logs_error_ring(base_addr: *mut u8, worker_id: usize, cap: usize) 
     let slot_off = worker_id * logs_slot_size(cap);
     let error_off = slot_off + ring_size_bytes(cap);
     unsafe { LogsWorkerRing::from_shm_ptr(base_addr.add(error_off)) }
+}
+
+/// Obtain a raw pointer to the **coalescer table** for `worker_id` in the logs shm zone.
+///
+/// The coalescer table occupies the last `coalesce_table_bytes()` bytes of the slot,
+/// after the access ring and error ring.  It is a `[CoalesceSlot; COALESCE_CAPACITY]`
+/// array; on fresh start the slot area is zeroed, giving `key_hash == 0` (empty) for
+/// every slot — the correct initial state.
+///
+/// Called by `init_process` (Step 2.3.5) to pre-compute the table pointer and stash
+/// it in `OtelErrorWriterState::coalesce_table`, so the hot path is a single
+/// null-guarded dereference.
+///
+/// # Safety
+/// - `base_addr` must point past the slab-pool header (`shm.addr + data_offset()`).
+/// - `worker_id < n_workers` and `cap` must match the zone registration.
+/// - The returned pointer must not outlive the zone mapping.
+#[allow(dead_code)]
+#[inline]
+pub unsafe fn logs_coalesce_table(
+    base_addr: *mut u8,
+    worker_id: usize,
+    cap: usize,
+) -> *mut crate::logs::coalesce::CoalesceSlot {
+    let slot_off = worker_id * logs_slot_size(cap);
+    let coalesce_off = slot_off + 2 * ring_size_bytes(cap);
+    unsafe { base_addr.add(coalesce_off).cast() }
 }
 
 /// Zone initialisation callback for the logs shm zone.

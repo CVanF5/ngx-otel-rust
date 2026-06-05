@@ -37,6 +37,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use nginx_sys::{ngx_shm_zone_t, ngx_uint_t};
 
+use crate::logs::coalesce::{self, CoalesceResult, CoalesceSlot};
+
 // ── OtelErrorWriterState ──────────────────────────────────────────────────────
 
 /// Per-writer state allocated from `cf->pool` by `cmd_set_error_log`.
@@ -67,6 +69,13 @@ pub struct OtelErrorWriterState {
     /// The logs shm zone pointer (set by `init_process`; null until then).
     /// Used by the coalescer (Step 2.3.2) and error-rate metric (Step 2.3.4).
     pub logs_zone: *mut ngx_shm_zone_t,
+    /// Pre-computed pointer to this worker's coalescer table within the logs shm zone.
+    /// Set by `init_process` (Step 2.3.5) alongside `coalesce_enabled`.
+    /// The coalescer path is a no-op (fall-through to TODO 2.3.3 ring push) until this is non-null.
+    pub coalesce_table: *mut CoalesceSlot,
+    /// Mirrors `MainConfig::error_log_coalesce`.  Set by `init_process` (Step 2.3.5).
+    /// Default zero/false means "no coalescing"; overridden before first error is emitted.
+    pub coalesce_enabled: bool,
 }
 
 // SAFETY: OtelErrorWriterState lives in nginx-managed pool memory and is
@@ -101,8 +110,8 @@ unsafe impl Sync for OtelErrorWriterState {}
 pub unsafe extern "C" fn ngx_otel_error_writer(
     log: *mut nginx_sys::ngx_log_t,
     level: ngx_uint_t,
-    _buf: *mut nginx_sys::u_char,
-    _len: usize,
+    buf: *mut nginx_sys::u_char,
+    len: usize,
 ) {
     let state = (*log).wdata as *mut OtelErrorWriterState;
 
@@ -129,8 +138,30 @@ pub unsafe extern "C" fn ngx_otel_error_writer(
     //    logs_zone is mapped (non-null). Return early for master/exporter/
     //    config-load contexts (structural fall-through to core error_log).
 
-    // 5. TODO Step 2.3.2: stable-core extraction + coalescer table.
-    //    (Exact-hash dedup; verbatim opt-out via error_log_coalesce flag.)
+    // 5. Coalescer (Step 2.3.2): exact-hash dedup with verbatim exception tail.
+    //    coalesce_table is null until init_process (Step 2.3.5) populates it.
+    //    When null, fall through (no record pushed yet; ring push wired at Step 2.3.3).
+    let coalesce_table = (*state).coalesce_table;
+    if !coalesce_table.is_null() {
+        // SAFETY: buf is valid for `len` bytes per ngx_log_error_core contract.
+        let buf_slice = core::slice::from_raw_parts(buf as *const u8, len);
+        match coalesce::coalesce(
+            coalesce_table,
+            level as u8,
+            buf_slice,
+            (*state).coalesce_enabled,
+        ) {
+            CoalesceResult::Coalesced => {
+                // Duplicate suppressed. The coalescer already bumped the count.
+                (*state).busy.store(false, Ordering::Release);
+                return;
+            }
+            CoalesceResult::EmitVerbatim => {
+                // TODO Step 2.3.3: push buf_slice to the error ring.
+                let _ = buf_slice; // suppress unused warning until 2.3.3
+            }
+        }
+    }
 
     // 6. TODO Step 2.3.4: companion error-rate metric bump (severity_class only).
 
@@ -221,6 +252,10 @@ mod tests {
             cleanup: AtomicBool::new(false),
             level_floor,
             logs_zone: core::ptr::null_mut(),
+            // coalesce_table null: coalescer path is dormant in unit tests
+            // (no shm available; init_process wires this at Step 2.3.5).
+            coalesce_table: core::ptr::null_mut(),
+            coalesce_enabled: false,
         });
         let mut log: nginx_sys::ngx_log_t = unsafe { core::mem::zeroed() };
         log.writer = Some(ngx_otel_error_writer);

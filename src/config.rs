@@ -1698,7 +1698,10 @@ extern "C" fn cmd_set_error_log(
         (*new_log).wdata = state as *mut core::ffi::c_void;
         // Fill the state (pcalloc gave us zeros; only non-zero fields needed).
         (*state).level_floor = level_floor;
-        // busy, cleanup, logs_zone stay zero/null — correct defaults.
+        // busy, cleanup, logs_zone, coalesce_table stay zero/null — correct defaults.
+        // coalesce_enabled is false until init_process (Step 2.3.5) sets it from
+        // MainConfig::error_log_coalesce; the coalescer path is gated on
+        // coalesce_table != null anyway, so false here is harmless.
     }
 
     // Insert into cycle->new_log chain (sorted descending by log_level).
