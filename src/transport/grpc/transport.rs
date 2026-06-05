@@ -328,4 +328,27 @@ mod tests {
         fn assert_transport_send<T: crate::transport::Transport + Send>() {}
         assert_transport_send::<GrpcTransport<NgxConnector>>();
     }
+
+    /// A DNS-name endpoint must parse and construct a `GrpcTransport` without
+    /// error.  The transport inherits DNS resolution from `NgxConnector` (Item 3)
+    /// via the `Connector::connect` delegation — `GrpcTransport` has no own
+    /// connect logic.  The resolver is `None` here; if `send` were called it
+    /// would produce a clear `TransportError::Connection` ("configure nginx's
+    /// resolver directive…").  This test verifies parse + origin-URI construction
+    /// succeed for a hostname endpoint.
+    #[test]
+    fn grpc_transport_dns_endpoint_constructs_ok() {
+        let log_ptr = core::ptr::NonNull::dangling();
+        let t = GrpcTransport::<NgxConnector>::with_ngx_log(
+            "http://otel-collector.example.com:4317",
+            log_ptr,
+            None,
+            0,
+        );
+        assert!(
+            t.is_ok(),
+            "DNS-name gRPC endpoint must parse and construct without error; got: {:?}",
+            t.err()
+        );
+    }
 }
