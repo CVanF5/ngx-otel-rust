@@ -17,6 +17,7 @@ RUN apt-get update && apt-get install -y \
     clang make curl pkg-config libssl-dev libpcre2-dev zlib1g-dev \
     protobuf-compiler \
     ca-certificates perl git netcat-openbsd lsof \
+    python3-minimal \
     && rm -rf /var/lib/apt/lists/*
 # libpcre2-dev:      required by nginx's HTTP rewrite module (default-enabled).
 # zlib1g-dev:        required by nginx's HTTP gzip module (default-enabled).

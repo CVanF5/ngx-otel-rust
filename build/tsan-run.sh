@@ -196,6 +196,16 @@ echo "[tsan-run] === Running run_signal_storm.sh under TSAN (Phase 2.3 re-entran
 # Asserts: no crash, no panic, no torn records, drain progresses.
 STORM_DURATION_S=30 bash tests/integration/run_signal_storm.sh
 
+echo ""
+echo "[tsan-run] === Running run_dns_dualstack.sh under TSAN (transport_dns async resolver path) ==="
+# Exercises Items 2 + 3 of the transport_dns work under TSAN:
+#   - NgxConnector::connect_dns: Resolver::resolve_name (UDP event-loop path)
+#   - connect_first_reachable / pc.sockaddr+socklen wiring
+#   - IPv6 literal connect path (build_ipv6_sockaddr, AF_INET6 socklen)
+# TEST A resolves "ngx-otel-dns-test" via a local Python DNS stub → 127.0.0.1
+# (real async resolver I/O under TSAN).  TEST B connects via a v6 literal.
+bash tests/integration/run_dns_dualstack.sh
+
 # ── Step 5: Belt-and-suspenders ThreadSanitizer warning scan ─────────────────
 
 echo ""
@@ -206,7 +216,9 @@ for log in /tmp/ngx-otel-grpc-smoke.*/logs/error.log \
            /tmp/ngx-otel-grpc-export.*/logs/error.log \
            /tmp/ngx-otel-access-log.*/logs/error.log \
            /tmp/ngx-otel-error-log.*/logs/error.log \
-           /tmp/ngx-otel-signal-storm.*/logs/error.log; do
+           /tmp/ngx-otel-signal-storm.*/logs/error.log \
+           /tmp/ngx-otel-dns-a.*/logs/error.log \
+           /tmp/ngx-otel-dns-b.*/logs/error.log; do
     if [[ -f "${log}" ]]; then
         count=$(grep -c "WARNING: ThreadSanitizer" "${log}" 2>/dev/null || true)
         if [[ "${count}" -gt 0 ]]; then
