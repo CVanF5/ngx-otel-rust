@@ -334,7 +334,13 @@ pub async fn export_loop(amcf: &'static MainConfig) {
     // For gRPC the connection is lazy (deferred to first send).
     let mut transport = match amcf.metric_protocol() {
         MetricProtocol::OtlpHttp => {
-            match HyperHttpTransport::<NgxConnector>::with_ngx_log(endpoint_str, headers, log) {
+            match HyperHttpTransport::<NgxConnector>::with_ngx_log(
+                endpoint_str,
+                headers,
+                log,
+                amcf.resolver,
+                amcf.resolver_timeout,
+            ) {
                 Ok(t) => ExportTransport::Http(t),
                 Err(e) => {
                     ngx::ngx_log_error!(
@@ -348,7 +354,12 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             }
         }
         MetricProtocol::OtlpGrpc => {
-            match GrpcTransport::<NgxConnector>::with_ngx_log(endpoint_str, log) {
+            match GrpcTransport::<NgxConnector>::with_ngx_log(
+                endpoint_str,
+                log,
+                amcf.resolver,
+                amcf.resolver_timeout,
+            ) {
                 Ok(t) => ExportTransport::Grpc(t),
                 Err(e) => {
                     ngx::ngx_log_error!(

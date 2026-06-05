@@ -986,4 +986,67 @@ mod nginx_test_stubs {
         _log: *mut nginx_sys::ngx_log_t,
     ) {
     }
+
+    // ── transport_dns stubs (Items 1–3: resolver + inet helpers) ─────────────
+    //
+    // On macOS flat-namespace linking these are resolved at runtime from the
+    // nginx binary.  On Linux ELF test binaries every referenced symbol must
+    // exist at link time — these no-op stubs satisfy the linker.  Unit tests
+    // never call the DNS resolution code path (pool alloc returns null, so
+    // OwnedNgxPool::new → Err before any resolver call).
+
+    #[no_mangle]
+    pub unsafe extern "C" fn ngx_inet_set_port(
+        _sa: *mut libc::sockaddr,
+        _port: libc::c_ushort,
+    ) {
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn ngx_resolve_start(
+        _r: *mut nginx_sys::ngx_resolver_t,
+        _temp: *mut nginx_sys::ngx_resolver_ctx_t,
+    ) -> *mut nginx_sys::ngx_resolver_ctx_t {
+        core::ptr::null_mut()
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn ngx_resolve_name(
+        _ctx: *mut nginx_sys::ngx_resolver_ctx_t,
+    ) -> nginx_sys::ngx_int_t {
+        nginx_sys::NGX_ERROR as nginx_sys::ngx_int_t
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn ngx_resolve_name_done(
+        _ctx: *mut nginx_sys::ngx_resolver_ctx_t,
+    ) {
+    }
+
+    // nginx pool allocator (ngx::core::Pool as Allocator, used by the resolver
+    // Vec<ngx_addr_t, Pool> return type).
+    #[no_mangle]
+    pub unsafe extern "C" fn ngx_pnalloc(
+        _pool: *mut nginx_sys::ngx_pool_t,
+        _size: usize,
+    ) -> *mut c_void {
+        core::ptr::null_mut()
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn ngx_pmemalign(
+        _pool: *mut nginx_sys::ngx_pool_t,
+        _size: usize,
+        _alignment: usize,
+    ) -> *mut c_void {
+        core::ptr::null_mut()
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn ngx_pfree(
+        _pool: *mut nginx_sys::ngx_pool_t,
+        _p: *mut c_void,
+    ) -> nginx_sys::ngx_int_t {
+        nginx_sys::NGX_OK as nginx_sys::ngx_int_t
+    }
 }

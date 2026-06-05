@@ -752,18 +752,38 @@ impl Connector for SpinConnector {
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Production connector.  Uses `ngx_event_connect_peer` to open a TCP
-/// connection via NGINX's event machinery.  Requires a running NGINX worker.
+/// connection via NGINX's event machinery.  Requires a running NGINX event loop.
 ///
-/// Supports IPv4 and IPv6 literal addresses (Phase 1.2 / Item 2).
-/// DNS-name endpoints are resolved in Item 3 (transport_dns).
+/// Supports:
+/// - Literal IPv4 and IPv6 addresses (Item 2).
+/// - DNS-name endpoints via nginx's async resolver (Item 3).  The resolver
+///   pointer is stored at config-parse time (Item 1) and driven by the
+///   exporter's nginx event loop.  Addresses are tried sequentially.
 pub struct NgxConnector {
     log: core::ptr::NonNull<ngx_log_t>,
+    /// Nginx resolver from `MainConfig::resolver`, wired at config-parse time.
+    /// `None` for literal-IP and unix: endpoints (no resolver needed).
+    resolver: Option<core::ptr::NonNull<nginx_sys::ngx_resolver_t>>,
+    /// Resolver timeout in milliseconds (from `clcf->resolver_timeout`).
+    resolver_timeout: nginx_sys::ngx_msec_t,
 }
 
 impl NgxConnector {
-    /// Create a connector with the given NGINX log handle.
+    /// Create a connector without a resolver (literal-IP or unix: endpoints).
     pub fn new(log: core::ptr::NonNull<ngx_log_t>) -> Self {
-        Self { log }
+        Self { log, resolver: None, resolver_timeout: 0 }
+    }
+
+    /// Create a connector with an nginx resolver for DNS-name endpoints.
+    ///
+    /// `resolver` is `NonNull<ngx_resolver_t>` stored at postconfiguration time
+    /// (see `MainConfig::resolver`).  `timeout` is milliseconds.
+    pub fn with_resolver(
+        log: core::ptr::NonNull<ngx_log_t>,
+        resolver: Option<core::ptr::NonNull<nginx_sys::ngx_resolver_t>>,
+        timeout: nginx_sys::ngx_msec_t,
+    ) -> Self {
+        Self { log, resolver, resolver_timeout: timeout }
     }
 }
 
@@ -807,12 +827,10 @@ impl Connector for NgxConnector {
                                 as nginx_sys::socklen_t,
                         ),
                         Err(_) => {
-                            // DNS name — resolver path wired in Item 3.
-                            return Err(TransportError::InvalidEndpoint {
-                                input: host.clone(),
-                                reason: "DNS resolution not yet available; \
-                                         configure a literal IPv4 or IPv6 address",
-                            });
+                            // DNS name — resolve using the nginx async resolver.
+                            return self
+                                .connect_dns(host, host_str, *port)
+                                .await;
                         }
                     };
 
@@ -822,8 +840,8 @@ impl Connector for NgxConnector {
                 // dereferences `pc->name` as `ngx_str_t *`.  With NGX_DEBUG
                 // undefined the macro expands to nothing (ngx_log.h:221) so
                 // a NULL `pc.name` is harmless; with `--with-debug` it
-                // expands to an active call (ngx_log.h:185-187) and the NULL
-                // deref crashes the worker.  See nginx-acme's
+                // expands to an active log call (`ngx_log.h:185-187`) and the
+                // NULL deref crashes the worker.  See nginx-acme's
                 // `PeerConnection::connect` for the precedent.
                 let name_ptr = build_pc_name(&io.pool, host, *port)?;
                 {
@@ -845,6 +863,113 @@ impl Connector for NgxConnector {
                 ),
             }),
         }
+    }
+}
+
+impl NgxConnector {
+    /// Resolve `host` via the nginx async resolver and connect to the first
+    /// reachable address.
+    ///
+    /// Addresses are tried **sequentially** (no happy-eyeballs).  Returns on
+    /// the first successful connect, or the last error if all addresses fail.
+    ///
+    /// # Lifecycle note
+    /// The `resolve_pool` holding the resolved `ngx_addr_t` list lives for the
+    /// duration of this function.  After a successful connect the sockaddr
+    /// pointer has already been consumed by `ngx_event_connect_peer` (the
+    /// kernel copies the address at `connect(2)` time), so dropping the pool
+    /// on return is safe.
+    ///
+    /// # STOP-AND-ASK if:
+    /// - The resolver returns a UAF/panic (would surface as a crash here).
+    /// - `ngx_inet_set_port` corrupts the address on a non-v4/v6 family.
+    /// These are the resolver-lifetime / UAF concerns from the loop doc.
+    async fn connect_dns(
+        &self,
+        host: &str,        // original host string (may have brackets for v6)
+        host_str: &str,    // bracket-stripped host string
+        port: u16,
+    ) -> Result<Pin<Box<NgxConnIo>>, TransportError> {
+        use ngx::async_::resolver::Resolver;
+
+        let resolver_nn = self.resolver.ok_or_else(|| TransportError::Connection {
+            cause: std::format!(
+                "DNS endpoint '{}' requires nginx's resolver directive; \
+                 add 'resolver <nameserver>;' to the http block",
+                host_str
+            ),
+        })?;
+
+        let resolver = Resolver::from_resolver(resolver_nn, self.resolver_timeout);
+
+        // Build a scratch pool for the resolved address list.  Dropped after
+        // all connect attempts; the sockaddr data is only needed until
+        // ngx_event_connect_peer returns.
+        let resolve_pool = OwnedNgxPool::new(NGX_DEFAULT_POOL_SIZE as usize, self.log)?;
+
+        // Build ngx_str_t from the host string.  The data pointer is borrowed
+        // for the duration of the resolve_name call only; the ngx_resolver_ctx_t
+        // copies it before the first await point returns.
+        //
+        // Safety: cast *const u8 → *mut u8 — nginx reads the name bytes but
+        // never writes to them.
+        let host_ngx_str = nginx_sys::ngx_str_t {
+            len: host_str.len(),
+            data: host_str.as_ptr() as *mut u8,
+        };
+
+        let addrs = resolver
+            .resolve_name(&host_ngx_str, &*resolve_pool)
+            .await
+            .map_err(|e| TransportError::Connection {
+                cause: std::format!("DNS resolve '{}': {}", host_str, e),
+            })?;
+
+        if addrs.is_empty() {
+            return Err(TransportError::Connection {
+                cause: std::format!("DNS resolve '{}': no addresses returned", host_str),
+            });
+        }
+
+        // Try addresses in order; return on first successful connect.
+        // Each attempt uses a fresh NgxConnIo (failed connects close the fd).
+        let mut last_err = std::string::String::from("no addresses");
+        for addr in addrs.iter() {
+            // Set the destination port on the resolved sockaddr.
+            // ngx_inet_set_port takes port in HOST byte order and calls htons()
+            // internally (nginx/src/core/ngx_inet.c:1436).
+            unsafe {
+                nginx_sys::ngx_inet_set_port(
+                    addr.sockaddr,
+                    port as nginx_sys::in_port_t,
+                );
+            }
+
+            let mut io = Box::pin(NgxConnIo::new(self.log)?);
+            // Build pc.name before the mutable borrow of io (borrow-split).
+            let name_ptr = build_pc_name(&io.pool, host, port)?;
+            {
+                let this = io.as_mut().get_mut();
+                // Install the ready sockaddr/socklen from the resolved addr.
+                // The plan: "each ngx_addr_t already carries a ready
+                // sockaddr + socklen + family — install it directly into pc"
+                // (TRANSPORT_DNS_DUALSTACK_PLAN.md Step 3).
+                this.pc.sockaddr = addr.sockaddr;
+                this.pc.socklen = addr.socklen;
+                // pc.name for debug logging under --with-debug.
+                this.pc.name = name_ptr;
+            }
+
+            match future::poll_fn(|cx| io.as_mut().poll_connect(cx)).await {
+                Ok(()) => return Ok(io),
+                Err(e) => {
+                    last_err = e.to_string();
+                    // io is dropped here, closing the failed connection fd.
+                }
+            }
+        }
+
+        Err(TransportError::Connection { cause: last_err })
     }
 }
 
@@ -1041,14 +1166,20 @@ impl HyperHttpTransport<SpinConnector> {
 }
 
 /// Production constructor — uses [`NgxConnector`] with proper event
-/// integration.  Requires a running NGINX worker.
+/// integration.  Requires a running NGINX event loop (exporter process).
 impl HyperHttpTransport<NgxConnector> {
     pub fn with_ngx_log(
         endpoint_str: &str,
         headers: std::vec::Vec<(std::string::String, std::string::String)>,
         log: core::ptr::NonNull<ngx_log_t>,
+        resolver: Option<core::ptr::NonNull<nginx_sys::ngx_resolver_t>>,
+        resolver_timeout: nginx_sys::ngx_msec_t,
     ) -> Result<Self, TransportError> {
-        Self::with_connector(endpoint_str, headers, NgxConnector::new(log))
+        Self::with_connector(
+            endpoint_str,
+            headers,
+            NgxConnector::with_resolver(log, resolver, resolver_timeout),
+        )
     }
 }
 

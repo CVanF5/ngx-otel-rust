@@ -103,8 +103,13 @@ impl GrpcTransport<NgxConnector> {
     pub fn with_ngx_log(
         endpoint_str: &str,
         log: NonNull<ngx_log_t>,
+        resolver: Option<core::ptr::NonNull<nginx_sys::ngx_resolver_t>>,
+        resolver_timeout: nginx_sys::ngx_msec_t,
     ) -> Result<Self, TransportError> {
-        Self::with_connector(endpoint_str, NgxConnector::new(log))
+        Self::with_connector(
+            endpoint_str,
+            NgxConnector::with_resolver(log, resolver, resolver_timeout),
+        )
     }
 }
 
@@ -293,7 +298,7 @@ mod tests {
         // Safety: we never actually use this pointer in the test; we only
         // construct GrpcTransport to verify the parse + URI build succeeds.
         let log_ptr = core::ptr::NonNull::dangling();
-        let t = GrpcTransport::<NgxConnector>::with_ngx_log("http://127.0.0.1:4317", log_ptr);
+        let t = GrpcTransport::<NgxConnector>::with_ngx_log("http://127.0.0.1:4317", log_ptr, None, 0);
         assert!(t.is_ok(), "valid http://host:port endpoint must parse OK");
     }
 
@@ -301,7 +306,7 @@ mod tests {
     #[test]
     fn grpc_transport_rejects_unix_endpoint() {
         let log_ptr = core::ptr::NonNull::dangling();
-        let result = GrpcTransport::<NgxConnector>::with_ngx_log("unix:///tmp/otel.sock", log_ptr);
+        let result = GrpcTransport::<NgxConnector>::with_ngx_log("unix:///tmp/otel.sock", log_ptr, None, 0);
         assert!(
             matches!(result, Err(TransportError::InvalidEndpoint { .. })),
             "unix socket endpoints must be rejected for gRPC transport"
@@ -312,7 +317,7 @@ mod tests {
     #[test]
     fn grpc_transport_rejects_https_endpoint() {
         let log_ptr = core::ptr::NonNull::dangling();
-        let result = GrpcTransport::<NgxConnector>::with_ngx_log("https://127.0.0.1:4317", log_ptr);
+        let result = GrpcTransport::<NgxConnector>::with_ngx_log("https://127.0.0.1:4317", log_ptr, None, 0);
         assert!(result.is_err(), "https:// endpoints must fail (TLS not implemented)");
     }
 
