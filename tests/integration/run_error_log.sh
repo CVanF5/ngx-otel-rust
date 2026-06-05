@@ -2,7 +2,7 @@
 # tests/integration/run_error_log.sh — Phase 2.3 error-log integration test
 #
 # Tests the §6.6.2 coalesced error-log + companion error-rate metric.
-# Runs THREE stages (each a fresh nginx):
+# Runs FOUR stages + two standalone checks (each a fresh nginx):
 #
 #   Stage A: Coalesce-on flood (default)
 #     - 100 /flood requests → broken upstream → "connect() failed" errors
@@ -20,6 +20,13 @@
 #     - "error" floor: only err/crit/alert/emerg → "connect() failed" passes
 #     - DP-C: bad nginx config → parse error lands in core error.log,
 #             NOT in LOGS_LOG (writer not active in config-load context)
+#   Stage E: Fixed-default floor proof (FU2 corrective)
+#     - Bare `otel_error_log;` + core error_log=notice
+#     - nc fake upstream triggers "upstream sent more data" at WARN (5)
+#     - HARD: "upstream sent more data" (WARN/5) IN core error.log (WARN was generated)
+#     - HARD: "upstream sent more data" (WARN/5) NOT in LOGS_LOG (fixed ERR floor blocks it)
+#     - HARD: "connect() failed" (ERR/4) IS in LOGS_LOG (passes fixed ERR floor)
+#     - Proves floor is FIXED at NGX_LOG_ERR, not mirrored from core error_log
 #
 # Exit codes: 0 = all assertions passed; 1 = preflight failure; 2 = assertion FAILED.
 
@@ -51,6 +58,8 @@ FLOOD_COUNT_OFF=20    # Stage B: flood count for coalesce-off
 LISTEN_PORT_A=9104
 LISTEN_PORT_B=9105
 LISTEN_PORT_C=9106
+LISTEN_PORT_E=9108   # Stage E: fixed-default floor proof (FU2)
+FAKE_WARN_PORT=9591  # Stage E: nc fake upstream that triggers WARN (Content-Length mismatch)
 
 # ─── Colour helpers ──────────────────────────────────────────────────────────
 
@@ -458,13 +467,156 @@ fi
 trap - EXIT
 _cleanup_dp_c
 
+# ─── Stage E: Fixed-default floor proof (FU2) ────────────────────────────────
+#
+# Proves bare `otel_error_log;` (NOARGS) uses a FIXED floor of NGX_LOG_ERR,
+# NOT the core error_log level (no mirroring).
+#
+# Setup: core error_log=notice (below ERR).
+#   /warn: nc fake upstream sends Content-Length:3 + longer body →
+#          nginx logs "upstream sent more data" at WARN (5) → BLOCKED.
+#   /flood: proxy to port 9 → "connect() failed" at ERR (4) → PASSES.
+# If the floor mirrored the core notice level (6), WARN messages would pass.
+
+info "=== Stage E: fixed-default floor proof — bare otel_error_log; with core=notice ==="
+
+STAGE_E_CONF="${SCRIPT_DIR}/nginx_error_log_stage_e.conf"
+STAGE_E_PREFIX="$(mktemp -d /tmp/ngx-otel-error-log-stage-e.XXXXXX)"
+STAGE_E_NGINX_PID=""
+STAGE_E_NC_PID=""
+
+_cleanup_stage_e() {
+    [[ -n "${STAGE_E_NGINX_PID:-}" ]] && kill "${STAGE_E_NGINX_PID}" 2>/dev/null || true
+    [[ -n "${STAGE_E_NC_PID:-}" ]]    && kill "${STAGE_E_NC_PID}"    2>/dev/null || true
+    echo ""
+    echo "=== Stage E error.log (last 20 lines) ==="
+    tail -20 "${STAGE_E_PREFIX}/logs/error.log" 2>/dev/null || echo "(not found)"
+    info "Tearing down ${STAGE_E_PREFIX}"
+    rm -rf "${STAGE_E_PREFIX}"
+}
+trap _cleanup_stage_e EXIT
+
+mkdir -p "${STAGE_E_PREFIX}/logs"
+mkdir -p "${STAGE_E_PREFIX}/client_body_temp"
+
+sed \
+    -e "s|@MODULE_PATH@|${MODULE_PATH}|g" \
+    -e "s|@PREFIX@|${STAGE_E_PREFIX}|g" \
+    -e "s|@LISTEN_PORT@|${LISTEN_PORT_E}|g" \
+    -e "s|@FAKE_WARN_PORT@|${FAKE_WARN_PORT}|g" \
+    "${STAGE_E_CONF}" > "${STAGE_E_PREFIX}/nginx.conf"
+
+# Start the fake WARN upstream BEFORE nginx.
+# nc sends Content-Length:3 but a longer body; nginx proxy logs WARN.
+# nc handles exactly one connection then exits — that's all we need.
+info "  Starting nc fake upstream on port ${FAKE_WARN_PORT} (triggers WARN on single request)..."
+printf 'HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nHELLO_WORLD_EXTRA_BYTES' \
+    | nc -l "${FAKE_WARN_PORT}" &
+STAGE_E_NC_PID=$!
+sleep 0.5
+
+# Snapshot sizes before starting nginx.
+PRE_LOGS_SIZE_E=0
+[[ -f "${LOGS_LOG}" ]] && PRE_LOGS_SIZE_E=$(wc -c < "${LOGS_LOG}")
+PRE_METRICS_SIZE_E=0
+[[ -f "${METRICS_LOG}" ]] && PRE_METRICS_SIZE_E=$(wc -c < "${METRICS_LOG}")
+
+# Start nginx.
+info "  Starting nginx (core=notice, otel floor=NGX_LOG_ERR fixed)..."
+"${NGINX_BINARY}" -p "${STAGE_E_PREFIX}" -c "${STAGE_E_PREFIX}/nginx.conf" &
+STAGE_E_NGINX_PID=$!
+sleep 1
+
+if ! kill -0 "${STAGE_E_NGINX_PID}" 2>/dev/null; then
+    echo "ERROR: Stage E nginx exited immediately." >&2
+    cat "${STAGE_E_PREFIX}/logs/error.log" >&2
+    hard_fail "Stage E: nginx failed to start"
+    trap - EXIT; _cleanup_stage_e
+else
+
+    # Send ONE request to /warn → nginx connects to nc → WARN generated.
+    info "  Sending 1 /warn request (Content-Length mismatch → 'upstream sent more data' WARN)..."
+    curl -sf "http://127.0.0.1:${LISTEN_PORT_E}/warn" >/dev/null 2>&1 || true
+    sleep 0.5
+    # nc exits after serving one connection; clear the PID so cleanup doesn't re-kill.
+    wait "${STAGE_E_NC_PID}" 2>/dev/null || true
+    STAGE_E_NC_PID=""
+
+    # Send /flood requests to generate ERR-level "connect() failed".
+    info "  Sending 10 /flood requests (expect 'connect() failed' ERR)..."
+    for i in $(seq 1 10); do
+        curl -sf "http://127.0.0.1:${LISTEN_PORT_E}/flood" >/dev/null 2>&1 || true
+    done
+
+    info "  Waiting ${FLUSH_WAIT_S}s for export flush..."
+    sleep "${FLUSH_WAIT_S}"
+
+    info "  Sending nginx -s quit..."
+    "${NGINX_BINARY}" -p "${STAGE_E_PREFIX}" -c "${STAGE_E_PREFIX}/nginx.conf" -s quit 2>/dev/null || true
+    for i in $(seq 1 10); do
+        if ! kill -0 "${STAGE_E_NGINX_PID}" 2>/dev/null; then break; fi
+        sleep 1
+    done
+    STAGE_E_NGINX_PID=""
+    sleep 1
+
+    # Extract new collector content.
+    NEW_LOGS_E=""
+    if [[ -f "${LOGS_LOG}" ]]; then
+        POST_LOGS_SIZE_E=$(wc -c < "${LOGS_LOG}")
+        if (( POST_LOGS_SIZE_E > PRE_LOGS_SIZE_E )); then
+            NEW_LOGS_E=$(tail -c "+$(( PRE_LOGS_SIZE_E + 1 ))" "${LOGS_LOG}")
+        fi
+    fi
+    NEW_METRICS_E=""
+    if [[ -f "${METRICS_LOG}" ]]; then
+        POST_METRICS_SIZE_E=$(wc -c < "${METRICS_LOG}")
+        if (( POST_METRICS_SIZE_E > PRE_METRICS_SIZE_E )); then
+            NEW_METRICS_E=$(tail -c "+$(( PRE_METRICS_SIZE_E + 1 ))" "${METRICS_LOG}")
+        fi
+    fi
+
+    info "Stage E: ${#NEW_LOGS_E} bytes new logs.json, ${#NEW_METRICS_E} bytes new metrics.json"
+
+    info "=== Stage E assertions (fixed-default floor) ==="
+
+    # HARD (sanity): "upstream sent more data" must appear in core error.log.
+    # This confirms the WARN was actually generated — the assertion below is
+    # NOT vacuously true.
+    if grep -q "upstream sent more data" "${STAGE_E_PREFIX}/logs/error.log" 2>/dev/null; then
+        pass "Stage E: 'upstream sent more data' WARN present in core error.log (WARN was generated)"
+    else
+        hard_fail "Stage E: 'upstream sent more data' NOT in core error.log — WARN was not generated (nc may have failed)"
+    fi
+
+    # HARD: WARN must NOT appear in LOGS_LOG.
+    # Fixed ERR floor (4) blocks WARN (5). If mirrored from notice (6), WARN would pass.
+    if echo "${NEW_LOGS_E}" | grep -q "upstream sent more data"; then
+        hard_fail "Stage E: 'upstream sent more data' (WARN) appeared in LOGS_LOG — floor is NOT fixed at ERR (mirroring suspected)"
+    else
+        pass "Stage E: 'upstream sent more data' (WARN) NOT in LOGS_LOG — fixed ERR floor blocks WARN"
+    fi
+
+    # HARD: "connect() failed" ERR must appear in LOGS_LOG.
+    # ERR (4) passes through the fixed ERR floor.
+    if echo "${NEW_LOGS_E}" | grep -q "connect() failed"; then
+        pass "Stage E: 'connect() failed' (ERR) present in LOGS_LOG — ERR passes fixed floor"
+    else
+        hard_fail "Stage E: 'connect() failed' NOT in LOGS_LOG — ERR messages not arriving with NOARGS floor"
+    fi
+
+fi
+
+trap - EXIT
+_cleanup_stage_e
+
 # ─── Final result ─────────────────────────────────────────────────────────────
 
 echo ""
 if [[ "${FAILED}" -eq 0 ]]; then
-    pass "All Phase 2.3 error-log assertions passed."
+    pass "All Phase 2.3 + FU2 error-log assertions passed."
     exit 0
 else
-    fail "One or more Phase 2.3 error-log assertions FAILED."
+    fail "One or more Phase 2.3 + FU2 error-log assertions FAILED."
     exit 2
 fi
