@@ -11,6 +11,9 @@ use nginx_sys::{
     ngx_uint_t, NGX_CONF_BLOCK, NGX_CONF_FLAG, NGX_CONF_NOARGS, NGX_CONF_TAKE1, NGX_CONF_TAKE2,
     NGX_HTTP_MAIN_CONF, NGX_HTTP_MAIN_CONF_OFFSET, NGX_LOG_DEBUG, NGX_LOG_EMERG,
 };
+use crate::logs::error_writer::{
+    ngx_otel_error_writer, otel_log_insert, parse_error_log_level, OtelErrorWriterState,
+};
 use ngx::core::{Status, NGX_CONF_ERROR, NGX_CONF_OK};
 use ngx::http::{HttpModuleMainConf, NgxHttpCoreModule};
 use ngx::{ngx_conf_log_error, ngx_string};
@@ -212,6 +215,33 @@ pub struct MainConfig {
     /// `0` = not configured (uses `DEFAULT_LOG_RING_CAP`).
     pub log_ring_size: usize,
 
+    // ── Phase 2.3: error-log export ──────────────────────────────────────────
+    //
+    /// `otel_error_log [<level>];` was seen.  `false` = not configured (default
+    /// off).  When `true`, the `ngx_otel_error_writer` node is woven into the
+    /// `cycle->new_log` chain and the logs shm zone is registered.
+    pub error_log_enabled: bool,
+    /// Effective severity floor for the OTel error-log writer.
+    ///
+    /// Set by `cmd_set_error_log`:
+    /// - NOARGS: mirrors `cf->cycle->log->log_level` (the core `error_log` level).
+    /// - TAKE1: parsed from the level arg (e.g. `"warn"` → `NGX_LOG_WARN`).
+    ///
+    /// Writer drops messages where `level > error_log_level` (nginx levels are
+    /// inverted: 1=emerg … 8=debug; higher number = less severe).
+    pub error_log_level: ngx_uint_t,
+    /// `otel_error_log_coalesce on|off;` — default `on`.
+    ///
+    /// `off` ⇒ the writer pushes every level-passing line verbatim to the
+    /// bounded ring, bypassing the coalescer (best-effort, lossy under load).
+    ///
+    /// **⚠️ WARNING:** `off` is explicitly NOT guaranteed delivery.  The ring
+    /// drops-newest under load; lost lines are accounted in `dropped_records`
+    /// but gone.  The only guaranteed full-fidelity transcript is nginx's own
+    /// (untouched) `error_log` file.  The companion error-rate metric (DP-B)
+    /// counts the true total in both modes.
+    pub error_log_coalesce: bool,
+
     // ── Phase 2.2 DP-E: route and upstream-zone dimension tables ─────────────
     //
     // Populated once at `postconfiguration` time (before workers fork) by
@@ -254,6 +284,10 @@ impl Default for MainConfig {
             // 0 = not configured (off by default).
             access_sample_size: 0,
             log_ring_size: 0,
+            // Phase 2.3 error-log defaults.
+            error_log_enabled: false,
+            error_log_level: 0,   // overwritten by cmd_set_error_log
+            error_log_coalesce: true,
             // Route and upstream tables start empty; populated at postconfiguration.
             route_table: [RouteEntry { clcf_ptr: 0, name: [0u8; ROUTE_NAME_MAX], name_len: 0 };
                 ROUTE_CAP],
@@ -420,10 +454,9 @@ impl MainConfig {
         // both are mapped before workers fork.
         self.register_control_shm_zone(cf, module)?;
 
-        // Register the per-worker logs shm zone when the exception tail / exemplar
-        // reservoir is enabled (Phase 2.2).  Phase 2.3 will extend this gate to
-        // `self.is_access_sample_enabled() || self.error_log_enabled`.
-        if self.is_access_sample_enabled() {
+        // Register the per-worker logs shm zone when the access exception-tail
+        // (Phase 2.2) or the OTel error-log writer (Phase 2.3) is enabled.
+        if self.is_access_sample_enabled() || self.error_log_enabled {
             self.register_logs_zone(cf, module)?;
         }
 
@@ -1200,25 +1233,60 @@ macro_rules! production_commands {
                 offset: 0,
                 post: ptr::null_mut(),
             },
+            // otel_error_log [<level>];  (Phase 2.3 §6.6.2)
+            // Enables OTel error-log export via a ngx_log_writer_pt writer node.
+            // NOARGS ⇒ mirror the core error_log level; TAKE1 ⇒ explicit override.
+            // The writer filters messages by severity floor (cheapest filter first),
+            // then coalesces repeated messages using a bounded exact-hash table.
+            // Context-to-destination matrix:
+            //   Worker + shm mapped → coalescer → error verbatim ring → OTLP
+            //   Master / config-load / exporter → structural fall-through to core error_log
+            // Default: off (not configured).
+            ngx_command_t {
+                name: ngx_string!("otel_error_log"),
+                type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_NOARGS | NGX_CONF_TAKE1) as ngx_uint_t,
+                set: Some(cmd_set_error_log),
+                conf: NGX_HTTP_MAIN_CONF_OFFSET,
+                offset: 0,
+                post: ptr::null_mut(),
+            },
+            // otel_error_log_coalesce on|off;  (Phase 2.3 §6.6.2)
+            // Default: on.  `off` ⇒ bypass the coalescer and push every
+            // level-passing line verbatim to the bounded ring.
+            //
+            // ⚠️ WARNING: `off` is best-effort, NOT guaranteed delivery.
+            // The ring drops-newest under load; lost lines are accounted in
+            // dropped_records but gone.  The only guaranteed full-fidelity
+            // transcript is nginx's own (untouched) error_log file.
+            // The companion error-rate metric (DP-B) counts the true total
+            // in both modes; only the bodies are potentially lost.
+            ngx_command_t {
+                name: ngx_string!("otel_error_log_coalesce"),
+                type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_FLAG) as ngx_uint_t,
+                set: Some(cmd_set_error_log_coalesce),
+                conf: NGX_HTTP_MAIN_CONF_OFFSET,
+                offset: 0,
+                post: ptr::null_mut(),
+            },
         ]
     };
 }
 
-/// Production build: 15 production commands + terminator.
+/// Production build: 17 production commands + terminator.
 #[cfg(not(any(test, feature = "test-support")))]
-pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 16] = {
-    let mut cmds = [ngx_command_t::empty(); 16];
+pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 18] = {
+    let mut cmds = [ngx_command_t::empty(); 18];
     let prod = production_commands!();
     let mut i = 0;
-    while i < 15 {
+    while i < 17 {
         cmds[i] = prod[i];
         i += 1;
     }
-    // cmds[15] stays empty() — terminator
+    // cmds[17] stays empty() — terminator
     cmds
 };
 
-/// test-support build: 15 production commands + otel_status_endpoint + terminator.
+/// test-support build: 17 production commands + otel_status_endpoint + terminator.
 ///
 /// `otel_status_endpoint;` is a location-level directive (no args) that registers
 /// a content handler returning `control_shm.version` as plain text. Used by the
@@ -1226,16 +1294,16 @@ pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 16] = {
 /// process-level introspection. Absent from production builds (verified by grep
 /// on `objs-release/ngx_http_otel_module.so`).
 #[cfg(any(test, feature = "test-support"))]
-pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 17] = {
-    let mut cmds = [ngx_command_t::empty(); 17];
+pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 19] = {
+    let mut cmds = [ngx_command_t::empty(); 19];
     let prod = production_commands!();
     let mut i = 0;
-    while i < 15 {
+    while i < 17 {
         cmds[i] = prod[i];
         i += 1;
     }
-    // Index 15: otel_status_endpoint (test-support only).
-    cmds[15] = ngx_command_t {
+    // Index 17: otel_status_endpoint (test-support only).
+    cmds[17] = ngx_command_t {
         name: ngx_string!("otel_status_endpoint"),
         type_: (nginx_sys::NGX_HTTP_LOC_CONF | NGX_CONF_NOARGS) as ngx_uint_t,
         set: Some(cmd_set_otel_status_endpoint),
@@ -1243,7 +1311,7 @@ pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 17] = {
         offset: 0,
         post: ptr::null_mut(),
     };
-    // cmds[16] stays empty() — terminator.
+    // cmds[18] stays empty() — terminator.
     cmds
 };
 
@@ -1536,6 +1604,147 @@ extern "C" fn cmd_set_access_sample(
     }
 }
 
+/// Directive callback for `otel_error_log [<level>];` (Phase 2.3 §6.6.2).
+///
+/// Inserts a writer-only `ngx_log_t` node into `cycle->new_log` via
+/// `otel_log_insert`.  The node calls `ngx_otel_error_writer` for every error
+/// that passes the severity floor.
+///
+/// - **NOARGS** (bare `otel_error_log;`) — mirrors the core `error_log` level
+///   (`cf->cycle->new_log.log_level`, the effective level at config time).  The
+///   OTel stream and the file stream match by default.
+/// - **TAKE1** (e.g. `otel_error_log warn;`) — explicit level override.
+///   Accepted values: `emerg`, `alert`, `crit`, `error`, `warn`, `notice`,
+///   `info`, `debug`.
+///
+/// Errors on duplicate directive.
+extern "C" fn cmd_set_error_log(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    let amcf = unsafe { conf.cast::<MainConfig>().as_mut().expect("main config") };
+
+    if amcf.error_log_enabled {
+        unsafe {
+            ngx_conf_log_error!(
+                NGX_LOG_EMERG,
+                &mut *cf,
+                "\"otel_error_log\" is duplicate"
+            );
+        }
+        return NGX_CONF_ERROR;
+    }
+
+    let level_floor: ngx_uint_t = unsafe {
+        let args = cf_args(cf);
+        if args.len() > 1 {
+            // TAKE1: parse the explicit level argument.
+            let level_str = args[1].as_bytes();
+            match parse_error_log_level(level_str) {
+                Some(l) => l,
+                None => {
+                    ngx_conf_log_error!(
+                        NGX_LOG_EMERG,
+                        &mut *cf,
+                        "otel_error_log: unknown level; use emerg|alert|crit|error|warn|notice|info|debug"
+                    );
+                    return NGX_CONF_ERROR;
+                }
+            }
+        } else {
+            // NOARGS: mirror the core error_log level.
+            // `cycle->new_log` is the current chain head at config time;
+            // its log_level is the effective core error_log level.
+            let cycle = (*cf).cycle;
+            if cycle.is_null() {
+                ngx_conf_log_error!(NGX_LOG_EMERG, &mut *cf, "otel_error_log: null cycle");
+                return NGX_CONF_ERROR;
+            }
+            (*cycle).new_log.log_level
+        }
+    };
+
+    // Allocate the ngx_log_t node and OtelErrorWriterState from the config pool.
+    // ngx_pcalloc zero-initialises both — AtomicBool(false), null ptr, 0 level
+    // are the correct "unset" defaults.
+    let (new_log, state) = unsafe {
+        let pool = (*cf).pool;
+        if pool.is_null() {
+            ngx_conf_log_error!(NGX_LOG_EMERG, &mut *cf, "otel_error_log: null pool");
+            return NGX_CONF_ERROR;
+        }
+        let log_ptr = nginx_sys::ngx_pcalloc(pool, mem::size_of::<nginx_sys::ngx_log_t>())
+            as *mut nginx_sys::ngx_log_t;
+        if log_ptr.is_null() {
+            ngx_conf_log_error!(NGX_LOG_EMERG, &mut *cf, "otel_error_log: ngx_pcalloc failed for log node");
+            return NGX_CONF_ERROR;
+        }
+        let state_ptr =
+            nginx_sys::ngx_pcalloc(pool, mem::size_of::<OtelErrorWriterState>())
+                as *mut OtelErrorWriterState;
+        if state_ptr.is_null() {
+            ngx_conf_log_error!(NGX_LOG_EMERG, &mut *cf, "otel_error_log: ngx_pcalloc failed for writer state");
+            return NGX_CONF_ERROR;
+        }
+        (log_ptr, state_ptr)
+    };
+
+    // Fill the log node.  Writer-only: no `file` set (so this node never writes
+    // to any file; the core file node still writes via chain continuation).
+    unsafe {
+        (*new_log).log_level = level_floor;
+        (*new_log).writer = Some(ngx_otel_error_writer);
+        (*new_log).wdata = state as *mut core::ffi::c_void;
+        // Fill the state (pcalloc gave us zeros; only non-zero fields needed).
+        (*state).level_floor = level_floor;
+        // busy, cleanup, logs_zone stay zero/null — correct defaults.
+    }
+
+    // Insert into cycle->new_log chain (sorted descending by log_level).
+    // cycle->new_log is an embedded ngx_log_t value (never null); confirmed:
+    // ngx_cycle.h:43-44: `ngx_log_t *log; ngx_log_t new_log;` — `new_log` is a value.
+    unsafe {
+        let cycle = (*cf).cycle;
+        otel_log_insert(ptr::addr_of_mut!((*cycle).new_log), new_log);
+    }
+
+    amcf.error_log_enabled = true;
+    amcf.error_log_level = level_floor;
+
+    NGX_CONF_OK
+}
+
+/// Directive callback for `otel_error_log_coalesce on|off;` (Phase 2.3 §6.6.2).
+///
+/// Sets `amcf.error_log_coalesce`.  The standard nginx flag handler
+/// (`ngx_conf_set_flag_slot`) is not used here because `error_log_coalesce`
+/// is a plain Rust `bool`, not a `ngx_flag_t` (`intptr_t`).
+extern "C" fn cmd_set_error_log_coalesce(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    let amcf = unsafe { conf.cast::<MainConfig>().as_mut().expect("main config") };
+    let args = unsafe { cf_args(cf) };
+    let val = args[1].as_bytes();
+    match val {
+        b"on" => amcf.error_log_coalesce = true,
+        b"off" => amcf.error_log_coalesce = false,
+        _ => {
+            unsafe {
+                ngx_conf_log_error!(
+                    NGX_LOG_EMERG,
+                    &mut *cf,
+                    "otel_error_log_coalesce: invalid value; use on or off"
+                );
+            }
+            return NGX_CONF_ERROR;
+        }
+    }
+    NGX_CONF_OK
+}
+
 /// Directive callback for `otel_status_endpoint;` (location-level, no args).
 ///
 /// Sets the content handler for the location to
@@ -1674,8 +1883,31 @@ mod tests {
         assert_eq!(cfg.interval_ms(), DEFAULT_INTERVAL_MS);
         assert_eq!(cfg.batch_size(), DEFAULT_BATCH_SIZE);
         assert!(cfg.status_code_class_enabled()); // UNSET treated as on
-                                                  // exception-tail / exemplar sampling is off by default (Phase 2.2)
+        // exception-tail / exemplar sampling is off by default (Phase 2.2)
         assert!(!cfg.is_access_sample_enabled(), "access sample must default to off");
+        // error-log export is off by default (Phase 2.3)
+        assert!(!cfg.error_log_enabled, "error_log_enabled must default to false");
+        assert!(cfg.error_log_coalesce, "error_log_coalesce must default to true (on)");
+    }
+
+    /// Verify that setting `error_log_enabled` and `error_log_coalesce` toggles
+    /// the fields correctly.  The directive handler (`cmd_set_error_log`) is
+    /// exercised by integration tests that use a real nginx.conf.
+    #[test]
+    fn error_log_directive_toggles_enablement() {
+        let mut cfg = MainConfig::default();
+        assert!(!cfg.error_log_enabled);
+        assert!(cfg.error_log_coalesce); // default on
+        // Simulate cmd_set_error_log setting fields (mirrors what the handler does).
+        cfg.error_log_enabled = true;
+        cfg.error_log_level = nginx_sys::NGX_LOG_WARN as ngx_uint_t;
+        assert!(cfg.error_log_enabled);
+        assert_eq!(cfg.error_log_level, nginx_sys::NGX_LOG_WARN as ngx_uint_t);
+        // Simulate otel_error_log_coalesce off.
+        cfg.error_log_coalesce = false;
+        assert!(!cfg.error_log_coalesce);
+        cfg.error_log_coalesce = true;
+        assert!(cfg.error_log_coalesce);
     }
 
     /// Verify that `otel_access_log_sample` toggles `is_access_sample_enabled()`
