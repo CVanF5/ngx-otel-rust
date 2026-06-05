@@ -653,3 +653,21 @@ early-exit/length-prefilter; it is a pessimistic ceiling.
 - **Realistic cost is far lower**: the exception tail is thin by design (only errors / >1 s
   latency are "interesting"), so production cost scales by the interesting fraction — e.g. ~5%
   interesting ≈ ~0.2% throughput, with the p99 hit applying only to the sampled subset.
+
+## Phase 2.2 + 2.3 Zero-cost logs bench — 2026-06-05
+
+> ⚠️ **DEV-BOX SMOKE ONLY** — these numbers are INFORMATIONAL.
+> The ±1% zero-cost gate and the 'enabled path is cheaper' proof
+> run **only on host-1** (the dedicated c7a EPYC), N≥50.
+> See RALPH_PHASE_2_2.md Step 2.2.6 and RALPH_PHASE_2_3.md Step 2.3.8.
+
+| Config | Median (req/s) | p95 (req/s) | Regression vs BL |
+|--------|---------------|-------------|-----------------|
+| BL (sample OFF, histogram always-on) | 59566.38 | 59566.38 | — |
+| TA (otel_access_log_sample 16) | 59500.22 | 59500.22 | 0.1% |
+| TB (otel_access_log_sample 16, high RPS) | 59015.16 | 59015.16 | 0.9% (informational) |
+| TC (otel_error_log warn, no errors — idle writer) | 59399.33 | 59399.33 | 0.3% |
+| TD (otel_error_log warn, flood → 502 — active writer) | 32354.70 | 32354.70 | 45.7% (informational) |
+
+Host: C6CQ3045N2; nginx: tests/bench/zero_cost_logs.sh: line 243: "/Users/c.vandesande/project-nginx-otel/ngx-otel-rust/objs-release/nginx": No such file or directory
+INFORMATIONAL — ±1% gate requires N≥50 on isolated hardware (host-1 / c7a EPYC).

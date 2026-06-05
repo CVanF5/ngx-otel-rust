@@ -64,6 +64,7 @@ WRK_CONNECTIONS=100
 WRK_CONNECTIONS_TB=200   # Treatment B uses 2× connections
 WRK_DURATION=30
 WRK_URL="http://127.0.0.1:9102/"
+WRK_URL_TD="http://127.0.0.1:9103/flood"  # Treatment D: flood → 502s
 COOLDOWN_S=5
 NGINX_BIND_WAIT_S=2
 
@@ -116,9 +117,10 @@ LOGFILE="${RESULTS_DIR}/logs_bench_${TIMESTAMP}.txt"
 # ─── Run one config ───────────────────────────────────────────────────────────
 
 run_config() {
-    local label="$1"     # BL / TA / TB
+    local label="$1"     # BL / TA / TB / TC / TD
     local conf_file="$2" # absolute path to template
     local connections="$3"
+    local url="${4:-${WRK_URL}}"  # optional URL override (Treatment D uses /flood)
 
     section "Config ${label}: ${connections} connections"
 
@@ -153,7 +155,7 @@ run_config() {
     local rps_values=()
     for _ in $(seq 1 "${BENCH_ITERATIONS}"); do
         local raw; raw=$(wrk -t "${WRK_THREADS}" -c "${connections}" \
-            -d "${WRK_DURATION}" "${WRK_URL}" 2>&1)
+            -d "${WRK_DURATION}" "${url}" 2>&1 || true)  # || true: wrk exits non-zero on 5xx (TD)
         local rps; rps=$(echo "${raw}" | grep "Requests/sec:" | awk '{print $2}')
         rps_values+=("${rps}")
         echo -e "  ${CYAN}${label}${NC}: ${rps} req/s"
@@ -188,47 +190,62 @@ run_config() {
 run_config "BL" "${SCRIPT_DIR}/nginx_logs_bl.conf" "${WRK_CONNECTIONS}"
 run_config "TA" "${SCRIPT_DIR}/nginx_logs_ta.conf" "${WRK_CONNECTIONS}"
 run_config "TB" "${SCRIPT_DIR}/nginx_logs_tb.conf" "${WRK_CONNECTIONS_TB}"
+# Phase 2.3 error-log treatments:
+# TC: otel_error_log on, no errors → idle writer (zero-cost claim for error path)
+# TD: otel_error_log on, /flood → every request generates proxy error (flood cost)
+run_config "TC" "${SCRIPT_DIR}/nginx_logs_tc.conf" "${WRK_CONNECTIONS}"
+run_config "TD" "${SCRIPT_DIR}/nginx_logs_td.conf" "${WRK_CONNECTIONS}" "${WRK_URL_TD}"
 
 # ─── Analysis ─────────────────────────────────────────────────────────────────
 
 section "Results"
-echo "BL (Baseline, access_log OFF): median ${MEDIAN_BL} req/s, p95 ${P95_BL} req/s"
-echo "TA (access_log ON, normal RPS): median ${MEDIAN_TA} req/s, p95 ${P95_TA} req/s"
-echo "TB (access_log ON, high RPS):   median ${MEDIAN_TB} req/s, p95 ${P95_TB} req/s"
+echo "BL (Baseline, access_log OFF):            median ${MEDIAN_BL} req/s, p95 ${P95_BL} req/s"
+echo "TA (access_log ON, normal RPS):            median ${MEDIAN_TA} req/s, p95 ${P95_TA} req/s"
+echo "TB (access_log ON, high RPS):              median ${MEDIAN_TB} req/s, p95 ${P95_TB} req/s"
+echo "TC (error_log ON, no errors — idle):       median ${MEDIAN_TC} req/s, p95 ${P95_TC} req/s"
+echo "TD (error_log ON, flood errors — active):  median ${MEDIAN_TD} req/s, p95 ${P95_TD} req/s"
 
 # Compute regression: (BL - TA) / BL * 100
 BL_F=$(echo "${MEDIAN_BL}" | tr -d ',')
 TA_F=$(echo "${MEDIAN_TA}" | tr -d ',')
 TB_F=$(echo "${MEDIAN_TB}" | tr -d ',')
+TC_F=$(echo "${MEDIAN_TC}" | tr -d ',')
+TD_F=$(echo "${MEDIAN_TD}" | tr -d ',')
 
 REG_TA=$(awk "BEGIN { printf \"%.1f\", (${BL_F} - ${TA_F}) / ${BL_F} * 100 }" 2>/dev/null || echo "N/A")
 REG_TB=$(awk "BEGIN { printf \"%.1f\", (${BL_F} - ${TB_F}) / ${BL_F} * 100 }" 2>/dev/null || echo "N/A")
+REG_TC=$(awk "BEGIN { printf \"%.1f\", (${BL_F} - ${TC_F}) / ${BL_F} * 100 }" 2>/dev/null || echo "N/A")
+REG_TD=$(awk "BEGIN { printf \"%.1f\", (${BL_F} - ${TD_F}) / ${BL_F} * 100 }" 2>/dev/null || echo "N/A")
 
 echo "BL vs TA regression: ${REG_TA}%"
 echo "BL vs TB regression: ${REG_TB}% (informational)"
+echo "BL vs TC regression: ${REG_TC}% (error_log idle — zero-cost claim)"
+echo "BL vs TD regression: ${REG_TD}% (error_log flood — active path, informational)"
 
 # Append summary to RESULTS.md
 {
     echo ""
-    echo "## Phase 2.2 Zero-cost logs bench — $(date +%Y-%m-%d)"
+    echo "## Phase 2.2 + 2.3 Zero-cost logs bench — $(date +%Y-%m-%d)"
     echo ""
     echo "> ⚠️ **DEV-BOX SMOKE ONLY** — these numbers are INFORMATIONAL."
     echo "> The ±1% zero-cost gate and the 'enabled path is cheaper' proof"
     echo "> run **only on host-1** (the dedicated c7a EPYC), N≥50."
-    echo "> See RALPH_PHASE_2_2.md Step 2.2.6."
+    echo "> See RALPH_PHASE_2_2.md Step 2.2.6 and RALPH_PHASE_2_3.md Step 2.3.8."
     echo ""
     echo "| Config | Median (req/s) | p95 (req/s) | Regression vs BL |"
     echo "|--------|---------------|-------------|-----------------|"
     echo "| BL (sample OFF, histogram always-on) | ${MEDIAN_BL} | ${P95_BL} | — |"
     echo "| TA (otel_access_log_sample 16) | ${MEDIAN_TA} | ${P95_TA} | ${REG_TA}% |"
     echo "| TB (otel_access_log_sample 16, high RPS) | ${MEDIAN_TB} | ${P95_TB} | ${REG_TB}% (informational) |"
+    echo "| TC (otel_error_log warn, no errors — idle writer) | ${MEDIAN_TC} | ${P95_TC} | ${REG_TC}% |"
+    echo "| TD (otel_error_log warn, flood → 502 — active writer) | ${MEDIAN_TD} | ${P95_TD} | ${REG_TD}% (informational) |"
     echo ""
     echo "Host: $(hostname); nginx: $(\"${NGINX_BINARY}\" -v 2>&1 | head -1)"
     echo "INFORMATIONAL — ±1% gate requires N≥50 on isolated hardware (host-1 / c7a EPYC)."
 } >> "${SCRIPT_DIR}/RESULTS.md"
 
 section "Gate checks (INFORMATIONAL on dev hardware)"
-# Gate: BL vs TA regression < 2% is the critical zero-cost claim.
+# Gate: BL vs TA regression < 2% is the critical zero-cost claim (access-log path).
 REG_TA_INT=$(echo "${REG_TA}" | awk '{printf "%d", int($1 + 0.5)}')
 if (( REG_TA_INT < 5 )); then
     pass "BL vs TA regression = ${REG_TA}% (< 5%) — no structural regression"
@@ -236,6 +253,17 @@ elif (( REG_TA_INT < 20 )); then
     info "BL vs TA regression = ${REG_TA}% — within informational range; verify on isolated hardware"
 else
     fail "BL vs TA regression = ${REG_TA}% (>= 20%) — POSSIBLE STRUCTURAL REGRESSION — STOP-AND-ASK"
+fi
+
+# Gate: BL vs TC regression < 5% is the idle-writer zero-cost claim (error-log path).
+# The writer is wired but the process-role guard returns immediately (no errors generated).
+REG_TC_INT=$(echo "${REG_TC}" | awk '{printf "%d", int($1 + 0.5)}')
+if (( REG_TC_INT < 5 )); then
+    pass "BL vs TC regression = ${REG_TC}% (< 5%) — error-log idle-writer no structural regression"
+elif (( REG_TC_INT < 20 )); then
+    info "BL vs TC regression = ${REG_TC}% — within informational range; verify on isolated hardware"
+else
+    fail "BL vs TC regression = ${REG_TC}% (>= 20%) — POSSIBLE STRUCTURAL REGRESSION — STOP-AND-ASK"
 fi
 
 echo ""
