@@ -1,0 +1,141 @@
+TSAN Results — Phase 2.3 §6.6.2 error-log path
+================================================
+Date:         2026-06-05
+Host:         debian-vm (Debian arm64 VM, aarch64)
+TSAN options: halt_on_error=1:second_deadlock_stack=1:detect_deadlocks=1
+Toolchain:    rustc 1.95.0 (stable), clang (TSAN instrumented nginx)
+Trigger:      make tsan-test  (build/tsan-run.sh inside Docker build/Dockerfile.tsan)
+
+Build
+─────
+Step 1 — Compile sanity check (make build BUILD=tsan):
+  NGINX_BUILD_DIR=objs-tsan, TSAN flags accepted by clang + rustc: OK
+
+Step 2 — Plain TSAN nginx (no --add-module):
+  objs-tsan-plain/nginx built successfully: OK
+
+Step 2.5 — bidi_echo_server example (no TSAN):
+  target/debug/examples/bidi_echo_server built without TSAN: OK
+
+Step 3 — TSAN env exported:
+  RUSTFLAGS=-Cforce-frame-pointers=yes -Zsanitizer=thread -Zexternal-clangrt
+  CARGO_BUILD_TARGET=aarch64-unknown-linux-gnu
+  CARGO_UNSTABLE_BUILD_STD=std,panic_abort
+
+Integration Tests (Step 4)
+───────────────────────────
+
+run_grpc_smoke.sh
+  [PASS] error.log: exactly 1 'grpc smoke: firing one unary' line (Worker 0 only)
+  [PASS] error.log: exactly 1 'grpc smoke: export complete' line (Ok(()) reached)
+  [PASS] error.log: zero 'grpc smoke: export failed' lines
+  [PASS] error.log: no panic / SIGSEGV / SIGABRT / unexpected worker exit signals
+  [PASS] metrics.json delta contains service.name = ngx-otel-grpc-smoke
+  [PASS] All assertions passed. Phase 1.2 Item 1 in-worker gRPC smoke COMPLETE.
+
+run_grpc_bidi_smoke.sh
+  [PASS] error.log: exactly 1 'grpc smoke: firing one unary' line
+  [PASS] error.log: exactly 1 'grpc smoke: export complete' line
+  [PASS] error.log: zero 'grpc smoke: export failed' lines
+  [PASS] error.log: no panic / SIGSEGV / SIGABRT / unexpected worker exit signals
+  [PASS] metrics.json delta contains service.name = ngx-otel-grpc-smoke
+  [PASS] error.log: exactly 1 'bidi smoke: firing one bidi stream' line
+  [PASS] error.log: exactly 1 'bidi smoke: bidi complete (sent=10, received=10)' line
+  [PASS] error.log: zero 'bidi smoke: bidi failed' lines
+  [PASS] All 8 assertions passed. Phase 1.2 Item 2 bidi gRPC smoke COMPLETE.
+
+run_grpc_export.sh
+  [PASS] error.log: export loop started with protocol=otlp_grpc
+  [PASS] metrics.json delta contains service.name = ngx-otel-grpc-export-integration
+  [PASS] metrics.json delta contains http.server.request.duration
+  [PASS] error.log: exactly 1 'export loop started' line
+  [PASS] graceful drain integrity: 1 start(s), 1 complete(s)
+  [PASS] error.log: no panics / crashes
+  [PASS] All assertions passed. Production gRPC export E2E test COMPLETE.
+
+run_access_log.sh  (Phase 2.2 §6.6.1 rebalanced path)
+  [PASS] metrics.json: service.name = ngx-otel-access-log-test present
+  [PASS] metrics.json: http.server.request.duration present
+  [PASS] metrics.json: http.server.request.duration is exponentialHistogram (DP-F)
+  [PASS] metrics.json: http.route dimension present (DP-E)
+  [PASS] metrics.json: nginx.upstream.zone dimension present (DP-E, FU4)
+  [PASS] metrics.json: >= 2 distinct http.route data points (different locations)
+  [PASS] metrics.json: '(other)' route bucket present (regex/unregistered, DP-E)
+  [PASS] logs.json: 200 flood blocked, interesting requests produced tail records (count=9)
+  [PASS] logs.json: at least 1 tail LogRecord present from error requests (got 9)
+  [PASS] logs.json: http.request.method attribute present
+  [PASS] logs.json: http.response.status_code attribute present
+  [PASS] logs.json: client.address attribute present
+  [PASS] logs.json: severity_number = 9 (INFO) present
+  [PASS] logs.json: event_name = http.access present
+  [PASS] metrics.json: trace_id 4bf92f3577b34da6a3ce929d0e0e4736 carried in exemplar (FU4a)
+  [PASS] logs.json: trace_id 4bf92f3577b34da6a3ce929d0e0e4736 on tail LogRecord (FU4a)
+  [PASS] logs.json: url.path attribute present on tail records (FU4b)
+  [PASS] All assertions passed.
+
+run_error_log.sh  (Phase 2.3 §6.6.2 error-log path)
+  Stage A (coalesce-on, floor=warn, 100 flood):
+    [PASS] Stage A: new logs.json content arrived
+    [PASS] Stage A: event_name=nginx.error present
+    [PASS] Stage A: body contains 'connect() failed'
+    [PASS] Stage A: body contains 'upstream:' context (nginx appended it)
+    [INFO] Stage A: nginx.error record count = 5  (for 100 flood events)
+    [PASS] Stage A: flood coalesced — 5 nginx.error records for 100 events (< 50)
+    [PASS] Stage A: nginx.error.coalesced_count attribute present (coalescing in effect)
+    [PASS] Stage A: no non-zero traceId on error records (decision #6 OK)
+    [PASS] Stage A: no http.route attribute on error records (decision #6 OK)
+    [PASS] Stage A: no nginx.upstream.zone attribute on error records (decision #6 OK)
+    [PASS] Stage A: ngx_otel.error_log.events metric present
+    [PASS] Stage A: severity_class attribute present on error_log.events metric
+    [PASS] Stage A: no DEBUG-severity nginx.error records (floor=warn in effect)
+    [PASS] Stage A: service.name=ngx-otel-error-log-test present (no metrics regression)
+  Stage B (coalesce-off, 20 flood):
+    [PASS] Stage B: new logs.json content arrived (coalesce-off)
+    [INFO] Stage B: nginx.error record count = 20 for 20 events
+    [PASS] Stage B: coalesce-off produced 20 records (> 1, not collapsed)
+    [PASS] Stage B: no coalesced_count in coalesce-off mode (expected)
+    [PASS] Stage B: ngx_otel.error_log.events metric present (coalesce-off)
+    [PASS] Stage B: body contains 'connect() failed' (coalesce-off verbatim)
+  Stage C (floor=crit, 10 flood):
+    [INFO] Stage C: nginx.error record count = 0
+    [PASS] Stage C: 'connect() failed' blocked by crit floor (floor filtering OK)
+  Stage D (DP-C guard):
+    [PASS] Stage D: config-load error present in core error.log
+    [PASS] Stage D: no new LOGS_LOG content during config-load test (DP-C guard working)
+  [PASS] All Phase 2.3 error-log assertions passed.
+
+run_signal_storm.sh  (Phase 2.3 re-entrancy gate — 30s flood + SIGUSR1/1s)
+  [PASS] nginx exited gracefully after signal storm
+  [PASS] No Rust panics in error.log
+  [PASS] No SIGABRT (signal 6) in error.log
+  [PASS] No SIGSEGV (signal 11) in error.log
+  [PASS] No ThreadSanitizer warnings in error.log
+  [PASS] Drain progressed — LOGS_LOG grew by 199727 bytes during storm
+  [PASS] All LOGS_LOG records are valid JSON (no torn records)
+  [INFO] nginx.error records in LOGS_LOG during storm: 352
+  [PASS] nginx.error records arrived during storm (coalescer active under signals)
+  [PASS] All signal-storm re-entrancy assertions passed.
+
+Step 5 — Belt-and-suspenders ThreadSanitizer warning scan
+──────────────────────────────────────────────────────────
+Scanned logs:
+  /tmp/ngx-otel-grpc-smoke.*/logs/error.log
+  /tmp/ngx-otel-grpc-bidi-smoke.*/logs/error.log
+  /tmp/ngx-otel-grpc-export.*/logs/error.log
+  /tmp/ngx-otel-access-log.*/logs/error.log
+  /tmp/ngx-otel-error-log.*/logs/error.log
+  /tmp/ngx-otel-signal-storm.*/logs/error.log
+
+Zero ThreadSanitizer warnings.  TSAN gate: PASS.
+
+Summary
+───────
+All integration tests passed under TSAN with halt_on_error=1.
+No data races detected on any Phase 1, 2.1, 2.2, or 2.3 shared-state paths:
+  - ExpHistogramSlot::record() (Relaxed fetch_add, exp-histogram buckets)
+  - ExemplarReservoir::write() (Relaxed stores on exemplar fields)
+  - SPSC logs ring writes (access tail records)
+  - CoalesceSlot::count.fetch_add / .swap(0, AcqRel)
+  - WorkerSlots::error_rate_counters[].fetch_add
+  - SPSC error ring push (verbatim error samples)
+  - busy-flag AcqRel swap under SIGUSR1 signal delivery (re-entrancy gate)
