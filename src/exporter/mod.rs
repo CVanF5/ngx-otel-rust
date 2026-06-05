@@ -43,12 +43,9 @@ pub(crate) static IS_OTEL_EXPORTER: AtomicBool = AtomicBool::new(false);
 /// distinction is tracked via the process-local `IS_OTEL_EXPORTER` flag.
 ///
 /// See `PHASE_1_3_RESEARCH.md` §3.5 for the design rationale.
-// Retained as a placeholder: this structured process-identity API (incl. the
-// `Exporter` variant) is intended to replace the raw `IS_OTEL_EXPORTER` flag
-// checks and to drive Phase 2 master-log gating (PHASE_2_RESEARCH.md §4). Not
-// yet wired to a caller — allow dead_code until adopted.
+// Phase 2.3.5: first live caller is `wire_error_writer_state` (init_process
+// process-role guard, DP-C). The allow(dead_code) annotations are dropped here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum NgxProcess {
     Single,
     Master,
@@ -65,7 +62,6 @@ pub(crate) enum NgxProcess {
 /// case, the process-local `IS_OTEL_EXPORTER` flag. This is a cold-path
 /// helper — it is only called from gating predicates, never from the
 /// request hot path.
-#[allow(dead_code)] // Phase 2 placeholder — see NgxProcess above.
 pub(crate) fn ngx_process() -> NgxProcess {
     let p = unsafe { nginx_sys::ngx_process } as u32;
     match p {

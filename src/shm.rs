@@ -852,6 +852,23 @@ pub unsafe fn logs_error_ring(base_addr: *mut u8, worker_id: usize, cap: usize) 
     unsafe { LogsWorkerRing::from_shm_ptr(base_addr.add(error_off)) }
 }
 
+/// Return the raw `*mut u8` of the **error** ring for `worker_id`.
+///
+/// Unlike [`logs_error_ring`] this returns the raw pointer suitable for stashing in
+/// `OtelErrorWriterState::error_ring_ptr`.  The writer reconstructs a
+/// [`LogsWorkerRing`] view via `LogsWorkerRing::from_shm_ptr` on each hot-path call.
+///
+/// Called by `init_process` (Step 2.3.5) once per worker after the logs zone is mapped.
+///
+/// # Safety
+/// Same as [`logs_error_ring`].
+#[inline]
+pub unsafe fn logs_error_ring_ptr(base_addr: *mut u8, worker_id: usize, cap: usize) -> *mut u8 {
+    let slot_off = worker_id * logs_slot_size(cap);
+    let error_off = slot_off + ring_size_bytes(cap);
+    unsafe { base_addr.add(error_off) }
+}
+
 /// Obtain a raw pointer to the **coalescer table** for `worker_id` in the logs shm zone.
 ///
 /// The coalescer table occupies the last `coalesce_table_bytes()` bytes of the slot,
@@ -867,7 +884,6 @@ pub unsafe fn logs_error_ring(base_addr: *mut u8, worker_id: usize, cap: usize) 
 /// - `base_addr` must point past the slab-pool header (`shm.addr + data_offset()`).
 /// - `worker_id < n_workers` and `cap` must match the zone registration.
 /// - The returned pointer must not outlive the zone mapping.
-#[allow(dead_code)]
 #[inline]
 pub unsafe fn logs_coalesce_table(
     base_addr: *mut u8,

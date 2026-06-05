@@ -131,9 +131,9 @@ unsafe impl Sync for OtelErrorWriterState {}
 /// 1. Cleanup flag — drop if cycle is tearing down.
 /// 2. Busy flag — drop re-entrant / concurrent calls.
 /// 3. Severity floor — drop if `level > level_floor`.
-/// 4. (Step 2.3.5) Process-role guard (DP-C).
-/// 5. (Step 2.3.2) Coalescer / verbatim push.
-/// 6. (Step 2.3.4) Error-rate metric bump.
+/// 4. Process-role guard (DP-C, Step 2.3.5): Worker + logs shm mapped.
+/// 4a. Error-rate metric bump (DP-B, Step 2.3.4): every floor-passing event.
+/// 5. Coalescer / verbatim push (Step 2.3.2 + 2.3.3).
 ///
 /// # Safety
 /// `log` must be a non-null pointer to an `ngx_log_t` whose `wdata` is a
@@ -164,10 +164,24 @@ pub unsafe extern "C" fn ngx_otel_error_writer(
         return;
     }
 
-    // 4. TODO Step 2.3.5 (DP-C): process-role guard —
-    //    `exporter::ngx_process() == NgxProcess::Worker(_)` AND
-    //    logs_zone is mapped (non-null). Return early for master/exporter/
-    //    config-load contexts (structural fall-through to core error_log).
+    // 4. Process-role guard (DP-C, Step 2.3.5).
+    //    The writer fires in EVERY nginx context (master, config-load, workers,
+    //    exporter helper) because the chain node is inserted before fork.  Only
+    //    worker processes have the logs shm mapped AND should touch the ring/coalescer.
+    //    For all other contexts we return here; the core file node handles the write.
+    //
+    //    Predicate: Worker(_) AND logs_zone mapped (non-null).
+    //    The exporter is NGX_PROCESS_HELPER + IS_OTEL_EXPORTER — NOT Worker — so it
+    //    is excluded even though it also maps the logs shm.  A shm-presence check
+    //    alone would NOT exclude it.
+    if !matches!(
+        crate::exporter::ngx_process(),
+        crate::exporter::NgxProcess::Worker(_)
+    ) || (*state).logs_zone.is_null()
+    {
+        (*state).busy.store(false, Ordering::Release);
+        return;
+    }
 
     // 4a. Companion error-rate metric bump (Step 2.3.4, DP-B).
     //     Fires for EVERY floor-passing event, independent of coalescing — counts
@@ -212,8 +226,6 @@ pub unsafe extern "C" fn ngx_otel_error_writer(
             }
         }
     }
-
-    // 6. TODO Step 2.3.4: companion error-rate metric bump (severity_class only).
 
     (*state).busy.store(false, Ordering::Release);
 }
@@ -302,6 +314,67 @@ pub unsafe fn set_cleanup_flag(cycle: *const nginx_sys::ngx_cycle_t) {
             if !state.is_null() {
                 // Release: pair with the Acquire load at the top of ngx_otel_error_writer.
                 (*state).cleanup.store(true, Ordering::Release);
+            }
+        }
+        log_ptr = log.next;
+    }
+}
+
+// ── Init-process wiring (Step 2.3.5) ─────────────────────────────────────────
+
+/// Walk `cycle->new_log` and populate `OtelErrorWriterState` with the three
+/// pre-computed shm pointers: coalescer table, error ring, and error-rate counter base,
+/// plus the runtime `coalesce_enabled` flag.
+///
+/// Called from `ngx_otel_init_process` in `lib.rs` after verifying the process
+/// is a `Worker` and the logs shm zone is mapped.  The pointers are null until
+/// this call; the writer silently skips the affected code paths while they remain null
+/// (belt-and-suspenders for the process-role guard which also gates those paths).
+///
+/// # Pointer meanings
+/// - `logs_zone`: the `ngx_shm_zone_t *` for the logs shm; stored so the
+///   process-role guard can confirm the zone is live.
+/// - `coalesce_table`: `*mut CoalesceSlot` for this worker's 1024-entry table.
+/// - `error_ring_ptr`: `*mut u8` pointing to the error ring header for this worker.
+/// - `error_rate_ptr`: `*mut AtomicU64` = `&WorkerSlots::error_rate_counters[0]`
+///   for this worker in the metrics shm zone.
+/// - `coalesce_enabled`: mirrors `MainConfig::error_log_coalesce`.
+///
+/// # Safety
+/// - `cycle` must be a valid, non-null pointer to the current nginx cycle.
+/// - All pointer arguments must be valid for the lifetime of the worker process.
+/// - Must be called at most once per worker per cycle (nginx init_process contract).
+pub unsafe fn wire_error_writer_state(
+    cycle: *const nginx_sys::ngx_cycle_t,
+    logs_zone: *mut nginx_sys::ngx_shm_zone_t,
+    coalesce_table: *mut crate::logs::coalesce::CoalesceSlot,
+    error_ring_ptr: *mut u8,
+    error_rate_ptr: *mut core::sync::atomic::AtomicU64,
+    coalesce_enabled: bool,
+) {
+    if cycle.is_null() {
+        return;
+    }
+    let our_writer: unsafe extern "C" fn(
+        *mut nginx_sys::ngx_log_t,
+        ngx_uint_t,
+        *mut nginx_sys::u_char,
+        usize,
+    ) = ngx_otel_error_writer;
+    let our_writer_addr = our_writer as usize;
+
+    let mut log_ptr: *mut nginx_sys::ngx_log_t =
+        core::ptr::addr_of!((*cycle).new_log) as *mut _;
+    while !log_ptr.is_null() {
+        let log = &*log_ptr;
+        if log.writer.map(|f| f as usize) == Some(our_writer_addr) {
+            let state = log.wdata as *mut OtelErrorWriterState;
+            if !state.is_null() {
+                (*state).logs_zone = logs_zone;
+                (*state).coalesce_table = coalesce_table;
+                (*state).error_ring_ptr = error_ring_ptr;
+                (*state).error_rate_ptr = error_rate_ptr;
+                (*state).coalesce_enabled = coalesce_enabled;
             }
         }
         log_ptr = log.next;
@@ -566,5 +639,48 @@ mod tests {
 
             assert!((*next2).next.is_null(), "chain must end after crit");
         }
+    }
+
+    /// Verify the process-role guard (DP-C) fires before the metric bump and
+    /// coalescer: when `logs_zone` is null (or ngx_process() returns non-Worker),
+    /// a floor-passing event must NOT touch `error_rate_ptr` or the coalescer.
+    ///
+    /// In unit tests `ngx_process()` always returns `Single` (the stub global is
+    /// `NGX_PROCESS_SINGLE`), so the guard fires on the first condition regardless
+    /// of `logs_zone`.  We still supply a real `AtomicU64` array so a spurious
+    /// bump would be visible.
+    #[test]
+    fn process_role_guard_does_not_reach_metric_or_coalescer() {
+        use crate::shm::N_SEVERITY_CLASSES;
+        // Allocate a real counter array — a bump would be visible.
+        let counters: std::vec::Vec<AtomicU64> = (0..N_SEVERITY_CLASSES)
+            .map(|_| AtomicU64::new(0))
+            .collect();
+        let counter_ptr = counters[0].as_ptr() as *mut AtomicU64;
+
+        let (state, mut log) = make_writer_state(nginx_sys::NGX_LOG_DEBUG as ngx_uint_t);
+        // Wire the real counter pointer into state (logs_zone stays null).
+        unsafe {
+            let s = log.wdata as *mut OtelErrorWriterState;
+            (*s).error_rate_ptr = counter_ptr;
+        }
+
+        let mut buf = *b"connect() failed";
+        unsafe {
+            ngx_otel_error_writer(
+                &mut log as *mut _,
+                nginx_sys::NGX_LOG_ERR as ngx_uint_t, // passes the debug floor
+                buf.as_mut_ptr(),
+                buf.len(),
+            );
+        }
+
+        // Guard fired (Single != Worker OR logs_zone == null) → no metric bump.
+        let total: u64 = counters.iter().map(|c| c.load(Ordering::SeqCst)).sum();
+        assert_eq!(total, 0, "metric must not be bumped when process-role guard fires");
+        // busy was released by the guard's early-return path.
+        assert!(!state.busy.load(Ordering::SeqCst), "busy must be released by guard");
+        // state pointer is used above — keep state alive via explicit drop.
+        drop(state);
     }
 }

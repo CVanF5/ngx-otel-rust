@@ -246,16 +246,59 @@ impl HttpModule for HttpOtelModule {
 /// The `#[cfg(any(test, feature = "test-support"))]` gRPC smoke harnesses
 /// remain on Worker 0 for the Phase 1.2 gRPC integration tests. They do
 /// not run in production builds (no allocation, no task spawn).
-extern "C" fn ngx_otel_init_process(_cycle: *mut ngx_cycle_t) -> ngx_int_t {
-    // Q3 RESOLVED: callback kept registered (not None) for Phase 2.
-    // Phase 1.3: the exporter owns the export task. Workers do
-    // nothing here. Phase 2 (logs) will populate this with
-    // per-worker LogProducer initialisation (one ring writer per
-    // worker).
+extern "C" fn ngx_otel_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
+    // ── Phase 2.3 Step 2.3.5: wire error-writer shm pointers (DP-C) ─────────
     //
-    // Existing #[cfg(test-support)] smoke harnesses still run on
-    // Worker(0) for the gRPC bidi tests. Their cfg-gating means
-    // production builds are completely empty here.
+    // Gate: Worker only + logs shm mapped.  Exporter and master contexts must
+    // fall through to core error_log; the process-role guard in
+    // ngx_otel_error_writer enforces this at call time; the null pointers here
+    // are the belt to that suspenders.
+    {
+        let cycle_ref = unsafe { &mut *cycle };
+        if let Some(amcf) = HttpOtelModule::main_conf(cycle_ref) {
+            if amcf.error_log_enabled {
+                // Process-role gate: Worker only (not master/exporter/config-load).
+                if matches!(
+                    crate::exporter::ngx_process(),
+                    crate::exporter::NgxProcess::Worker(_)
+                ) {
+                    let worker_id =
+                        unsafe { nginx_sys::ngx_worker as usize };
+                    let cap = amcf.log_ring_cap();
+
+                    if let Some(logs_base) = amcf.logs_shm_base() {
+                        let coalesce_table = unsafe {
+                            crate::shm::logs_coalesce_table(logs_base, worker_id, cap)
+                        };
+                        let error_ring_ptr = unsafe {
+                            crate::shm::logs_error_ring_ptr(logs_base, worker_id, cap)
+                        };
+
+                        // Error-rate counters live in the metrics shm (WorkerSlots).
+                        let error_rate_ptr = amcf.shm_base().and_then(|metrics_base| {
+                            let ws = unsafe {
+                                crate::shm::worker_slots(metrics_base, worker_id)
+                            };
+                            Some(unsafe {
+                                (*ws).error_rate_counters.as_ptr() as *mut core::sync::atomic::AtomicU64
+                            })
+                        });
+
+                        unsafe {
+                            crate::logs::error_writer::wire_error_writer_state(
+                                cycle as *const _,
+                                amcf.logs_shm_zone,
+                                coalesce_table,
+                                error_ring_ptr,
+                                error_rate_ptr.unwrap_or(core::ptr::null_mut()),
+                                amcf.error_log_coalesce,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // ── Phase 1.2 Item 1: in-worker gRPC viability harness ──────────────────
     //
@@ -268,7 +311,6 @@ extern "C" fn ngx_otel_init_process(_cycle: *mut ngx_cycle_t) -> ngx_int_t {
     // `tests/integration/run_grpc_smoke.sh` greps for the success line.
     #[cfg(any(test, feature = "test-support"))]
     {
-        let cycle = _cycle;
         let process_type = unsafe { nginx_sys::ngx_process } as u32;
         let worker_num = unsafe { nginx_sys::ngx_worker };
         let log = unsafe { (*cycle).log };
