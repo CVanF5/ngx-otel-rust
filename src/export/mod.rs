@@ -41,7 +41,7 @@ use core::task::{Context, Poll};
 use core::time::Duration;
 use std::collections::VecDeque;
 
-use nginx_sys::{NGX_LOG_ERR, NGX_LOG_NOTICE};
+use nginx_sys::{NGX_LOG_ERR, NGX_LOG_INFO, NGX_LOG_NOTICE};
 use pin_project_lite::pin_project;
 
 use crate::config::{MainConfig, MetricProtocol};
@@ -450,11 +450,19 @@ pub async fn export_loop(amcf: &'static MainConfig) {
         // Phase 1.3.2: unlike workers, the exporter is not subject to
         // ngx_event_no_timers_left, so cancelable timers fire reliably on quit.
         //
-        // Phase 2.1 (FU2): logs are drained on EVERY sub-interval wake
-        // (SHUTDOWN_POLL_INTERVAL, default 250 ms) to decouple log throughput
-        // from the metric aggregation interval.  This keeps rings from saturating
-        // under high RPS and improves delivery fraction.  Metrics continue to
+        // Logs are drained on EVERY sub-interval wake (SHUTDOWN_POLL_INTERVAL,
+        // default 250 ms), decoupled from the metric aggregation interval; metrics
         // aggregate and export only at the full otel_metric_interval boundary.
+        // Rationale (updated 2026-06-05): the original Phase 2.1 motive was draining a
+        // per-request log firehose before the ring saturated under high RPS. The §6.6
+        // summary+samples redesign collapsed that volume (the ring now carries only the
+        // thin exception tail + coalesced error samples), so the fast cadence now exists
+        // for: (a) timeliness — ship the high-value tail/error records promptly instead
+        // of holding them up to a full (possibly long) metric interval; (b) incident-burst
+        // resilience — a spike of 5xx-tail / novel / high-severity records is exactly when
+        // the bounded ring could fill and drop; (c) it protects the
+        // `otel_error_log_coalesce off` verbatim opt-out. Near-free: it piggybacks the
+        // shutdown poll the loop already wakes on, and an empty ring sends nothing.
         let interval = Duration::from_millis(amcf.interval_ms());
         let mut slept = Duration::ZERO;
         let mut shutdown_during_sleep = ShutdownKind::None;
@@ -527,7 +535,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                         match transport.send_logs(logs_bytes.clone()).await {
                             Ok(()) => {
                                 ngx::ngx_log_error!(
-                                    NGX_LOG_NOTICE,
+                                    NGX_LOG_INFO,
                                     log.as_ptr(),
                                     "otel export: sent {} log records to collector",
                                     n_logs
@@ -611,7 +619,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             match transport.send(bytes.clone()).await {
                 Ok(()) => {
                     ngx::ngx_log_error!(
-                        NGX_LOG_NOTICE,
+                        NGX_LOG_INFO,
                         log.as_ptr(),
                         "otel export: queued batch ({} pts) sent successfully",
                         n_pts
@@ -647,7 +655,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             match transport.send(bytes.clone()).await {
                 Ok(()) => {
                     ngx::ngx_log_error!(
-                        NGX_LOG_NOTICE,
+                        NGX_LOG_INFO,
                         log.as_ptr(),
                         "otel export: sent {} data points to collector",
                         n_pts
