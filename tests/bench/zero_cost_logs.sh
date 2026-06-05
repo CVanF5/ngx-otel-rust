@@ -244,24 +244,26 @@ echo "BL vs TD regression: ${REG_TD}% (error_log flood — active path, informat
     echo "INFORMATIONAL — ±1% gate requires N≥50 on isolated hardware (host-1 / c7a EPYC)."
 } >> "${SCRIPT_DIR}/RESULTS.md"
 
-section "Gate checks (INFORMATIONAL on dev hardware)"
-# Gate: BL vs TA regression < 2% is the critical zero-cost claim (access-log path).
+section "Structural-sentinel checks (dev box: functional smoke only — no timing verdicts)"
+#
+# On the dev box (macOS laptop / co-located VM) ±1% timing is invalid.
+# These checks are STRUCTURAL SENTINELS only:
+#   < 20%  → neutral smoke; real timing verdict deferred to host-1 (c7a EPYC)
+#   ≥ 20%  → hard fail: something is catastrophically broken (stop and investigate)
+#
+# No green [PASS] is emitted for any below-threshold result.
+# A green pass requires N≥50 on isolated hardware (host-1).
+
 REG_TA_INT=$(echo "${REG_TA}" | awk '{printf "%d", int($1 + 0.5)}')
-if (( REG_TA_INT < 5 )); then
-    pass "BL vs TA regression = ${REG_TA}% (< 5%) — no structural regression"
-elif (( REG_TA_INT < 20 )); then
-    info "BL vs TA regression = ${REG_TA}% — within informational range; verify on isolated hardware"
+if (( REG_TA_INT < 20 )); then
+    info "BL vs TA regression = ${REG_TA}% — functional smoke: output well-formed (timing verdict deferred to host-1)"
 else
     fail "BL vs TA regression = ${REG_TA}% (>= 20%) — POSSIBLE STRUCTURAL REGRESSION — STOP-AND-ASK"
 fi
 
-# Gate: BL vs TC regression < 5% is the idle-writer zero-cost claim (error-log path).
-# The writer is wired but the process-role guard returns immediately (no errors generated).
 REG_TC_INT=$(echo "${REG_TC}" | awk '{printf "%d", int($1 + 0.5)}')
-if (( REG_TC_INT < 5 )); then
-    pass "BL vs TC regression = ${REG_TC}% (< 5%) — error-log idle-writer no structural regression"
-elif (( REG_TC_INT < 20 )); then
-    info "BL vs TC regression = ${REG_TC}% — within informational range; verify on isolated hardware"
+if (( REG_TC_INT < 20 )); then
+    info "BL vs TC regression = ${REG_TC}% — functional smoke: output well-formed (timing verdict deferred to host-1)"
 else
     fail "BL vs TC regression = ${REG_TC}% (>= 20%) — POSSIBLE STRUCTURAL REGRESSION — STOP-AND-ASK"
 fi
@@ -271,9 +273,9 @@ info "Results appended to tests/bench/RESULTS.md"
 info "Raw data: ${LOGFILE}"
 
 if [[ "${FAILED}" -eq 0 ]]; then
-    pass "All gate checks passed."
+    info "Functional smoke complete — no structural regressions detected (timing verdict deferred to host-1 / c7a EPYC)."
     exit 0
 else
-    echo -e "${RED}[FAIL]${NC} One or more gate checks failed." >&2
+    echo -e "${RED}[FAIL]${NC} One or more structural-sentinel checks failed." >&2
     exit 2
 fi
