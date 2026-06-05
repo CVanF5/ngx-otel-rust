@@ -6,6 +6,13 @@ producer-side contract: metric names, instruments, units, temporality, and
 the attribute set the OTAP collector dictionary-encodes downstream
 (proposal §6.4, "Producer-side cardinality discipline").
 
+> **Currency.** Reflects the shipped module through **Phase 2.2** (access-log
+> rebalancing, June 2026): the request-duration histogram is now an OTel
+> **exponential histogram in microseconds**, the `fix3b` dimensions are **live**
+> (no longer "planned"), per-route / per-upstream series were added, and the
+> temporality mislabel is **fixed (Cumulative)**. The Phase 2.3 error-rate metric
+> is listed as *planned* at the end (not yet emitted).
+
 ## Provenance — read this first
 
 The metric **model** (which signals to collect from each request, and how
@@ -24,7 +31,7 @@ OpenTelemetry HTTP semantic conventions. Keep both lineages intact:
 - **Names / units → OTel semconv.** So the OTAP collector-side classifier
   recognises them and the cardinality stays bounded.
 
-> The duration defect fixed in `RALPH_METRICS_CORRECTNESS.md` was a *drift*
+> The duration defect fixed in the metrics-correctness loop was a *drift*
 > from the avr model: `LogPhaseHandler` reimplemented request duration as
 > `ngx_current_msec - r->start_msec` instead of avr's `get_request_time`.
 > This doc exists so that lineage is not lost again.
@@ -34,100 +41,85 @@ OpenTelemetry HTTP semantic conventions. Keep both lineages intact:
 | Field | Value | Source |
 |---|---|---|
 | Resource `service.name` | from `otel_service_name` directive | `src/config.rs` |
+| Resource `service.instance.id` | master pid by default (operator-overridable) | `src/export/mod.rs` |
 | Resource (extra) | from `otel_resource_attr` k/v pairs | `src/export/mod.rs` |
-| Instrumentation scope name | `ngx-otel-rust` | `src/export/mod.rs:691` |
-| Instrumentation scope version | crate version (`CARGO_PKG_VERSION`, currently `0.1.0`) | `src/export/mod.rs:692` |
+| Instrumentation scope name | `ngx-otel-rust` | `src/export/mod.rs` |
+| Instrumentation scope version | crate version (`CARGO_PKG_VERSION`) | `src/export/mod.rs` |
 
 ## Aggregation temporality
 
 All instrumented `http.*` metrics are aggregated per-worker in shared memory
 as cumulative running totals (workers bump; the exporter snapshots without
-resetting) and SHOULD be emitted **Cumulative** with a fixed
-`start_time_unix_nano`, matching the `nginx.*` counters. The avr reference
-aggregates into windowed time-slices (`trans_slice_bucket`); whether the
-OTLP wire temporality should be Cumulative or Delta-windowed is tracked in
-`RALPH_METRICS_CORRECTNESS.md` Sub-item 2.
+resetting) and are emitted **Cumulative** with a fixed
+`start_time_unix_nano`, matching the `nginx.*` counters.
 
-> **Status (2026-05-29):** the `http.*` metrics currently emit `Delta`
-> temporality with a zero `StartTimestamp` while carrying cumulative
-> values — a mislabel under fix in `RALPH_METRICS_CORRECTNESS.md`. The
-> tables below describe the *intended* model.
+> **Resolved (metrics-correctness loop).** An earlier build emitted `Delta`
+> temporality with a zero `StartTimestamp` while carrying cumulative values —
+> a mislabel. Fixed: every `http.*` data point now sets
+> `aggregation_temporality = Cumulative` (`src/encoder/mod.rs`,
+> `src/metric_source/instrumented.rs`).
 
 ---
 
-## HTTP server metrics
+## HTTP server request duration (exponential histogram, µs)
 
-Derived per request in `LogPhaseHandler` (`src/metric_source/instrumented.rs`).
-All are explicit-bucket **Histograms**.
+Derived per request in `LogPhaseHandler`
+(`src/metric_source/instrumented.rs`). Phase 2.2 (DP-F) switched the request
+duration from an explicit-bucket `ms` histogram to an **OTel exponential
+histogram recorded in microseconds**, for native sub-millisecond quantiles
+in the ~90–200µs operating regime. Source values come from avr's
+`get_request_time` idiom (`data_sources.c:10-13`), now in µs.
 
-### Metric: `http.server.request.duration`
+The duration is emitted as **three decomposed series** (not a cross-product —
+proposal §6.6.1): a base series carrying the bounded `{method × status-class ×
+protocol}` dimensions, plus independent per-route and per-upstream series.
+Each is its own `ExpHistogramSlot` table in `WorkerSlots` (`src/shm.rs`).
 
-Duration of HTTP server requests.
+| Metric | Instrument | Unit | Temporality | Attributes (data-point keys) |
+|---|---|---|---|---|
+| `http.server.request.duration` | ExponentialHistogram | `us` | Cumulative | `http.request.method`, `http.response.status_code`, `network.protocol.version` — **only when `otel_metric_status_code_class on`**; otherwise a single unattributed data point |
+| `http.server.request.duration.by_route` | ExponentialHistogram | `us` | Cumulative | `http.route` (matched `location` name) |
+| `http.server.request.duration.by_upstream` | ExponentialHistogram | `us` | Cumulative | `nginx.upstream.zone` (declared upstream `zone`) |
 
-| Name | Instrument | Unit (UCUM) | Temporality | Stability | avr-module source |
-|---|---|---|---|---|---|
-| `http.server.request.duration` | Histogram | `ms` | Cumulative | experimental | `request_duration` ← `get_request_time` (`data_sources.c:10-13,99`) |
+- The base series emits up to **160** data points (`N_HTTP_METHODS(8) ×
+  N_STATUS_CLASSES(5) × N_PROTO_VERSIONS(4)`); empty combos are skipped.
+  `http.response.status_code` carries the **status-class representative**
+  (100/200/300/400/500), not the raw code — class bucketing keeps the column
+  WithinU8 (proposal §6.4).
+- `by_route` / `by_upstream` are **always** emitted (independent of
+  `otel_metric_status_code_class`). Route names are the matched `location`
+  name (never the raw URI), bounded `ROUTE_CAP = 64` + an `"other"` slot;
+  upstream zones are bounded `UPSTREAM_CAP = 32` + `"other"` / no-upstream.
+- **Exemplars:** the base series attaches reservoir-sampled exemplars
+  (value + `trace_id`/`span_id` + `filtered_attributes`) per combo, populated
+  from the access-log sampling path (`otel_access_log_sample`).
 
-### Metric: `http.server.request.body.size`
+### Exponential histogram parameters (`src/shm.rs`)
 
-Size of the HTTP request message body.
+- **Scale:** `EXP_HISTOGRAM_SCALE = 3` → base = 2^(2^-3) ≈ 1.091 (8 buckets
+  per power-of-two µs). 90µs / 150µs / 200µs land in distinct buckets.
+- **Buckets:** `N_EXP_BUCKETS = 192`, `positive_offset = 0`, covering
+  ≈ [1µs, 2^24µs ≈ 16.7s); values above clamp to the last bucket; 0µs →
+  `zero_count`.
 
-| Name | Instrument | Unit (UCUM) | Temporality | Stability | avr-module source |
-|---|---|---|---|---|---|
-| `http.server.request.body.size` | Histogram | `By` | Cumulative | experimental | `bytes_in` (`data_sources.h:78`) |
+---
 
-### Metric: `http.server.response.body.size`
+## HTTP server size + upstream metrics (explicit-bucket histograms)
 
-Size of the HTTP response message body.
+These were **not** changed by Phase 2.2 — they remain explicit-bucket
+`Histogram<N>` (`src/shm.rs`), single unattributed data point each (no
+method/route/zone decomposition). Recorded in `LogPhaseHandler`; upstream
+metrics only when an upstream was used (from `ngx_http_upstream_state_t`).
 
-| Name | Instrument | Unit (UCUM) | Temporality | Stability | avr-module source |
-|---|---|---|---|---|---|
-| `http.server.response.body.size` | Histogram | `By` | Cumulative | experimental | `bytes_out` (`data_sources.h:79`) |
-
-## HTTP upstream metrics
-
-Recorded only when an upstream was used (`src/metric_source/instrumented.rs:101-115`),
-from `ngx_http_upstream_state_t`.
-
-### Metric: `http.server.upstream.response.duration`
-
-Time from establishing the upstream connection to the last response byte.
-
-| Name | Instrument | Unit (UCUM) | Temporality | Stability | avr-module source |
-|---|---|---|---|---|---|
-| `http.server.upstream.response.duration` | Histogram | `ms` | Cumulative | experimental | `uppstream_response_time` (`data_sources.h:88`) |
-
-### Metric: `http.server.upstream.header.duration`
-
-Time to first upstream response byte (TTFB).
-
-| Name | Instrument | Unit (UCUM) | Temporality | Stability | avr-module source |
-|---|---|---|---|---|---|
-| `http.server.upstream.header.duration` | Histogram | `ms` | Cumulative | experimental | `uppstream_header_time` (`data_sources.h:86`) |
-
-### Metric: `http.server.upstream.connect.duration`
-
-Time to establish the upstream connection.
-
-| Name | Instrument | Unit (UCUM) | Temporality | Stability | avr-module source |
-|---|---|---|---|---|---|
-| `http.server.upstream.connect.duration` | Histogram | `ms` | Cumulative | experimental | `uppstream_connect_time` (`data_sources.h:87`) |
-
-### Metric: `http.server.upstream.bytes.received`
-
-Bytes received from the upstream.
-
-| Name | Instrument | Unit (UCUM) | Temporality | Stability | avr-module source |
-|---|---|---|---|---|---|
-| `http.server.upstream.bytes.received` | Histogram | `By` | Cumulative | experimental | `uppstream_bytes_received` (`data_sources.h:83`) |
-
-### Metric: `http.server.upstream.bytes.sent`
-
-Bytes sent to the upstream.
-
-| Name | Instrument | Unit (UCUM) | Temporality | Stability | avr-module source |
-|---|---|---|---|---|---|
-| `http.server.upstream.bytes.sent` | Histogram | `By` | Cumulative | experimental | `uppstream_bytes_sent` (`data_sources.h:84`) |
+| Metric | Instrument | Unit | Temporality | avr-module source |
+|---|---|---|---|---|
+| `http.server.request.body.size` | Histogram (explicit) | `By` | Cumulative | `bytes_in` (`data_sources.h:78`) |
+| `http.server.response.body.size` | Histogram (explicit) | `By` | Cumulative | `bytes_out` (`data_sources.h:79`) |
+| `http.server.upstream.response.duration` | Histogram (explicit) | `ms` | Cumulative | `uppstream_response_time` (`data_sources.h:88`) |
+| `http.server.upstream.header.duration` | Histogram (explicit) | `ms` | Cumulative | `uppstream_header_time` (`data_sources.h:86`) |
+| `http.server.upstream.connect.duration` | Histogram (explicit) | `ms` | Cumulative | `uppstream_connect_time` (`data_sources.h:87`) |
+| `http.server.upstream.bytes.received` | Histogram (explicit) | `By` | Cumulative | `uppstream_bytes_received` (`data_sources.h:83`) |
+| `http.server.upstream.bytes.sent` | Histogram (explicit) | `By` | Cumulative | `uppstream_bytes_sent` (`data_sources.h:84`) |
 
 ## NGINX connection / request metrics
 
@@ -150,34 +142,56 @@ These are not part of the avr model; they come from nginx core
 
 ---
 
-## Attributes (planned — `fix3b` / proposal §6.4)
+## Attributes (implemented — `fix3b` shipped, Phase 2.1; route/zone, Phase 2.2)
 
-Data points are currently emitted with **no attributes**
-(`src/metric_source/instrumented.rs:192-224`, `fix3b` TODO). The avr model
-keys each transaction on the entity set below; the OTel port will attach
-the bounded, semconv-aligned subset as data-point attributes once the
-multi-dimensional histogram slots land. High-cardinality values stay
-opt-in (`otel_metric_high_cardinality_attr`) so the collector-side
-classifier can dictionary-encode at u8 key width.
+The duration series attach the bounded, semconv-aligned dimensions below.
+All are **WithinU8 cardinality** so the OTAP collector-side classifier can
+dictionary-encode each per-point column at u8 key width (proposal §6.4). The
+closed-cardinality enums live in `src/shm.rs` (`HttpMethod`, `StatusClass`,
+`ProtoVersion`).
 
-| Attribute | Type | Requirement level | avr-module source (entity / lookup) |
+| Attribute | On series | Cardinality | avr-module source |
 |---|---|---|---|
-| `http.request.method` | string (low-card) | Recommended | `method` → `avr_lookup_or_insert_method` (`output.c:144-148`) |
-| `http.response.status_code` | int (or 5 status classes) | Recommended | `rcode`/`status` (`output.c:129-131`) |
-| `network.protocol.version` | string (low-card) | Recommended | `http_version` (`output.c:132-134`) |
-| `server.address` / host | string | Opt-in | `fqdn` → `avr_lookup_or_insert_id` (`output.c:150-154`) |
-| `url.path` | string (high-card) | Opt-in | `url` → `avr_lookup_or_insert_url` (`output.c:138-142`) |
-| `user_agent.original` | string (high-card) | Opt-in | `uagent` → `avr_lookup_or_insert_uagent` (`output.c:156-160`) |
-| `client.address` | string (high-card) | Opt-in | `ip` → `avr_lookup_or_insert_ip` (`output.c:172-177`) |
+| `http.request.method` | base duration | 8 (`HttpMethod`, 7 + `_OTHER`) | `method` → `avr_lookup_or_insert_method` (`output.c:144-148`) |
+| `http.response.status_code` | base duration | 5 status classes (representative value) | `rcode`/`status` (`output.c:129-131`) |
+| `network.protocol.version` | base duration | 4 (`ProtoVersion`) | `http_version` (`output.c:132-134`) |
+| `http.route` | `…by_route` | ≤ 64 + `other` (location name) | matched `location` name (cf. C++ module `clcf->name`) |
+| `nginx.upstream.zone` | `…by_upstream` | ≤ 32 + `other`/none | declared upstream `zone` (NGINX Plus model) |
 
-## Histogram bucket boundaries
+> **High-cardinality detail is NOT a metric dimension.** `url.path`,
+> `user_agent.original`, and `client.address` were considered (avr keys on
+> them) but are deliberately kept **off** the metrics. As of Phase 2.2 they
+> ride on **access-log exemplars + the exception tail** (proposal §6.6.1),
+> reachable via the exemplar → trace drill-down, never as histogram
+> attributes (that would break the WithinU8 budget).
 
-`src/shm.rs:32-42`.
+## Histogram bucket boundaries (`src/shm.rs`)
 
-- **Duration (`ms`)** — 14 boundaries + overflow:
+- **Request duration** — exponential (see parameters above): scale 3, µs,
+  192 buckets, offset 0. **Not** the explicit `ms` boundaries below.
+- **Upstream durations (`ms`)** — explicit, `DURATION_BOUNDS_MS`, 14 + overflow:
   `5, 10, 25, 50, 75, 100, 250, 500, 750, 1000, 2500, 5000, 7500, 10000`
-- **Byte sizes (`By`)** — 6 boundaries + overflow:
+- **Byte sizes (`By`)** — explicit, `BYTES_BOUNDS`, 6 + overflow:
   `128, 512, 4096, 65536, 524288, 4194304`
+
+---
+
+## Planned — Phase 2.3 error-rate metric (not yet emitted)
+
+The error-log work (proposal §6.6.2) adds a **companion error-rate metric**
+alongside the coalesced `LogRecord`s. Per the ratified design
+(`PHASE_2_IMPLEMENTATION_PLAN.md` Step 2.3.4):
+
+| Metric | Instrument | Unit | Temporality | Attributes |
+|---|---|---|---|---|
+| error-rate counter (name TBD by the loop) | Counter (Sum, monotonic) | `{error}` | Cumulative | `severity_class` only |
+
+> **Scope boundary (decided 2026-06-05).** The error metric is keyed on
+> `severity_class` **only** — no `http.route` / `nginx.upstream.zone` and no
+> `trace_id`. The `ngx_log_writer_pt` seam hands the writer its own log node,
+> not the connection's `c->log`, so the request context is structurally
+> unreachable on the error path (the access path is unaffected). "Which
+> upstream/route" remains readable in the error sample's **body text**.
 
 ## avr-module signals not yet ported
 
@@ -191,7 +205,7 @@ candidates for future metrics, listed so they aren't forgotten:
 | `serverside_network_latency` | from `uppstream_connect_time` (`output.c:123`) |
 | `uppstream_status` | upstream response status code |
 | `uppstream_response_length` | upstream response content length |
-| `uppstream_addr` | upstream peer address (dimension) |
+| `uppstream_addr` | upstream peer address (high-card; sample/exemplar only) |
 | `is_ssl` | TLS yes/no (dimension) |
 
 ## References
@@ -199,7 +213,8 @@ candidates for future metrics, listed so they aren't forgotten:
 - [OpenTelemetry Semantic Conventions — HTTP metrics][semconv]
 - Reference model: `avr-module/src/ngx_http_avr_data_sources.{h,c}`,
   `ngx_http_avr_output.c`
-- Producer-side cardinality discipline: proposal §6.4
-- Open correctness items: `RALPH_METRICS_CORRECTNESS.md`
+- Producer-side cardinality discipline: proposal §6.4; logs-as-summary §6.6
+- Shared-memory layout + histograms: `src/shm.rs`
+- Emission + attributes: `src/metric_source/instrumented.rs`, `src/encoder/mod.rs`
 
 [semconv]: https://opentelemetry.io/docs/specs/semconv/http/http-metrics/
