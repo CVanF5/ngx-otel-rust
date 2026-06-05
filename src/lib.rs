@@ -468,12 +468,18 @@ fn run_grpc_smoke_harness<Fut>(
 /// Phase 2 (logs) will populate this with producer-side final flush —
 /// drain the worker's local log buffer into the shared ring before exit
 /// so the exporter picks up the tail records.
-unsafe extern "C" fn ngx_otel_exit_process(_cycle: *mut ngx_cycle_t) {
-    // Q3 RESOLVED: callback kept registered (not None) for Phase 2.
-    // Phase 1.3: the exporter's cycle owns the final drain.
-    // Phase 2 (logs) will populate this with producer-side final
-    // flush — drain the worker's local log buffer into the shared
-    // ring before exit so the exporter picks up the tail records.
+unsafe extern "C" fn ngx_otel_exit_process(cycle: *mut ngx_cycle_t) {
+    // Step 2.3.3: set the cleanup flag on our error-log writer node so that any
+    // late emissions after this point are dropped instead of touching the ring.
+    // The ring itself is in shm; the exporter drains it on its next tick.
+    //
+    // This mirrors `ngx_syslog_cleanup`: stop producer emissions before the
+    // cycle tears down the log chain.
+    if !cycle.is_null() {
+        unsafe {
+            crate::logs::error_writer::set_cleanup_flag(cycle as *const _);
+        }
+    }
 }
 
 // ── otel_status_endpoint content handler ─────────────────────────────────────

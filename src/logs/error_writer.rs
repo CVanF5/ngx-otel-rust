@@ -38,6 +38,19 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use nginx_sys::{ngx_shm_zone_t, ngx_uint_t};
 
 use crate::logs::coalesce::{self, CoalesceResult, CoalesceSlot};
+use crate::logs::ring::LogsWorkerRing;
+
+// ── Error-ring wire-format constants ─────────────────────────────────────────
+
+/// Kind byte for error-log ring records (0x01; access records use 0x00).
+pub const KIND_ERROR: u8 = 0x01;
+
+/// Maximum bytes of error-message body stored per ring record.
+///
+/// Nginx error messages are bounded in practice: the longest include client
+/// address, request line, and upstream address — well under 512 bytes.
+/// This cap prevents pathological messages from blowing out the ring.
+pub const MAX_ERROR_BODY_LEN: usize = 512;
 
 // ── OtelErrorWriterState ──────────────────────────────────────────────────────
 
@@ -76,6 +89,14 @@ pub struct OtelErrorWriterState {
     /// Mirrors `MainConfig::error_log_coalesce`.  Set by `init_process` (Step 2.3.5).
     /// Default zero/false means "no coalescing"; overridden before first error is emitted.
     pub coalesce_enabled: bool,
+    /// Pre-computed pointer to the start of the **error ring** header for this worker
+    /// (within the logs shm zone).  Set by `init_process` (Step 2.3.5) at the same time
+    /// as `coalesce_table`.  Null until then; writer silently skips the ring push.
+    ///
+    /// SAFETY invariant: non-null ⇒ the pointer is valid for
+    /// `ring_size_bytes(cap)` bytes in the logs shm zone and lives at least as
+    /// long as the worker process.
+    pub error_ring_ptr: *mut u8,
 }
 
 // SAFETY: OtelErrorWriterState lives in nginx-managed pool memory and is
@@ -156,9 +177,16 @@ pub unsafe extern "C" fn ngx_otel_error_writer(
                 (*state).busy.store(false, Ordering::Release);
                 return;
             }
-            CoalesceResult::EmitVerbatim => {
-                // TODO Step 2.3.3: push buf_slice to the error ring.
-                let _ = buf_slice; // suppress unused warning until 2.3.3
+            CoalesceResult::EmitVerbatim { template_hash } => {
+                // Push the verbatim sample to the error ring (Step 2.3.3).
+                // error_ring_ptr is null until init_process (Step 2.3.5) — skip silently.
+                let ring_ptr = (*state).error_ring_ptr;
+                if !ring_ptr.is_null() {
+                    // SAFETY: ngx_current_msec is a valid nginx global.
+                    // Convert ms → ns for the OTel timestamp.
+                    let ts_ns = nginx_sys::ngx_current_msec as u64 * 1_000_000;
+                    push_error_record(ring_ptr, ts_ns, level as u8, template_hash, buf_slice);
+                }
             }
         }
     }
@@ -166,6 +194,96 @@ pub unsafe extern "C" fn ngx_otel_error_writer(
     // 6. TODO Step 2.3.4: companion error-rate metric bump (severity_class only).
 
     (*state).busy.store(false, Ordering::Release);
+}
+
+// ── Error-ring record push ────────────────────────────────────────────────────
+
+/// Push one error-log record into the per-worker error ring.
+///
+/// # Wire format
+/// ```text
+/// [0]      kind      = KIND_ERROR (0x01)
+/// [1..9]   ts_ns     u64 big-endian  — ngx_current_msec * 1_000_000
+/// [9]      ngx_level u8              — nginx severity level (1=emerg … 8=debug)
+/// [10..18] template_hash u64 be     — 0 when untracked (high-sev / coalesce-off /
+///                                      table-full)
+/// [18..20] body_len  u16 big-endian — capped at MAX_ERROR_BODY_LEN
+/// [20..]   body bytes               — the verbatim formatted log line
+/// ```
+///
+/// The stack buffer is 532 bytes (20-byte header + 512-byte body cap).  The writer
+/// runs on the worker's main stack (≥ 8 MB); signal-handler callers go via the
+/// normal worker stack (nginx does not install a sigaltstack for worker processes),
+/// so 532 bytes is safe.
+///
+/// # Safety
+/// `ring_ptr` must be a valid pointer to an initialised [`LogsWorkerRingHeader`]
+/// in the logs shm zone, valid for the duration of this call.
+pub unsafe fn push_error_record(
+    ring_ptr: *mut u8,
+    ts_ns: u64,
+    ngx_level: u8,
+    template_hash: u64,
+    body: &[u8],
+) {
+    // SAFETY: ring_ptr points to an initialised LogsWorkerRingHeader in shm.
+    let ring = unsafe { LogsWorkerRing::from_shm_ptr(ring_ptr) };
+    let body_len = body.len().min(MAX_ERROR_BODY_LEN);
+
+    // Build the full wire record on the stack (no heap allocation).
+    const HDR: usize = 20; // 1 + 8 + 1 + 8 + 2
+    let mut record = [0u8; HDR + MAX_ERROR_BODY_LEN];
+    record[0] = KIND_ERROR;
+    record[1..9].copy_from_slice(&ts_ns.to_be_bytes());
+    record[9] = ngx_level;
+    record[10..18].copy_from_slice(&template_hash.to_be_bytes());
+    record[18..20].copy_from_slice(&(body_len as u16).to_be_bytes());
+    record[20..20 + body_len].copy_from_slice(&body[..body_len]);
+
+    // push() returns false on ring-full (accounted in the ring's drop counter).
+    ring.push(&record[..HDR + body_len]);
+}
+
+// ── Cleanup-flag wiring ───────────────────────────────────────────────────────
+
+/// Walk the `cycle->new_log` chain and set `cleanup = true` on every
+/// `OtelErrorWriterState` node (identified by `writer == ngx_otel_error_writer`).
+///
+/// Called from `ngx_otel_exit_process` (Step 2.3.3) to stop new emissions before
+/// the nginx cycle tears down its log infrastructure.  After this returns, any
+/// call to the writer exits immediately at the cleanup-flag check without touching
+/// the ring or the coalescer.
+///
+/// # Safety
+/// `cycle` must be a valid non-null pointer to the current nginx cycle.
+pub unsafe fn set_cleanup_flag(cycle: *const nginx_sys::ngx_cycle_t) {
+    if cycle.is_null() {
+        return;
+    }
+    // new_log is an *embedded* ngx_log_t (head of the chain).
+    // Take a raw pointer to it so we can walk the chain via ->next.
+    let mut log_ptr: *mut nginx_sys::ngx_log_t =
+        core::ptr::addr_of!((*cycle).new_log) as *mut _;
+
+    // Compare function pointers as usize to identify our writer node.
+    // Direct function-pointer equality triggers a compiler lint
+    // (unpredictable_function_pointer_comparisons); casting via a fn-pointer
+    // binding avoids the "direct cast of function item" lint too.
+    let our_writer: unsafe extern "C" fn(*mut nginx_sys::ngx_log_t, ngx_uint_t, *mut nginx_sys::u_char, usize) = ngx_otel_error_writer;
+    let our_writer_addr = our_writer as usize;
+
+    while !log_ptr.is_null() {
+        let log = &*log_ptr;
+        // Identify our node by the writer function-pointer address.
+        if log.writer.map(|f| f as usize) == Some(our_writer_addr) {
+            let state = log.wdata as *mut OtelErrorWriterState;
+            if !state.is_null() {
+                // Release: pair with the Acquire load at the top of ngx_otel_error_writer.
+                (*state).cleanup.store(true, Ordering::Release);
+            }
+        }
+        log_ptr = log.next;
+    }
 }
 
 // ── Chain insertion ───────────────────────────────────────────────────────────
@@ -256,6 +374,9 @@ mod tests {
             // (no shm available; init_process wires this at Step 2.3.5).
             coalesce_table: core::ptr::null_mut(),
             coalesce_enabled: false,
+            // error_ring_ptr null: ring-push path is dormant in unit tests
+            // (no logs shm available; init_process wires this at Step 2.3.5).
+            error_ring_ptr: core::ptr::null_mut(),
         });
         let mut log: nginx_sys::ngx_log_t = unsafe { core::mem::zeroed() };
         log.writer = Some(ngx_otel_error_writer);

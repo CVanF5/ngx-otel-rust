@@ -54,7 +54,8 @@ use crate::logs::severity::nginx_to_otel;
 use crate::metric_source::instrumented::InstrumentedSource;
 use crate::metric_source::stub_status::StubStatusSource;
 use crate::metric_source::MetricSource;
-use crate::shm::{logs_access_ring, logs_n_workers_from_zone};
+use crate::logs::coalesce;
+use crate::shm::{logs_access_ring, logs_coalesce_table, logs_error_ring, logs_n_workers_from_zone};
 use crate::transport::hyper_http::NgxConnector;
 use crate::transport::{GrpcTransport, HyperHttpTransport, Transport};
 
@@ -510,7 +511,8 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             }
 
             // Drain fresh log records from all workers' rings and ship them.
-            if amcf.is_access_sample_enabled() {
+            // Gate on access_sample OR error_log — either enables the logs shm path.
+            if amcf.is_access_sample_enabled() || amcf.error_log_enabled {
                 if let Some(logs_base) = amcf.logs_shm_base() {
                     let n_workers = unsafe {
                         let zone = &*amcf.logs_shm_zone;
@@ -839,8 +841,8 @@ async fn graceful_drain(
         }
     }
 
-    // Final freshly-collected logs batch.
-    if amcf.is_access_sample_enabled() {
+    // Final freshly-collected logs batch (access + error rings).
+    if amcf.is_access_sample_enabled() || amcf.error_log_enabled {
         if let Some(logs_base) = amcf.logs_shm_base() {
             let n_workers = unsafe {
                 let zone = &*amcf.logs_shm_zone;
@@ -1134,6 +1136,37 @@ fn collect_log_records(
     // Update the ACCESS_LOGS_DROPPED self-metric.
     ACCESS_LOGS_DROPPED.store(total_dropped, Ordering::Relaxed);
 
+    // Drain error rings (Step 2.3.3): only when error_log_enabled.
+    if amcf.error_log_enabled {
+        let mut error_dropped: u64 = 0;
+        for w in 0..n_workers {
+            // 1. Drain the coalescer table to get (key_hash, severity, count) tuples.
+            //    Safety: zone sized for n_workers; w < n_workers; cap correct.
+            let coalesce_tbl = unsafe { logs_coalesce_table(logs_base, w, cap) };
+            let counts_vec = unsafe { coalesce::drain_coalesce_table(coalesce_tbl) };
+            // Build a lookup: key_hash → count (number of occurrences in this interval,
+            // including the initial verbatim sample that was already pushed to the ring).
+            let counts_map: std::collections::HashMap<u64, u32> =
+                counts_vec.into_iter().map(|(hash, _sev, count)| (hash, count)).collect();
+
+            // 2. Drain error ring records for this worker.
+            //    Safety: same invariants as the access ring drain above.
+            let ring = unsafe { logs_error_ring(logs_base, w, cap) };
+            error_dropped += ring.drop_count();
+
+            let mut record_buf: std::vec::Vec<u8> = std::vec::Vec::new();
+            let mut drained = 0usize;
+            while drained < MAX_RECORDS_PER_WORKER_PER_DRAIN && ring.pop_into(&mut record_buf) {
+                if let Some(lr) = parse_error_record(&record_buf, now, &counts_map) {
+                    logs.push(lr);
+                }
+                record_buf.clear();
+                drained += 1;
+            }
+        }
+        ERROR_LOGS_DROPPED.store(error_dropped, Ordering::Relaxed);
+    }
+
     LogsBatch {
         resource: Resource { attributes: build_resource_attrs(amcf) },
         scope: Scope { name: "ngx-otel-rust".into(), version: env!("CARGO_PKG_VERSION").into() },
@@ -1271,6 +1304,92 @@ fn parse_access_record(buf: &[u8], observed_now_ns: u64) -> Option<LogRecord> {
         event_name: "http.access".into(),
         trace_id,
         span_id,
+    })
+}
+
+/// Parse one error-log ring record and build a `LogRecord`.
+///
+/// Wire format (see `logs::error_writer::push_error_record`):
+/// ```text
+/// [0]      kind = 0x01
+/// [1..9]   ts_unix_ns (u64 big-endian)
+/// [9]      ngx_level  (u8)
+/// [10..18] template_hash (u64 big-endian; 0 = untracked)
+/// [18..20] body_len (u16 big-endian)
+/// [20..]   body bytes
+/// ```
+///
+/// `counts_map` is the result of draining the coalescer table for this worker
+/// (key_hash → total occurrences this interval).  When `template_hash` is present
+/// in the map and `count > 1`, the `nginx.error.coalesced_count` attribute is
+/// attached to indicate that the verbatim sample represents N occurrences.
+///
+/// # Decision #6 invariants (non-negotiable)
+/// - NO `trace_id` / `span_id` — request context is unreachable from the writer.
+/// - NO `http.route` or `nginx.upstream.zone` attributes.
+/// - `event_name = "nginx.error"`
+/// - Body carries the full verbatim formatted line (including any `, client:` context).
+fn parse_error_record(
+    buf: &[u8],
+    observed_now_ns: u64,
+    counts_map: &std::collections::HashMap<u64, u32>,
+) -> Option<LogRecord> {
+    use crate::data_model::{AnyValue, KeyValue};
+
+    // Minimum: kind(1) + ts(8) + level(1) + hash(8) + body_len(2) = 20 bytes
+    if buf.len() < 20 {
+        return None;
+    }
+    // kind must be 0x01 (error record)
+    if buf[0] != crate::logs::error_writer::KIND_ERROR {
+        return None;
+    }
+
+    let ts = u64::from_be_bytes(buf[1..9].try_into().ok()?);
+    let ngx_level = buf[9] as u32;
+    let template_hash = u64::from_be_bytes(buf[10..18].try_into().ok()?);
+    let body_len = u16::from_be_bytes([buf[18], buf[19]]) as usize;
+
+    if 20 + body_len > buf.len() {
+        return None;
+    }
+    let body_bytes = &buf[20..20 + body_len];
+    let body_str = std::string::String::from_utf8_lossy(body_bytes).into_owned();
+
+    let (severity_number, severity_text) = nginx_to_otel(ngx_level);
+
+    // Build attributes.  Decision #6: NO route/zone/trace_id.
+    let mut attributes: std::vec::Vec<KeyValue> = std::vec::Vec::new();
+
+    // nginx.error.template_hash: carry the hash so backends can group by template.
+    // Absent when template_hash == 0 (untracked: high-sev / coalesce-off / table-full).
+    if template_hash != 0 {
+        attributes.push(KeyValue {
+            key: "nginx.error.template_hash".into(),
+            value: AnyValue::Int(template_hash as i64),
+        });
+
+        // nginx.error.coalesced_count: present when > 1 occurrence was coalesced.
+        // Lookup the drain count; absent (not == 0) when count ≤ 1.
+        let count = counts_map.get(&template_hash).copied().unwrap_or(0);
+        if count > 1 {
+            attributes.push(KeyValue {
+                key: "nginx.error.coalesced_count".into(),
+                value: AnyValue::Int(count as i64),
+            });
+        }
+    }
+
+    Some(LogRecord {
+        time_unix_nano: ts,
+        observed_time_unix_nano: observed_now_ns,
+        severity_number,
+        severity_text: std::string::String::from(severity_text),
+        body: AnyValue::String(body_str),
+        attributes,
+        event_name: "nginx.error".into(),
+        trace_id: std::vec::Vec::new(), // decision #6: no trace context on error records
+        span_id: std::vec::Vec::new(),  // decision #6
     })
 }
 
@@ -1437,8 +1556,8 @@ pub fn exit_process_flush(amcf: &MainConfig) {
     }
 
     // ── Sync flush of pending tail logs (Phase 2.2, HTTP only) ──────────────
-    // Only flush logs if access_sample is enabled and the logs shm zone is mapped.
-    if amcf.is_access_sample_enabled() {
+    // Flush logs if access_sample OR error_log is enabled and the logs shm is mapped.
+    if amcf.is_access_sample_enabled() || amcf.error_log_enabled {
         if let Some(logs_base) = amcf.logs_shm_base() {
             let n_workers = unsafe {
                 let zone = &*amcf.logs_shm_zone;
@@ -1719,5 +1838,195 @@ mod tests {
         // Verify there's exactly ONE service.instance.id (no duplication).
         let count = attrs.iter().filter(|kv| kv.key == "service.instance.id").count();
         assert_eq!(count, 1, "service.instance.id must appear exactly once");
+    }
+
+    // ── Step 2.3.3 error-drain tests ─────────────────────────────────────────
+
+    /// Helper: build a one-worker logs shm slot with initialised ring headers.
+    fn make_logs_slot(cap: usize) -> (std::vec::Vec<u8>, *mut u8) {
+        use crate::logs::ring::{ring_size_bytes, LogsWorkerRingHeader};
+        use crate::shm::logs_slot_size;
+
+        let slot_sz = logs_slot_size(cap);
+        let mut buf = std::vec![0u8; slot_sz];
+        let ptr = buf.as_mut_ptr();
+        unsafe {
+            let access_hdr = ptr.cast::<LogsWorkerRingHeader>();
+            (*access_hdr).cap = cap as u64;
+            let error_hdr = ptr.add(ring_size_bytes(cap)).cast::<LogsWorkerRingHeader>();
+            (*error_hdr).cap = cap as u64;
+        }
+        (buf, ptr)
+    }
+
+    /// Error drain alongside access drain — both rings drain into one `LogsBatch`.
+    ///
+    /// Push one access record and one error record, then call `collect_log_records`.
+    /// The resulting batch must contain exactly two `LogRecord`s: one `http.access`
+    /// and one `nginx.error`.
+    #[test]
+    fn error_drain_alongside_access_drain() {
+        use crate::logs::ring::DEFAULT_LOG_RING_CAP;
+        use crate::logs::error_writer::KIND_ERROR;
+        use crate::shm::logs_error_ring;
+
+        let cap = DEFAULT_LOG_RING_CAP;
+        let (mut slot_buf, slot_ptr) = make_logs_slot(cap);
+        let _ = &mut slot_buf; // keep alive
+
+        // Push one error ring record directly (simulate what the writer does).
+        let ts_ns: u64 = 1_700_000_000_000_000_000;
+        let body = b"connect() failed (111: Connection refused)";
+        let template_hash: u64 = 0xdeadbeef_cafebabe;
+        unsafe {
+            let error_ring = logs_error_ring(slot_ptr, 0, cap);
+            // Build and push the wire record manually.
+            const HDR: usize = 20;
+            let body_len = body.len();
+            let mut record = [0u8; HDR + 512];
+            record[0] = KIND_ERROR;
+            record[1..9].copy_from_slice(&ts_ns.to_be_bytes());
+            record[9] = 4u8; // NGX_LOG_ERR
+            record[10..18].copy_from_slice(&template_hash.to_be_bytes());
+            record[18..20].copy_from_slice(&(body_len as u16).to_be_bytes());
+            record[20..20 + body_len].copy_from_slice(body);
+            assert!(error_ring.push(&record[..HDR + body_len]), "error ring push must succeed");
+        }
+
+        // Note: access ring is empty — we're testing that the error record still lands.
+        // Synthesize a MainConfig with error_log_enabled = true.
+        let mut amcf = crate::config::MainConfig::default();
+        amcf.error_log_enabled = true;
+
+        let batch = collect_log_records(&amcf, slot_ptr, 1, 0);
+
+        // Must have exactly ONE record: the nginx.error entry.
+        assert_eq!(batch.logs.len(), 1, "one error record must be drained");
+        let rec = &batch.logs[0];
+        assert_eq!(rec.event_name, "nginx.error", "event_name must be nginx.error");
+
+        // Body must be the verbatim message.
+        assert_eq!(
+            rec.body,
+            crate::data_model::AnyValue::String(
+                std::string::String::from_utf8_lossy(body).into_owned()
+            ),
+            "body must be the verbatim error message"
+        );
+
+        // Severity must be ERROR (mapped from NGX_LOG_ERR = 4).
+        assert_eq!(
+            rec.severity_number,
+            crate::data_model::SeverityNumber::Error,
+            "severity must be ERROR for ngx_level=4"
+        );
+
+        // Decision #6: NO trace_id, span_id.
+        assert!(rec.trace_id.is_empty(), "trace_id must be empty on error records");
+        assert!(rec.span_id.is_empty(), "span_id must be empty on error records");
+
+        // Decision #6: NO route / zone attributes.
+        let has_route = rec.attributes.iter().any(|kv| kv.key == "http.route");
+        let has_zone = rec.attributes.iter().any(|kv| kv.key == "nginx.upstream.zone");
+        assert!(!has_route, "http.route must be absent from error records");
+        assert!(!has_zone, "nginx.upstream.zone must be absent from error records");
+    }
+
+    /// Coalesced flood ⇒ one `LogRecord` with `nginx.error.coalesced_count = N`.
+    ///
+    /// Simulate a flood of N identical messages that all coalesced into one verbatim
+    /// sample in the ring.  The coalescer table holds `count = N`.  After draining,
+    /// the single ring record must carry `coalesced_count = N`.
+    #[test]
+    fn coalesced_count_attached_to_sample() {
+        use crate::logs::ring::DEFAULT_LOG_RING_CAP;
+        use crate::logs::error_writer::KIND_ERROR;
+        use crate::logs::coalesce::COALESCE_CAPACITY;
+        use crate::shm::{logs_error_ring, logs_coalesce_table};
+
+        let cap = DEFAULT_LOG_RING_CAP;
+        let (mut slot_buf, slot_ptr) = make_logs_slot(cap);
+        let _ = &mut slot_buf;
+
+        let template_hash: u64 = 0x1234_5678_9abc_def0;
+        let coalesced_n: u32 = 150;
+
+        // 1. Push one verbatim ring record with the given template_hash.
+        unsafe {
+            let error_ring = logs_error_ring(slot_ptr, 0, cap);
+            const HDR: usize = 20;
+            let body = b"no live upstreams while connecting to upstream";
+            let body_len = body.len();
+            let mut record = [0u8; HDR + 512];
+            record[0] = KIND_ERROR;
+            record[1..9].copy_from_slice(&1_700_000_000_000_000_000u64.to_be_bytes());
+            record[9] = 4u8; // ERR
+            record[10..18].copy_from_slice(&template_hash.to_be_bytes());
+            record[18..20].copy_from_slice(&(body_len as u16).to_be_bytes());
+            record[20..20 + body_len].copy_from_slice(body);
+            assert!(error_ring.push(&record[..HDR + body_len]));
+        }
+
+        // 2. Populate the coalescer table slot for this template_hash with count=N.
+        //    We directly write the slot to simulate what the writer would have done.
+        unsafe {
+            let table = logs_coalesce_table(slot_ptr, 0, cap);
+            let slot_idx = (template_hash as usize) & (COALESCE_CAPACITY - 1);
+            let slot = &*table.add(slot_idx);
+            core::ptr::write_volatile(
+                core::ptr::addr_of_mut!((*table.add(slot_idx)).key_hash),
+                template_hash,
+            );
+            core::ptr::write_volatile(
+                core::ptr::addr_of_mut!((*table.add(slot_idx)).severity),
+                4u8,
+            );
+            slot.count.store(coalesced_n, core::sync::atomic::Ordering::Release);
+            slot.sample_emitted.store(true, core::sync::atomic::Ordering::Release);
+        }
+
+        // 3. Drain via collect_log_records.
+        let mut amcf = crate::config::MainConfig::default();
+        amcf.error_log_enabled = true;
+
+        let batch = collect_log_records(&amcf, slot_ptr, 1, 0);
+
+        assert_eq!(batch.logs.len(), 1, "one error record");
+        let rec = &batch.logs[0];
+        assert_eq!(rec.event_name, "nginx.error");
+
+        // nginx.error.template_hash must be present.
+        let hash_attr = rec.attributes.iter().find(|kv| kv.key == "nginx.error.template_hash");
+        assert!(hash_attr.is_some(), "nginx.error.template_hash must be present");
+        assert_eq!(
+            hash_attr.unwrap().value,
+            crate::data_model::AnyValue::Int(template_hash as i64),
+            "template_hash attribute value must match"
+        );
+
+        // nginx.error.coalesced_count must be N (the flood count).
+        let count_attr = rec.attributes.iter().find(|kv| kv.key == "nginx.error.coalesced_count");
+        assert!(count_attr.is_some(), "nginx.error.coalesced_count must be present for flood");
+        assert_eq!(
+            count_attr.unwrap().value,
+            crate::data_model::AnyValue::Int(coalesced_n as i64),
+            "coalesced_count must equal the flood count"
+        );
+
+        // Coalescer table must have been reset (count = 0, sample_emitted = false).
+        unsafe {
+            let table = logs_coalesce_table(slot_ptr, 0, cap);
+            let slot_idx = (template_hash as usize) & (COALESCE_CAPACITY - 1);
+            let slot = &*table.add(slot_idx);
+            assert_eq!(
+                slot.count.load(core::sync::atomic::Ordering::Acquire),
+                0,
+                "coalescer count must be reset to 0 after drain"
+            );
+            assert!(
+                !slot.sample_emitted.load(core::sync::atomic::Ordering::Acquire),
+                "sample_emitted must be reset to false after drain"
+            );
+        }
     }
 }

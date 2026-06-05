@@ -89,7 +89,13 @@ pub enum CoalesceResult {
     Coalesced,
     /// Push the full `buf` verbatim to the error ring.
     /// Covers: novel template, high-severity (≤ crit), table-full, coalesce-off.
-    EmitVerbatim,
+    ///
+    /// `template_hash` is the coalescer slot key for this template (non-zero when
+    /// the coalescer assigned a slot), or `0` when the record is untracked
+    /// (high-severity exception tail, `coalesce=off`, or table-full fallback).
+    /// The writer stores this in the ring record so the drain can join the
+    /// verbatim sample to its coalescer count without re-computing the hash.
+    EmitVerbatim { template_hash: u64 },
 }
 
 // ── Stable-core extraction ────────────────────────────────────────────────────
@@ -251,13 +257,15 @@ pub unsafe fn coalesce(
     coalesce_enabled: bool,
 ) -> CoalesceResult {
     // Verbatim opt-out: bypass the table entirely.
+    // template_hash = 0: no coalescer slot assigned; the drain will not find a count.
     if !coalesce_enabled {
-        return CoalesceResult::EmitVerbatim;
+        return CoalesceResult::EmitVerbatim { template_hash: 0 };
     }
 
     // High-severity exception tail: emerg/alert/crit always verbatim.
+    // template_hash = 0: these are never tracked in the coalescer table.
     if severity <= HIGH_SEVERITY_THRESHOLD {
-        return CoalesceResult::EmitVerbatim;
+        return CoalesceResult::EmitVerbatim { template_hash: 0 };
     }
 
     // Compute the dedup key from the stable core (alloc-free, stack-only).
@@ -290,9 +298,13 @@ pub unsafe fn coalesce(
                     severity,
                 );
             }
-            slot.count.store(1, Ordering::Relaxed);
+            // Release ordering: the key_hash/severity writes above must be visible
+            // to the drain before it reads count > 0.  The drain does an AcqRel swap
+            // on count; the Acquire half synchronises with this Release store.
+            slot.count.store(1, Ordering::Release);
             slot.sample_emitted.store(true, Ordering::Release);
-            return CoalesceResult::EmitVerbatim;
+            // Return the assigned key so the ring record can carry it for the drain join.
+            return CoalesceResult::EmitVerbatim { template_hash: key };
         }
 
         if slot_key == key && slot.severity == severity {
@@ -304,8 +316,9 @@ pub unsafe fn coalesce(
                 return CoalesceResult::Coalesced;
             } else {
                 // Drain reset sample_emitted in the previous interval; re-emit.
+                // The existing key is slot_key (== key); carry it for the drain join.
                 slot.sample_emitted.store(true, Ordering::Release);
-                return CoalesceResult::EmitVerbatim;
+                return CoalesceResult::EmitVerbatim { template_hash: key };
             }
         }
 
@@ -314,13 +327,14 @@ pub unsafe fn coalesce(
         probes += 1;
 
         // Table-full guard: if we've probed the entire table, fall back to verbatim.
+        // template_hash = 0: no slot assigned; drain will not find a count for this record.
         if probes >= COALESCE_CAPACITY {
-            return CoalesceResult::EmitVerbatim;
+            return CoalesceResult::EmitVerbatim { template_hash: 0 };
         }
 
         // Cycle detection: if we're back to where we started, table is full.
         if probe == start {
-            return CoalesceResult::EmitVerbatim;
+            return CoalesceResult::EmitVerbatim { template_hash: 0 };
         }
     }
 }
@@ -329,6 +343,55 @@ pub unsafe fn coalesce(
 #[inline]
 pub const fn coalesce_table_bytes() -> usize {
     COALESCE_CAPACITY * core::mem::size_of::<CoalesceSlot>()
+}
+
+/// Drain the per-worker coalescer table for one export interval.
+///
+/// Called by the exporter's `collect_log_records` once per drain cycle.
+/// Sweeps all occupied slots, atomically reads-and-resets `count`, and
+/// returns `(key_hash, severity, count)` for every slot that had `count > 0`.
+/// Also resets `sample_emitted` so the next interval emits a fresh verbatim
+/// sample (the writer path sees `!already_emitted` and calls `EmitVerbatim`).
+///
+/// # Ownership of key_hash / severity
+/// These fields are NEVER cleared by the drain — evicted templates persist in
+/// the table until their slot is probed-over by a new insert (impossible at 256
+/// slots since the table never shrinks entries; the drain only zeroes `count`
+/// and flips `sample_emitted`).
+///
+/// # Memory ordering
+/// The `count.swap(0, AcqRel)` Acquire half synchronises with the `count.store(1,
+/// Release)` in the writer's novel-insert path, ensuring `key_hash` and
+/// `severity` (written before that Release) are visible here.
+///
+/// # Safety
+/// `table` must be a valid, non-null pointer to a `[CoalesceSlot; COALESCE_CAPACITY]`
+/// in the logs shm zone, aligned to `align_of::<CoalesceSlot>()`.
+pub unsafe fn drain_coalesce_table(table: *mut CoalesceSlot) -> std::vec::Vec<(u64, u8, u32)> {
+    let mut out = std::vec::Vec::new();
+    for i in 0..COALESCE_CAPACITY {
+        let slot = unsafe { &*table.add(i) };
+        // Cheap pre-filter: a zero key_hash means the slot was never written.
+        // (key_hash is only written once, before count; if count > 0 then
+        //  key_hash is definitely non-zero, so this skips all empty slots.)
+        if slot.key_hash == 0 {
+            continue;
+        }
+        // AcqRel: the Acquire half synchronises with the Release count.store(1)
+        // on the writer's novel-insert path, making key_hash/severity visible.
+        let count = slot.count.swap(0, Ordering::AcqRel);
+        if count > 0 {
+            // Read key_hash and severity AFTER the Acquire swap for correct ordering.
+            let key_hash = slot.key_hash;
+            let severity = slot.severity;
+            // Reset sample_emitted so the next interval re-emits a fresh sample.
+            // The Release ensures the reset is visible to the writer before it
+            // loads sample_emitted with Acquire.
+            slot.sample_emitted.store(false, Ordering::Release);
+            out.push((key_hash, severity, count));
+        }
+    }
+    out
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -440,7 +503,7 @@ mod tests {
 
         // First call: novel → EmitVerbatim.
         let r1 = unsafe { coalesce(ptr, 4, msg, true) };
-        assert!(matches!(r1, CoalesceResult::EmitVerbatim), "first call must emit verbatim");
+        assert!(matches!(r1, CoalesceResult::EmitVerbatim { .. }), "first call must emit verbatim");
 
         // Subsequent calls: coalesced → count bumped.
         let n = 99;
@@ -475,7 +538,7 @@ mod tests {
         let mut emitted = 0usize;
         for msg in msgs {
             let r = unsafe { coalesce(ptr, 4, msg, true) };
-            if matches!(r, CoalesceResult::EmitVerbatim) {
+            if matches!(r, CoalesceResult::EmitVerbatim { .. }) {
                 emitted += 1;
             }
         }
@@ -494,14 +557,14 @@ mod tests {
         for _ in 0..10 {
             let r = unsafe { coalesce(ptr, 3, msg, true) };
             assert!(
-                matches!(r, CoalesceResult::EmitVerbatim),
+                matches!(r, CoalesceResult::EmitVerbatim { .. }),
                 "crit must always emit verbatim"
             );
         }
         // Also emerg (1) and alert (2).
         let msg_emerg = b"2024/01/01 12:00:00 [emerg] 1#1: worker process exited\n";
         let r = unsafe { coalesce(ptr, 1, msg_emerg, true) };
-        assert!(matches!(r, CoalesceResult::EmitVerbatim), "emerg must always emit verbatim");
+        assert!(matches!(r, CoalesceResult::EmitVerbatim { .. }), "emerg must always emit verbatim");
     }
 
     /// Table-full degrades to verbatim, never panics.
@@ -539,7 +602,7 @@ mod tests {
         let r = unsafe { coalesce(ptr, 4, novel, true) };
         // Must fall back to verbatim — no panic, no silent discard.
         assert!(
-            matches!(r, CoalesceResult::EmitVerbatim),
+            matches!(r, CoalesceResult::EmitVerbatim { .. }),
             "table-full must degrade to verbatim emit, never panic"
         );
     }
@@ -557,7 +620,7 @@ mod tests {
         for _ in 0..n {
             let r = unsafe { coalesce(ptr, 4, msg, false) }; // coalesce disabled
             assert!(
-                matches!(r, CoalesceResult::EmitVerbatim),
+                matches!(r, CoalesceResult::EmitVerbatim { .. }),
                 "coalesce=off must always emit verbatim"
             );
         }
