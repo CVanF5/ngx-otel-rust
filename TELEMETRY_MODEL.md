@@ -308,6 +308,43 @@ candidates for future metrics, listed so they aren't forgotten:
 | `uppstream_addr` | upstream peer address (high-card; sample/exemplar only) |
 | `is_ssl` | TLS yes/no (dimension) |
 
+## Dashboard
+
+A reference Grafana dashboard is committed at
+`test-harness/demo/grafana/dashboards/ngx-otel-rust-overview.json`. It covers the
+current surface: request rate / avg latency by method · status-class · route
+(`by_route`, topk) · upstream zone (`by_upstream`); body-size and upstream-timing
+quantiles (those are explicit-bucket, so `histogram_quantile(…, _bucket … by le)`);
+nginx `stub_status`; the exporter self-metrics (incl. the Phase-2 log drop / send-failure
+counters); and a Loki panel for 4xx/5xx access logs.
+
+**Open iteration items (the dashboard is a working base, not final):**
+- **Request-duration percentiles** are shown as **averages** (`rate(_sum)/rate(_count)`),
+  NOT p50/p90/p99. The duration metric is an OTel **exponential histogram (µs)**; true
+  quantiles need the collector→Prometheus **native-histogram** path
+  (`histogram_quantile(0.99, sum(rate(metric[range])))`, no `le`) or an exp→classic
+  bucket conversion. Wiring this is what validates DP-F's sub-ms quantile benefit
+  (tied to the §6.6.5 demo plan). Until then, averages can hide the tail.
+- **Exemplars** are not yet wired (no metric→trace pivot) — lands with traces (Phase 3).
+- **Error-rate panel** (`ngx_otel.error_log.events`) to add once Phase 2.3 closes.
+- **Provisioning reconciliation:** the committed file uses the new Grafana **dynamic
+  dashboard schema** (`elements`/`layout`); set a stable `uid` (`ngx-otel-rust-overview`),
+  a generic title, and reconcile datasource UIDs with the demo provisioning + confirm
+  the demo Grafana version supports the schema before relying on auto-load.
+
+**Connecting metrics ↔ logs in Grafana (design direction):** two mechanisms, both
+serve the §6.6.3 "drill-down without SSH" story:
+1. **Grafana Correlations / data links (label-based, available now):** click a metric
+   panel → open Explore in Loki filtered by the shared labels (`service_name`,
+   `http.route`, …) at the clicked time range. Works for *any* logs (access tail AND
+   error), needs no traces. The dashboard's existing "Explore service logs" link is a
+   basic form; a Correlation makes it click-through from a spike.
+2. **Exemplar → trace → log (richer, Phase 3):** exemplars on the duration histogram
+   carry `trace_id`; Grafana's `exemplarTraceIdDestinations` links them to Tempo, and
+   Tempo→Loki via `trace_id`. Works for the **access** path (its tail/exemplars carry
+   `trace_id`); **error** logs are NOT trace-linked (the writer can't reach request
+   context — see Logs above), so error correlation stays label-based (#1).
+
 ## References
 
 - [OpenTelemetry Semantic Conventions — HTTP metrics][semconv]
