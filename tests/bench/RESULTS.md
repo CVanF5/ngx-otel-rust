@@ -671,3 +671,29 @@ early-exit/length-prefilter; it is a pessimistic ceiling.
 
 Host: C6CQ3045N2; nginx: tests/bench/zero_cost_logs.sh: line 243: "/Users/c.vandesande/project-nginx-otel/ngx-otel-rust/objs-release/nginx": No such file or directory
 INFORMATIONAL — ±1% gate requires N≥50 on isolated hardware (host-1 / c7a EPYC).
+
+## Phase 2.3 error-log zero-cost gate — GATE OF RECORD (host-1 c7a, N=50, 2026-06-05)
+
+Host: host-1, AWS c7a.xlarge (EPYC 9R14, 4 real cores / no SMT, non-burstable,
+dedicated), `ip-172-16-0-72`. Release build (`target/release/libngx_http_otel_module.so`
++ release nginx). `BENCH_ITERATIONS=50`. Native `otelcol-contrib` collector.
+
+> **This run IS the dedicated-hardware gate of record** for the Phase 2.3 error-log
+> idle-writer zero-cost claim — it overrides the generic "DEV-BOX SMOKE / INFORMATIONAL"
+> banner the script prints (the harness, post-FU3, can't detect it is running on host-1).
+
+| Config | Median (req/s) | p95 (req/s) | Regression vs BL |
+|--------|---------------|-------------|-----------------|
+| BL (sample OFF, histogram always-on) | 257411.12 | 259835.40 | — |
+| TA (otel_access_log_sample 16) | 257051.43 | 259930.86 | 0.1% |
+| TB (otel_access_log_sample 16, high RPS) | 262296.97 | 264363.74 | -1.9% (informational) |
+| TC (otel_error_log warn, no errors — idle writer) | 258248.13 | 259859.95 | **-0.3%** |
+| TD (otel_error_log warn, flood → 502 — active writer) | 102926.94 | 103060.52 | 60.0% (informational) |
+
+**Gate (BL vs TC, error-log idle writer): -0.3% — PASS** (< 2% gate; effectively zero,
+the negative sign is measurement noise). The access path re-validates within gate
+(TA 0.1%). TD (60%) is the every-request-errors worst case (coalescer + writer fully
+active) — informational, not a gate. This closes the Phase 2.3 Step 2.3.8 timing gate.
+
+(Cosmetic: the `line 243` `-v` footer message is a script quoting bug, not a missing
+binary — `objs-release/nginx` exists and the release module was loaded.)
