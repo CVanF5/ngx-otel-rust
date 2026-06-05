@@ -122,22 +122,29 @@ pub fn sync_post(
             };
             let request = build_http_request(&authority, &path, extra_headers, body);
 
-            // Resolve the address.  DNS is blocking; that is acceptable here
+            // Resolve all addresses.  DNS is blocking; that is acceptable here
             // because exit_process runs outside the NGINX async event loop.
-            let addr = (host.as_str(), port)
+            // Collecting into a Vec lets us iterate multiple addresses
+            // (e.g. both A and AAAA) without holding the iterator across an
+            // error-handling branch.
+            let addrs: std::vec::Vec<_> = (host.as_str(), port)
                 .to_socket_addrs()
                 .map_err(SyncSendError::Connect)?
-                .next()
-                .ok_or_else(|| {
-                    SyncSendError::Connect(std::io::Error::new(
-                        std::io::ErrorKind::AddrNotAvailable,
-                        "no addresses resolved for endpoint host",
-                    ))
-                })?;
+                .collect();
+            if addrs.is_empty() {
+                return Err(SyncSendError::Connect(std::io::Error::new(
+                    std::io::ErrorKind::AddrNotAvailable,
+                    "no addresses resolved for endpoint host",
+                )));
+            }
 
-            // Connect with a hard deadline so a refused or unreachable
-            // collector does not stall worker exit beyond the 500 ms budget.
-            let mut stream = std::net::TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
+            // Try each resolved address in order until one connects.
+            // Each attempt gets its own CONNECT_TIMEOUT budget (500 ms) so
+            // the total is bounded by `n_addresses × 500 ms`.  This is
+            // acceptable in exit_process (blocking is fine there); the outer
+            // backstop is worker_shutdown_timeout.  Sequential iteration is
+            // intentional — no happy-eyeballs (same policy as the async path).
+            let mut stream = connect_first_reachable(&addrs, CONNECT_TIMEOUT)
                 .map_err(SyncSendError::Connect)?;
             stream.set_write_timeout(Some(WRITE_TIMEOUT)).map_err(SyncSendError::Write)?;
             stream.set_read_timeout(Some(READ_TIMEOUT)).map_err(SyncSendError::Read)?;
@@ -169,6 +176,37 @@ pub fn sync_post(
             send_request_and_read_response(&mut stream, &request)
         }
     }
+}
+
+/// Try each `SocketAddr` in `addrs` in order using `connect_timeout`.
+///
+/// Returns the first successfully connected `TcpStream`, or the last
+/// connection error if all addresses fail.  Callers guarantee `addrs` is
+/// non-empty.
+///
+/// This function is the `sync_post` equivalent of the async connector's
+/// address-iteration loop in `NgxConnector::connect_dns`.  The same
+/// sequential-not-happy-eyeballs policy applies here: simpler, sufficient
+/// for a cold-path flush, and consistent with the async path.
+fn connect_first_reachable(
+    addrs: &[std::net::SocketAddr],
+    timeout: Duration,
+) -> Result<std::net::TcpStream, std::io::Error> {
+    let mut last_err: Option<std::io::Error> = None;
+    for addr in addrs {
+        match std::net::TcpStream::connect_timeout(addr, timeout) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => {
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "connect_first_reachable: no addresses to try",
+        )
+    }))
 }
 
 /// Build the on-wire HTTP/1.1 request bytes for a sync POST.
@@ -267,6 +305,59 @@ mod tests {
             raw.contains(expected_cl.as_str()),
             "Content-Length header missing or wrong; expected {:?}",
             expected_cl
+        );
+    }
+
+    /// `connect_first_reachable` skips unreachable addresses and connects to
+    /// the first reachable one.  Uses two addresses:
+    ///   - address[0] = 127.0.0.1:1  (port 1, typically refused immediately)
+    ///   - address[1] = 127.0.0.1:N  (an ephemeral port with a listener)
+    ///
+    /// Asserts that the function returns `Ok` (connected to address[1]) even
+    /// though address[0] failed.
+    #[test]
+    fn connect_first_reachable_skips_to_reachable_address() {
+        // Bind a listener on an OS-assigned ephemeral port.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let reachable_port = listener.local_addr().expect("local_addr").port();
+
+        // Spin a server thread that accepts exactly one connection then exits.
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().expect("accept");
+            // Just write a minimal response and close.
+            let _ = conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        });
+
+        // Address list: first entry is almost certainly refused (port 1);
+        // second entry is our listening server.
+        let addrs = std::vec![
+            std::net::SocketAddr::from(([127, 0, 0, 1], 1u16)),
+            std::net::SocketAddr::from(([127, 0, 0, 1], reachable_port)),
+        ];
+
+        let result = connect_first_reachable(&addrs, Duration::from_millis(500));
+        let _ = server.join();
+
+        assert!(
+            result.is_ok(),
+            "connect_first_reachable must succeed when the second address is reachable; err: {:?}",
+            result.err()
+        );
+    }
+
+    /// `connect_first_reachable` returns the last error when all addresses fail.
+    #[test]
+    fn connect_first_reachable_returns_error_when_all_fail() {
+        // Port 1 is almost never listening; use two such addresses.
+        let addrs = std::vec![
+            std::net::SocketAddr::from(([127, 0, 0, 1], 1u16)),
+            std::net::SocketAddr::from(([127, 0, 0, 1], 2u16)),
+        ];
+
+        let result = connect_first_reachable(&addrs, Duration::from_millis(100));
+        assert!(
+            result.is_err(),
+            "connect_first_reachable must fail when all addresses are unreachable"
         );
     }
 
