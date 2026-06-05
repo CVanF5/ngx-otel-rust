@@ -178,6 +178,24 @@ echo "[tsan-run] === Running run_access_log.sh under TSAN (Phase 2.2 §6.6.1 reb
 # All new shared-state paths from RALPH_PHASE_2_2.md steps 2.2.1–2.2.5.
 bash tests/integration/run_access_log.sh
 
+echo ""
+echo "[tsan-run] === Running run_error_log.sh under TSAN (Phase 2.3 §6.6.2 error-log path) ==="
+# Exercises Phase 2.3 shared state under TSAN:
+#   - CoalesceSlot::count.fetch_add / .swap(0, AcqRel) — coalescer on writer path
+#   - WorkerSlots::error_rate_counters[].fetch_add — error-rate metric bump
+#   - SPSC error ring push (workers write verbatim samples)
+#   - drain_coalesce_table / logs_error_ring drain in exporter
+# Stage A (coalesce-on flood), Stage B (coalesce-off), Stage C (floor),
+# Stage D (DP-C config-load guard).
+bash tests/integration/run_error_log.sh
+
+echo ""
+echo "[tsan-run] === Running run_signal_storm.sh under TSAN (Phase 2.3 re-entrancy gate) ==="
+# THE load-bearing safety gate: busy-flag + lock-free coalescer under
+# SIGUSR1 signal delivery.  30-second flood + signal storm.
+# Asserts: no crash, no panic, no torn records, drain progresses.
+STORM_DURATION_S=30 bash tests/integration/run_signal_storm.sh
+
 # ── Step 5: Belt-and-suspenders ThreadSanitizer warning scan ─────────────────
 
 echo ""
@@ -186,7 +204,9 @@ TSAN_WARNINGS=0
 for log in /tmp/ngx-otel-grpc-smoke.*/logs/error.log \
            /tmp/ngx-otel-grpc-bidi-smoke.*/logs/error.log \
            /tmp/ngx-otel-grpc-export.*/logs/error.log \
-           /tmp/ngx-otel-access-log.*/logs/error.log; do
+           /tmp/ngx-otel-access-log.*/logs/error.log \
+           /tmp/ngx-otel-error-log.*/logs/error.log \
+           /tmp/ngx-otel-signal-storm.*/logs/error.log; do
     if [[ -f "${log}" ]]; then
         count=$(grep -c "WARNING: ThreadSanitizer" "${log}" 2>/dev/null || true)
         if [[ "${count}" -gt 0 ]]; then
