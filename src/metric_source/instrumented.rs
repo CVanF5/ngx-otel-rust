@@ -217,17 +217,32 @@ impl HttpRequestHandler for LogPhaseHandler {
 
                 // W3C trace correlation (Phase 2.2.3): read `traceparent` header.
                 // Also scan for User-Agent (Phase 2.2.5). One O(n) pass covers both.
-                // Hot-path budget: one header-list scan (O(n), small n) + parsing.
-                // No alloc, no lock, no syscall.
+                // Hot-path budget: one header-list scan + parsing. No alloc, no lock,
+                // no syscall. Cheapened two ways with no ngx-rust binding change:
+                // (1) a name-length pre-check rejects non-matching headers with a
+                //     single integer compare before the case-insensitive byte compare;
+                // (2) we stop walking as soon as both headers are captured.
+                // Phase 3 plan: move this parse to once-per-request span-context setup
+                // and cache the result on the per-request module ctx, so the span
+                // emitter + exemplar + tail all reuse it (no second scan). See §6.6.3.
                 let mut trace_context: Option<([u8; 16], [u8; 8])> = None;
                 let mut user_agent_raw: &[u8] = b"";
                 {
                     use crate::logs::access::parse_traceparent;
+                    let mut seen_tp = false;
+                    let mut seen_ua = false;
                     for (key, value) in request.headers_in_iterator() {
-                        if key.as_bytes().eq_ignore_ascii_case(b"traceparent") {
+                        let k = key.as_bytes();
+                        if !seen_tp && k.len() == 11 && k.eq_ignore_ascii_case(b"traceparent") {
                             trace_context = parse_traceparent(value.as_bytes());
-                        } else if key.as_bytes().eq_ignore_ascii_case(b"user-agent") {
+                            seen_tp = true;
+                        } else if !seen_ua && k.len() == 10 && k.eq_ignore_ascii_case(b"user-agent")
+                        {
                             user_agent_raw = value.as_bytes();
+                            seen_ua = true;
+                        }
+                        if seen_tp && seen_ua {
+                            break; // both captured — skip the rest of the header list
                         }
                     }
                 }
