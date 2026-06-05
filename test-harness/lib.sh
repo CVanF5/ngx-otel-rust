@@ -144,6 +144,54 @@ collector_status() {
     fi
 }
 
+# ─── Collector receipt verification ──────────────────────────────────────────
+#
+# The collector's `file` exporter appends one NDJSON record per export flush to
+# METRICS_LOG (test-harness/logs/metrics.json — same path on both the docker
+# collector and the host-1 native otelcol-contrib). These helpers let a
+# benchmark PROVE a configured exporter actually delivered telemetry during a
+# run. Without this, a silent export failure (collector down, wrong port,
+# exporter never spawned) makes C3 == C1 and the comparison "passes" for the
+# wrong reason — the exact blind spot that motivated this gate.
+
+# Echo the number of metric flush records the collector has written so far.
+# 0 if the file is absent. (NDJSON: one ResourceMetrics object per line.)
+collector_metric_count() {
+    if [[ -f "${METRICS_LOG}" ]]; then
+        wc -l < "${METRICS_LOG}" | tr -d ' '
+    else
+        echo 0
+    fi
+}
+
+# assert_collector_received <before_count> [label]
+# Re-counts METRICS_LOG and returns non-zero if the collector received NO new
+# metric records since <before_count>. Prints the delta either way. Capture
+# <before_count> immediately before the load run and call this after the
+# exporter has had a chance to flush (e.g. after nginx graceful stop drains it):
+#   before="$(collector_metric_count)"; <run wrk>; <stop nginx>
+#   assert_collector_received "${before}" C3 || exit 2
+assert_collector_received() {
+    local before="${1:-0}"
+    local label="${2:-export}"
+    local after
+    after="$(collector_metric_count)"
+    if (( after > before )); then
+        _harness_info "collector-receipt[${label}]: +$(( after - before )) metric record(s) received (${before} -> ${after})"
+        return 0
+    fi
+    if (( after < before )); then
+        # The file exporter rotated (10 MB cap) — only happens after heavy
+        # writes, so export is confirmed by the rotation itself.
+        _harness_info "collector-receipt[${label}]: METRICS_LOG rotated (${before} -> ${after}); export confirmed by rotation"
+        return 0
+    fi
+    _harness_err "collector-receipt[${label}]: NO new metric records received (count unchanged at ${after})."
+    _harness_err "  A configured exporter that delivers nothing makes the C3-vs-C1 comparison meaningless."
+    _harness_err "  Check: collector reachable on \${COLLECTOR_HTTP_ENDPOINT}? exporter process spawned? endpoint/port correct?"
+    return 1
+}
+
 # Resolve NGINX_BINARY by checking candidate paths in priority order.
 # Honors a pre-existing NGINX_BINARY env value if it points at an
 # executable.  Otherwise prefers the make-built artifacts under the

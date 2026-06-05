@@ -146,14 +146,26 @@ This is the per-request cost of running the module with a configured exporter.
 | p99 latency    | 2.56 ms | 2.55 ms | **−0.39%** (within noise) |
 | Throughput     | 56,683  | 56,646  | **+0.07%** (within noise) |
 
-**C3 is indistinguishable from C1 under this workload.**  The export loop
-runs asynchronously in a background task and writes to shared memory without
-locking the request path — consistent with the Phase 1.1 architecture
-(shared-memory per-worker counters, async OTLP export by Worker 0 only).
+**C3's per-request cost is within measurement noise — and that is expected by
+construction, not magic.** The module does no encoding and no network I/O on the
+request path: each request does a *bump-and-defer* (atomic increment + memcpy into
+per-worker shared memory) and returns to serving. Encoding and the gRPC/HTTP send
+happen in the separate exporter task, and because metrics are **aggregated**, that
+export fires only once per `otel_metric_interval` (10 s here) — roughly 3 times
+across this 30 s run, while ~1.7 M requests are served (56,646 req/s × 30 s). The
+export work is real, but it is a few small batches amortized over ~1.7 M requests
+and it runs off the request path, so the per-request marginal cost is just the
+bump-and-defer. This is the N→1 collapse aggregation is supposed to deliver.
 
-> This local-machine result is not a substitute for the production
-> characterisation.  Step 12 will run on representative hardware with a
-> real-shape workload for 24 hours.
+> **What this run does and does NOT prove.** It is a latency-bound, closed-loop
+> test (`wrk -c100`) on a box with spare cores. It proves the *per-request* path is
+> free; it does **not** saturate CPU, so it cannot measure the exporter task's own
+> CPU cost under contention, and it does not by itself prove the exporter actually
+> exported (see the collector-receipt assertion added to the harness). The
+> dedicated-hardware **saturation variant** (`tests/bench/saturation.sh`) pins
+> workers + exporter to a fixed core budget, ramps to the throughput ceiling, and
+> samples the exporter process's CPU directly — that is the run that bounds the
+> exporter's real cost. Step 12 adds the 24 h production-shape soak.
 
 ---
 
@@ -189,9 +201,12 @@ The Step 11 benchmark proves statistically that:
    gate (`postconfiguration` check) and the export-task gate
    (`ngx_otel_init_process` check) operate correctly.
 
-3. **Operational overhead is effectively zero:** C3 (module + exporter) is
-   indistinguishable from C1 on this workload, consistent with the async
-   export architecture.
+3. **Operational per-request overhead is within noise — by construction:** C3
+   (module + exporter) matches C1 on this workload because export is deferred to a
+   separate task and metrics are aggregated (flushed every `otel_metric_interval`,
+   not per request), so the only per-request work is the bump-and-defer. The
+   exporter's own CPU cost is real but off the request path; bounding it under CPU
+   contention is the job of `tests/bench/saturation.sh`, not this latency-bound test.
 
 This satisfies the upstream-acceptance requirement documented in
 `PHASE_1.1_IMPLEMENTATION_PLAN.md` §"Non-negotiable constraints".
@@ -591,3 +606,50 @@ per-route/per-upstream exponential histogram) costs ~0.8% vs loaded-disabled at 
 within the gate and effectively noise. It replaces the Phase 2.1 per-request transcript
 (a LogRecord built on every request), so the enabled path is materially lighter than the
 path it supersedes. Raw per-iteration log retained on host-1 at /tmp/zc50.log.
+
+## Saturation / cycle-steal bench — metrics histogram path (2026-06-04→05, dedicated hardware)
+
+Host: host-1, AWS c7a.xlarge (EPYC 9R14, 4 real cores / no SMT, dedicated).
+Bench: `tests/bench/saturation.sh`, **N=150 rounds / 450 samples over ~9 h**. Module (nginx
+master + workers + the `otel exporter` child) pinned to 2 cores (SERVER_CORES=0,1); wrk +
+collector quarantined to cores 2,3; server cores held **~98% busy** (saturation proven via
+per-core `/proc/stat`), so a C3-vs-C1 delta reflects server-side (module) cost, not load-side
+contention. `return 200`, no `otel_access_log_sample` → exercises the always-on
+**histogram-recording** hot path only.
+
+| Config | median req/s | vs C1 | exporter CPU | exporter RSS |
+|---|---|---|---|---|
+| C1 — no module | 262,970 | — | — | — |
+| C3 — module + exporter, `otel_metric_interval 10s` | 262,886 | −0.03% | 0.00% | 4.68 MB |
+| C3 — module + exporter, `otel_metric_interval 1s` | 263,285 | +0.12% | 0.02% | 4.67 MB |
+
+**The metrics/histogram hot path is free under sustained saturation:** throughput delta within
+noise even at a 1 s flush, exporter CPU 0.00–0.02% of one core, and **RSS flat at ~4.68 MB over
+the full 9 h (no leak)**. This is the per-request `record()` cost (3 decomposed exponential
+histograms + byte/duration histograms), with the spare-core escape hatch removed.
+
+## Saturation / cycle-steal bench — full access-log sampling path (2026-06-05, dedicated hardware)
+
+Host / pinning as above. Bench: `tests/bench/saturation_accesslog.sh`, **N=34 rounds / 102
+samples over 2 h**, `otel_metric_interval 1s`. Every request returns **500** (≥ TAIL_STATUS_FLOOR
+= 400, so `is_interesting` is true on every request) and carries an inbound **`traceparent`**
+header — the absolute **worst case** in which the full sampling path fires on 100% of requests:
+exemplar reservoir write + exception-tail LogRecord + traceparent/UA header scan. Module = the
+prebuilt Phase 2.2 build, so this does **not** include the later traceparent scan
+early-exit/length-prefilter; it is a pessimistic ceiling.
+
+| Config | median req/s | vs C1 | exporter CPU | exporter RSS | p99 |
+|---|---|---|---|---|---|
+| C1 — no module | 260,176 | — | — | — | ~0.78 ms |
+| C3_metrics — module, sampling OFF | 260,018 | −0.06% | 0.02% | 4.7 MB | ~0.78 ms |
+| C3_full — `otel_access_log_sample 64` ON | 250,534 | −3.7% | 2.96% | 18.0 MB | ~4.4 ms |
+
+- Histogram path (C3_metrics − C1): **−0.06%** → re-confirms the metrics result above.
+- Full sampling path (C3_full − C1): **−3.7% throughput, 2.96% of one core in the exporter,
+  ~18 MB exporter RSS, p99 ~0.78→4.4 ms** — the worst-case ceiling (every request interesting).
+- RSS **plateaus / no leak**: first round 17,992 KB → last round 18,040 KB; tight 17.8–18.3 MB
+  band across all 34 rounds = bounded steady-state working set (tail + exemplar + retry buffers).
+  p99 **stable** (4.27–4.56 ms the whole run).
+- **Realistic cost is far lower**: the exception tail is thin by design (only errors / >1 s
+  latency are "interesting"), so production cost scales by the interesting fraction — e.g. ~5%
+  interesting ≈ ~0.2% throughput, with the p99 hit applying only to the sampled subset.

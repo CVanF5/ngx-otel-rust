@@ -398,6 +398,15 @@ for round in $(seq 1 "${BENCH_ITERATIONS}"); do
 
         nginx_start "${PREFIX}"
 
+        # For C3, snapshot the collector's received-record count so we can
+        # prove afterwards that the configured exporter actually delivered
+        # telemetry. A silent export failure would otherwise make C3 == C1 and
+        # "pass" for the wrong reason.
+        RECV_BEFORE=0
+        if [[ "${cfg}" == "c3" ]]; then
+            RECV_BEFORE="$(collector_metric_count)"
+        fi
+
         # Run wrk and capture output.
         info "  Config ${cfg}, round ${round}: running wrk -t${WRK_THREADS} -c${WRK_CONNECTIONS} -d${WRK_DURATION}s"
         WRK_OUT="$(wrk -t"${WRK_THREADS}" -c"${WRK_CONNECTIONS}" -d"${WRK_DURATION}s" \
@@ -420,6 +429,20 @@ for round in $(seq 1 "${BENCH_ITERATIONS}"); do
                 echo "       This is a Phase 1.1 invariant failure. STOP-AND-ASK." >&2
                 echo "       Relevant log lines:" >&2
                 grep "spawning export task" "${PREFIX}/logs/error.log" >&2
+                sandbox_cleanup "${PREFIX}"
+                exit 2
+            fi
+        fi
+
+        # Check C3 receipt: the configured exporter MUST have delivered metrics
+        # to the collector during this run, otherwise the C3-vs-C1 comparison is
+        # meaningless. Give the collector's 1s batch processor a moment to flush
+        # the final export to the file exporter before counting.
+        if [[ "${cfg}" == "c3" ]]; then
+            sleep 2
+            if ! assert_collector_received "${RECV_BEFORE}" "C3 r${round}"; then
+                echo "ERROR: C3 (module + exporter) produced NO telemetry at the collector." >&2
+                echo "       The C3-vs-C1 overhead number would be meaningless. STOP-AND-ASK." >&2
                 sandbox_cleanup "${PREFIX}"
                 exit 2
             fi
