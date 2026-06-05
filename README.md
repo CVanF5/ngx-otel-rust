@@ -5,9 +5,10 @@ OpenTelemetry signals to an OTel collector.  Designed for migration to
 OTAP (OpenTelemetry Protocol with Apache Arrow) — the columnar evolution
 of OTLP — in a later phase.
 
-The metrics it emits are defined in **[`METRIC_MODEL.md`](METRIC_MODEL.md)**
-(OTel-semantic-conventions format) — the producer-side contract, modelled
-on the F5 AVR nginx module (`avr-module/`) with OTel-semconv names/units.
+Everything it emits — metrics, logs, and (Phase 3) traces — is defined in
+**[`TELEMETRY_MODEL.md`](TELEMETRY_MODEL.md)** (OTel-semantic-conventions format),
+the producer-side contract, modelled on the F5 AVR nginx module (`avr-module/`)
+with OTel-semconv names/units. See [Signals](#signals-what-this-module-emits).
 
 [NGINX]: https://nginx.org/
 [`ngx-rust`]: https://github.com/nginx/ngx-rust
@@ -35,7 +36,7 @@ What works today:
   plus a histogram set inspired by F5 AVR
   (`http.server.request.duration`, request/response body size, upstream
   timings, upstream byte counts).  Full model in
-  [`METRIC_MODEL.md`](METRIC_MODEL.md).
+  [`TELEMETRY_MODEL.md`](TELEMETRY_MODEL.md).
 - OTLP protobuf encoding with vendored proto files; collector receives
   the expected Sum / Gauge / Histogram shapes with correct Cumulative
   temporality.
@@ -141,6 +142,29 @@ request path, no background process runs.  This is the
 case rests on.
 
 [hyper]: https://hyper.rs/
+
+## Signals (what this module emits)
+
+The full producer-side contract — every metric, log record, and (Phase 3) trace,
+with names, units, attributes, and temporality — lives in
+**[`TELEMETRY_MODEL.md`](TELEMETRY_MODEL.md)**. That file is the source of truth for
+building dashboards, alerts, or pipelines against this module; you do **not** need the
+design proposal to integrate. In brief:
+
+- **Metrics** (on by default): HTTP request duration as an OTel **exponential
+  histogram (µs)** decomposed into base (`method × status-class × protocol`),
+  per-`http.route`, and per-`nginx.upstream.zone` series; request/response/upstream
+  byte + timing histograms; nginx `stub_status` counters/gauges; and a
+  `ngx_otel.error_log.events` error-rate counter. Cumulative temporality.
+- **Logs — access** (`otel_access_log_sample <n>`): metrics-primary, plus
+  reservoir-sampled **exemplars** (trace-linked) and a **thin exception tail** of
+  `LogRecord`s for status ≥ 4xx / latency outliers. Not a per-request log.
+- **Logs — error** (`otel_error_log [level]`): coalesced `nginx.error` `LogRecord`s
+  (one sample + count per template) with a companion error-rate metric.
+- **Traces**: Phase 3 (not yet emitted).
+
+A ready-made Grafana dashboard is provided at
+[`test-harness/demo/grafana/dashboards/ngx-otel-rust-overview.json`](test-harness/demo/grafana/dashboards/ngx-otel-rust-overview.json).
 
 ## Getting Started
 
@@ -306,12 +330,16 @@ http {
     otel_exporter_header authorization "Bearer ...";
     otel_metric_interval 10s;
     otel_metric_zone otel_metrics 1m;
-    otel_metric_status_code_class on;       # accepted (default on); class emission deferred to Phase 2 — see Limitations
+    otel_metric_status_code_class on;       # emit method × status-class × protocol attrs on the duration series (live)
 
-    # Opt-in high-cardinality attributes (off by default for series safety):
+    # Logs (off unless these are set; orthogonal to nginx's own access_log/error_log):
+    otel_access_log_sample 128;             # enable access exemplars + thin exception tail; arg = exemplar reservoir size
+    # otel_log_ring_size 512k;              # per-worker logs ring capacity (tail + exemplar substrate)
+    otel_error_log;                         # enable error-log export; floor defaults to `error`. e.g. `otel_error_log warn;`
+    # otel_error_log_coalesce off;          # default on; off = best-effort verbatim streaming (lossy under load — see TELEMETRY_MODEL.md)
+
+    # High-cardinality attributes ride on exemplars/tail only, never metric dimensions:
     # otel_metric_high_cardinality_attr url.path;
-    # otel_metric_high_cardinality_attr client.address;
-    # otel_metric_high_cardinality_attr user_agent.original;
 
     server { ... }
 }

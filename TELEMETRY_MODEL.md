@@ -1,10 +1,32 @@
-# ngx-otel-rust — Metric Model
+# ngx-otel-rust — Telemetry Model
 
-This document defines the metrics the module emits, in the style of the
-[OpenTelemetry Semantic Conventions for metrics][semconv]. It is the
-producer-side contract: metric names, instruments, units, temporality, and
-the attribute set the OTAP collector dictionary-encodes downstream
-(proposal §6.4, "Producer-side cardinality discipline").
+This document is the **producer-side contract for everything the module emits** —
+metrics, logs, and (Phase 3) traces — in the style of the
+[OpenTelemetry Semantic Conventions][semconv]: signal names, instruments/record
+shapes, units, temporality, and the bounded attribute set the OTAP collector
+dictionary-encodes downstream (proposal §6.4, "Producer-side cardinality
+discipline"). **If you are building a dashboard, alert, or pipeline against this
+module and do not have the proposal, this file is the source of truth** — the repo
+is meant to be self-describing for *what it emits*; the proposal covers *why*.
+
+## Signals at a glance
+
+| Signal | Status | Enabled by | Where |
+|---|---|---|---|
+| **Metrics** | shipped (1.1–2.2) | on by default (`otel_metrics`) | [Metrics](#metrics) |
+| **Logs — access (tail + exemplars)** | shipped (2.1–2.2) | `otel_access_log_sample <n>` | [Logs](#logs) |
+| **Logs — error (coalesced + rate metric)** | shipped (2.3) | `otel_error_log [level]` | [Logs](#logs) |
+| **Traces** | Phase 3 (not yet emitted) | — | [Traces](#traces-phase-3--not-yet-emitted) |
+
+**Conventions shared by all signals:** the [Resource and scope](#resource-and-scope)
+below applies to every signal; all attributes are drawn from OTel semconv and kept
+**WithinU8 cardinality** (§6.4) so the collector dictionary-encodes per-point columns
+at u8 key width; high-cardinality detail (`url.path`, `client.address`,
+`user_agent.original`, upstream peer addr) never becomes a metric dimension — it rides
+on exemplars, the access tail, or error-record bodies. Transport is OTLP (HTTP or
+gRPC, `otel_export_protocol`) from the dedicated `nginx: otel exporter` process.
+
+## Metrics
 
 > **Currency.** Reflects the shipped module through **Phase 2.3** (error-log
 > §6.6.2, June 2026): the request-duration histogram is an OTel
@@ -205,6 +227,72 @@ Severity classes (5 values, WithinU8 cardinality):
 > Per-template counts ride on the `LogRecord`'s `nginx.error.coalesced_count`
 > attribute, never on the metric.
 
+---
+
+## Logs
+
+OTel logs are **orthogonal to nginx's own `access_log`/`error_log`** (the module emits
+via its own directives; core file logging is untouched and remains the on-box
+transcript). The OTel stream carries "summary + samples", not a per-request firehose
+(proposal §6.6).
+
+### Access log — exemplars + thin exception tail (§6.6.1)
+
+The bulk of access information is the **metrics** above. Per-event access output is
+**gated by `otel_access_log_sample <reservoir-size>`** (absent ⇒ off) and is two
+things, never a per-request log:
+
+- **Exemplars** on the `http.server.request.duration` base series: reservoir-sampled
+  representative requests, each carrying the measured value + `trace_id`/`span_id`
+  (from the inbound W3C `traceparent`, when present) + `filtered_attributes` (the
+  high-cardinality detail `url.path`, `client.address`, `user_agent.original`). This is
+  the metric → exemplar → trace drill-down pivot. (`src/metric_source/instrumented.rs`,
+  encoder `Exemplar`.)
+- **Exception-tail `LogRecord`s**: emitted ONLY for "interesting" requests (status
+  ≥ 4xx, latency outliers — an is-interesting gate), carrying the same high-cardinality
+  attributes + `trace_id`/`span_id`. Substrate is the per-worker SPSC ring.
+  (`src/logs/access.rs`, `src/logs/ring.rs`.)
+
+A common (2xx, fast) request produces **neither** — only the histogram `fetch_add`.
+
+### Error log — coalesced `LogRecord`s (§6.6.2)
+
+Enabled by `otel_error_log [level]`. Logs-primary (the message body is the payload).
+Floods of identical lines are collapsed at the producer.
+
+| `LogRecord` field | Value |
+|---|---|
+| `severity_number` / `severity_text` | nginx level → OTel mapping (`src/logs/severity.rs`) |
+| `event_name` | `nginx.error` |
+| `body` | the verbatim nginx error line (already includes `, client:/request:/upstream:` context text) |
+| attr `nginx.error.template_hash` | stable-core hash; joins a sample to its coalesced count group |
+| attr `nginx.error.coalesced_count` | flood size for this template this interval (present when > 1) |
+
+- **No** `http.route` / `nginx.upstream.zone` / `trace_id` / `span_id` — the
+  `ngx_log_writer_pt` seam can't reach request context (see the error-rate metric
+  scope-boundary note above). "Which upstream/route" is in the **body text**.
+- **Volume controls:** a **severity floor** (fixed `NGX_LOG_ERR` default, decoupled
+  from core `error_log`; override with the level arg); producer-side **exact-hash
+  coalescing** on the extracted stable core (one verbatim sample per template per
+  interval, plus always-verbatim high-severity crit/alert/emerg and never-before-seen
+  templates); **`otel_error_log_coalesce off`** opts into best-effort verbatim
+  streaming (lossy under load — see the directive doc).
+- **Companion:** the `ngx_otel.error_log.events` rate metric (in [Metrics](#metrics)
+  above) is the always-on summary. Master / config-load / shutdown / exporter-context
+  errors fall through to nginx's own `error_log` (structural; not exported over OTel).
+- Source: `src/logs/error_writer.rs`, `src/logs/coalesce.rs`, drain in `src/export/mod.rs`.
+
+## Traces (Phase 3 — not yet emitted)
+
+No spans are emitted today. Phase 3 will emit OTel **server spans**, parsing the
+inbound `traceparent` once at span-context setup and reusing it for the span + the
+access exemplars/tail. Until then, the `trace_id`/`span_id` that appear on access
+exemplars and tail records come from the **caller's propagated `traceparent`**, not
+from module-emitted spans — so a backend correlates exemplars to *upstream-of-nginx*
+traces, and per-hop nginx server spans arrive in Phase 3. (proposal §6.6.3, §3.)
+
+---
+
 ## avr-module signals not yet ported
 
 Present in the avr model but not currently emitted by ngx-otel-rust —
@@ -227,6 +315,9 @@ candidates for future metrics, listed so they aren't forgotten:
   `ngx_http_avr_output.c`
 - Producer-side cardinality discipline: proposal §6.4; logs-as-summary §6.6
 - Shared-memory layout + histograms: `src/shm.rs`
-- Emission + attributes: `src/metric_source/instrumented.rs`, `src/encoder/mod.rs`
+- Metrics emission + attributes: `src/metric_source/instrumented.rs`, `src/encoder/mod.rs`
+- Logs: `src/logs/{access,ring,error_writer,coalesce,severity}.rs`; drain in `src/export/mod.rs`
+- Traces: Phase 3 (not yet implemented)
+- Configuration directives: see the project `README.md`
 
 [semconv]: https://opentelemetry.io/docs/specs/semconv/http/http-metrics/
