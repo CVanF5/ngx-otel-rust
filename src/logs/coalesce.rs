@@ -33,7 +33,7 @@
 //! - **Re-entrancy-safe**: the coalescer itself is called only after the busy-flag
 //!   swap in the writer; it does no logging and no allocation.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 // ── CoalesceSlot ──────────────────────────────────────────────────────────────
 
@@ -49,8 +49,8 @@ pub const COALESCE_CAPACITY: usize = 256;
 ///
 /// # Memory layout (`#[repr(C)]`, 24 bytes)
 /// ```text
-/// offset 0:  key_hash:       u64  (8)   — stable until evicted (never cleared)
-/// offset 8:  severity:       u8   (1)   — written once with key_hash
+/// offset 0:  key_hash:       AtomicU64  — stable until evicted (never cleared)
+/// offset 8:  severity:       AtomicU8   — written once with key_hash
 /// offset 9:  _pad:           [u8; 3]
 /// offset 12: count:          AtomicU32  — bumped by writer; swap-to-0 by drain
 /// offset 16: sample_emitted: AtomicBool — set by writer; swap-to-false by drain
@@ -61,13 +61,20 @@ pub const COALESCE_CAPACITY: usize = 256;
 /// The writer (single-threaded per worker via the busy-flag) reads/writes all
 /// fields.  The drain (exporter process) atomically reads-and-resets `count` and
 /// `sample_emitted` only; it NEVER modifies `key_hash` or `severity`.
+///
+/// All fields are atomics. `key_hash`/`severity` use `Relaxed`: they are
+/// write-once and ordered against the drain by the `count` Release/Acquire pair
+/// (the writer's `count.store(1, Release)` publishes them; the drain's
+/// `count.swap(0, AcqRel)` makes them visible). Atomics — rather than plain
+/// fields with `write_volatile` — give a clean cross-process shared-memory
+/// contract with no `&T → *mut T` casting.
 #[repr(C)]
 pub struct CoalesceSlot {
     /// FNV-1a hash of `severity_byte ++ stable_core_bytes`.
     /// `0` means the slot is empty.
-    pub key_hash: u64,
+    pub key_hash: AtomicU64,
     /// Nginx severity level (1=emerg … 8=debug) at time of first insertion.
-    pub severity: u8,
+    pub severity: AtomicU8,
     pub _pad: [u8; 3],
     /// Number of times this template was seen this interval (including the initial
     /// verbatim sample that was pushed to the ring on first insertion).
@@ -268,25 +275,14 @@ pub unsafe fn coalesce(
         // it is in-bounds. The writer is single-threaded (the caller's busy flag),
         // so the shared ref does not alias a concurrent `&mut`.
         let slot = unsafe { &*table.add(probe) };
-        let slot_key = slot.key_hash;
+        let slot_key = slot.key_hash.load(Ordering::Relaxed);
 
         if slot_key == 0 {
             // Empty slot — this template is novel.  Insert and emit one verbatim sample.
-            // Write key_hash and severity first (both stable; never changed after).
-            // Use addr_of_mut! to obtain *mut T from a field projection through a
-            // raw pointer — avoids the &T → *mut T cast that triggers lint
-            // `invalid_reference_casting`.
-            // SAFETY: writer is single-threaded (busy flag); no concurrent writer.
-            unsafe {
-                core::ptr::write_volatile(
-                    core::ptr::addr_of_mut!((*table.add(probe)).key_hash),
-                    key,
-                );
-                core::ptr::write_volatile(
-                    core::ptr::addr_of_mut!((*table.add(probe)).severity),
-                    severity,
-                );
-            }
+            // Write key_hash and severity first (both stable; never changed after),
+            // as Relaxed stores: the `count.store(1, Release)` below publishes them.
+            slot.key_hash.store(key, Ordering::Relaxed);
+            slot.severity.store(severity, Ordering::Relaxed);
             // Release ordering: the key_hash/severity writes above must be visible
             // to the drain before it reads count > 0.  The drain does an AcqRel swap
             // on count; the Acquire half synchronises with this Release store.
@@ -296,7 +292,7 @@ pub unsafe fn coalesce(
             return CoalesceResult::EmitVerbatim { template_hash: key };
         }
 
-        if slot_key == key && slot.severity == severity {
+        if slot_key == key && slot.severity.load(Ordering::Relaxed) == severity {
             // Existing entry — bump the count.  Do NOT emit again this interval
             // UNLESS sample_emitted is false (drain reset it; re-emit one sample).
             let already_emitted = slot.sample_emitted.load(Ordering::Acquire);
@@ -369,7 +365,7 @@ pub unsafe fn drain_coalesce_table(table: *mut CoalesceSlot) -> std::vec::Vec<(u
         // Cheap pre-filter: a zero key_hash means the slot was never written.
         // (key_hash is only written once, before count; if count > 0 then
         //  key_hash is definitely non-zero, so this skips all empty slots.)
-        if slot.key_hash == 0 {
+        if slot.key_hash.load(Ordering::Relaxed) == 0 {
             continue;
         }
         // AcqRel: the Acquire half synchronises with the Release count.store(1)
@@ -377,8 +373,8 @@ pub unsafe fn drain_coalesce_table(table: *mut CoalesceSlot) -> std::vec::Vec<(u
         let count = slot.count.swap(0, Ordering::AcqRel);
         if count > 0 {
             // Read key_hash and severity AFTER the Acquire swap for correct ordering.
-            let key_hash = slot.key_hash;
-            let severity = slot.severity;
+            let key_hash = slot.key_hash.load(Ordering::Relaxed);
+            let severity = slot.severity.load(Ordering::Relaxed);
             // Reset sample_emitted so the next interval re-emits a fresh sample.
             // The Release ensures the reset is visible to the writer before it
             // loads sample_emitted with Acquire.
@@ -577,16 +573,8 @@ mod tests {
         // We do this by directly populating table slots.
         for i in 0..COALESCE_CAPACITY {
             // Fill every slot with a non-zero key_hash so the table appears full.
-            // SAFETY: `ptr` is the base of the valid zeroed table from
-            // make_table(); `i < COALESCE_CAPACITY`, so the field projections are
-            // in-bounds. Single-threaded test, no concurrent access.
-            unsafe {
-                core::ptr::write_volatile(
-                    core::ptr::addr_of_mut!((*ptr.add(i)).key_hash),
-                    (i + 1) as u64,
-                );
-                core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr.add(i)).severity), 4u8);
-            }
+            table[i].key_hash.store((i + 1) as u64, Ordering::Relaxed);
+            table[i].severity.store(4u8, Ordering::Relaxed);
             table[i].count.store(1, Ordering::Relaxed);
             table[i].sample_emitted.store(true, Ordering::Relaxed);
         }
@@ -628,6 +616,10 @@ mod tests {
         let core = stable_core(msg);
         let key = coalesce_key(4, core);
         let slot_idx = (key as usize) & (COALESCE_CAPACITY - 1);
-        assert_eq!(table[slot_idx].key_hash, 0, "coalesce=off must not write to the table");
+        assert_eq!(
+            table[slot_idx].key_hash.load(Ordering::Relaxed),
+            0,
+            "coalesce=off must not write to the table"
+        );
     }
 }

@@ -1147,14 +1147,29 @@ fn collect_log_records(
 
     let cap = amcf.log_ring_cap();
 
-    // Maximum records to drain from each worker ring per cycle.
+    // Per-ring, per-worker drain caps. These are applied INDEPENDENTLY to the
+    // access and error loops below (each loop has its own `drained` counter) —
+    // there is no shared budget, so a high access volume cannot starve the
+    // error drain.
     //
-    // Caps the HTTP POST body size: at ~200 bytes/record, 2 500 records per
-    // worker = ~500 KB/worker → total batch ≤ 2 MB for N ≤ 4 workers.
-    // Remaining records stay in the ring and are drained on the next 250 ms
-    // wake.  This keeps batches within the collector's max request body size
-    // (default 20 MB for otelcol-contrib) even when rings are large.
-    const MAX_RECORDS_PER_WORKER_PER_DRAIN: usize = 2_500;
+    // Access cap bounds the HTTP POST body: at ~200 bytes/record, 2 500
+    // records/worker = ~500 KB/worker → total batch ≤ 2 MB for N ≤ 4 workers,
+    // well within the collector's max request body (default 20 MB for
+    // otelcol-contrib). Remaining records stay in the ring for the next 250 ms
+    // wake; access logs are drop-tolerant by design.
+    const MAX_ACCESS_RECORDS_PER_WORKER_PER_DRAIN: usize = 2_500;
+
+    // Error cap is deliberately larger. Error logs are low-volume (the whole
+    // point of template coalescing) AND carry an enrichment-coherence
+    // constraint the access path does not: the coalescer table is drained and
+    // reset once per interval (below), so the verbatim sample for a key must be
+    // drained from the ring in the SAME interval its coalescer count is read,
+    // or that sample arrives next interval with `coalesced_count == 0` (the
+    // record body still ships; only the ×N enrichment is lost). Sizing the cap
+    // generously keeps the ring drain ahead of the coalescer reset under any
+    // realistic error rate; bounding it at all still guards body size against a
+    // pathological error storm.
+    const MAX_ERROR_RECORDS_PER_WORKER_PER_DRAIN: usize = 50_000;
 
     // Drain access rings for all workers.
     for w in 0..n_workers {
@@ -1164,10 +1179,10 @@ fn collect_log_records(
         // Accumulate drop counts.
         total_dropped += ring.drop_count();
 
-        // Drain up to MAX_RECORDS_PER_WORKER_PER_DRAIN records per worker.
+        // Drain up to MAX_ACCESS_RECORDS_PER_WORKER_PER_DRAIN records per worker.
         let mut record_buf: std::vec::Vec<u8> = std::vec::Vec::new();
         let mut drained = 0usize;
-        while drained < MAX_RECORDS_PER_WORKER_PER_DRAIN && ring.pop_into(&mut record_buf) {
+        while drained < MAX_ACCESS_RECORDS_PER_WORKER_PER_DRAIN && ring.pop_into(&mut record_buf) {
             // Parse the wire format from access.rs:
             // [0] kind(1) [1..9] ts_unix_nano_be [9] ngx_level [10..12] method_len
             // [12..12+method_len] method [12+ml..14+ml] status_u16
@@ -1209,7 +1224,8 @@ fn collect_log_records(
 
             let mut record_buf: std::vec::Vec<u8> = std::vec::Vec::new();
             let mut drained = 0usize;
-            while drained < MAX_RECORDS_PER_WORKER_PER_DRAIN && ring.pop_into(&mut record_buf) {
+            while drained < MAX_ERROR_RECORDS_PER_WORKER_PER_DRAIN && ring.pop_into(&mut record_buf)
+            {
                 if let Some(lr) = parse_error_record(&record_buf, now, &counts_map) {
                     logs.push(lr);
                 }
@@ -1958,20 +1974,13 @@ mod tests {
         // `logs_coalesce_table(slot_ptr, 0, cap)` returns the in-slot coalescer
         // table base. `slot_idx` is masked by `COALESCE_CAPACITY - 1` (a
         // power-of-two capacity), so `table.add(slot_idx)` stays within the
-        // `[CoalesceSlot; COALESCE_CAPACITY]` array; the `write_volatile`s target
-        // that one in-bounds slot and `count`/`sample_emitted` are atomics.
+        // `[CoalesceSlot; COALESCE_CAPACITY]` array; all fields are atomics.
         unsafe {
             let table = logs_coalesce_table(slot_ptr, 0, cap);
             let slot_idx = (template_hash as usize) & (COALESCE_CAPACITY - 1);
             let slot = &*table.add(slot_idx);
-            core::ptr::write_volatile(
-                core::ptr::addr_of_mut!((*table.add(slot_idx)).key_hash),
-                template_hash,
-            );
-            core::ptr::write_volatile(
-                core::ptr::addr_of_mut!((*table.add(slot_idx)).severity),
-                4u8,
-            );
+            slot.key_hash.store(template_hash, core::sync::atomic::Ordering::Relaxed);
+            slot.severity.store(4u8, core::sync::atomic::Ordering::Relaxed);
             slot.count.store(coalesced_n, core::sync::atomic::Ordering::Release);
             slot.sample_emitted.store(true, core::sync::atomic::Ordering::Release);
         }
