@@ -53,6 +53,11 @@ http {
 
     # Backend the front server proxies to (populates upstream.* metrics).
     upstream demo_backend {
+        # The shared-memory `zone` names this upstream — the module keys the
+        # per-upstream latency series (nginx.upstream.zone) on it. Without a
+        # zone there is no name to attribute to, so the by-upstream panel stays
+        # empty. (NGINX Plus model; `zone` is OSS since 1.9.0.)
+        zone demo_backend 64k;
         server 127.0.0.1:9401;
         keepalive 16;
     }

@@ -270,7 +270,7 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "sum(rate(http_server_request_duration_microseconds_sum{service_name=\"$service\"}[$__rate_interval])) / sum(rate(http_server_request_duration_microseconds_count{service_name=\"$service\"}[$__rate_interval])) / 1000",
+              "expr": "sum(rate(http_server_request_duration_sum{service_name=\"$service\"}[$__rate_interval])) / sum(rate(http_server_request_duration_count{service_name=\"$service\"}[$__rate_interval])) / 1000",
               "refId": "A",
               "legendFormat": ""
             }
@@ -303,7 +303,7 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "sum(rate(http_server_request_duration_microseconds_sum{service_name=\"$service\"}[$__rate_interval])) / sum(rate(http_server_request_duration_microseconds_count{service_name=\"$service\"}[$__rate_interval])) / 1000",
+              "expr": "sum(rate(http_server_request_duration_sum{service_name=\"$service\"}[$__rate_interval])) / sum(rate(http_server_request_duration_count{service_name=\"$service\"}[$__rate_interval])) / 1000",
               "refId": "A",
               "legendFormat": "avg ms"
             }
@@ -336,7 +336,7 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "sum(rate(http_server_request_duration_microseconds_count{service_name=\"$service\"}[$__rate_interval])) by (http_response_status_code)",
+              "expr": "sum(rate(http_server_request_duration_count{service_name=\"$service\"}[$__rate_interval])) by (http_response_status_code)",
               "refId": "A",
               "legendFormat": "{{http_response_status_code}}"
             }
@@ -369,7 +369,7 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "sum(rate(http_server_request_duration_microseconds_count{service_name=\"$service\"}[$__rate_interval])) by (http_request_method)",
+              "expr": "sum(rate(http_server_request_duration_count{service_name=\"$service\"}[$__rate_interval])) by (http_request_method)",
               "refId": "A",
               "legendFormat": "{{http_request_method}}"
             }
@@ -402,7 +402,7 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "sum(rate(http_server_request_duration_microseconds_sum{service_name=\"$service\"}[$__rate_interval])) by (http_response_status_code) / sum(rate(http_server_request_duration_microseconds_count{service_name=\"$service\"}[$__rate_interval])) by (http_response_status_code) / 1000",
+              "expr": "sum(rate(http_server_request_duration_sum{service_name=\"$service\"}[$__rate_interval])) by (http_response_status_code) / sum(rate(http_server_request_duration_count{service_name=\"$service\"}[$__rate_interval])) by (http_response_status_code) / 1000",
               "refId": "A",
               "legendFormat": "{{http_response_status_code}}"
             }
@@ -435,7 +435,7 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "topk(12, sum(rate(http_server_request_duration_by_route_microseconds_sum{service_name=\"$service\"}[$__rate_interval])) by (http_route) / sum(rate(http_server_request_duration_by_route_microseconds_count{service_name=\"$service\"}[$__rate_interval])) by (http_route) / 1000)",
+              "expr": "topk(12, sum(rate(http_server_request_duration_by_route_sum{service_name=\"$service\"}[$__rate_interval])) by (http_route) / sum(rate(http_server_request_duration_by_route_count{service_name=\"$service\"}[$__rate_interval])) by (http_route) / 1000)",
               "refId": "A",
               "legendFormat": "{{http_route}}"
             }
@@ -469,7 +469,7 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "sum(rate(http_server_request_duration_by_upstream_microseconds_sum{service_name=\"$service\"}[$__rate_interval])) by (nginx_upstream_zone) / sum(rate(http_server_request_duration_by_upstream_microseconds_count{service_name=\"$service\"}[$__rate_interval])) by (nginx_upstream_zone) / 1000",
+              "expr": "sum(rate(http_server_request_duration_by_upstream_sum{service_name=\"$service\"}[$__rate_interval])) by (nginx_upstream_zone) / sum(rate(http_server_request_duration_by_upstream_count{service_name=\"$service\"}[$__rate_interval])) by (nginx_upstream_zone) / 1000",
               "refId": "A",
               "legendFormat": "{{nginx_upstream_zone}}"
             }
@@ -502,7 +502,7 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "histogram_quantile(0.95, sum(rate(http_server_request_body_size_bytes_bucket{service_name=\"$service\"}[$__rate_interval])) by (le))",
+              "expr": "histogram_quantile(0.95, sum(rate(http_server_request_body_size_bucket{service_name=\"$service\"}[$__rate_interval])) by (le))",
               "refId": "A",
               "legendFormat": "request p95"
             },
@@ -511,7 +511,7 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "histogram_quantile(0.95, sum(rate(http_server_response_body_size_bytes_bucket{service_name=\"$service\"}[$__rate_interval])) by (le))",
+              "expr": "histogram_quantile(0.95, sum(rate(http_server_response_body_size_bucket{service_name=\"$service\"}[$__rate_interval])) by (le))",
               "refId": "B",
               "legendFormat": "response p95"
             }
@@ -544,7 +544,7 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "sum(rate(http_server_request_body_size_bytes_sum{service_name=\"$service\"}[$__rate_interval]))",
+              "expr": "sum(rate(http_server_request_body_size_sum{service_name=\"$service\"}[$__rate_interval]))",
               "refId": "A",
               "legendFormat": "request"
             },
@@ -553,7 +553,7 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "sum(rate(http_server_response_body_size_bytes_sum{service_name=\"$service\"}[$__rate_interval]))",
+              "expr": "sum(rate(http_server_response_body_size_sum{service_name=\"$service\"}[$__rate_interval]))",
               "refId": "B",
               "legendFormat": "response"
             }
@@ -586,7 +586,7 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "histogram_quantile(0.95, sum(rate(http_server_upstream_connect_duration_milliseconds_bucket{service_name=\"$service\"}[$__rate_interval])) by (le))",
+              "expr": "histogram_quantile(0.95, sum(rate(http_server_upstream_connect_duration_bucket{service_name=\"$service\"}[$__rate_interval])) by (le))",
               "refId": "A",
               "legendFormat": "connect"
             },
@@ -595,7 +595,7 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "histogram_quantile(0.95, sum(rate(http_server_upstream_header_duration_milliseconds_bucket{service_name=\"$service\"}[$__rate_interval])) by (le))",
+              "expr": "histogram_quantile(0.95, sum(rate(http_server_upstream_header_duration_bucket{service_name=\"$service\"}[$__rate_interval])) by (le))",
               "refId": "B",
               "legendFormat": "header"
             },
@@ -604,7 +604,7 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "histogram_quantile(0.95, sum(rate(http_server_upstream_response_duration_milliseconds_bucket{service_name=\"$service\"}[$__rate_interval])) by (le))",
+              "expr": "histogram_quantile(0.95, sum(rate(http_server_upstream_response_duration_bucket{service_name=\"$service\"}[$__rate_interval])) by (le))",
               "refId": "C",
               "legendFormat": "response"
             }
@@ -816,7 +816,7 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "ngx_otel_export_interval_milliseconds{service_name=\"$service\"} / 1000",
+              "expr": "ngx_otel_export_interval{service_name=\"$service\"} / 1000",
               "refId": "A",
               "legendFormat": ""
             }
@@ -849,7 +849,7 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "sum(increase(ngx_otel_send_failures_total{service_name=\"$service\"}[$__rate_interval]))",
+              "expr": "sum(increase(ngx_otel_send_failures{service_name=\"$service\"}[$__rate_interval]))",
               "refId": "A",
               "legendFormat": ""
             }
@@ -880,7 +880,7 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "sum(rate(ngx_otel_send_failures_total{service_name=\"$service\"}[$__rate_interval]))",
+              "expr": "sum(rate(ngx_otel_send_failures{service_name=\"$service\"}[$__rate_interval]))",
               "refId": "A",
               "legendFormat": "metrics"
             },
@@ -889,7 +889,7 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "sum(rate(ngx_otel_logs_send_failures_total{service_name=\"$service\"}[$__rate_interval]))",
+              "expr": "sum(rate(ngx_otel_logs_send_failures{service_name=\"$service\"}[$__rate_interval]))",
               "refId": "B",
               "legendFormat": "logs"
             }
@@ -920,7 +920,7 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "sum(rate(ngx_otel_dropped_records_points_total{service_name=\"$service\"}[$__rate_interval]))",
+              "expr": "sum(rate(ngx_otel_dropped_records{service_name=\"$service\"}[$__rate_interval]))",
               "refId": "A",
               "legendFormat": "metrics points"
             },
@@ -929,7 +929,7 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "sum(rate(ngx_otel_logs_access_dropped_records_total{service_name=\"$service\"}[$__rate_interval]))",
+              "expr": "sum(rate(ngx_otel_logs_access_dropped_records{service_name=\"$service\"}[$__rate_interval]))",
               "refId": "B",
               "legendFormat": "access logs"
             },
@@ -938,7 +938,7 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "sum(rate(ngx_otel_logs_error_dropped_records_total{service_name=\"$service\"}[$__rate_interval]))",
+              "expr": "sum(rate(ngx_otel_logs_error_dropped_records{service_name=\"$service\"}[$__rate_interval]))",
               "refId": "C",
               "legendFormat": "error logs"
             }
