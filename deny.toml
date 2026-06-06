@@ -1,0 +1,44 @@
+# cargo-deny configuration — polices the dependency surface (licenses,
+# security advisories, source provenance, version duplication).
+#
+# This is the dependency-policy gate the NGINX/upstream audience cares most
+# about for a Rust module living in the nginx address space. Mirrors the intent
+# of nginx/ngx-rust's cargo-deny workflow.
+#
+# Run locally:  cargo deny check
+# CI runs it via EmbarkStudios/cargo-deny-action (see .github/workflows/ci.yaml).
+
+[advisories]
+# Pull the RUSTSEC advisory DB and fail on a known-vulnerable dependency.
+version = 2
+yanked = "warn"
+
+[licenses]
+version = 2
+# Allow-list derived from the actual dependency tree (cargo metadata, 2026-06-06).
+# Unicode-3.0 and BSD-3-Clause are required because they appear in AND-expressions
+# ("(MIT OR Apache-2.0) AND Unicode-3.0", "MIT AND BSD-3-Clause"); the rest are
+# satisfied via MIT / Apache-2.0 in OR-expressions. Add new IDs here as the tree
+# changes (CI will flag an unlisted license).
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Dependency bloat is the upstream concern; surface duplicate versions (warn,
+# not deny — the hyper/tonic stack legitimately pulls some duplicates today).
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# Note: `ngx` / `nginx-sys` are local path deps (../ngx-rust fork); path deps are
+# not registry/git sources and are not flagged here.
