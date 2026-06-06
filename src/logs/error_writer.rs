@@ -218,9 +218,16 @@ pub unsafe extern "C" fn ngx_otel_error_writer(
                 // error_ring_ptr is null until init_process (Step 2.3.5) — skip silently.
                 let ring_ptr = (*state).error_ring_ptr;
                 if !ring_ptr.is_null() {
-                    // SAFETY: ngx_current_msec is a valid nginx global.
-                    // Convert ms → ns for the OTel timestamp.
-                    let ts_ns = nginx_sys::ngx_current_msec as u64 * 1_000_000;
+                    // OTel timestamps are Unix-epoch nanoseconds. Use nginx's cached
+                    // WALL-CLOCK (`ngx_cached_time`), NOT `ngx_current_msec`: the latter
+                    // is monotonic (boot-relative), so an OTLP backend with a freshness
+                    // window (e.g. Loki rejects entries older than ~1 week) reads it as
+                    // 1970 and 400s the whole batch — silently dropping good records
+                    // alongside it. Mirrors the access path (instrumented.rs: start_sec).
+                    // SAFETY: ngx_cached_time is a valid nginx global pointing at the
+                    // cached `ngx_time_t`; reading it is signal-safe (cached globals, no
+                    // syscall) — same profile as the previous ngx_current_msec read.
+                    let ts_ns = cached_unix_nanos(nginx_sys::ngx_cached_time);
                     push_error_record(ring_ptr, ts_ns, level as u8, template_hash, buf_slice);
                 }
             }
@@ -230,6 +237,27 @@ pub unsafe extern "C" fn ngx_otel_error_writer(
     (*state).busy.store(false, Ordering::Release);
 }
 
+/// Unix-epoch nanoseconds from nginx's cached wall-clock (`ngx_time_t`).
+///
+/// MUST be sourced from `ngx_cached_time` (wall-clock), NOT `ngx_current_msec`
+/// (monotonic / boot-relative): an OTLP backend with an ingest freshness window
+/// (e.g. Loki rejects entries older than ~1 week) reads a boot-relative value as
+/// 1970 and 400s the whole batch. See the call site for the full rationale.
+///
+/// Returns 0 when `tp` is null (early init / tests with the zeroed stub).
+#[inline]
+fn cached_unix_nanos(tp: *const nginx_sys::ngx_time_t) -> u64 {
+    if tp.is_null() {
+        return 0;
+    }
+    // SAFETY: caller passes a valid `ngx_time_t` pointer — the nginx global in
+    // production, or a stack value in tests.
+    let tp = unsafe { &*tp };
+    (tp.sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add((tp.msec as u64).saturating_mul(1_000_000))
+}
+
 // ── Error-ring record push ────────────────────────────────────────────────────
 
 /// Push one error-log record into the per-worker error ring.
@@ -237,7 +265,7 @@ pub unsafe extern "C" fn ngx_otel_error_writer(
 /// # Wire format
 /// ```text
 /// [0]      kind      = KIND_ERROR (0x01)
-/// [1..9]   ts_ns     u64 big-endian  — ngx_current_msec * 1_000_000
+/// [1..9]   ts_ns     u64 big-endian  — Unix-epoch ns from ngx_cached_time
 /// [9]      ngx_level u8              — nginx severity level (1=emerg … 8=debug)
 /// [10..18] template_hash u64 be     — 0 when untracked (high-sev / coalesce-off /
 ///                                      table-full)
@@ -682,5 +710,40 @@ mod tests {
         assert!(!state.busy.load(Ordering::SeqCst), "busy must be released by guard");
         // state pointer is used above — keep state alive via explicit drop.
         drop(state);
+    }
+
+    /// Regression test for the error-log timestamp bug (found 2026-06-06 via the
+    /// Grafana demo): the writer must stamp records with WALL-CLOCK Unix-epoch
+    /// nanoseconds, not the monotonic `ngx_current_msec`. A boot-relative value is
+    /// read by Loki (and any freshness-windowed OTLP backend) as ~1970 and the
+    /// whole batch is rejected (HTTP 400). This asserts the conversion math and,
+    /// crucially, that the result is a *plausible wall-clock* value — the hard
+    /// assert the original Phase 2.3 suite lacked (it ran against a file exporter
+    /// that never validated timestamps).
+    #[test]
+    fn cached_unix_nanos_is_wall_clock_not_monotonic() {
+        // Null pointer → 0 (early-init / stub).
+        assert_eq!(super::cached_unix_nanos(core::ptr::null()), 0);
+
+        // A realistic cached wall-clock: 2023-11-14T22:13:20Z + 500 ms.
+        let tp = nginx_sys::ngx_time_t {
+            sec: 1_700_000_000,
+            msec: 500,
+            gmtoff: 0,
+        };
+        let ns = super::cached_unix_nanos(&tp as *const _);
+        assert_eq!(
+            ns, 1_700_000_000_500_000_000,
+            "must be sec*1e9 + msec*1e6 (Unix-epoch ns)"
+        );
+
+        // The bug's signature: a monotonic uptime (~a few days of seconds) read as
+        // epoch lands in Jan 1970. Assert our value is firmly past 2020, i.e. it
+        // could NOT have come from a boot-relative clock.
+        const Y2020_NS: u64 = 1_577_836_800_000_000_000; // 2020-01-01T00:00:00Z
+        assert!(
+            ns > Y2020_NS,
+            "wall-clock ns must be past 2020 — a monotonic source would be near epoch"
+        );
     }
 }
