@@ -127,7 +127,14 @@ pub fn sync_post(
             // Collecting into a Vec lets us iterate multiple addresses
             // (e.g. both A and AAAA) without holding the iterator across an
             // error-handling branch.
-            let addrs: std::vec::Vec<_> = (host.as_str(), port)
+            //
+            // Strip IPv6 bracket notation before resolution.
+            // `ParsedEndpoint::parse` stores `"[::1]"` for `http://[::1]:PORT/`;
+            // `to_socket_addrs` rejects the bracketed form.  The async path uses
+            // the same `strip_v6_brackets` helper (hyper_http.rs).
+            let bare_host =
+                crate::transport::hyper_http::strip_v6_brackets(host.as_str());
+            let addrs: std::vec::Vec<_> = (bare_host, port)
                 .to_socket_addrs()
                 .map_err(SyncSendError::Connect)?
                 .collect();
@@ -358,6 +365,60 @@ mod tests {
         assert!(
             result.is_err(),
             "connect_first_reachable must fail when all addresses are unreachable"
+        );
+    }
+
+    /// `sync_post` resolves a bracketed IPv6 literal (`http://[::1]:PORT/…`) by
+    /// stripping the brackets before `to_socket_addrs`.  Binds a TcpListener on
+    /// `[::1]:0` and asserts the POST arrives successfully.
+    ///
+    /// Guards: if IPv6 loopback isn't available (e.g. a CI environment with
+    /// `net.ipv6.conf.lo.disable_ipv6=1`), the bind will fail and we skip the
+    /// test rather than fail it — the assertion we care about (brackets stripped)
+    /// is independently tested by `strip_v6_brackets_removes_brackets_from_ipv6_literal`.
+    #[test]
+    fn sync_post_to_ipv6_literal_strips_brackets_and_connects() {
+        use std::io::{Read, Write};
+
+        let v6_addr: std::net::SocketAddr = "[::1]:0".parse().unwrap();
+        let listener = match std::net::TcpListener::bind(v6_addr) {
+            Ok(l) => l,
+            Err(_) => {
+                // IPv6 loopback unavailable — skip gracefully.
+                return;
+            }
+        };
+        let port = listener.local_addr().expect("local_addr").port();
+
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().expect("accept");
+            let mut buf = std::vec![0u8; 8192];
+            let n = conn.read(&mut buf).expect("read");
+            buf.truncate(n);
+            conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .expect("write response");
+            buf
+        });
+
+        // The endpoint uses the bracketed form — this is what a real nginx config
+        // produces.  The bug (before FU1) was that this string was passed directly
+        // to to_socket_addrs, which rejected it.
+        let endpoint = std::format!("http://[::1]:{}/v1/metrics", port);
+        let body = b"test-v6-payload";
+        let result = sync_post(&endpoint, &[], body);
+        let request_bytes = server.join().expect("server thread");
+
+        assert!(
+            result.is_ok(),
+            "sync_post to IPv6 literal [::1] must succeed after bracket strip; err: {:?}",
+            result.err()
+        );
+
+        let raw = std::string::String::from_utf8_lossy(&request_bytes);
+        assert!(
+            raw.starts_with("POST /v1/metrics HTTP/1.1\r\n"),
+            "request line mismatch for v6 endpoint: {:?}",
+            raw.get(..60.min(raw.len())).unwrap_or(&raw)
         );
     }
 

@@ -163,6 +163,23 @@ fn parse_authority(authority: &str, default_port: u16) -> (&str, u16) {
     }
 }
 
+/// Strip IPv6 bracket notation from a host string.
+///
+/// `ParsedEndpoint::parse` stores the bracket form as found in the URL
+/// (e.g. `"[::1]"` from `http://[::1]:4317/`).  Any caller that needs to
+/// pass the host to `IpAddr::parse` or `(host, port).to_socket_addrs()` must
+/// strip the brackets first.  Both the async and sync connect paths use this
+/// shared helper so the two can't drift.
+///
+/// Returns `host` unchanged when no brackets are present.
+pub(crate) fn strip_v6_brackets(host: &str) -> &str {
+    if host.starts_with('[') && host.ends_with(']') {
+        &host[1..host.len() - 1]
+    } else {
+        host
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // OwnedNgxPool — owning wrapper for ngx_pool_t
 // (Ported from nginx-acme/src/util.rs `OwnedPool`)
@@ -804,11 +821,9 @@ impl Connector for NgxConnector {
                 // Strip IPv6 bracket notation ("[::1]" → "::1") before parsing.
                 // `ParsedEndpoint::parse` stores the bracket form for IPv6 URLs
                 // such as `http://[::1]:4317/`, so we must strip here.
-                let host_str = if host.starts_with('[') && host.ends_with(']') {
-                    &host[1..host.len() - 1]
-                } else {
-                    host.as_str()
-                };
+                // Uses the shared `strip_v6_brackets` helper so the sync path
+                // (sync_http.rs) can't drift from this logic.
+                let host_str = strip_v6_brackets(host.as_str());
 
                 // Branch on address family.  DNS names fall through to the
                 // error arm below; resolution is wired in Item 3 (transport_dns).
@@ -1410,5 +1425,24 @@ mod tests {
 
         // Confirm they differ (the key invariant — mismatch corrupts connect).
         assert_ne!(v4_socklen, v6_socklen, "IPv4 and IPv6 socklens must differ");
+    }
+
+    // ── FU1: strip_v6_brackets shared helper ─────────────────────────────────
+
+    /// `strip_v6_brackets` removes surrounding `[` `]` from an IPv6 host string
+    /// and leaves non-bracketed strings unchanged.
+    #[test]
+    fn strip_v6_brackets_removes_brackets_from_ipv6_literal() {
+        assert_eq!(strip_v6_brackets("[::1]"), "::1");
+        assert_eq!(strip_v6_brackets("[2001:db8::1]"), "2001:db8::1");
+        assert_eq!(strip_v6_brackets("[::ffff:127.0.0.1]"), "::ffff:127.0.0.1");
+    }
+
+    /// `strip_v6_brackets` is a no-op for IPv4 literals and DNS names.
+    #[test]
+    fn strip_v6_brackets_is_noop_for_non_bracketed_hosts() {
+        assert_eq!(strip_v6_brackets("127.0.0.1"), "127.0.0.1");
+        assert_eq!(strip_v6_brackets("otel-collector.example.com"), "otel-collector.example.com");
+        assert_eq!(strip_v6_brackets("::1"), "::1"); // already unbracketed
     }
 }
