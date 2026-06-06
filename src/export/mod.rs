@@ -90,22 +90,6 @@ pub static ERROR_LOGS_DROPPED: AtomicU64 = AtomicU64::new(0);
 /// Cumulative logs transport send failures since exporter startup.
 pub static LOGS_SEND_FAILURES: AtomicU64 = AtomicU64::new(0);
 
-/// Unix epoch nanoseconds when this worker's export loop started.
-///
-/// Written once by [`export_loop`] immediately after computing `worker_start_ns`.
-/// Read by [`exit_process_flush`] to anchor the final batch's
-/// `start_time_unix_nano`. Value 0 means the loop has not yet started
-/// (e.g., SIGQUIT arrived before the first async task iteration ran).
-///
-/// Process-global static: each forked worker inherits a zeroed copy and
-/// sets its own value independently. No cross-process coordination needed.
-// Phase 1.3.2: repurposed — now the exporter's start time (not a worker's).
-// The variable name is intentionally unchanged; a hygiene-only rename is
-// deferred to a separate commit after Phase 1.3 closes.
-// Sub-item 2 (exporter cycle) reads this to anchor the export epoch.
-#[allow(dead_code)]
-pub static WORKER_START_NS: AtomicU64 = AtomicU64::new(0);
-
 /// Master (parent) PID captured once at exporter startup via `nginx_sys::ngx_parent`.
 ///
 /// Written once by [`export_loop`] before the first export tick.  Used by
@@ -149,13 +133,13 @@ const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(250);
 ///
 /// # Exit-time flush note
 ///
-/// The synchronous `exit_process_flush` path (HTTP-only) is intentionally
-/// NOT mirrored for gRPC: building a blocking one-shot h2 stack after the
-/// async runtime has been torn down is fragile.  For `otlp_grpc`, the
-/// in-loop async [`graceful_drain`] (which runs while the event loop is
-/// still alive) provides the final flush.  This is safe because the
-/// exporter process stays alive until `EXPORT_LOOP_DONE` is set (set by
-/// `graceful_drain` after it completes), so `graceful_drain` always runs
+/// The final flush is handled uniformly for both transports by the in-loop
+/// async [`graceful_drain`], which runs while the nginx event loop is still
+/// alive. There is no separate synchronous exit-time flush path: it would
+/// mean building a blocking one-shot stack after the async runtime has been
+/// torn down, which is fragile (and impossible for gRPC's h2). This is safe
+/// because the exporter process stays alive until `EXPORT_LOOP_DONE` is set
+/// (by `graceful_drain` after it completes), so `graceful_drain` always runs
 /// before `process::exit`.
 #[allow(clippy::large_enum_variant)]
 enum ExportTransport {
@@ -378,9 +362,6 @@ pub async fn export_loop(amcf: &'static MainConfig) {
     // for cumulative monotonic Sum self-metrics so that downstream rate
     // panels and delta-conversion processors can anchor windows correctly.
     let worker_start_ns = now_unix_nano();
-    // Publish to the process-global atomic so that exit_process_flush can
-    // read the same epoch anchor without re-computing it (see WORKER_START_NS).
-    WORKER_START_NS.store(worker_start_ns, Ordering::Relaxed);
 
     // Capture the master (parent) PID once at export loop startup.
     // nginx_sys::ngx_parent is set by ngx_spawn_process to the master's PID
@@ -759,9 +740,9 @@ pub async fn export_loop(amcf: &'static MainConfig) {
 /// runs this drain. The chunked sleep ([`SHUTDOWN_POLL_INTERVAL`]) caps
 /// detection latency at 250 ms.
 ///
-/// On Phase 1.3 builds, `exit_process_flush` is a dead-code helper (Phase 2
-/// may resurrect it). The exporter cycle waits for [`EXPORT_LOOP_DONE`]
-/// before calling `process::exit`, ensuring the drain always completes.
+/// This async drain is the sole final-flush path. The exporter cycle waits
+/// for [`EXPORT_LOOP_DONE`] before calling `process::exit`, ensuring the
+/// drain always completes.
 ///
 /// Q2 RESOLVED — option (a): old exporter races workers on SIGHUP. Dedup
 /// via `time_unix_nano` on the collector side (cumulative-counter model).
@@ -1078,9 +1059,9 @@ fn build_resource_attrs(amcf: &MainConfig) -> std::vec::Vec<KeyValue> {
 /// Collect from all configured [`MetricSource`]s and assemble a [`Batch`].
 ///
 /// Accepts `&MainConfig` rather than `&'static MainConfig` so it can be
-/// called from both the async export loop (which holds `'static`) and from
-/// synchronous paths like [`exit_process_flush`] that hold a shorter-lived
-/// reference to the current cycle's config.
+/// called both from the async export loop (which holds `'static`) and from
+/// the [`graceful_drain`] path, which holds a shorter-lived reference to the
+/// current cycle's config.
 fn collect_all_sources(amcf: &MainConfig, worker_start_ns: u64) -> Batch {
     let mut metrics = std::vec::Vec::new();
 
@@ -1591,167 +1572,6 @@ fn collect_error_rate_metric(base: *mut u8, n_workers: usize, start_time_ns: u64
 }
 
 // ── exit_process flush ────────────────────────────────────────────────────────
-
-/// Synchronous final flush for the `exit_process` module callback.
-///
-/// Collects one final batch from all configured [`MetricSource`]s, encodes it,
-/// and ships it via the synchronous HTTP client in
-/// [`crate::transport::sync_http`].  Uses a 500 ms budget for each I/O phase.
-///
-/// This function **closes the Phase 1.1 graceful-drain limitation** described
-/// in [`graceful_drain`]: the async drain may not fire when SIGQUIT arrives
-/// while the export loop is between intervals (asleep on a cancelable timer).
-/// `exit_process_flush` fires unconditionally when the worker exits, covering
-/// that gap.
-///
-/// If both the async drain and `exit_process_flush` fire (e.g., SIGQUIT
-/// arrives during the active part of the loop body), the worst case is a
-/// duplicate batch arriving at the collector; the collector deduplicates via
-/// timestamps.
-///
-/// # Called from
-/// `ngx_otel_exit_process` in `src/lib.rs`, gated on Worker 0 / single-process
-/// mode.  Do not call from other contexts.
-// Phase 1.3.2: no longer called from ngx_otel_exit_process (workers are no-ops).
-// Kept as a callable helper for the exporter's graceful_drain path; Sub-item 2
-// wires it up. Phase 2 (logs) may also use it from the producer side.
-#[allow(dead_code)]
-pub fn exit_process_flush(amcf: &MainConfig) {
-    let log = ngx::log::ngx_cycle_log();
-
-    // Read the epoch anchor published by export_loop at startup.
-    let worker_start_ns = WORKER_START_NS.load(Ordering::Acquire);
-    if worker_start_ns == 0 {
-        // export_loop never ran its first iteration (e.g., SIGQUIT arrived
-        // before the async task was polled).  Nothing to flush.
-        return;
-    }
-
-    ngx::ngx_log_error!(NGX_LOG_NOTICE, log.as_ptr(), "exit_process: sync flush starting");
-
-    let batch = collect_all_sources(amcf, worker_start_ns);
-    let n_pts = count_data_points(&batch);
-
-    if n_pts == 0 {
-        return;
-    }
-
-    let encoder = OtlpHttpEncoder;
-    let bytes = encoder.encode(&batch);
-
-    let endpoint_str = match core::str::from_utf8(amcf.exporter.endpoint.as_bytes()) {
-        Ok(s) => s,
-        Err(_) => {
-            ngx::ngx_log_error!(
-                NGX_LOG_ERR,
-                log.as_ptr(),
-                "exit_process: sync flush: endpoint is not valid UTF-8, skipping"
-            );
-            return;
-        }
-    };
-
-    let headers: std::vec::Vec<(std::string::String, std::string::String)> = amcf
-        .exporter_headers
-        .iter()
-        .filter_map(|kv| {
-            let k = std::string::String::from(core::str::from_utf8(kv.key.as_bytes()).ok()?);
-            let v = std::string::String::from(core::str::from_utf8(kv.value.as_bytes()).ok()?);
-            Some((k, v))
-        })
-        .collect();
-
-    match crate::transport::sync_http::sync_post(endpoint_str, &headers, &bytes) {
-        Ok(()) => {
-            ngx::ngx_log_error!(
-                NGX_LOG_NOTICE,
-                log.as_ptr(),
-                "exit_process: sync flush complete ({} data points)",
-                n_pts
-            );
-        }
-        Err(ref e) if e.is_timeout() => {
-            ngx::ngx_log_error!(NGX_LOG_NOTICE, log.as_ptr(), "exit_process: sync flush timed out");
-        }
-        Err(ref e) => {
-            ngx::ngx_log_error!(
-                NGX_LOG_ERR,
-                log.as_ptr(),
-                "exit_process: sync flush failed: {}",
-                e
-            );
-        }
-    }
-
-    // ── Sync flush of pending tail logs (Phase 2.2, HTTP only) ──────────────
-    // Flush logs if access_sample OR error_log is enabled and the logs shm is mapped.
-    if amcf.is_access_sample_enabled() || amcf.error_log_enabled {
-        if let Some(logs_base) = amcf.logs_shm_base() {
-            // SAFETY: `logs_shm_base()` returned `Some`, so the logs zone is
-            // mapped and `amcf.logs_shm_zone` points to a live `ngx_shm_zone_t`
-            // valid for the current cycle. The `&*` borrow does not escape this
-            // block; `shm.size` is a plain field read.
-            let n_workers = unsafe {
-                let zone = &*amcf.logs_shm_zone;
-                let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
-                logs_n_workers_from_zone(avail, amcf.log_ring_cap())
-            };
-            let logs_batch = collect_log_records(amcf, logs_base, n_workers, worker_start_ns);
-            if !logs_batch.logs.is_empty() {
-                let n_logs = logs_batch.logs.len() as u64;
-                let logs_bytes = OtlpLogsEncoder.encode(&logs_batch);
-                // Derive /v1/logs endpoint from the metrics endpoint base.
-                let logs_endpoint = derive_logs_endpoint(endpoint_str);
-                match crate::transport::sync_http::sync_post(&logs_endpoint, &headers, &logs_bytes)
-                {
-                    Ok(()) => {
-                        ngx::ngx_log_error!(
-                            NGX_LOG_NOTICE,
-                            log.as_ptr(),
-                            "exit_process: sync logs flush complete ({} records)",
-                            n_logs
-                        );
-                    }
-                    Err(ref e) if e.is_timeout() => {
-                        ngx::ngx_log_error!(
-                            NGX_LOG_NOTICE,
-                            log.as_ptr(),
-                            "exit_process: sync logs flush timed out"
-                        );
-                    }
-                    Err(ref e) => {
-                        ngx::ngx_log_error!(
-                            NGX_LOG_ERR,
-                            log.as_ptr(),
-                            "exit_process: sync logs flush failed: {}",
-                            e
-                        );
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Derive the `/v1/logs` OTLP endpoint URL from the metrics endpoint.
-///
-/// For HTTP endpoints of the form `http://host:port/v1/metrics`, replaces the
-/// path with `/v1/logs`.  For endpoints without an explicit path component or
-/// with other paths, appends `/v1/logs` to the host:port.
-fn derive_logs_endpoint(metrics_endpoint: &str) -> std::string::String {
-    // Strip the path from the metrics endpoint and replace with /v1/logs.
-    if let Some(rest) = metrics_endpoint.strip_prefix("http://") {
-        let (authority, _path) = match rest.find('/') {
-            Some(i) => (&rest[..i], &rest[i..]),
-            None => (rest, "/"),
-        };
-        std::format!("http://{}/v1/logs", authority)
-    } else {
-        // For non-HTTP (gRPC, unix), return as-is.  The gRPC logs flush is
-        // handled by the async graceful_drain path; sync_post is HTTP-only.
-        std::string::String::from(metrics_endpoint)
-    }
-}
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
 

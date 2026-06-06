@@ -566,9 +566,9 @@ fn run_grpc_smoke_harness<Fut>(
 /// Called by NGINX when the worker process is exiting (SIGQUIT, SIGHUP-induced
 /// shutdown, or natural exit).
 ///
-/// Phase 1.3.2: workers no longer own the export state. The sync
-/// `exit_process_flush` call has been removed. The exporter's graceful_drain
-/// (called on its `ngx_quit` path) handles the final flush.
+/// Phase 1.3.2: workers no longer own the export state, so there is no
+/// worker-side exit flush. The exporter's `graceful_drain` (called on its
+/// `ngx_quit` path) is the sole final-flush path for both transports.
 ///
 /// Q3 RESOLVED: callback kept registered (not `None`) for Phase 2.
 /// Phase 2 (logs) will populate this with producer-side final flush —

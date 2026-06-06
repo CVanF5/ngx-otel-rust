@@ -71,7 +71,7 @@ pub struct OtelErrorWriterState {
     /// A concurrent or re-entrant call (signal handler, OOM path) that
     /// finds `busy == true` drops immediately without touching shared state.
     pub busy: AtomicBool,
-    /// Cycle-teardown flag: set by `exit_process_flush` (Step 2.3.3) BEFORE
+    /// Cycle-teardown flag: set via `set_cleanup_flag` on the exit path BEFORE
     /// `cycle->log` is torn down.  Late emissions after teardown are dropped.
     pub cleanup: AtomicBool,
     /// Effective severity floor (from the directive or mirrored from core).
