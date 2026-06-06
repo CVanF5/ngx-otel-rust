@@ -89,6 +89,14 @@ http {
             proxy_http_version 1.1;
             proxy_set_header Connection "";
         }
+
+        # Proxy to a port with nothing listening → real "connect() failed"
+        # nginx error_log lines (error level). These exercise the OTel ERROR
+        # log signal (coalesced nginx.error LogRecords), distinct from the
+        # access tail above — drives the dashboard's "Error Log" panel.
+        location /backend-down {
+            proxy_pass http://127.0.0.1:9099;
+        }
     }
 
     # ── Backend upstream ──────────────────────────────────────────────────

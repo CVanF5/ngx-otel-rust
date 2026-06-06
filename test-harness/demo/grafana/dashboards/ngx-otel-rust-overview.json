@@ -748,7 +748,7 @@
         {
           "id": 22,
           "type": "logs",
-          "title": "Sampled Access Logs",
+          "title": "Sampled Access Logs (tail)",
           "datasource": {
             "type": "loki",
             "uid": "loki"
@@ -765,7 +765,7 @@
                 "type": "loki",
                 "uid": "loki"
               },
-              "expr": "{service_name=\"$service\"}",
+              "expr": "{service_name=\"$service\", http_response_status_code=~\".+\"} | line_format \"{{.severity_text}} {{.http_request_method}} {{.http_response_status_code}} {{.url_path}} (client {{.client_address}})\"",
               "refId": "A",
               "legendFormat": "",
               "queryType": "range"
@@ -780,6 +780,43 @@
             "wrapLogMessage": false,
             "dedupStrategy": "none",
             "enableLogDetails": true
+          }
+        },
+        {
+          "id": 28,
+          "type": "logs",
+          "title": "Error Log (nginx.error \u2014 coalesced)",
+          "description": "OTel error-log signal: coalesced nginx error LogRecords (severity >= warn). Body is the verbatim nginx message; distinct from the access tail above.",
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "gridPos": {
+            "h": 9,
+            "w": 24,
+            "x": 0,
+            "y": 43
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "loki",
+                "uid": "loki"
+              },
+              "refId": "A",
+              "queryType": "range",
+              "expr": "{service_name=\"$service\"} | severity_number >= 13"
+            }
+          ],
+          "options": {
+            "showTime": true,
+            "wrapLogMessage": true,
+            "dedupStrategy": "none",
+            "enableLogDetails": true
+          },
+          "fieldConfig": {
+            "defaults": {},
+            "overrides": []
           }
         }
       ]

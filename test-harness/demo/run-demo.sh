@@ -65,6 +65,9 @@ start_traffic() {
         curl -s -o /dev/null "http://127.0.0.1:9400/client-error"   || true  # 4xx
         # 5xx less often, so the breakdown shows a realistic error mix
         [ $((RANDOM % 4)) -eq 0 ] && curl -s -o /dev/null "http://127.0.0.1:9400/server-error" || true
+        # Periodic dead-upstream hit → real nginx "connect() failed" error_log
+        # lines → the OTel error-log signal (coalesced) for the Error Log panel.
+        [ $((RANDOM % 5)) -eq 0 ] && curl -s -o /dev/null "http://127.0.0.1:9400/backend-down" || true
         sleep 0.05
       done ) >/dev/null 2>&1 &
     echo $! > "${PREFIX}/traffic.pid"
