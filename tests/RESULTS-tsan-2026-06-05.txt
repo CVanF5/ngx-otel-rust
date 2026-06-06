@@ -183,3 +183,57 @@ Note: run_error_log.sh was NOT re-run in this follow-up (option-a decision, 2026
 The 2026-06-05 baseline run above covers all Phase 2.3 error-log paths with zero TSAN
 findings.  The TSAN-environment timing flakiness observed in a separate run attempt is
 tracked as a standalone issue (coalescer window narrowing under TSAN overhead).
+
+─────────────────────────────────────────────────────────────────────────────
+DNS Follow-up FU1+FU2 TSAN run (transport_dns_fu Items 1–2)
+─────────────────────────────────────────────────────────────────────────────
+Date:     2026-06-06  (appended; same host, same TSAN image)
+Trigger:  build/tsan-run-dns-only.sh  (`make tsan-test-dns`)
+Commits:  75671e5 (transport_dns_fu(1): bracket strip)
+          5884751 (transport_dns_fu(2): DNS→v6 AAAA + NXDOMAIN)
+
+Build
+  Step 1 — Compile sanity (make build BUILD=tsan): OK
+  Step 2 — Plain TSAN nginx (objs-tsan-plain/nginx): OK
+  Step 3 — TSAN env:
+    RUSTFLAGS=-Cforce-frame-pointers=yes -Zsanitizer=thread -Zexternal-clangrt
+    CARGO_BUILD_TARGET=aarch64-unknown-linux-gnu
+    CARGO_UNSTABLE_BUILD_STD=std,panic_abort
+
+run_dns_dualstack.sh  (all 4 tests — FU1 + FU2 paths exercised)
+  TEST A — DNS name → IPv4 connect:
+    [PASS] TEST A: error.log contains 'export loop started'
+    [PASS] TEST A: no resolver-missing error in error.log
+    [PASS] TEST A: no connection / DNS errors in error.log
+    [PASS] TEST A: collector received +3 new metric record(s) (DNS → v4 path confirmed)
+  TEST B — IPv6 literal endpoint ([::1]:<port>) — FU1 bracket-strip path:
+    [PASS] TEST B: error.log contains 'export loop started'
+    [PASS] TEST B: no IPv6 connection errors in error.log
+    [PASS] TEST B: v6 stub received 13332 bytes — IPv6 literal connect confirmed
+  TEST C — DNS name → IPv6 via AAAA (FU2 headline proof):
+    [PASS] TEST C: error.log contains 'export loop started'
+    [PASS] TEST C: no resolver-missing error in error.log
+    [PASS] TEST C: no connection / DNS errors in error.log
+    [PASS] TEST C: v6 AAAA stub received 13350 bytes — DNS→v6 AAAA path confirmed (FU2)
+  TEST D — Unresolvable name clean error (FU2):
+    [PASS] TEST D: nginx exited cleanly within 0s of -QUIT (no hang)
+    [PASS] TEST D: no panic or fatal signal in error.log
+    [PASS] TEST D: error.log contains expected connection-failure entry (NXDOMAIN error path)
+    [PASS] TEST D: collector metric count unchanged (292) — no records exported on NXDOMAIN
+  [PASS] All DNS + dual-stack integration assertions passed.
+
+ThreadSanitizer warning scan:
+  /tmp/ngx-otel-dns-a.*/logs/error.log
+  /tmp/ngx-otel-dns-b.*/logs/error.log
+  /tmp/ngx-otel-dns-c.*/logs/error.log
+  /tmp/ngx-otel-dns-d.*/logs/error.log
+
+Zero ThreadSanitizer warnings.  DNS TSAN gate: PASS.
+
+New paths exercised under TSAN (no races detected):
+  - strip_v6_brackets() — shared helper called from NgxConnector::connect (async)
+    and sync_http connect_first_reachable (FU1 bracket-strip path)
+  - DNS→AAAA resolution: nginx resolver returns sockaddr_in6 + socklen=28;
+    NgxConnector::connect_dns installs into pc; NgxConnIo::poll_connect on ::1
+  - NXDOMAIN error path: resolver error → TransportError::Connection → logged,
+    retried; exporter exits cleanly on -QUIT with no queued records
