@@ -99,9 +99,14 @@ pub struct LogsWorkerRing {
     header: *mut LogsWorkerRingHeader,
 }
 
-// Safety: the ring lives in shared memory accessible from multiple processes
-// (workers + exporter).  The caller upholds the SPSC invariant.
+// SAFETY: `LogsWorkerRing` is just a pointer into shared memory accessible from
+// multiple processes (workers + exporter). All header fields it touches are
+// atomics, and the caller upholds the SPSC single-writer/single-reader
+// invariant, so it is sound to move across threads/processes.
 unsafe impl Send for LogsWorkerRing {}
+// SAFETY: as for the `Send` impl above — shared access goes through atomic
+// header fields under the SPSC invariant, so concurrent `&LogsWorkerRing` use
+// is sound.
 unsafe impl Sync for LogsWorkerRing {}
 
 impl LogsWorkerRing {
@@ -117,12 +122,20 @@ impl LogsWorkerRing {
 
     #[inline]
     fn cap(&self) -> usize {
+        // SAFETY: `self.header` points to a valid `LogsWorkerRingHeader` in the
+        // logs shm zone for this view's lifetime (the `from_shm_ptr` contract);
+        // `cap` is an `AtomicU64`, so the load is well-defined under concurrent
+        // cross-process access.
         unsafe { (*self.header).cap.load(Ordering::Relaxed) as usize }
     }
 
     #[inline]
     fn payload_ptr(&self) -> *mut u8 {
         // Payload immediately follows the header.
+        // SAFETY: `self.header` is a valid header pointer; `.add(1)` yields the
+        // address one past the header, i.e. the start of the `cap`-byte payload
+        // region the `from_shm_ptr` contract guarantees follows it. The pointer
+        // is only formed here, not dereferenced.
         unsafe { self.header.add(1).cast() }
     }
 
@@ -138,6 +151,9 @@ impl LogsWorkerRing {
         let record_len = record.len();
         let total = 4 + record_len;
 
+        // SAFETY: valid header pointer (from_shm_ptr contract), live for this
+        // view. This is the single producer (SPSC), so the shared `&` reference
+        // to the atomic header fields never aliases a concurrent `&mut`.
         let hdr = unsafe { &*self.header };
         let write_off = hdr.write_offset.load(Ordering::Relaxed);
         let read_off = hdr.read_offset.load(Ordering::Acquire);
@@ -166,6 +182,9 @@ impl LogsWorkerRing {
         if cap == 0 {
             return false;
         }
+        // SAFETY: valid header pointer (from_shm_ptr contract), live for this
+        // view. This is the single consumer (SPSC), so the shared `&` reference
+        // to the atomic header fields never aliases a concurrent `&mut`.
         let hdr = unsafe { &*self.header };
         let write_off = hdr.write_offset.load(Ordering::Acquire);
         let read_off = hdr.read_offset.load(Ordering::Relaxed);
@@ -195,6 +214,8 @@ impl LogsWorkerRing {
     /// Number of records dropped because the ring was full.
     #[inline]
     pub fn drop_count(&self) -> u64 {
+        // SAFETY: valid header pointer (from_shm_ptr contract); `dropped` is an
+        // `AtomicU64`, so the concurrent load is well-defined.
         unsafe { (*self.header).dropped.load(Ordering::Acquire) }
     }
 }
@@ -208,6 +229,11 @@ fn write_wrap(base: *mut u8, cap: usize, offset: usize, data: &[u8]) {
     }
     let start = offset % cap;
     let end_space = cap - start;
+    // SAFETY: `base` is the start of the `cap`-byte payload region (callers pass
+    // `payload_ptr()` with the matching `cap`). `start < cap`, and each copy
+    // length is bounded by `end_space` or `data.len() - end_space`, so both
+    // copies stay within `[base, base + cap)`; `data` is a valid readable slice.
+    // The split implements ring wrap-around.
     unsafe {
         if data.len() <= end_space {
             core::ptr::copy_nonoverlapping(data.as_ptr(), base.add(start), data.len());
@@ -229,6 +255,11 @@ fn read_wrap(base: *const u8, cap: usize, offset: usize, dst: &mut [u8]) {
     }
     let start = offset % cap;
     let end_space = cap - start;
+    // SAFETY: `base` is the start of the `cap`-byte payload region (callers pass
+    // `payload_ptr()` with the matching `cap`). `start < cap`, and each copy
+    // length is bounded by `end_space` or `dst.len() - end_space`, so both reads
+    // stay within `[base, base + cap)`; `dst` is a valid writable slice. The
+    // split implements ring wrap-around.
     unsafe {
         if dst.len() <= end_space {
             core::ptr::copy_nonoverlapping(base.add(start), dst.as_mut_ptr(), dst.len());
@@ -260,11 +291,17 @@ pub(crate) mod tests {
         let total = ring_size_bytes(cap);
         let mut buf = vec![0u8; total].into_boxed_slice();
         let ptr = buf.as_mut_ptr();
-        // Safety: ptr is valid and aligned for LogsWorkerRingHeader.
+        // SAFETY: `ptr` is the start of a freshly-allocated, zero-initialised
+        // `ring_size_bytes(cap)` buffer. The global allocator returns memory
+        // aligned well above `LogsWorkerRingHeader`'s 8-byte requirement, so the
+        // cast and atomic store are well-defined in this test helper (the
+        // production path lives in 8-byte-aligned slab memory).
         unsafe {
             let hdr = ptr.cast::<LogsWorkerRingHeader>();
             (*hdr).cap.store(cap as u64, Ordering::Relaxed);
         }
+        // SAFETY: `ptr` points to that header followed by `cap` payload bytes,
+        // satisfying `from_shm_ptr`'s contract; `buf` outlives the returned ring.
         let ring = unsafe { LogsWorkerRing::from_shm_ptr(ptr) };
         (buf, ring)
     }
