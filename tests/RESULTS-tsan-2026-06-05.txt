@@ -139,3 +139,47 @@ No data races detected on any Phase 1, 2.1, 2.2, or 2.3 shared-state paths:
   - WorkerSlots::error_rate_counters[].fetch_add
   - SPSC error ring push (verbatim error samples)
   - busy-flag AcqRel swap under SIGUSR1 signal delivery (re-entrancy gate)
+
+─────────────────────────────────────────────────────────────────────────────
+DNS + Dual-Stack Transport TSAN Follow-up (transport_dns Items 1–6)
+─────────────────────────────────────────────────────────────────────────────
+Date:     2026-06-06  (appended to 2026-06-05 run; same host, same TSAN image)
+Trigger:  build/tsan-run-dns-only.sh  (`make tsan-test-dns`)
+Commit:   f169a77  (transport_dns(7b): DNS-only TSAN target for option-a follow-up)
+
+Build
+  Step 1 — Compile sanity (make build BUILD=tsan): OK
+  Step 2 — Plain TSAN nginx (objs-tsan-plain/nginx): OK
+  Step 3 — TSAN env:
+    RUSTFLAGS=-Cforce-frame-pointers=yes -Zsanitizer=thread -Zexternal-clangrt
+    CARGO_BUILD_TARGET=aarch64-unknown-linux-gnu
+    CARGO_UNSTABLE_BUILD_STD=std,panic_abort
+
+run_dns_dualstack.sh  (transport_dns §plan Steps 2–4)
+  TEST A — DNS name → IPv4 connect (async nginx resolver path):
+    [PASS] TEST A: error.log contains 'export loop started'
+    [PASS] TEST A: no resolver-missing error in error.log
+    [PASS] TEST A: no connection / DNS errors in error.log
+    [PASS] TEST A: collector received +3 new metric record(s) (DNS → v4 path confirmed)
+  TEST B — IPv6 literal endpoint ([::1]:<port>):
+    [PASS] TEST B: error.log contains 'export loop started'
+    [PASS] TEST B: no IPv6 connection errors in error.log
+    [PASS] TEST B: v6 stub received 13326 bytes — IPv6 literal connect confirmed
+  [PASS] All DNS + dual-stack integration assertions passed.
+
+ThreadSanitizer warning scan (DNS error logs):
+  /tmp/ngx-otel-dns-a.*/logs/error.log
+  /tmp/ngx-otel-dns-b.*/logs/error.log
+
+Zero ThreadSanitizer warnings.  DNS TSAN gate: PASS.
+
+New paths exercised under TSAN (no races detected):
+  - NgxConnector::connect_dns — Resolver::resolve_name UDP event-loop path
+  - connect_first_reachable — sequential address iteration, TcpStream::connect_timeout
+  - build_ipv6_sockaddr — AF_INET6 sockaddr_in6 construction, pc.socklen=28
+  - NgxConnIo::poll_connect on IPv6 socket
+
+Note: run_error_log.sh was NOT re-run in this follow-up (option-a decision, 2026-06-06).
+The 2026-06-05 baseline run above covers all Phase 2.3 error-log paths with zero TSAN
+findings.  The TSAN-environment timing flakiness observed in a separate run attempt is
+tracked as a standalone issue (coalescer window narrowing under TSAN overhead).
