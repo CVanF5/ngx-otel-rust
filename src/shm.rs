@@ -694,6 +694,9 @@ impl WorkerSlots {
     /// The caller must ensure the memory at `ptr` is valid for a `WorkerSlots`.
     #[cfg(test)] // only used by in-crate unit tests; production zeroes the zone via nginx
     pub unsafe fn init_at(ptr: *mut WorkerSlots) {
+        // SAFETY: the caller guarantees `ptr` is valid for a `WorkerSlots` (fn
+        // contract); `write_bytes(_, 0, 1)` zero-initialises exactly one, the
+        // correct initial state for all its `AtomicU64` fields.
         unsafe { ptr::write_bytes(ptr, 0, 1) };
     }
 }
@@ -707,6 +710,9 @@ impl WorkerSlots {
 #[inline]
 pub unsafe fn worker_slots(base_addr: *mut u8, worker_id: usize) -> *mut WorkerSlots {
     let offset = worker_id * mem::size_of::<WorkerSlots>();
+    // SAFETY: per the fn contract `base_addr` is the zone start and `worker_id`
+    // is < the worker count the zone was sized for, so `offset` lands within the
+    // zone. The pointer is only formed here, not dereferenced.
     unsafe { base_addr.add(offset).cast() }
 }
 
@@ -743,6 +749,8 @@ pub unsafe fn register_zone(
     size: usize,
     module: *mut nginx_sys::ngx_module_t,
 ) -> Option<*mut ngx_shm_zone_t> {
+    // SAFETY: per the fn contract `cf` and `module` are valid; this is a plain
+    // FFI call into nginx's shared-memory registration with valid arguments.
     let zone = unsafe { ngx_shared_memory_add(cf, name, size, module.cast()) };
     if zone.is_null() {
         None
@@ -781,11 +789,19 @@ pub unsafe extern "C" fn otel_shm_zone_init(
     // Fresh start: zero only the WorkerSlots area — never the slab-pool header.
     // (The OS provides zero-filled pages for new mmap regions, but we zero
     //  explicitly here for clarity and to handle edge cases.)
+    // SAFETY: nginx invokes this callback with a valid, non-null
+    // `ngx_shm_zone_t` (fn contract); the reference does not outlive the call.
     let zone = unsafe { &*shm_zone };
     let offset = data_offset();
     if zone.shm.size > offset {
+        // SAFETY: `offset == data_offset()` and we checked `zone.shm.size >
+        // offset`, so `addr + offset` is within the mapped zone.
         let base: *mut u8 = unsafe { zone.shm.addr.cast::<u8>().add(offset) };
         let size = zone.shm.size - offset;
+        // SAFETY: `base` is within the zone and `size = zone.shm.size - offset`
+        // bytes remain after it, so the zero-fill stays in-bounds. It clears only
+        // the WorkerSlots area, never the slab-pool header in [0, offset) (see
+        // the doc above — zeroing it would crash the master).
         unsafe { ptr::write_bytes(base, 0, size) };
     }
 
@@ -848,6 +864,10 @@ pub fn logs_n_workers_from_zone(zone_data_bytes: usize, cap: usize) -> usize {
 #[inline]
 pub unsafe fn logs_access_ring(base_addr: *mut u8, worker_id: usize, cap: usize) -> LogsWorkerRing {
     let slot_off = worker_id * logs_slot_size(cap);
+    // SAFETY: per the fn contract `base_addr` is `shm.addr + data_offset()`,
+    // `worker_id < n_workers`, and `cap` matches registration, so `slot_off` is
+    // within the zone. The access ring header begins at slot offset 0,
+    // satisfying `from_shm_ptr`'s contract.
     unsafe { LogsWorkerRing::from_shm_ptr(base_addr.add(slot_off)) }
 }
 
@@ -859,6 +879,9 @@ pub unsafe fn logs_access_ring(base_addr: *mut u8, worker_id: usize, cap: usize)
 pub unsafe fn logs_error_ring(base_addr: *mut u8, worker_id: usize, cap: usize) -> LogsWorkerRing {
     let slot_off = worker_id * logs_slot_size(cap);
     let error_off = slot_off + ring_size_bytes(cap);
+    // SAFETY: same contract as `logs_access_ring`; the error ring header begins
+    // one `ring_size_bytes(cap)` past the access ring within the same in-zone
+    // slot, satisfying `from_shm_ptr`'s contract.
     unsafe { LogsWorkerRing::from_shm_ptr(base_addr.add(error_off)) }
 }
 
@@ -876,6 +899,9 @@ pub unsafe fn logs_error_ring(base_addr: *mut u8, worker_id: usize, cap: usize) 
 pub unsafe fn logs_error_ring_ptr(base_addr: *mut u8, worker_id: usize, cap: usize) -> *mut u8 {
     let slot_off = worker_id * logs_slot_size(cap);
     let error_off = slot_off + ring_size_bytes(cap);
+    // SAFETY: same contract as `logs_error_ring`; `error_off` is within the
+    // zone, so the pointer is in-bounds. It is only formed here, not
+    // dereferenced (the writer rebuilds a view via `from_shm_ptr`).
     unsafe { base_addr.add(error_off) }
 }
 
@@ -902,6 +928,9 @@ pub unsafe fn logs_coalesce_table(
 ) -> *mut crate::logs::coalesce::CoalesceSlot {
     let slot_off = worker_id * logs_slot_size(cap);
     let coalesce_off = slot_off + 2 * ring_size_bytes(cap);
+    // SAFETY: same contract as `logs_access_ring`; the coalescer table occupies
+    // the slot region after both rings (`2 * ring_size_bytes(cap)` in), still
+    // within the zone. The pointer is only formed here, not dereferenced.
     unsafe { base_addr.add(coalesce_off).cast() }
 }
 
@@ -927,6 +956,8 @@ pub unsafe extern "C" fn logs_shm_zone_init(
         return Status::NGX_OK.into();
     }
 
+    // SAFETY: nginx invokes this callback with a valid, non-null
+    // `ngx_shm_zone_t` (fn contract); the reference does not outlive the call.
     let zone = unsafe { &*shm_zone };
     let offset = data_offset();
     let zone_data_bytes = zone.shm.size.saturating_sub(offset);
@@ -934,6 +965,8 @@ pub unsafe extern "C" fn logs_shm_zone_init(
         return Status::NGX_OK.into();
     }
 
+    // SAFETY: `zone_data_bytes > 0` implies `zone.shm.size > offset`, so
+    // `addr + offset` is within the mapped zone (past the slab-pool header).
     let base: *mut u8 = unsafe { zone.shm.addr.cast::<u8>().add(offset) };
 
     // Recover `cap` from the tagged-pointer stored in zone.data.
@@ -945,6 +978,9 @@ pub unsafe extern "C" fn logs_shm_zone_init(
     }
 
     // Zero the whole slot area first.
+    // SAFETY: `base` is within the zone and exactly `zone_data_bytes` bytes
+    // remain after it, so the zero-fill stays in-bounds (and never touches the
+    // slab-pool header in [0, offset)).
     unsafe { ptr::write_bytes(base, 0, zone_data_bytes) };
 
     // Then stamp `cap` into every ring header so push/pop know the capacity.
@@ -952,12 +988,20 @@ pub unsafe extern "C" fn logs_shm_zone_init(
     for w in 0..n_workers {
         let slot_off = w * slot_sz;
         // Access ring header.
+        // SAFETY: `slot_off = w * slot_sz` with `w < n_workers = zone_data_bytes
+        // / slot_sz`, so `base + slot_off` is within the just-zeroed slot area;
+        // the header type lives at the start of each slot.
         let access_hdr = unsafe { base.add(slot_off).cast::<LogsWorkerRingHeader>() };
-        // Init-time store, before any worker forks (single writer, exclusive).
+        // SAFETY: `access_hdr` points to a valid (just-zeroed) header; this runs
+        // at zone-init before any worker forks (single exclusive writer), and
+        // `cap` is an `AtomicU64`.
         unsafe { (*access_hdr).cap.store(cap as u64, Ordering::Relaxed) };
         // Error ring header.
+        // SAFETY: the error header sits one `ring_size_bytes(cap)` past the
+        // access header, still within the same in-bounds slot.
         let error_hdr =
             unsafe { base.add(slot_off + ring_size_bytes(cap)).cast::<LogsWorkerRingHeader>() };
+        // SAFETY: as above — valid just-zeroed header, exclusive init-time write.
         unsafe { (*error_hdr).cap.store(cap as u64, Ordering::Relaxed) };
     }
 
@@ -983,17 +1027,23 @@ mod tests {
         let base = buffer.as_mut_ptr();
 
         for i in 0..n_workers {
+            // SAFETY: `base` is sized via `zone_size_for(n_workers)` and `i <
+            // n_workers`, so `worker_slots` yields an in-bounds slot pointer;
+            // `init_at` zero-initialises it.
             unsafe { WorkerSlots::init_at(worker_slots(base, i)) };
         }
 
         // Use GET/2xx/HTTP1.1 base combo (decomposed: 3-arg only).
         let combo = combo_index(HttpMethod::Get, StatusClass::S2xx, ProtoVersion::Http11);
 
+        // SAFETY: `base` is sized for `n_workers` slots and 0 < n_workers, so
+        // the pointer is in-bounds and (after `init_at`) valid for this test.
         let slot0 = unsafe { &*worker_slots(base, 0) };
         for _ in 0..3 {
             slot0.request_duration_combos[combo].record(100);
         }
 
+        // SAFETY: as for slot0 — 1 < n_workers, in-bounds, init'd slot.
         let slot1 = unsafe { &*worker_slots(base, 1) };
         for _ in 0..2 {
             slot1.request_duration_combos[combo].record(500);
@@ -1135,6 +1185,10 @@ mod tests {
     #[test]
     fn histogram_overflow_bucket() {
         let mut buf = std::vec![0u8; mem::size_of::<WorkerSlots>()];
+        // SAFETY: `buf` is a freshly-allocated, zero-initialised `Vec<u8>` sized
+        // to exactly hold a `WorkerSlots`; the global allocator over-aligns it,
+        // and zero is the valid initial state for its atomic fields. The shared
+        // reference lives only for the test.
         let slot = unsafe { &*buf.as_mut_ptr().cast::<WorkerSlots>() };
 
         // Record a very large value in the GET/2xx/HTTP1.1 base combo (µs).
@@ -1174,6 +1228,10 @@ mod tests {
         ];
         for (value, expected) in cases {
             let mut buf = std::vec![0u8; mem::size_of::<ExpHistogramSlot>()];
+            // SAFETY: `buf` is a freshly-allocated, zero-initialised `Vec<u8>` sized
+            // to exactly hold an `ExpHistogramSlot`; the global allocator over-aligns
+            // it, and zero is the valid initial state for its atomic fields. The
+            // shared reference lives only for the test.
             let slot = unsafe { &*buf.as_mut_ptr().cast::<ExpHistogramSlot>() };
             slot.record(value);
             let (buckets, zero, sum, count) = slot.snapshot();
@@ -1189,6 +1247,10 @@ mod tests {
     #[test]
     fn exp_histogram_zero_goes_to_zero_count() {
         let mut buf = std::vec![0u8; mem::size_of::<ExpHistogramSlot>()];
+        // SAFETY: `buf` is a freshly-allocated, zero-initialised `Vec<u8>` sized
+        // to exactly hold an `ExpHistogramSlot`; the global allocator over-aligns
+        // it, and zero is the valid initial state for its atomic fields. The
+        // shared reference lives only for the test.
         let slot = unsafe { &*buf.as_mut_ptr().cast::<ExpHistogramSlot>() };
         slot.record(0);
         let (buckets, zero, sum, count) = slot.snapshot();
@@ -1202,6 +1264,10 @@ mod tests {
     #[test]
     fn exemplar_reservoir_bounded_and_alloc_free() {
         let mut buf = std::vec![0u8; mem::size_of::<WorkerSlots>()];
+        // SAFETY: `buf` is a freshly-allocated, zero-initialised `Vec<u8>` sized
+        // to exactly hold a `WorkerSlots`; the global allocator over-aligns it,
+        // and zero is the valid initial state for its atomic fields. The shared
+        // reference lives only for the test.
         let slot = unsafe { &*buf.as_mut_ptr().cast::<WorkerSlots>() };
         let reservoir = &slot.exemplar_reservoir;
 
@@ -1256,6 +1322,10 @@ mod tests {
     #[test]
     fn sub_ms_values_land_in_distinct_buckets() {
         let mut buf = std::vec![0u8; core::mem::size_of::<ExpHistogramSlot>()];
+        // SAFETY: `buf` is a freshly-allocated, zero-initialised `Vec<u8>` sized
+        // to exactly hold an `ExpHistogramSlot`; the global allocator over-aligns
+        // it, and zero is the valid initial state for its atomic fields. The
+        // shared reference lives only for the test.
         let slot = unsafe { &*buf.as_mut_ptr().cast::<ExpHistogramSlot>() };
 
         slot.record(90); // 90 µs
