@@ -567,54 +567,10 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
             for m_idx in 0..N_HTTP_METHODS {
                 for sc_idx in 0..N_STATUS_CLASSES {
                     for p_idx in 0..N_PROTO_VERSIONS {
-                        let combo = combo_index(
-                            match m_idx {
-                                0 => HttpMethod::Get,
-                                1 => HttpMethod::Head,
-                                2 => HttpMethod::Post,
-                                3 => HttpMethod::Put,
-                                4 => HttpMethod::Delete,
-                                5 => HttpMethod::Patch,
-                                6 => HttpMethod::Options,
-                                _ => HttpMethod::Other,
-                            },
-                            match sc_idx {
-                                0 => StatusClass::S1xx,
-                                1 => StatusClass::S2xx,
-                                2 => StatusClass::S3xx,
-                                3 => StatusClass::S4xx,
-                                _ => StatusClass::S5xx,
-                            },
-                            match p_idx {
-                                0 => ProtoVersion::Http10,
-                                1 => ProtoVersion::Http11,
-                                2 => ProtoVersion::Http2,
-                                _ => ProtoVersion::Http3,
-                            },
-                        );
-                        let method = match m_idx {
-                            0 => HttpMethod::Get,
-                            1 => HttpMethod::Head,
-                            2 => HttpMethod::Post,
-                            3 => HttpMethod::Put,
-                            4 => HttpMethod::Delete,
-                            5 => HttpMethod::Patch,
-                            6 => HttpMethod::Options,
-                            _ => HttpMethod::Other,
-                        };
-                        let status_class = match sc_idx {
-                            0 => StatusClass::S1xx,
-                            1 => StatusClass::S2xx,
-                            2 => StatusClass::S3xx,
-                            3 => StatusClass::S4xx,
-                            _ => StatusClass::S5xx,
-                        };
-                        let proto = match p_idx {
-                            0 => ProtoVersion::Http10,
-                            1 => ProtoVersion::Http11,
-                            2 => ProtoVersion::Http2,
-                            _ => ProtoVersion::Http3,
-                        };
+                        let method = HttpMethod::from_index(m_idx);
+                        let status_class = StatusClass::from_index(sc_idx);
+                        let proto = ProtoVersion::from_index(p_idx);
+                        let combo = combo_index(method, status_class, proto);
                         let combo_exemplars: std::vec::Vec<Exemplar> = all_exemplars
                             .iter()
                             .filter(|(cidx, _)| *cidx == combo as u32)

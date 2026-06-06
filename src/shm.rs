@@ -223,6 +223,21 @@ impl HttpMethod {
         }
     }
 
+    /// Inverse of the `repr(u8)` index — rebuilds the variant from a combo loop index.
+    #[inline]
+    pub fn from_index(idx: usize) -> Self {
+        match idx {
+            0 => Self::Get,
+            1 => Self::Head,
+            2 => Self::Post,
+            3 => Self::Put,
+            4 => Self::Delete,
+            5 => Self::Patch,
+            6 => Self::Options,
+            _ => Self::Other,
+        }
+    }
+
     /// OTel attribute string value for this method.
     #[inline]
     pub fn as_str(self) -> &'static str {
@@ -260,6 +275,18 @@ impl StatusClass {
             200..=299 => Self::S2xx,
             300..=399 => Self::S3xx,
             400..=499 => Self::S4xx,
+            _ => Self::S5xx,
+        }
+    }
+
+    /// Inverse of the `repr(u8)` index — rebuilds the variant from a combo loop index.
+    #[inline]
+    pub fn from_index(idx: usize) -> Self {
+        match idx {
+            0 => Self::S1xx,
+            1 => Self::S2xx,
+            2 => Self::S3xx,
+            3 => Self::S4xx,
             _ => Self::S5xx,
         }
     }
@@ -306,6 +333,17 @@ impl ProtoVersion {
             3000 => Self::Http3,
             // Unrecognised version → bucket as HTTP/1.1 (most common).
             _ => Self::Http11,
+        }
+    }
+
+    /// Inverse of the `repr(u8)` index — rebuilds the variant from a combo loop index.
+    #[inline]
+    pub fn from_index(idx: usize) -> Self {
+        match idx {
+            0 => Self::Http10,
+            1 => Self::Http11,
+            2 => Self::Http2,
+            _ => Self::Http3,
         }
     }
 
