@@ -187,7 +187,7 @@ timer-panic-watch: ## Sub-item 3.2: 1-hour Time::sleep panic watch
 # macOS operators: `make build BUILD=tsan` still works for flag-validity checks;
 # only `make tsan-test` (the dockerized run) is Linux arm64-only.
 
-.PHONY: tsan-test
+.PHONY: tsan-test tsan-test-dns
 
 tsan-test: ## Sub-item 3.1: TSAN build + smoke scripts in Docker (Linux arm64 only)
 tsan-test: collector-up
@@ -209,3 +209,24 @@ tsan-test: collector-up
 	    -v "$(CURDIR)/../ngx-rust":/work/ngx-rust \
 	    ngx-otel-tsan:latest \
 	    bash /work/ngx-otel-rust/build/tsan-run.sh
+
+tsan-test-dns: ## DNS-only TSAN gate: exercises resolver+connect path under TSAN (Linux arm64 only)
+tsan-test-dns: collector-up
+	DOCKER_ARCH="$$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"; \
+	docker build \
+	    --platform "linux/$${DOCKER_ARCH}" \
+	    -f build/Dockerfile.tsan \
+	    -t ngx-otel-tsan:latest \
+	    .; \
+	docker run --rm \
+	    --network=host \
+	    --cap-add=SYS_PTRACE \
+	    --security-opt seccomp=unconfined \
+	    --platform "linux/$${DOCKER_ARCH}" \
+	    -e TSAN_OPTIONS="halt_on_error=1:second_deadlock_stack=1:detect_deadlocks=1" \
+	    -e OTEL_COLLECTOR_AUTOSTART=0 \
+	    -v "$(CURDIR)":/work/ngx-otel-rust \
+	    -v "$(CURDIR)/../nginx":/work/nginx \
+	    -v "$(CURDIR)/../ngx-rust":/work/ngx-rust \
+	    ngx-otel-tsan:latest \
+	    bash /work/ngx-otel-rust/build/tsan-run-dns-only.sh
