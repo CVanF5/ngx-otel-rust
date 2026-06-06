@@ -46,10 +46,6 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// Raise with `otel_log_ring_size` if rings fill under your load.
 pub const DEFAULT_LOG_RING_CAP: usize = 512 * 1024;
 
-/// Kept for backward compat with tests/code that still reference the old name.
-#[allow(dead_code)]
-pub const LOG_RING_CAP: usize = DEFAULT_LOG_RING_CAP;
-
 /// Fixed-size header for a per-worker log ring.
 ///
 /// Immediately followed in shm by `cap` bytes of payload.

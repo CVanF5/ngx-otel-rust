@@ -87,9 +87,10 @@ pub unsafe extern "C" fn control_shm_zone_init(
         return Status::NGX_OK.into();
     }
 
-    // Fresh start: zero the ControlShm area only — never the slab-pool
-    // header.  The OS already zero-fills new mmap regions, but we zero
-    // explicitly for clarity and to handle edge cases (zone reuse paths).
+    // Fresh start: zero the ControlShm area only — never the slab-pool header.
+    // Explicit zeroing (rather than relying on the OS zero-filling fresh mmap
+    // pages) because the same zone can be reused — e.g. across a binary upgrade
+    // where `old_data` is null yet the pages are recycled.
     // SAFETY: nginx invokes this callback with a valid, non-null
     // `ngx_shm_zone_t` (fn contract); the reference does not outlive the call.
     let zone = unsafe { &*shm_zone };

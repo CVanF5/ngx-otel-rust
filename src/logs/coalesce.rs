@@ -184,25 +184,6 @@ pub fn stable_core(buf: &[u8]) -> &[u8] {
     &buf[core_start..end]
 }
 
-// ── FNV-1a hash ───────────────────────────────────────────────────────────────
-
-/// FNV-1a 64-bit hash (no alloc, no std).
-///
-/// Standard constants per <https://www.isthe.com/chongo/tech/comp/fnv/>.
-/// Used in unit tests; production code uses the inlined [`coalesce_key`].
-#[allow(dead_code)]
-#[inline(always)]
-pub fn fnv1a(data: &[u8]) -> u64 {
-    const OFFSET_BASIS: u64 = 14695981039346656037;
-    const PRIME: u64 = 1099511628211;
-    let mut h = OFFSET_BASIS;
-    for &b in data {
-        h ^= b as u64;
-        h = h.wrapping_mul(PRIME);
-    }
-    h
-}
-
 /// Compute the coalescer key: FNV-1a over `[severity_byte] ++ stable_core_bytes`.
 ///
 /// Severity is included in the key so the same message text at different
@@ -358,8 +339,11 @@ pub const fn coalesce_table_bytes() -> usize {
 /// Called by the exporter's `collect_log_records` once per drain cycle.
 /// Sweeps all occupied slots, atomically reads-and-resets `count`, and
 /// returns `(key_hash, severity, count)` for every slot that had `count > 0`.
-/// Also resets `sample_emitted` so the next interval emits a fresh verbatim
+/// Also resets `sample_emitted` so the next interval CAN emit a fresh verbatim
 /// sample (the writer path sees `!already_emitted` and calls `EmitVerbatim`).
+/// Best-effort, not guaranteed: a cross-process race between this reset and the
+/// writer's `sample_emitted` check can carry a `count` into the next interval
+/// without an accompanying verbatim sample for that interval.
 ///
 /// # Ownership of key_hash / severity
 /// These fields are NEVER cleared by the drain — evicted templates persist in
@@ -463,19 +447,7 @@ mod tests {
         assert_eq!(core, b"no live upstreams");
     }
 
-    // ── fnv1a / key tests ────────────────────────────────────────────────────
-
-    /// FNV-1a test vector: empty input.
-    #[test]
-    fn fnv1a_empty() {
-        assert_eq!(fnv1a(b""), 14695981039346656037);
-    }
-
-    /// FNV-1a basic: different inputs produce different hashes.
-    #[test]
-    fn fnv1a_distinct_inputs() {
-        assert_ne!(fnv1a(b"foo"), fnv1a(b"bar"));
-    }
+    // ── coalesce_key tests ───────────────────────────────────────────────────
 
     /// coalesce_key: zero is remapped to 1 (avoid empty-slot sentinel).
     #[test]

@@ -12,22 +12,20 @@ if [ $HTTP = YES ]; then
     ngx_module_deps=
     ngx_module_order=
 
-    if :; then
-        # The exported ngx_module_t symbol name in src/lib.rs:
-        # `pub static mut ngx_http_otel_module: ngx_module_t = ...`
-        ngx_module_name=ngx_http_otel_module
-        # The Cargo [lib] name (matches src/lib.rs's `[lib] name = ...`).
-        # `cargo rustc --crate-type staticlib` produces libngx_http_otel_module.a.
-        ngx_rust_target_name=ngx_http_otel_module
-        ngx_rust_target_type=LIB
-        # No cargo features needed for the static-lib autoconf path:
-        # auto/rust passes `--no-default-features`, which disables
-        # `export-modules` (the cdylib helper we don't need here because
-        # nginx's auto/module generates its own ngx_modules entry).
-        ngx_rust_target_features=
-        # Math lib (-lm) is used transitively by openssl-sys; libc by libstd.
-        ngx_module_libs="-lm"
+    # The exported ngx_module_t symbol name in src/lib.rs:
+    # `pub static mut ngx_http_otel_module: ngx_module_t = ...`
+    ngx_module_name=ngx_http_otel_module
+    # The Cargo [lib] name (matches src/lib.rs's `[lib] name = ...`).
+    # `cargo rustc --crate-type staticlib` produces libngx_http_otel_module.a.
+    ngx_rust_target_name=ngx_http_otel_module
+    ngx_rust_target_type=LIB
+    # No cargo features needed for the static-lib autoconf path:
+    # auto/rust passes `--no-default-features`, which disables
+    # `export-modules` (the cdylib helper we don't need here because
+    # nginx's auto/module generates its own ngx_modules entry).
+    ngx_rust_target_features=
+    # Math lib (-lm) is used transitively by openssl-sys; libc by libstd.
+    ngx_module_libs="-lm"
 
-        ngx_rust_module
-    fi
+    ngx_rust_module
 fi

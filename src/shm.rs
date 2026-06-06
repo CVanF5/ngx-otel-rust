@@ -799,8 +799,9 @@ pub unsafe extern "C" fn otel_shm_zone_init(
     }
 
     // Fresh start: zero only the WorkerSlots area — never the slab-pool header.
-    // (The OS provides zero-filled pages for new mmap regions, but we zero
-    //  explicitly here for clarity and to handle edge cases.)
+    // Explicit zeroing (rather than relying on the OS zero-filling fresh mmap
+    // pages) because the same zone can be reused — e.g. across a binary upgrade
+    // where `old_data` is null yet the pages are recycled.
     // SAFETY: nginx invokes this callback with a valid, non-null
     // `ngx_shm_zone_t` (fn contract); the reference does not outlive the call.
     let zone = unsafe { &*shm_zone };
