@@ -1,0 +1,43 @@
+R3-2 root-start privilege-drop smoke
+====================================
+
+Date:    2026-06-06
+Host:    debian-vm (Linux aarch64), inside a root Docker container
+         (ngx-otel-tsan:latest, --network=host --cap-add=SYS_PTRACE).
+Base:    3b15407 (local main) — R3-2 reordered the exporter's privilege drop to
+         BEFORE the init_process fan-out + channel registration, matching
+         ngx_worker_process_init.
+Binary:  objs-tsan-plain/nginx (TSAN) + matching release module .so.
+
+Why this run: the dockerized TSAN gate runs non-root, so the geteuid()==0
+setgid/setuid branch was never exercised there. This smoke starts nginx AS ROOT
+with `user nobody nogroup;` to fire the privileged path.
+
+What it verifies:
+  1. The reordered privilege drop actually fires for the exporter process.
+  2. The init_process fan-out + ngx_add_channel_event (which now run AFTER the
+     drop) still work — i.e. the exporter still receives QUIT and graceful-drains.
+
+Config: load_module <so>; user nobody nogroup; worker_processes 1;
+        http { otel_exporter { endpoint http://127.0.0.1:4318/v1/metrics; }
+               otel_service_name r32-root-smoke; server { listen 8099; ... } }
+
+Result (R32_SMOKE=PASS):
+  whoami at start: root (uid 0); nobody uid = 65534
+
+  process            euid     verdict
+  -----------------  -------  ----------------------------------------------
+  master  (pid 16)   0        PASS — stays root (holds privileges, as nginx)
+  worker  (pid 20)   65534    PASS — dropped to nobody
+  exporter(pid 15)   65534    PASS — dropped to nobody  <-- the R3-2 crux
+
+  - error.log: "spawned exporter process" + "otel exporter: cycle entered";
+    NO setgid()/setuid() failure.
+  - QUIT -> "graceful drain starting" -> "drain: final batch sent (21 data
+    points)" -> "graceful drain complete" -> "drain_done=true, exit".
+    => channel registration survived running before the drop.
+  - No panic / SIGSEGV / SIGABRT.
+
+Conclusion: with the privilege drop moved ahead of the init fan-out + channel
+registration, the exporter runs UNPRIVILEGED (nobody) yet still completes its
+full QUIT/drain lifecycle. R3-2 verified on the privileged path.
