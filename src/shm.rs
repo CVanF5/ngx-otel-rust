@@ -537,10 +537,13 @@ pub struct ExemplarEntry {
     _pad: [u8; 1],
     /// `url.path` bytes — high-cardinality, exemplar filtered_attribute ONLY.
     /// NEVER a metric dimension.
-    pub url_path_buf: [u8; EXEMPLAR_URL_PATH_MAX],
+    /// `UnsafeCell` so the hot-path byte writes through `&self` are sound
+    /// interior mutation rather than aliasing UB. `repr(transparent)`, so the
+    /// shm layout is unchanged.
+    pub url_path_buf: core::cell::UnsafeCell<[u8; EXEMPLAR_URL_PATH_MAX]>,
     /// `user_agent.original` bytes — high-cardinality, exemplar filtered_attribute ONLY.
-    /// NEVER a metric dimension.
-    pub user_agent_buf: [u8; EXEMPLAR_USER_AGENT_MAX],
+    /// NEVER a metric dimension. `UnsafeCell` for the same reason as `url_path_buf`.
+    pub user_agent_buf: core::cell::UnsafeCell<[u8; EXEMPLAR_USER_AGENT_MAX]>,
 }
 
 /// Per-worker exemplar reservoir — a fixed-capacity circular buffer of
@@ -615,11 +618,16 @@ impl ExemplarReservoir {
         // record (see TELEMETRY_MODEL.md "Exemplars are best-effort hints").
         let url_len = url_path.len().min(EXEMPLAR_URL_PATH_MAX) as u8;
         let ua_len = user_agent.len().min(EXEMPLAR_USER_AGENT_MAX) as u8;
-        // Safety: all indices are within array bounds (len ≤ max).
+        // SAFETY: the buffers are `UnsafeCell<[u8; N]>`, so mutating through
+        // `&self` is sound interior mutability (not aliasing UB). `.get()` yields
+        // `*mut [u8; N]`; the cast to `*mut u8` addresses the first byte. `url_len`
+        // / `ua_len` are clamped ≤ the buffer length, so both copies stay in
+        // bounds. Within a worker this is the single writer; cross-process tearing
+        // vs the exporter's read is the accepted best-effort-hint semantics.
         unsafe {
-            let dst = e.url_path_buf.as_ptr() as *mut u8;
+            let dst = e.url_path_buf.get().cast::<u8>();
             core::ptr::copy_nonoverlapping(url_path.as_ptr(), dst, url_len as usize);
-            let dst = e.user_agent_buf.as_ptr() as *mut u8;
+            let dst = e.user_agent_buf.get().cast::<u8>();
             core::ptr::copy_nonoverlapping(user_agent.as_ptr(), dst, ua_len as usize);
         }
         e.url_path_len.store(url_len, Ordering::Relaxed);
@@ -651,8 +659,12 @@ impl ExemplarReservoir {
             let span_id = e.span_id.load(Ordering::Acquire).to_be_bytes();
             let url_path_len = e.url_path_len.load(Ordering::Acquire);
             let user_agent_len = e.user_agent_len.load(Ordering::Acquire);
-            let url_path = e.url_path_buf;
-            let user_agent = e.user_agent_buf;
+            // SAFETY: single-threaded read within the exporter process; `.get()`
+            // yields `*mut [u8; N]` which we copy out. Concurrent worker writes
+            // live in another process — the documented best-effort tearing.
+            let url_path = unsafe { *e.url_path_buf.get() };
+            // SAFETY: as above — exporter-process read of the UnsafeCell buffer.
+            let user_agent = unsafe { *e.user_agent_buf.get() };
             out.push(ExemplarSnapshot {
                 value_ms,
                 combo_idx,
