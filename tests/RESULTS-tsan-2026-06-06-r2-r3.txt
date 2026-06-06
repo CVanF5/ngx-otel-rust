@@ -1,0 +1,62 @@
+ThreadSanitizer gate — R2/R3 hostile-review hardening batch
+===========================================================
+
+Date:       2026-06-06
+Host:       debian-vm (Linux aarch64) — the project's TSAN/correctness platform
+Toolchain:  rust nightly inside build/Dockerfile.tsan (TSAN requires
+            -Zsanitizer=thread + -Zbuild-std, hence an explicit --target;
+            cargo writes the cdylib to target/<triple>/release/)
+Base:       3b15407 (local main, 22 commits ahead of origin/main; UNPUSHED) —
+            the full R2 + R3 hostile-review fix series.
+Under test (concurrency-relevant items):
+  - R2-1  exemplar reservoir url_path_buf/user_agent_buf -> UnsafeCell<[u8;N]>
+          (the exemplar-buffer UB fix); exercised by the access/exemplar path.
+  - R3-6  per-ring drain caps split (access vs error); error-log drain path.
+  - R3-7  CoalesceSlot.key_hash/severity -> AtomicU64/AtomicU8 (Relaxed),
+          ordered by the count Release/Acquire; error-log coalescer path.
+  - R3-2  exporter privilege-drop reordered before the init_process fan-out +
+          channel registration. NOTE: the setgid/setuid branch only runs when
+          nginx starts as root (geteuid()==0); the container runs non-root, so
+          this run exercises the reordered control flow but NOT the syscall
+          branch. A root-start smoke is still owed for the privileged path.
+  (The remaining R2/R3 items — config-honesty, dead-code removal, doc notes —
+   are not concurrency-relevant and are covered by `make check` + unit tests.)
+
+Harness fix applied for this run (test-only, committed alongside):
+  - MODULE_PATH / CARGO_MODULE made CARGO_BUILD_TARGET-aware across 17 test
+    scripts. Previously only the gRPC-smoke scripts knew that the TSAN gate's
+    --target moves the cdylib to target/<triple>/release/; run_error_log.sh and
+    run_grpc_export.sh (both in the gate path) still hardcoded target/release/,
+    so the error-log gate aborted before nginx started ("module not found")
+    and the smoke gate's 3rd script failed the same way. Fixed all 17 for
+    consistency; bash -n clean.
+
+Commands:   make tsan-test-error   (error-log / coalescer path)
+            make tsan-test         (full gRPC + access + error + signal-storm + DNS)
+
+Scripts run under TSAN:
+  - run_error_log.sh             (Phase 2.3 §6.6.2 error-log path; R3-6/R3-7)
+  - run_grpc_smoke.sh            (in-worker unary gRPC)
+  - run_grpc_bidi_smoke.sh       (bidi gRPC stream)
+  - run_grpc_export.sh           (production gRPC export E2E)
+  - run_access_log.sh            (Phase 2.2 access path; R2-1 exemplars)
+  - run_signal_storm.sh          (re-entrancy gate)
+  - run_dns_dualstack.sh         (async resolver path)
+
+Result:
+  - [PASS] assertions: 115
+  - [FAIL] assertions: 0
+  - Race reports (`WARNING: ThreadSanitizer` / `data race` / `SUMMARY: ...`): 0
+  - Gate lines:
+      "Zero ThreadSanitizer warnings.  Error-log TSAN gate: PASS."
+      "Zero ThreadSanitizer warnings.  TSAN gate: PASS."
+  - Exit codes: tsan-test-error=0, tsan-test=0
+
+Notes:
+  - Collector: the run was first attempted against a stale pre-existing
+    collector (Up 14h), whose 5.6 MB metrics.json made the "metrics.json delta"
+    assertion spuriously fail; tearing it down (make collector-down) and letting
+    the harness start a fresh one made the delta assertions pass. No code change.
+  - The two grep hits for "ThreadSanitizer" in the full log are both PASS/banner
+    lines ("No ThreadSanitizer warnings in error.log" / "Checking for ..."),
+    not race reports.

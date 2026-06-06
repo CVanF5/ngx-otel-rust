@@ -61,7 +61,14 @@ case "$(uname -s)" in
     Darwin) MODULE_EXT="dylib" ;;
     *)      MODULE_EXT="so"    ;;
 esac
-MODULE_PATH="${CRATE_DIR}/target/release/libngx_http_otel_module.${MODULE_EXT}"
+# When CARGO_BUILD_TARGET is set (e.g., the TSAN gate uses --target so cargo
+# can also -Zbuild-std), cargo writes its output to target/<triple>/release/
+# rather than target/release/.  Backwards-compatible: unset -> original path.
+if [[ -n "${CARGO_BUILD_TARGET:-}" ]]; then
+    MODULE_PATH="${CRATE_DIR}/target/${CARGO_BUILD_TARGET}/release/libngx_http_otel_module.${MODULE_EXT}"
+else
+    MODULE_PATH="${CRATE_DIR}/target/release/libngx_http_otel_module.${MODULE_EXT}"
+fi
 
 SERVICE_NAME="ngx-otel-step10-epchange"
 ENDPOINT_A="http://127.0.0.1:4318/v1/metrics"   # real collector

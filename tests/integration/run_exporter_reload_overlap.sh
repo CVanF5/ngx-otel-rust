@@ -39,7 +39,13 @@ case "$(uname -s)" in
 esac
 
 RELEASE_MODULE="${CRATE_DIR}/objs-release/ngx_http_otel_module.so"
-CARGO_MODULE="${CRATE_DIR}/target/release/libngx_http_otel_module.${MODULE_EXT}"
+# CARGO_BUILD_TARGET set (TSAN gate uses --target) -> cargo writes to
+# target/<triple>/release/ rather than target/release/.
+if [[ -n "${CARGO_BUILD_TARGET:-}" ]]; then
+    CARGO_MODULE="${CRATE_DIR}/target/${CARGO_BUILD_TARGET}/release/libngx_http_otel_module.${MODULE_EXT}"
+else
+    CARGO_MODULE="${CRATE_DIR}/target/release/libngx_http_otel_module.${MODULE_EXT}"
+fi
 if [[ -f "${RELEASE_MODULE}" ]]; then
     MODULE_PATH="${RELEASE_MODULE}"
 elif [[ -f "${CARGO_MODULE}" ]]; then

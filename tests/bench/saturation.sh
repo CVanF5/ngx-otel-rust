@@ -85,7 +85,16 @@ step() { echo -e "${CYAN}[STEP]${NC} $*"; }
 # ─── Resolve binaries ────────────────────────────────────────────────────────
 resolve_nginx_binary || true
 case "$(uname -s)" in Darwin) EXT=dylib;; *) EXT=so;; esac
-MODULE_PATH="${MODULE_PATH:-${CRATE_DIR}/target/release/libngx_http_otel_module.${EXT}}"
+# Respect an externally-provided MODULE_PATH; otherwise derive it. When
+# CARGO_BUILD_TARGET is set (TSAN gate uses --target), cargo writes to
+# target/<triple>/release/ rather than target/release/.
+if [[ -z "${MODULE_PATH:-}" ]]; then
+    if [[ -n "${CARGO_BUILD_TARGET:-}" ]]; then
+        MODULE_PATH="${CRATE_DIR}/target/${CARGO_BUILD_TARGET}/release/libngx_http_otel_module.${EXT}"
+    else
+        MODULE_PATH="${CRATE_DIR}/target/release/libngx_http_otel_module.${EXT}"
+    fi
+fi
 
 # ─── Preflight ───────────────────────────────────────────────────────────────
 step "Preflight"
