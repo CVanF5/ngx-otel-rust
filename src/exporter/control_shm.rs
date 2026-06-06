@@ -90,11 +90,20 @@ pub unsafe extern "C" fn control_shm_zone_init(
     // Fresh start: zero the ControlShm area only — never the slab-pool
     // header.  The OS already zero-fills new mmap regions, but we zero
     // explicitly for clarity and to handle edge cases (zone reuse paths).
+    // SAFETY: nginx invokes this callback with a valid, non-null
+    // `ngx_shm_zone_t` (fn contract); the reference does not outlive the call.
     let zone = unsafe { &*shm_zone };
     let offset = crate::shm::data_offset();
     if zone.shm.size > offset {
+        // SAFETY: `offset == data_offset()` and we checked `zone.shm.size >
+        // offset`, so `addr + offset` is within the mapped zone (past the
+        // slab-pool header).
         let base: *mut u8 = unsafe { zone.shm.addr.cast::<u8>().add(offset) };
         let size = zone.shm.size - offset;
+        // SAFETY: `base` is within the zone and `size = zone.shm.size - offset`
+        // bytes remain after it, so the zero-fill stays in-bounds and never
+        // touches the slab-pool header in [0, offset) (zeroing it would crash
+        // the master — see the doc above).
         unsafe { ptr::write_bytes(base, 0, size) };
     }
 
@@ -115,6 +124,10 @@ mod tests {
     #[test]
     fn control_shm_init_and_increment() {
         let buf = std::vec![0u8; mem::size_of::<ControlShm>()];
+        // SAFETY: `buf` is a freshly-allocated, zero-initialised `Vec<u8>` sized
+        // to exactly hold a `ControlShm`; the global allocator over-aligns it,
+        // and zero is the valid initial state for its `AtomicU64` fields. The
+        // shared reference lives only for the test.
         let ctrl = unsafe { &*buf.as_ptr().cast::<ControlShm>() };
 
         // Fresh-allocated buffer zeroed by vec! — simulating zone init.

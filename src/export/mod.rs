@@ -420,6 +420,9 @@ pub async fn export_loop(amcf: &'static MainConfig) {
 
     loop {
         // ── Check for immediate SIGTERM ────────────────────────────────────
+        // SAFETY: `ngx_terminate` is a `sig_atomic_t` global owned by nginx,
+        // written only by the master/signal-delivery path and read here in the
+        // single-threaded exporter process; a plain read of it is well-defined.
         if unsafe { nginx_sys::ngx_terminate } != 0 {
             ngx::ngx_log_error!(
                 NGX_LOG_NOTICE,
@@ -434,6 +437,9 @@ pub async fn export_loop(amcf: &'static MainConfig) {
         // worker; master signals it to quit via ngx_quit on the channel handler
         // path (SIGQUIT → master → NGX_CMD_QUIT → ngx_quit). ngx_exiting is a
         // worker-specific flag set by the worker's SIGQUIT handler.
+        // SAFETY: `ngx_quit` is a `sig_atomic_t` global owned by nginx, set via
+        // the master's NGX_CMD_QUIT channel handler and read here in the
+        // single-threaded exporter process; a plain read of it is well-defined.
         if unsafe { nginx_sys::ngx_quit } != 0 {
             ngx::ngx_log_error!(
                 NGX_LOG_NOTICE,
@@ -479,10 +485,16 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             let chunk = (interval - slept).min(SHUTDOWN_POLL_INTERVAL);
             ngx::async_::sleep(chunk).await;
             slept += chunk;
+            // SAFETY: `ngx_terminate` is a nginx-owned `sig_atomic_t` global;
+            // read here in the single-threaded exporter process, the read is
+            // well-defined.
             if unsafe { nginx_sys::ngx_terminate } != 0 {
                 shutdown_during_sleep = ShutdownKind::Terminate;
                 break;
             }
+            // SAFETY: `ngx_quit` is a nginx-owned `sig_atomic_t` global; read
+            // here in the single-threaded exporter process, the read is
+            // well-defined.
             if unsafe { nginx_sys::ngx_quit } != 0 {
                 shutdown_during_sleep = ShutdownKind::Exiting;
                 break;
@@ -531,6 +543,11 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             // Gate on access_sample OR error_log — either enables the logs shm path.
             if amcf.is_access_sample_enabled() || amcf.error_log_enabled {
                 if let Some(logs_base) = amcf.logs_shm_base() {
+                    // SAFETY: `logs_shm_base()` returned `Some`, so the logs zone
+                    // was registered and mapped; `amcf.logs_shm_zone` therefore
+                    // points to a live `ngx_shm_zone_t` valid for the exporter's
+                    // lifetime (cycle-pool allocated). The `&*` borrow does not
+                    // escape this block, and `shm.size` is a plain field read.
                     let n_workers = unsafe {
                         let zone = &*amcf.logs_shm_zone;
                         let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
@@ -574,11 +591,15 @@ pub async fn export_loop(amcf: &'static MainConfig) {
 
         // ── Re-check shutdown flags after sleep ───────────────────────────
         if matches!(shutdown_during_sleep, ShutdownKind::Terminate)
+            // SAFETY: nginx-owned `sig_atomic_t` global, read in the
+            // single-threaded exporter process — a plain read is well-defined.
             || unsafe { nginx_sys::ngx_terminate } != 0
         {
             return;
         }
         if matches!(shutdown_during_sleep, ShutdownKind::Exiting)
+            // SAFETY: nginx-owned `sig_atomic_t` global, read in the
+            // single-threaded exporter process — a plain read is well-defined.
             || unsafe { nginx_sys::ngx_quit } != 0
         {
             ngx::ngx_log_error!(
@@ -606,6 +627,10 @@ pub async fn export_loop(amcf: &'static MainConfig) {
         // TODO(phase-5): also write reconfig payload from control channel
         // into control_shm.flags before/after this bump.
         if let Some(ctrl) = amcf.control_shm_ptr() {
+            // SAFETY: `control_shm_ptr()` returned `Some`, so `ctrl` points to a
+            // live control-shm header in the mapped zone (valid for the
+            // exporter's lifetime). `version` is an `AtomicU64`, so the
+            // cross-process `fetch_add` is well-defined.
             unsafe { (*ctrl).version.fetch_add(1, Ordering::Relaxed) };
         }
 
@@ -861,6 +886,10 @@ async fn graceful_drain(
     // Final freshly-collected logs batch (access + error rings).
     if amcf.is_access_sample_enabled() || amcf.error_log_enabled {
         if let Some(logs_base) = amcf.logs_shm_base() {
+            // SAFETY: `logs_shm_base()` returned `Some`, so the logs zone is
+            // registered and mapped; `amcf.logs_shm_zone` points to a live
+            // `ngx_shm_zone_t` valid for the exporter's lifetime. The `&*`
+            // borrow does not escape this block; `shm.size` is a plain read.
             let n_workers = unsafe {
                 let zone = &*amcf.logs_shm_zone;
                 let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
@@ -1060,6 +1089,10 @@ fn collect_all_sources(amcf: &MainConfig, worker_start_ns: u64) -> Batch {
 
     // 2. Per-worker shm histograms (http.server.request.duration, etc.).
     if let Some(base) = amcf.shm_base() {
+        // SAFETY: `shm_base()` returned `Some`, so the metrics zone is
+        // registered and mapped; `amcf.shm_zone` points to a live
+        // `ngx_shm_zone_t` valid for the exporter's lifetime. The `&*` borrow
+        // does not escape this block; `shm.size` is a plain field read.
         let n_workers = unsafe {
             let zone = &*amcf.shm_zone;
             // zone.shm.size includes the slab-pool header; subtract it to get
@@ -1092,6 +1125,10 @@ fn collect_all_sources(amcf: &MainConfig, worker_start_ns: u64) -> Batch {
     //    Collected from metrics shm when error_log is enabled and shm is mapped.
     if amcf.error_log_enabled {
         if let Some(base) = amcf.shm_base() {
+            // SAFETY: `shm_base()` returned `Some`, so the metrics zone is
+            // mapped and `amcf.shm_zone` points to a live `ngx_shm_zone_t`
+            // valid for the exporter's lifetime. The `&*` borrow does not
+            // escape this block; `shm.size` is a plain field read.
             let n_workers = unsafe {
                 let zone = &*amcf.shm_zone;
                 let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
@@ -1173,6 +1210,11 @@ fn collect_log_records(
             // 1. Drain the coalescer table to get (key_hash, severity, count) tuples.
             //    Safety: zone sized for n_workers; w < n_workers; cap correct.
             let coalesce_tbl = unsafe { logs_coalesce_table(logs_base, w, cap) };
+            // SAFETY: `coalesce_tbl` is the in-zone coalescer-table pointer just
+            // obtained from `logs_coalesce_table`, valid for the zone mapping;
+            // the exporter is the single reader/draining process, so the
+            // in-place reset performed by `drain_coalesce_table` does not race a
+            // concurrent drainer.
             let counts_vec = unsafe { coalesce::drain_coalesce_table(coalesce_tbl) };
             // Build a lookup: key_hash → count (number of occurrences in this interval,
             // including the initial verbatim sample that was already pushed to the ring).
@@ -1512,6 +1554,11 @@ fn collect_error_rate_metric(base: *mut u8, n_workers: usize, start_time_ns: u64
     // Sum each severity class across all workers.
     let mut totals = [0i64; N_SEVERITY_CLASSES];
     for w in 0..n_workers {
+        // SAFETY: per this fn's contract `base` is the metrics zone start (past
+        // the slab header) and `n_workers` is ≤ the slot count the zone was
+        // sized for, so `w < n_workers` makes `worker_slots(base, w)` an
+        // in-bounds, initialised `WorkerSlots`; the `&*` borrow lives only for
+        // this iteration and all reads below go through `AtomicU64` fields.
         let slots = unsafe { &*worker_slots(base, w) };
         for (i, cnt) in slots.error_rate_counters.iter().enumerate() {
             totals[i] = totals[i].saturating_add(cnt.load(Ordering::Acquire) as i64);
@@ -1640,6 +1687,10 @@ pub fn exit_process_flush(amcf: &MainConfig) {
     // Flush logs if access_sample OR error_log is enabled and the logs shm is mapped.
     if amcf.is_access_sample_enabled() || amcf.error_log_enabled {
         if let Some(logs_base) = amcf.logs_shm_base() {
+            // SAFETY: `logs_shm_base()` returned `Some`, so the logs zone is
+            // mapped and `amcf.logs_shm_zone` points to a live `ngx_shm_zone_t`
+            // valid for the current cycle. The `&*` borrow does not escape this
+            // block; `shm.size` is a plain field read.
             let n_workers = unsafe {
                 let zone = &*amcf.logs_shm_zone;
                 let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
@@ -1775,9 +1826,16 @@ mod tests {
         let cap = DEFAULT_LOG_RING_CAP;
         let slot_sz = logs_slot_size(cap);
         let layout = std::alloc::Layout::from_size_align(slot_sz, 8).unwrap();
+        // SAFETY: `slot_sz = logs_slot_size(cap) > 0`, so the layout is valid and
+        // non-zero-sized; `alloc_zeroed` returns a buffer sized for one full logs
+        // slot, 8-byte aligned (matching the ring header's alignment).
         let slot_ptr = unsafe { std::alloc::alloc_zeroed(layout) };
 
         // Stamp cap into both ring headers (mirrors logs_shm_zone_init).
+        // SAFETY: `slot_ptr` is the start of the just-zeroed `slot_sz` buffer; the
+        // access header lives at offset 0 and the error header one
+        // `ring_size_bytes(cap)` in, both within the slot, and `cap` is an
+        // `AtomicU64`. The buffer is 8-byte aligned for `LogsWorkerRingHeader`.
         unsafe {
             let access_hdr = slot_ptr.cast::<LogsWorkerRingHeader>();
             (*access_hdr).cap.store(cap as u64, Ordering::Relaxed);
@@ -1791,6 +1849,8 @@ mod tests {
         let batch = collect_log_records(&amcf, slot_ptr, 1, 0);
         assert!(batch.logs.is_empty(), "empty rings must produce empty LogsBatch");
 
+        // SAFETY: `slot_ptr`/`layout` are the exact pointer and layout returned
+        // by the `alloc_zeroed` above and the buffer is no longer referenced.
         unsafe { std::alloc::dealloc(slot_ptr, layout) };
         let _ = RING_HEADER_SIZE; // suppress unused import
     }
@@ -1862,7 +1922,13 @@ mod tests {
         let cap = DEFAULT_LOG_RING_CAP;
         let slot_sz = logs_slot_size(cap);
         let layout = std::alloc::Layout::from_size_align(slot_sz, 8).unwrap();
+        // SAFETY: `slot_sz > 0` so the layout is valid and non-zero-sized;
+        // `alloc_zeroed` returns a buffer sized for one logs slot, 8-byte aligned.
         let slot_ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        // SAFETY: `slot_ptr` is the start of the just-zeroed `slot_sz` buffer;
+        // access header at offset 0, error header one `ring_size_bytes(cap)` in,
+        // both within the slot; `cap` is an `AtomicU64` and the buffer is aligned
+        // for `LogsWorkerRingHeader`.
         unsafe {
             let access_hdr = slot_ptr.cast::<LogsWorkerRingHeader>();
             (*access_hdr).cap.store(cap as u64, Ordering::Relaxed);
@@ -1870,6 +1936,8 @@ mod tests {
             (*error_hdr).cap.store(cap as u64, Ordering::Relaxed);
         }
         let logs_batch = collect_log_records(&amcf, slot_ptr, 1, 0);
+        // SAFETY: same pointer/layout returned by `alloc_zeroed` above; the
+        // buffer is no longer referenced after `collect_log_records` returns.
         unsafe { std::alloc::dealloc(slot_ptr, layout) };
         let _ = RING_HEADER_SIZE;
 
@@ -1931,6 +1999,12 @@ mod tests {
         let slot_sz = logs_slot_size(cap);
         let mut buf = std::vec![0u8; slot_sz];
         let ptr = buf.as_mut_ptr();
+        // SAFETY: `ptr` is the start of the just-zeroed `slot_sz`-byte `Vec`
+        // buffer (Vec's allocation is suitably aligned for `LogsWorkerRingHeader`
+        // here, with `RING_HEADER_SIZE` headroom); the access header sits at
+        // offset 0 and the error header one `ring_size_bytes(cap)` in, both
+        // within the slot, and `cap` is an `AtomicU64`. `buf` is returned so it
+        // outlives every use of `ptr`.
         unsafe {
             let access_hdr = ptr.cast::<LogsWorkerRingHeader>();
             (*access_hdr).cap.store(cap as u64, Ordering::Relaxed);
@@ -1959,6 +2033,10 @@ mod tests {
         let ts_ns: u64 = 1_700_000_000_000_000_000;
         let body = b"connect() failed (111: Connection refused)";
         let template_hash: u64 = 0xdeadbeef_cafebabe;
+        // SAFETY: `slot_ptr` is the one-worker logs slot from `make_logs_slot`
+        // (correct `cap`, initialised headers); `worker_id = 0 < 1` worker, so
+        // `logs_error_ring` yields a valid in-slot ring view, and `push`
+        // operates only on that view's atomic header + in-bounds payload.
         unsafe {
             let error_ring = logs_error_ring(slot_ptr, 0, cap);
             // Build and push the wire record manually.
@@ -2035,6 +2113,10 @@ mod tests {
         let coalesced_n: u32 = 150;
 
         // 1. Push one verbatim ring record with the given template_hash.
+        // SAFETY: `slot_ptr` is the one-worker logs slot from `make_logs_slot`
+        // (correct `cap`, initialised headers); `worker_id = 0 < 1` worker, so
+        // `logs_error_ring` yields a valid in-slot ring view and `push` touches
+        // only that view's atomic header + in-bounds payload.
         unsafe {
             let error_ring = logs_error_ring(slot_ptr, 0, cap);
             const HDR: usize = 20;
@@ -2052,6 +2134,12 @@ mod tests {
 
         // 2. Populate the coalescer table slot for this template_hash with count=N.
         //    We directly write the slot to simulate what the writer would have done.
+        // SAFETY: `slot_ptr` is the one-worker logs slot from `make_logs_slot`;
+        // `logs_coalesce_table(slot_ptr, 0, cap)` returns the in-slot coalescer
+        // table base. `slot_idx` is masked by `COALESCE_CAPACITY - 1` (a
+        // power-of-two capacity), so `table.add(slot_idx)` stays within the
+        // `[CoalesceSlot; COALESCE_CAPACITY]` array; the `write_volatile`s target
+        // that one in-bounds slot and `count`/`sample_emitted` are atomics.
         unsafe {
             let table = logs_coalesce_table(slot_ptr, 0, cap);
             let slot_idx = (template_hash as usize) & (COALESCE_CAPACITY - 1);
@@ -2099,6 +2187,9 @@ mod tests {
         );
 
         // Coalescer table must have been reset (count = 0, sample_emitted = false).
+        // SAFETY: same in-slot coalescer table as above; `slot_idx` is masked by
+        // `COALESCE_CAPACITY - 1`, so `table.add(slot_idx)` is in-bounds, and the
+        // reads below go through the slot's `count`/`sample_emitted` atomics.
         unsafe {
             let table = logs_coalesce_table(slot_ptr, 0, cap);
             let slot_idx = (template_hash as usize) & (COALESCE_CAPACITY - 1);
@@ -2131,8 +2222,15 @@ mod tests {
 
         // Zero-init the WorkerSlots area.
         let off = crate::shm::data_offset();
+        // SAFETY: `buf` is sized `zone_size_for(n_workers)` = `off + n_workers *
+        // size_of::<WorkerSlots>()`, so `base + off` is in-bounds and exactly
+        // `zone_sz - off` bytes remain after it; the zero-fill stays within the
+        // buffer and never touches the simulated slab-header region `[0, off)`.
         unsafe { core::ptr::write_bytes(base.add(off), 0, zone_sz - off) };
 
+        // SAFETY: `base + off` points past the simulated slab header to the
+        // WorkerSlots area, satisfying `collect_error_rate_metric`'s contract
+        // that `base` be the zone data start; the buffer holds `n_workers` slots.
         let metric = collect_error_rate_metric(unsafe { base.add(off) }, n_workers, 0);
 
         assert_eq!(metric.name, "ngx_otel.error_log.events");
@@ -2183,10 +2281,20 @@ mod tests {
         let base = buf.as_mut_ptr();
 
         let off = crate::shm::data_offset();
+        // SAFETY: `buf` is sized `zone_size_for(n_workers)` = `off + n_workers *
+        // size_of::<WorkerSlots>()`, so `base + off` is in-bounds; the pointer is
+        // only formed here for the WorkerSlots data region.
         let data_base = unsafe { base.add(off) };
+        // SAFETY: `data_base = base + off` is in-bounds and exactly `zone_sz - off`
+        // bytes remain after it, so the zero-fill of the WorkerSlots area stays
+        // within the buffer.
         unsafe { core::ptr::write_bytes(data_base, 0, zone_sz - off) };
 
         // Worker 0 bumps: 10 × error (level 4), 5 × warn (level 5)
+        // SAFETY: `data_base` is the WorkerSlots data start of a buffer sized for
+        // `n_workers = 2` slots; `0 < n_workers`, so `worker_slots(data_base, 0)`
+        // is in-bounds and (post zero-fill) a valid `WorkerSlots`; the bumps go
+        // through its `AtomicU64` counters.
         unsafe {
             let slots = &*worker_slots(data_base, 0);
             for _ in 0..10 {
@@ -2200,6 +2308,9 @@ mod tests {
         }
 
         // Worker 1 bumps: 3 × fatal (level 1), 10 × error (level 4)
+        // SAFETY: `1 < n_workers = 2`, so `worker_slots(data_base, 1)` is the
+        // in-bounds second slot (post zero-fill, a valid `WorkerSlots`); the
+        // bumps go through its `AtomicU64` counters.
         unsafe {
             let slots = &*worker_slots(data_base, 1);
             for _ in 0..3 {

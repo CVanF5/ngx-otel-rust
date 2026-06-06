@@ -102,6 +102,15 @@ unsafe fn read_stats() -> (u64, u64, u64, u64, u64, u64, u64) {
             // TODO(portability): ngx_atomic_t is c_ulong-wide. This alias is correct
             // on 64-bit Linux/macOS where c_ulong == u64, but breaks on 32-bit
             // platforms where c_ulong == u32. Revisit before declaring v1.0 portable.
+            // SAFETY: `$ptr` is one of nginx's `ngx_stat_*` globals (a non-null
+            // `*mut ngx_atomic_t`), allocated and zero-initialised by nginx at
+            // startup before any worker runs (the `read_stats` fn contract requires
+            // nginx to have started), so it is valid and properly aligned. We only
+            // ever read it, never write, so casting to `*const AtomicU64` and taking
+            // an `Acquire` load is sound: `AtomicU64` matches `ngx_atomic_t`'s
+            // 8-byte layout on the supported 64-bit targets (see TODO above), and the
+            // atomic load is the correct way to observe a counter that other workers
+            // mutate concurrently via nginx's own atomic ops.
             unsafe { (*(($ptr) as *const core::sync::atomic::AtomicU64)).load(Ordering::Acquire) }
         };
     }

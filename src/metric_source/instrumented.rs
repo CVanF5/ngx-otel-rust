@@ -61,6 +61,10 @@ impl HttpRequestHandler for LogPhaseHandler {
         // module is disabled) so module-loaded-but-disabled stays zero-cost.
         // TODO(phase-5): act on the loaded flags value.
         if let Some(ctrl) = amcf.control_shm_ptr() {
+            // SAFETY: `control_shm_ptr()` returns `Some` only when the control shm
+            // zone is mapped, so `ctrl` points to a valid control struct in shm for
+            // the worker's lifetime; `flags` is an atomic, so the concurrent load is
+            // well-defined.
             let _ = unsafe { (*ctrl).flags.load(Ordering::Relaxed) };
         }
 
@@ -71,6 +75,9 @@ impl HttpRequestHandler for LogPhaseHandler {
         };
 
         // Determine current worker index (no syscall — nginx global).
+        // SAFETY: `ngx_worker` is a `static mut` set once by nginx during worker
+        // init and only ever read thereafter from this worker process, so reading
+        // it on the (single-threaded) request path is sound.
         let worker_id = unsafe { nginx_sys::ngx_worker };
 
         // Get our slot. No allocation; pointer arithmetic only.
@@ -120,8 +127,14 @@ impl HttpRequestHandler for LogPhaseHandler {
         // 3. Per-upstream table: nginx.upstream.zone.
         //    Skip if no upstream (zone_ptr = 0 → UPSTREAM_IDX_OTHER).
         let upstream_zone_ptr: usize = if let Some(upstream) = request.upstream() {
+            // SAFETY: `request.upstream()` returns `Some` only when nginx has set
+            // up the per-request upstream struct, so `upstream` is a valid
+            // `ngx_http_upstream_t` pointer for the duration of this handler.
             let us = unsafe { (*upstream).upstream };
             if !us.is_null() {
+                // SAFETY: `us` is the non-null `ngx_http_upstream_srv_conf_t`
+                // pointer just read from the live upstream struct; reading its
+                // `shm_zone` field is sound.
                 let zone = unsafe { (*us).shm_zone };
                 if !zone.is_null() {
                     zone as usize
@@ -153,6 +166,10 @@ impl HttpRequestHandler for LogPhaseHandler {
             if conn.is_null() {
                 0u64
             } else {
+                // SAFETY: `conn` is non-null here (null-checked above) and is the
+                // request's `ngx_connection_t`, which nginx keeps valid for the
+                // duration of the Log-phase handler; reading its `sent` field is
+                // sound.
                 unsafe { (*conn).sent as u64 }
             }
         };
@@ -160,12 +177,24 @@ impl HttpRequestHandler for LogPhaseHandler {
 
         // ── upstream timings (if an upstream was used) ────────────────────
         if let Some(upstream) = request.upstream() {
+            // SAFETY: `request.upstream()` returned `Some`, so `upstream` is a
+            // valid `ngx_http_upstream_t` for this handler; reading its `state`
+            // array pointer is sound.
             let state = unsafe { (*upstream).state };
             if !state.is_null() {
+                // SAFETY: `state` is non-null (checked above) and points to the
+                // upstream's `ngx_http_upstream_state_t` (the timing record nginx
+                // populates per upstream attempt), valid for this handler. This and
+                // the next four reads access plain numeric fields, so the
+                // dereferences are sound.
                 let resp_ms = unsafe { (*state).response_time as u64 };
+                // SAFETY: as above — non-null upstream state, plain field read.
                 let hdr_ms = unsafe { (*state).header_time as u64 };
+                // SAFETY: as above — non-null upstream state, plain field read.
                 let conn_ms = unsafe { (*state).connect_time as u64 };
+                // SAFETY: as above — non-null upstream state, plain field read.
                 let bytes_rx = unsafe { (*state).bytes_received as u64 };
+                // SAFETY: as above — non-null upstream state, plain field read.
                 let bytes_tx = unsafe { (*state).bytes_sent as u64 };
 
                 slot.upstream_response_ms.record(resp_ms, &DURATION_BOUNDS_MS);
@@ -197,6 +226,12 @@ impl HttpRequestHandler for LogPhaseHandler {
 
                 // Client address from the connection.
                 let client_addr: &[u8] = if !request.connection().is_null() {
+                    // SAFETY: the connection pointer is non-null (checked above) and
+                    // points to the request's `ngx_connection_t`, valid for this
+                    // handler. `addr_text` is an `ngx_str_t` whose `data`/`len` nginx
+                    // fills with the client address text; the `from_raw_parts` slice
+                    // is only built when `len > 0` and `data` is non-null, so it
+                    // covers `len` initialised bytes that outlive this borrow.
                     unsafe {
                         let conn = &*request.connection();
                         if conn.addr_text.len > 0 && !conn.addr_text.data.is_null() {
@@ -334,6 +369,10 @@ pub struct InstrumentedSource {
 
 // Safety: InstrumentedSource is only used on Worker 0's export loop.
 unsafe impl Send for InstrumentedSource {}
+// SAFETY: `InstrumentedSource` holds raw `*mut`/`*const` pointers into shm and
+// the main config, but it is only ever accessed from the single export worker
+// (Worker 0); there is no concurrent `&InstrumentedSource` aliasing, and the
+// shm it reads is via per-field atomics, so sharing it is sound.
 unsafe impl Sync for InstrumentedSource {}
 
 impl crate::metric_source::MetricSource for InstrumentedSource {
@@ -367,6 +406,10 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
         let mut up_bytes_sent = ([0u64; N_BYTES_BUCKETS], 0u64, 0u64);
 
         // amcf needed before the worker loop for effective_size.
+        // SAFETY: `self.amcf` is the main-config pointer captured at exporter
+        // setup; it is either null or points to the `MainConfig` that lives for
+        // the whole process. `as_ref()` yields `None` for null and otherwise a
+        // reference that does not outlive `self`, so it is sound.
         let amcf_ref_early: Option<&crate::config::MainConfig> = unsafe { self.amcf.as_ref() };
         // Effective exemplar reservoir size (from otel_access_log_sample directive).
         let effective_size = amcf_ref_early.map(|c| c.access_sample_size().max(1)).unwrap_or(1);
@@ -375,6 +418,11 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
         let mut all_exemplars: std::vec::Vec<(u32, Exemplar)> = std::vec::Vec::new();
 
         for i in 0..self.n_workers {
+            // SAFETY: `self.base` is the shm zone start and `i < self.n_workers`,
+            // the worker count the zone was sized for, so `worker_slots` returns an
+            // in-bounds, zone-init-zeroed `WorkerSlots` pointer; the zone outlives
+            // this export loop, so the reference is valid. All slot fields read here
+            // are atomics, so concurrent worker writes are well-defined.
             let slot = unsafe { &*worker_slots(self.base, i) };
 
             // Sum base combination histograms (method × sc × proto, 160 combos).

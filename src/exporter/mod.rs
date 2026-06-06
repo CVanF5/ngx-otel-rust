@@ -63,12 +63,17 @@ pub(crate) enum NgxProcess {
 /// helper — it is only called from gating predicates, never from the
 /// request hot path.
 pub(crate) fn ngx_process() -> NgxProcess {
+    // SAFETY: `ngx_process` is an nginx `static mut` set during process init and
+    // only read thereafter; this cold-path read runs on the single-threaded
+    // event loop, so there is no data race.
     let p = unsafe { nginx_sys::ngx_process } as u32;
     match p {
         nginx_sys::NGX_PROCESS_SINGLE => NgxProcess::Single,
         nginx_sys::NGX_PROCESS_MASTER => NgxProcess::Master,
         nginx_sys::NGX_PROCESS_SIGNALLER => NgxProcess::Signaller,
         nginx_sys::NGX_PROCESS_WORKER => {
+            // SAFETY: `ngx_worker` is an nginx `static mut` set once at worker
+            // init; read-only here on the single-threaded worker.
             NgxProcess::Worker(unsafe { nginx_sys::ngx_worker } as u32)
         }
         nginx_sys::NGX_PROCESS_HELPER => {
@@ -109,6 +114,11 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
     cycle: *mut nginx_sys::ngx_cycle_t,
     _data: *mut c_void,
 ) {
+    // SAFETY: FFI callback invoked by nginx with a valid non-null `cycle` (fn
+    // contract), running in the freshly-forked exporter process. The block sets
+    // and reads nginx globals (`ngx_cycle`, `ngx_process`) and calls nginx setup
+    // routines on the single-threaded event loop before any other task runs, so
+    // the static-mut writes are race-free. Per-step rationale is inline below.
     unsafe {
         // 0. Update ngx_cycle to point to the new cycle. At the time of fork,
         //    the master's ngx_cycle still points to the previous init cycle
@@ -467,12 +477,18 @@ mod tests {
     fn ngx_process_returns_helper_when_not_exporter() {
         let _guard = global_state_lock().lock().unwrap();
         IS_OTEL_EXPORTER.store(false, Ordering::SeqCst);
+        // SAFETY: the test holds `global_state_lock`, serialising all nginx
+        // process-global mutation; these writes set/reset `ngx_process` (and
+        // `ngx_worker`) in a single-threaded test and are reset before asserting.
         unsafe {
             nginx_sys::ngx_process = nginx_sys::NGX_PROCESS_HELPER as nginx_sys::ngx_uint_t;
         }
         let result = ngx_process();
         // Reset globals before the assert so the state is clean even if the
         // assert panics and unwinds past the mutex guard.
+        // SAFETY: the test holds `global_state_lock`, serialising all nginx
+        // process-global mutation; these writes set/reset `ngx_process` (and
+        // `ngx_worker`) in a single-threaded test and are reset before asserting.
         unsafe {
             nginx_sys::ngx_process = nginx_sys::NGX_PROCESS_SINGLE as nginx_sys::ngx_uint_t;
         }
@@ -485,6 +501,9 @@ mod tests {
     fn ngx_process_returns_exporter_when_flag_set() {
         let _guard = global_state_lock().lock().unwrap();
         IS_OTEL_EXPORTER.store(false, Ordering::SeqCst); // reset first
+                                                         // SAFETY: the test holds `global_state_lock`, serialising all nginx
+                                                         // process-global mutation; these writes set/reset `ngx_process` (and
+                                                         // `ngx_worker`) in a single-threaded test and are reset before asserting.
         unsafe {
             nginx_sys::ngx_process = nginx_sys::NGX_PROCESS_HELPER as nginx_sys::ngx_uint_t;
         }
@@ -492,6 +511,9 @@ mod tests {
         let result = ngx_process();
         // Reset globals and flag before the assert.
         IS_OTEL_EXPORTER.store(false, Ordering::SeqCst);
+        // SAFETY: the test holds `global_state_lock`, serialising all nginx
+        // process-global mutation; these writes set/reset `ngx_process` (and
+        // `ngx_worker`) in a single-threaded test and are reset before asserting.
         unsafe {
             nginx_sys::ngx_process = nginx_sys::NGX_PROCESS_SINGLE as nginx_sys::ngx_uint_t;
         }
@@ -504,12 +526,18 @@ mod tests {
     fn ngx_process_returns_worker_zero() {
         let _guard = global_state_lock().lock().unwrap();
         IS_OTEL_EXPORTER.store(false, Ordering::SeqCst);
+        // SAFETY: the test holds `global_state_lock`, serialising all nginx
+        // process-global mutation; these writes set/reset `ngx_process` (and
+        // `ngx_worker`) in a single-threaded test and are reset before asserting.
         unsafe {
             nginx_sys::ngx_process = nginx_sys::NGX_PROCESS_WORKER as nginx_sys::ngx_uint_t;
             nginx_sys::ngx_worker = 0;
         }
         let result = ngx_process();
         // Reset globals before the assert.
+        // SAFETY: the test holds `global_state_lock`, serialising all nginx
+        // process-global mutation; these writes set/reset `ngx_process` (and
+        // `ngx_worker`) in a single-threaded test and are reset before asserting.
         unsafe {
             nginx_sys::ngx_process = nginx_sys::NGX_PROCESS_SINGLE as nginx_sys::ngx_uint_t;
         }
