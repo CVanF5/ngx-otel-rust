@@ -21,10 +21,15 @@ datasources:
       # tagged with the W3C trace_id (when a traceparent came in). Clicking an
       # exemplar diamond jumps to the matching access tail LogRecord in Loki,
       # joined by trace_id. (Traces/Tempo are Phase 3; the log is the target here.)
+      # Clicking an exemplar diamond navigates to this dashboard with the
+      # `trace_id` variable set to the exemplar's trace_id, which filters the
+      # "Exemplar → Request Log" Loki panel to that exact request. (datasourceUid
+      # links only work for trace datasources like Tempo; Loki isn't one, so we
+      # drive an on-dashboard variable instead — the whole flow stays on screen.)
       exemplarTraceIdDestinations:
         - name: trace_id
-          datasourceUid: loki
-          urlDisplayLabel: "View tail log (Loki)"
+          url: "/d/ngx-otel-rust-overview?var-trace_id=${__value.raw}"
+          urlDisplayLabel: "Show this request's log ↓"
 
   # ── FUTURE: logs (Phase 2). Brought online by `--profile logs`. ────────
   - name: Loki

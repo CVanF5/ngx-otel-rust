@@ -34,6 +34,17 @@
         "includeAll": false,
         "multi": false,
         "current": {}
+      },
+      {
+        "name": "trace_id",
+        "label": "Trace ID (exemplar)",
+        "type": "textbox",
+        "query": ".+",
+        "current": {
+          "text": ".+",
+          "value": ".+"
+        },
+        "description": "Set by clicking an exemplar diamond (or paste a trace_id). Filters the 'Exemplar \u2192 Request Log' panel."
       }
     ]
   },
@@ -1425,6 +1436,39 @@
       },
       "panels": [
         {
+          "id": 50,
+          "type": "logs",
+          "title": "Exemplar \u2192 Request Log  (trace_id = $trace_id)",
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "description": "The access tail LogRecord for the exemplar(s) selected above. Click an exemplar diamond on the latency panel to set $trace_id, or paste one into the Trace ID box. trace_id is the join key between the duration-histogram exemplar and this log line.",
+          "gridPos": {
+            "h": 9,
+            "w": 24,
+            "x": 0,
+            "y": 16
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "loki",
+                "uid": "loki"
+              },
+              "refId": "A",
+              "expr": "{service_name=\"$service\"} | trace_id=~\"$trace_id\" | line_format \"{{.severity_text}} trace={{.trace_id}} {{.http_request_method}} {{.http_response_status_code}} {{.url_path}}\""
+            }
+          ],
+          "options": {
+            "showTime": true,
+            "wrapLogMessage": true,
+            "dedupStrategy": "none",
+            "enableLogDetails": true,
+            "sortOrder": "Descending"
+          }
+        },
+        {
           "id": 18,
           "type": "timeseries",
           "title": "Log Rate",
@@ -1437,7 +1481,7 @@
             "h": 6,
             "w": 24,
             "x": 0,
-            "y": 16
+            "y": 25
           },
           "targets": [
             {
@@ -1508,7 +1552,7 @@
             "h": 9,
             "w": 24,
             "x": 0,
-            "y": 22
+            "y": 31
           },
           "targets": [
             {
@@ -1546,7 +1590,7 @@
             "h": 9,
             "w": 24,
             "x": 0,
-            "y": 31
+            "y": 40
           },
           "targets": [
             {
@@ -1584,7 +1628,7 @@
             "h": 9,
             "w": 24,
             "x": 0,
-            "y": 40
+            "y": 49
           },
           "targets": [
             {
