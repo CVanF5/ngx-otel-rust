@@ -42,6 +42,15 @@ http {
     # not the exact code — bounded to 5 classes (§6.4 cardinality discipline).
     otel_metric_status_code_class on;
 
+    # ── Phase 2 logs (populate the Grafana "Logs" section via Loki) ──────────
+    # Access log as summary + samples: emit a thin exception tail (status >= 4xx /
+    # latency outliers) + exemplars over OTLP. The reservoir size (64) sizes the
+    # exemplar set; the tail carries url.path / status / method / client.address.
+    otel_access_log_sample 64;
+    # Error log over OTLP (coalesced LogRecords + companion rate metric); fixed
+    # NGX_LOG_ERR floor unless an explicit level is given.
+    otel_error_log warn;
+
     # Backend the front server proxies to (populates upstream.* metrics).
     upstream demo_backend {
         server 127.0.0.1:9401;

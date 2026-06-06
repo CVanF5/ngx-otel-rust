@@ -50,15 +50,16 @@ exporters:
     send_timestamps: false
     metric_expiration: 5m
 
-  # ── FUTURE: logs (Phase 2) ────────────────────────────────────────────
-  # When the module starts emitting OTLP logs, ship them straight to Loki's
-  # native OTLP endpoint — no Promtail, no format translation. Enable the
-  # `logs` compose profile (brings up the loki service) and uncomment the
-  # exporter + logs pipeline below.
-  # otlphttp/loki:
-  #   logs_endpoint: http://loki:3100/otlp/v1/logs
-  #   tls:
-  #     insecure: true
+  # ── Logs (Phase 2) ────────────────────────────────────────────────────
+  # Ship the module's OTLP logs (access exception tail + coalesced error log)
+  # straight to Loki's native OTLP endpoint — no Promtail, no format
+  # translation. Loki promotes service.name -> the `service_name` index label
+  # and keeps per-record attributes (url.path -> url_path, etc.) as structured
+  # metadata, which the dashboard's LogQL filters on.
+  otlphttp/loki:
+    logs_endpoint: http://loki:3100/otlp/v1/logs
+    tls:
+      insecure: true
 
   # ── FUTURE: traces ────────────────────────────────────────────────────
   # otlp/tempo:
@@ -75,11 +76,10 @@ service:
       receivers: [otlp]
       processors: [batch]
       exporters: [prometheus, debug]
-    # ── FUTURE: uncomment when Phase 2 logs land (compose `logs` profile) ──
-    # logs:
-    #   receivers: [otlp]
-    #   processors: [batch]
-    #   exporters: [otlphttp/loki, debug]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/loki, debug]
     # ── FUTURE: traces ────────────────────────────────────────────────────
     # traces:
     #   receivers: [otlp]

@@ -8,13 +8,12 @@
 # nginx runs on the HOST (it loads the host-built module .so) and ships
 # OTLP/HTTP to 127.0.0.1:14318 — see demo/run-demo.sh and nginx-demo.conf.
 #
-# Profiles:
-#   (default)   collector + prometheus + grafana  → metrics, available today
-#   logs        adds loki                          → Phase 2 (logs)
-#   traces      adds tempo                         → future (traces)
+# Services:
+#   (default)   collector + prometheus + grafana + loki  → metrics AND logs
+#   traces      adds tempo (--profile traces)             → future (traces)
 #
-#   docker compose -f docker-compose.demo.yml up -d                  # metrics
-#   docker compose -f docker-compose.demo.yml --profile logs up -d   # + loki
+#   docker compose -f docker-compose.demo.yml up -d                    # metrics + logs
+#   docker compose -f docker-compose.demo.yml --profile traces up -d   # + tempo
 #
 # Grafana: http://localhost:3000  (anonymous, Admin role — demo only)
 
@@ -31,6 +30,8 @@ services:
       - "127.0.0.1:14318:4318"   # OTLP/HTTP  (point nginx here)
       - "127.0.0.1:14317:4317"   # OTLP/gRPC
       - "127.0.0.1:18889:8889"   # Prometheus scrape endpoint (debug/curl)
+    depends_on:
+      - loki
     restart: unless-stopped
 
   prometheus:
@@ -68,17 +69,17 @@ services:
       - prometheus
     restart: unless-stopped
 
-  # ── FUTURE: logs (Phase 2) — `--profile logs` ─────────────────────────
+  # ── Logs (Phase 2) — starts by default with the stack ─────────────────
   # Loki 3.x ingests OTLP logs natively at /otlp/v1/logs; the collector's
   # otlphttp/loki exporter ships straight to it (no Promtail). The Grafana
-  # Loki datasource is already provisioned and points here.
+  # Loki datasource is already provisioned and points here. (Uses the image's
+  # built-in single-binary /etc/loki/local-config.yaml; auth disabled.)
   loki:
     image: grafana/loki:3.3.2
     container_name: ngx-otel-demo-loki
     command: ["-config.file=/etc/loki/local-config.yaml"]
     ports:
       - "127.0.0.1:13100:3100"
-    profiles: ["logs"]
     restart: unless-stopped
 
   # ── FUTURE: traces — `--profile traces` ───────────────────────────────

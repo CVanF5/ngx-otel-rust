@@ -72,7 +72,7 @@ start_traffic() {
 
 cmd_up() {
     ensure_built
-    info "starting docker stack (collector + prometheus + grafana)..."
+    info "starting docker stack (collector + prometheus + grafana + loki)..."
     "${COMPOSE[@]}" up -d
 
     info "waiting for collector on ${COLLECTOR_HTTP} ..."
@@ -97,8 +97,9 @@ cmd_up() {
     echo "  Grafana:            ${GRAFANA_URL}   (opens on the ngx-otel-rust dashboard)"
     echo "  Prometheus:         http://localhost:19090"
     echo "  Collector /metrics: http://localhost:18889/metrics"
-    echo "  nginx front:        http://127.0.0.1:9400/  (also /big, /api/)"
-    echo "  metric export interval: 2s — allow ~10s for the dashboard to fill."
+    echo "  Loki:               http://localhost:13100  (logs → Grafana 'Logs' section)"
+    echo "  nginx front:        http://127.0.0.1:9400/  (also /big, /api/, /client-error, /server-error)"
+    echo "  export interval: 2s — allow ~10s for metrics; the Logs section needs a few 4xx/5xx (traffic gen drives them)."
     echo "  stop with: ${BASH_SOURCE[0]} down"
 }
 
