@@ -41,6 +41,12 @@ services:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.retention.time=6h
       - --web.enable-lifecycle
+      # Accept metrics pushed by the collector's prometheusremotewrite exporter.
+      - --web.enable-remote-write-receiver
+      # native-histograms: ingest the module's exp-histograms faithfully (buckets
+      #   + quantiles + heatmap). exemplar-storage: keep the exemplars so Grafana
+      #   can overlay diamonds and drill from the duration metric to the Loki log.
+      - --enable-feature=native-histograms,exemplar-storage
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:

@@ -56,18 +56,27 @@ wait_for_collector() {
 
 start_traffic() {
     # Light, varied background load so every histogram populates.
-    ( while true; do
-        curl -s -o /dev/null "http://127.0.0.1:9400/"               || true
-        curl -s -o /dev/null "http://127.0.0.1:9400/big"            || true
-        curl -s -o /dev/null "http://127.0.0.1:9400/api/"           || true
-        curl -s -o /dev/null "http://127.0.0.1:9400/api/"           || true
-        curl -s -o /dev/null -X POST "http://127.0.0.1:9400/"       || true  # method=POST
-        curl -s -o /dev/null "http://127.0.0.1:9400/client-error"   || true  # 4xx
+    #
+    # Each request carries a UNIQUE W3C `traceparent` so the trace_id propagates
+    # to BOTH the request-duration histogram exemplar (Phase 2.2.4) and the
+    # access tail LogRecord — that shared trace_id is the join key behind the
+    # Grafana exemplar→Loki drill-down (click an exemplar diamond → its tail log).
+    (
+      # 00-<16-byte trace-id>-<8-byte span-id>-01 (01 = sampled).
+      tp() { printf '00-%s-%s-01' "$(openssl rand -hex 16)" "$(openssl rand -hex 8)"; }
+      req() { curl -s -o /dev/null -H "traceparent: $(tp)" "$@" || true; }
+      while true; do
+        req "http://127.0.0.1:9400/"
+        req "http://127.0.0.1:9400/big"
+        req "http://127.0.0.1:9400/api/"
+        req "http://127.0.0.1:9400/api/"
+        req -X POST "http://127.0.0.1:9400/"                      # method=POST
+        req "http://127.0.0.1:9400/client-error"                 # 4xx
         # 5xx less often, so the breakdown shows a realistic error mix
-        [ $((RANDOM % 4)) -eq 0 ] && curl -s -o /dev/null "http://127.0.0.1:9400/server-error" || true
+        [ $((RANDOM % 4)) -eq 0 ] && req "http://127.0.0.1:9400/server-error"
         # Periodic dead-upstream hit → real nginx "connect() failed" error_log
         # lines → the OTel error-log signal (coalesced) for the Error Log panel.
-        [ $((RANDOM % 5)) -eq 0 ] && curl -s -o /dev/null "http://127.0.0.1:9400/backend-down" || true
+        [ $((RANDOM % 5)) -eq 0 ] && req "http://127.0.0.1:9400/backend-down"
         sleep 0.05
       done ) >/dev/null 2>&1 &
     echo $! > "${PREFIX}/traffic.pid"

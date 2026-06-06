@@ -1,10 +1,12 @@
-# Prometheus scrape config for the ngx-otel-rust demo.
-# Scrapes the OTel collector's Prometheus exporter inside the compose network.
+# Prometheus config for the ngx-otel-rust demo.
+#
+# Metrics are PUSHED in via remote-write (the collector's prometheusremotewrite
+# exporter → --web.enable-remote-write-receiver), NOT scraped — this is the
+# canonical path for the module's exponential histograms (ingested as native
+# histograms) and it carries their exemplars. So there are no scrape_configs
+# for the collector.
 global:
   scrape_interval: 5s
   evaluation_interval: 5s
 
-scrape_configs:
-  - job_name: otel-collector
-    static_configs:
-      - targets: ["collector:8889"]
+scrape_configs: []

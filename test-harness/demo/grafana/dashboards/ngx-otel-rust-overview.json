@@ -133,7 +133,7 @@
             "uid": "prometheus"
           },
           "refId": "A",
-          "expr": "sum(nginx_connections_active_sum{service_name=\"$service\"})"
+          "expr": "sum(nginx_connections_active{service_name=\"$service\"})"
         }
       ],
       "fieldConfig": {
@@ -247,7 +247,7 @@
             "uid": "prometheus"
           },
           "refId": "A",
-          "expr": "sum(nginx_connections_reading_sum{service_name=\"$service\"})",
+          "expr": "sum(nginx_connections_reading{service_name=\"$service\"})",
           "legendFormat": "reading"
         },
         {
@@ -256,7 +256,7 @@
             "uid": "prometheus"
           },
           "refId": "B",
-          "expr": "sum(nginx_connections_writing_sum{service_name=\"$service\"})",
+          "expr": "sum(nginx_connections_writing{service_name=\"$service\"})",
           "legendFormat": "writing"
         },
         {
@@ -265,7 +265,7 @@
             "uid": "prometheus"
           },
           "refId": "C",
-          "expr": "sum(nginx_connections_waiting_sum{service_name=\"$service\"})",
+          "expr": "sum(nginx_connections_waiting{service_name=\"$service\"})",
           "legendFormat": "waiting"
         }
       ],
@@ -428,12 +428,12 @@
                 "uid": "prometheus"
               },
               "refId": "A",
-              "expr": "sum(rate(http_server_request_duration_sum{service_name=\"$service\"}[$__rate_interval])) / sum(rate(http_server_request_duration_count{service_name=\"$service\"}[$__rate_interval])) / 1000"
+              "expr": "sum(histogram_sum(rate(http_server_request_duration{service_name=\"$service\"}[$__rate_interval]))) / sum(histogram_count(rate(http_server_request_duration{service_name=\"$service\"}[$__rate_interval]))) / 1000"
             }
           ],
           "fieldConfig": {
             "defaults": {
-              "unit": "ms",
+              "unit": "\u00b5s",
               "thresholds": {
                 "mode": "absolute",
                 "steps": [
@@ -494,7 +494,7 @@
                 "uid": "prometheus"
               },
               "refId": "A",
-              "expr": "sum(rate(http_server_request_duration_count{service_name=\"$service\",http_response_status_code=\"500\"}[$__rate_interval]))"
+              "expr": "sum(histogram_count(rate(http_server_request_duration{service_name=\"$service\",http_response_status_code=\"500\"}[$__rate_interval])))"
             }
           ],
           "fieldConfig": {
@@ -555,7 +555,7 @@
                 "uid": "prometheus"
               },
               "refId": "A",
-              "expr": "sum(rate(http_server_request_duration_count{service_name=\"$service\"}[$__rate_interval])) by (http_response_status_code)",
+              "expr": "sum(histogram_count(rate(http_server_request_duration{service_name=\"$service\"}[$__rate_interval]))) by (http_response_status_code)",
               "legendFormat": "{{http_response_status_code}}"
             }
           ],
@@ -702,7 +702,7 @@
                 "uid": "prometheus"
               },
               "refId": "A",
-              "expr": "sum(rate(http_server_request_duration_count{service_name=\"$service\"}[$__rate_interval])) by (http_request_method)",
+              "expr": "sum(histogram_count(rate(http_server_request_duration{service_name=\"$service\"}[$__rate_interval]))) by (http_request_method)",
               "legendFormat": "{{http_request_method}}"
             }
           ],
@@ -773,9 +773,8 @@
                 "uid": "prometheus"
               },
               "refId": "A",
-              "expr": "sum(rate(http_server_request_duration_bucket{service_name=\"$service\"}[$__rate_interval])) by (le)",
-              "format": "heatmap",
-              "legendFormat": "{{le}}"
+              "expr": "sum(rate(http_server_request_duration{service_name=\"$service\"}[$__rate_interval]))",
+              "format": "heatmap"
             }
           ],
           "options": {
@@ -805,12 +804,12 @@
         {
           "id": 11,
           "type": "timeseries",
-          "title": "Avg Duration by Status Class",
+          "title": "Request Latency by Status (avg \u00b5s) \u00b7 \u2b26 exemplars \u2192 click to Loki",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "description": null,
+          "description": "Avg request duration (\u00b5s) per status class, with EXEMPLAR diamonds: each \u2b26 is one sampled real request placed at its own latency (its native-histogram bucket), tagged with the W3C trace_id. Click a diamond \u2192 \"View tail log (Loki)\" to open the matching access tail LogRecord (joined by trace_id). This is the metric\u2192exemplar\u2192log drill-down.",
           "gridPos": {
             "h": 8,
             "w": 12,
@@ -824,13 +823,14 @@
                 "uid": "prometheus"
               },
               "refId": "A",
-              "expr": "sum(rate(http_server_request_duration_sum{service_name=\"$service\"}[$__rate_interval])) by (http_response_status_code) / sum(rate(http_server_request_duration_count{service_name=\"$service\"}[$__rate_interval])) by (http_response_status_code) / 1000",
-              "legendFormat": "{{http_response_status_code}}"
+              "expr": "sum(histogram_sum(rate(http_server_request_duration{service_name=\"$service\"}[$__rate_interval]))) by (http_response_status_code) / sum(histogram_count(rate(http_server_request_duration{service_name=\"$service\"}[$__rate_interval]))) by (http_response_status_code) / 1000",
+              "legendFormat": "{{http_response_status_code}}",
+              "exemplar": true
             }
           ],
           "fieldConfig": {
             "defaults": {
-              "unit": "ms",
+              "unit": "\u00b5s",
               "custom": {
                 "drawStyle": "line",
                 "lineWidth": 2,
@@ -952,7 +952,7 @@
         {
           "id": 12,
           "type": "bargauge",
-          "title": "Slowest Routes (avg ms \u00b7 http.route)",
+          "title": "Slowest Routes (avg \u00b5s \u00b7 http.route)",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
@@ -971,14 +971,14 @@
                 "uid": "prometheus"
               },
               "refId": "A",
-              "expr": "topk(10, sum(rate(http_server_request_duration_by_route_sum{service_name=\"$service\"}[$__rate_interval])) by (http_route) / sum(rate(http_server_request_duration_by_route_count{service_name=\"$service\"}[$__rate_interval])) by (http_route) / 1000)",
+              "expr": "topk(10, sum(histogram_sum(rate(http_server_request_duration_by_route{service_name=\"$service\"}[$__rate_interval]))) by (http_route) / sum(histogram_count(rate(http_server_request_duration_by_route{service_name=\"$service\"}[$__rate_interval]))) by (http_route) / 1000)",
               "legendFormat": "{{http_route}}",
               "instant": true
             }
           ],
           "fieldConfig": {
             "defaults": {
-              "unit": "ms",
+              "unit": "\u00b5s",
               "thresholds": {
                 "mode": "absolute",
                 "steps": [
@@ -1018,7 +1018,7 @@
         {
           "id": 13,
           "type": "bargauge",
-          "title": "Avg Duration by Upstream Zone (ms \u00b7 nginx.upstream.zone)",
+          "title": "Avg Duration by Upstream Zone (\u00b5s \u00b7 nginx.upstream.zone)",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
@@ -1037,14 +1037,14 @@
                 "uid": "prometheus"
               },
               "refId": "A",
-              "expr": "sum(rate(http_server_request_duration_by_upstream_sum{service_name=\"$service\"}[$__rate_interval])) by (nginx_upstream_zone) / sum(rate(http_server_request_duration_by_upstream_count{service_name=\"$service\"}[$__rate_interval])) by (nginx_upstream_zone) / 1000",
+              "expr": "sum(histogram_sum(rate(http_server_request_duration_by_upstream{service_name=\"$service\"}[$__rate_interval]))) by (nginx_upstream_zone) / sum(histogram_count(rate(http_server_request_duration_by_upstream{service_name=\"$service\"}[$__rate_interval]))) by (nginx_upstream_zone) / 1000",
               "legendFormat": "{{nginx_upstream_zone}}",
               "instant": true
             }
           ],
           "fieldConfig": {
             "defaults": {
-              "unit": "ms",
+              "unit": "\u00b5s",
               "thresholds": {
                 "mode": "absolute",
                 "steps": [
@@ -1287,7 +1287,7 @@
           ],
           "fieldConfig": {
             "defaults": {
-              "unit": "ms",
+              "unit": "\u00b5s",
               "custom": {
                 "drawStyle": "line",
                 "lineWidth": 2,
@@ -1518,7 +1518,7 @@
               },
               "refId": "A",
               "queryType": "range",
-              "expr": "{service_name=\"$service\"} | severity_number >= 13 | line_format \"×{{if .nginx_error_coalesced_count}}{{.nginx_error_coalesced_count}}{{else}}1{{end}} │ {{ __line__ }}\""
+              "expr": "{service_name=\"$service\"} | severity_number >= 13 | line_format \"\u00d7{{if .nginx_error_coalesced_count}}{{.nginx_error_coalesced_count}}{{else}}1{{end}} \u2502 {{ __line__ }}\""
             }
           ],
           "options": {

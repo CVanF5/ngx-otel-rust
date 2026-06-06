@@ -17,6 +17,14 @@ datasources:
       httpMethod: POST
       # Match the collector exporter scrape cadence for sane $__rate_interval.
       timeInterval: 5s
+      # Exemplar drill-down: the request-duration histogram carries exemplars
+      # tagged with the W3C trace_id (when a traceparent came in). Clicking an
+      # exemplar diamond jumps to the matching access tail LogRecord in Loki,
+      # joined by trace_id. (Traces/Tempo are Phase 3; the log is the target here.)
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          datasourceUid: loki
+          urlDisplayLabel: "View tail log (Loki)"
 
   # ── FUTURE: logs (Phase 2). Brought online by `--profile logs`. ────────
   - name: Loki

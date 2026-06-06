@@ -34,21 +34,22 @@ exporters:
   debug:
     verbosity: normal
 
-  # Scraped by the Prometheus container at collector:8889/metrics.
-  prometheus:
-    endpoint: 0.0.0.0:8889
-    # Predictable metric names: http.server.request.duration ->
-    # http_server_request_duration{,_bucket,_sum,_count}. No unit suffixes.
+  # Push metrics to Prometheus via remote-write (NOT scrape). This is the
+  # canonical OTLP→Prometheus path for EXPONENTIAL histograms: the module's
+  # request.duration{,.by_route,.by_upstream} are exp-histograms, which the
+  # classic scrape exporter can only render as a single le="+Inf" bucket (it
+  # also DROPS the exemplars). Remote-write carries the exp-histograms as
+  # Prometheus NATIVE histograms AND ships their EXEMPLARS (trace_id + url.path,
+  # Phase 2.2.4), so Grafana can overlay exemplar diamonds and drill to the
+  # Loki tail log. Pairs with Prometheus --web.enable-remote-write-receiver +
+  # --enable-feature=native-histograms,exemplar-storage.
+  prometheusremotewrite:
+    endpoint: http://prometheus:9090/api/v1/write
+    # Predictable metric names (matches the dashboard queries): no unit suffixes.
     add_metric_suffixes: false
-    # Promote resource attributes (service.name, etc.) to series labels so
-    # the dashboard can filter by service_name.
+    # Promote resource attributes (service.name, etc.) to series labels.
     resource_to_telemetry_conversion:
       enabled: true
-    # Sample at scrape time (NOT the OTLP datapoint timestamp). The exporter
-    # accumulates the module's deltas into a monotonic counter; stamping at
-    # scrape time keeps rate()/histogram_quantile() well-behaved.
-    send_timestamps: false
-    metric_expiration: 5m
 
   # ── Logs (Phase 2) ────────────────────────────────────────────────────
   # Ship the module's OTLP logs (access exception tail + coalesced error log)
@@ -75,7 +76,7 @@ service:
     metrics:
       receivers: [otlp]
       processors: [batch]
-      exporters: [prometheus, debug]
+      exporters: [prometheusremotewrite, debug]
     logs:
       receivers: [otlp]
       processors: [batch]
