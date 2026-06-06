@@ -132,8 +132,8 @@ unsafe impl Sync for OtelErrorWriterState {}
 /// 2. Busy flag — drop re-entrant / concurrent calls.
 /// 3. Severity floor — drop if `level > level_floor`.
 /// 4. Process-role guard (DP-C, Step 2.3.5): Worker + logs shm mapped.
-/// 4a. Error-rate metric bump (DP-B, Step 2.3.4): every floor-passing event.
-/// 5. Coalescer / verbatim push (Step 2.3.2 + 2.3.3).
+/// 5. Error-rate metric bump (DP-B, Step 2.3.4): every floor-passing event.
+/// 6. Coalescer / verbatim push (Step 2.3.2 + 2.3.3).
 ///
 /// # Safety
 /// `log` must be a non-null pointer to an `ngx_log_t` whose `wdata` is a
@@ -428,9 +428,7 @@ pub unsafe fn otel_log_insert(head: *mut nginx_sys::ngx_log_t, new_log: *mut ngi
         // New node has higher level: it should be the new head.
         // The head address is permanent (it's an embedded value in ngx_cycle_t),
         // so we swap the *contents* and set head->next to old-head memory.
-        let tmp = *head;
-        *head = *new_log;
-        *new_log = tmp;
+        core::ptr::swap(head, new_log);
         (*head).next = new_log;
         return;
     }

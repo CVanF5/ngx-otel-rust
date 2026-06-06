@@ -414,12 +414,12 @@ pub const SEVERITY_CLASS_NAMES: [&str; N_SEVERITY_CLASSES] =
 #[inline]
 pub fn severity_class_index(ngx_level: u8) -> usize {
     match ngx_level {
-        1 | 2 | 3 => 0, // fatal: emerg / alert / crit
-        4 => 1,         // error
-        5 => 2,         // warn
-        6 | 7 => 3,     // info: notice / info
-        8 => 4,         // debug
-        _ => 0,         // clamp unknown to fatal (conservative; never OOB)
+        1..=3 => 0, // fatal: emerg / alert / crit
+        4 => 1,     // error
+        5 => 2,     // warn
+        6 | 7 => 3, // info: notice / info
+        8 => 4,     // debug
+        _ => 0,     // clamp unknown to fatal (conservative; never OOB)
     }
 }
 

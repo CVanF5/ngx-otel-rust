@@ -500,7 +500,7 @@ mod tests {
     #[test]
     fn flood_collapses_to_one_sample() {
         let mut table = make_table();
-        let ptr = table.as_mut_ptr() as *mut CoalesceSlot;
+        let ptr = table.as_mut_ptr();
 
         let msg = b"2024/01/01 12:00:00 [error] 1#1: *1 connect() failed, client: 1.2.3.4\n";
 
@@ -527,7 +527,7 @@ mod tests {
     #[test]
     fn distinct_templates_each_sampled() {
         let mut table = make_table();
-        let ptr = table.as_mut_ptr() as *mut CoalesceSlot;
+        let ptr = table.as_mut_ptr();
 
         // 5 distinct messages.
         let msgs: &[&[u8]] = &[
@@ -552,7 +552,7 @@ mod tests {
     #[test]
     fn high_severity_never_coalesced() {
         let mut table = make_table();
-        let ptr = table.as_mut_ptr() as *mut CoalesceSlot;
+        let ptr = table.as_mut_ptr();
 
         let msg = b"2024/01/01 12:00:00 [crit] 1#1: accept() failed\n";
         // severity 3 = crit (≤ HIGH_SEVERITY_THRESHOLD)
@@ -581,7 +581,7 @@ mod tests {
     #[test]
     fn table_full_falls_back_to_verbatim() {
         let mut table = make_table();
-        let ptr = table.as_mut_ptr() as *mut CoalesceSlot;
+        let ptr = table.as_mut_ptr();
 
         // Fill the table with COALESCE_CAPACITY distinct entries by
         // fabricating unique "messages" with distinct hash keys.
@@ -615,7 +615,7 @@ mod tests {
     #[test]
     fn coalesce_off_emits_every_line() {
         let mut table = make_table();
-        let ptr = table.as_mut_ptr() as *mut CoalesceSlot;
+        let ptr = table.as_mut_ptr();
 
         let msg = b"2024/01/01 12:00:00 [error] 1#1: connect() failed, client: 1.2.3.4\n";
 

@@ -1976,8 +1976,10 @@ mod tests {
 
         // Note: access ring is empty — we're testing that the error record still lands.
         // Synthesize a MainConfig with error_log_enabled = true.
-        let mut amcf = crate::config::MainConfig::default();
-        amcf.error_log_enabled = true;
+        let amcf = crate::config::MainConfig {
+            error_log_enabled: true,
+            ..crate::config::MainConfig::default()
+        };
 
         let batch = collect_log_records(&amcf, slot_ptr, 1, 0);
 
@@ -2067,8 +2069,10 @@ mod tests {
         }
 
         // 3. Drain via collect_log_records.
-        let mut amcf = crate::config::MainConfig::default();
-        amcf.error_log_enabled = true;
+        let amcf = crate::config::MainConfig {
+            error_log_enabled: true,
+            ..crate::config::MainConfig::default()
+        };
 
         let batch = collect_log_records(&amcf, slot_ptr, 1, 0);
 

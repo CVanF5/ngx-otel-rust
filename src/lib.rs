@@ -260,7 +260,7 @@ extern "C" fn ngx_otel_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
                 // Process-role gate: Worker only (not master/exporter/config-load).
                 if matches!(crate::exporter::ngx_process(), crate::exporter::NgxProcess::Worker(_))
                 {
-                    let worker_id = unsafe { nginx_sys::ngx_worker as usize };
+                    let worker_id = unsafe { nginx_sys::ngx_worker };
                     let cap = amcf.log_ring_cap();
 
                     if let Some(logs_base) = amcf.logs_shm_base() {
@@ -270,12 +270,12 @@ extern "C" fn ngx_otel_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
                             unsafe { crate::shm::logs_error_ring_ptr(logs_base, worker_id, cap) };
 
                         // Error-rate counters live in the metrics shm (WorkerSlots).
-                        let error_rate_ptr = amcf.shm_base().and_then(|metrics_base| {
+                        let error_rate_ptr = amcf.shm_base().map(|metrics_base| {
                             let ws = unsafe { crate::shm::worker_slots(metrics_base, worker_id) };
-                            Some(unsafe {
+                            unsafe {
                                 (*ws).error_rate_counters.as_ptr()
                                     as *mut core::sync::atomic::AtomicU64
-                            })
+                            }
                         });
 
                         unsafe {

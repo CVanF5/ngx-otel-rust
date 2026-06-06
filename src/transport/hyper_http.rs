@@ -892,6 +892,7 @@ impl NgxConnector {
     /// # STOP-AND-ASK if:
     /// - The resolver returns a UAF/panic (would surface as a crash here).
     /// - `ngx_inet_set_port` corrupts the address on a non-v4/v6 family.
+    ///
     /// These are the resolver-lifetime / UAF concerns from the loop doc.
     async fn connect_dns(
         &self,
@@ -925,7 +926,7 @@ impl NgxConnector {
         let host_ngx_str =
             nginx_sys::ngx_str_t { len: host_str.len(), data: host_str.as_ptr() as *mut u8 };
 
-        let addrs = resolver.resolve_name(&host_ngx_str, &*resolve_pool).await.map_err(|e| {
+        let addrs = resolver.resolve_name(&host_ngx_str, &resolve_pool).await.map_err(|e| {
             TransportError::Connection { cause: std::format!("DNS resolve '{}': {}", host_str, e) }
         })?;
 
