@@ -81,7 +81,7 @@ TEST_ENV	+= NGINX_BUILD_DIR="$(NGINX_BUILD_DIR)"
 
 # Build targets
 
-.PHONY: help build check unittest test full-test clean
+.PHONY: help build check install-hooks unittest test full-test clean
 
 help:
 	@echo "Available targets:"
@@ -124,6 +124,10 @@ build: $(TEST_NGINX_BINARY) ## Build the module
 check: $(NGINX_BUILD_DIR)/Makefile ## Check style and lint
 	$(BUILD_ENV) $(NGX_CARGO) fmt --all -- --check
 	$(BUILD_ENV) $(NGX_CARGO) clippy --all-targets --verbose -- -D warnings
+
+install-hooks: ## Install the local pre-commit gate (sets git core.hooksPath)
+	git config core.hooksPath .githooks
+	@echo "Installed: core.hooksPath=.githooks — pre-commit now runs 'make check'."
 
 unittest: $(NGINX_BUILD_DIR)/Makefile  ## Run unit-tests
 	$(BUILD_ENV) $(NGX_CARGO) test --lib

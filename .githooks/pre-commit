@@ -1,0 +1,26 @@
+#!/bin/sh
+# Local pre-commit gate — we enforce "CI" here instead of via GitHub Actions.
+#
+# Install once per clone:   make install-hooks   (sets core.hooksPath=.githooks)
+#
+# Runs `make check`:
+#   cargo fmt --all -- --check
+#   cargo clippy --all-targets -- -D warnings
+# clippy includes the crate's [lints] table, so `undocumented_unsafe_blocks =
+# deny` is enforced here too (every `unsafe` block must keep its `// SAFETY:`).
+#
+# Skipped automatically when a commit touches no Rust/Cargo files (doc-only
+# commits stay instant). Bypass in an emergency with `git commit --no-verify`.
+#
+# Heavier gates stay manual / dedicated-host (see HANDOFF.md): `make unittest`,
+# the integration suite, TSAN on debian-vm, benches on host-1, and
+# `cargo deny check` (network-dependent advisory DB) against deny.toml.
+set -e
+
+if git diff --cached --name-only --diff-filter=ACM \
+     | grep -qE '\.rs$|(^|/)Cargo\.(toml|lock)$|(^|/)rustfmt\.toml$'; then
+    echo "pre-commit: Rust/Cargo changes staged — running 'make check'…"
+    make check
+else
+    echo "pre-commit: no Rust/Cargo changes staged — skipping 'make check'."
+fi
