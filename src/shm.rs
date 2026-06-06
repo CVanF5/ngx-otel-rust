@@ -516,8 +516,8 @@ pub const EXEMPLAR_USER_AGENT_MAX: usize = 128;
 ///     = 40 + 4 + 1 + 1 + 2 + 64 + 128 = 240 bytes.
 #[repr(C)]
 pub struct ExemplarEntry {
-    /// Observed request duration in ms.
-    pub value_ms: AtomicU64,
+    /// Observed request duration in µs (matches the exp-histogram `us` unit).
+    pub value_us: AtomicU64,
     /// Lower 8 bytes of the W3C trace_id (bytes 0–7).
     pub trace_id_lo: AtomicU64,
     /// Upper 8 bytes of the W3C trace_id (bytes 8–15).
@@ -581,7 +581,7 @@ impl ExemplarReservoir {
     pub fn write(
         &self,
         effective_size: usize,
-        value_ms: u64,
+        value_us: u64,
         combo_idx: u32,
         trace_id: Option<[u8; 16]>,
         span_id: Option<[u8; 8]>,
@@ -593,7 +593,7 @@ impl ExemplarReservoir {
         let n = self.count.fetch_add(1, Ordering::Relaxed) as usize;
         let slot = n % k;
         let e = &self.entries[slot];
-        e.value_ms.store(value_ms, Ordering::Relaxed);
+        e.value_us.store(value_us, Ordering::Relaxed);
         e.ts_unix_nano.store(ts_unix_nano, Ordering::Relaxed);
         e.combo_idx.store(combo_idx, Ordering::Relaxed);
         if let (Some(tid), Some(sid)) = (trace_id, span_id) {
@@ -647,7 +647,7 @@ impl ExemplarReservoir {
         let mut out = std::vec::Vec::with_capacity(filled);
         for i in 0..filled {
             let e = &self.entries[i];
-            let value_ms = e.value_ms.load(Ordering::Acquire);
+            let value_us = e.value_us.load(Ordering::Acquire);
             let combo_idx = e.combo_idx.load(Ordering::Acquire);
             let has_trace = e.has_trace.load(Ordering::Acquire) != 0;
             let ts_ns = e.ts_unix_nano.load(Ordering::Acquire);
@@ -666,7 +666,7 @@ impl ExemplarReservoir {
             // SAFETY: as above — exporter-process read of the UnsafeCell buffer.
             let user_agent = unsafe { *e.user_agent_buf.get() };
             out.push(ExemplarSnapshot {
-                value_ms,
+                value_us,
                 combo_idx,
                 has_trace,
                 trace_id,
@@ -684,7 +684,7 @@ impl ExemplarReservoir {
 
 /// Snapshot result from `ExemplarReservoir::snapshot`.
 pub struct ExemplarSnapshot {
-    pub value_ms: u64,
+    pub value_us: u64,
     pub combo_idx: u32,
     pub has_trace: bool,
     pub trace_id: [u8; 16],
@@ -1304,7 +1304,7 @@ mod tests {
 
         // Slot 0 was overwritten by write #3 (value=300, combo=7, url=/v2, ua=Go-http)
         let s0 = &snapshot[0];
-        assert_eq!(s0.value_ms, 300, "slot 0 has latest value");
+        assert_eq!(s0.value_us, 300, "slot 0 has latest value");
         assert_eq!(s0.combo_idx, 7, "slot 0 has latest combo_idx");
         assert!(s0.has_trace, "slot 0 has trace context");
         assert_eq!(s0.url_path_len, 3); // "/v2"
@@ -1312,7 +1312,7 @@ mod tests {
 
         // Slot 1 was written by write #2 (value=200, combo=6, no trace, no url)
         let s1 = &snapshot[1];
-        assert_eq!(s1.value_ms, 200, "slot 1 has its value");
+        assert_eq!(s1.value_us, 200, "slot 1 has its value");
         assert_eq!(s1.combo_idx, 6, "slot 1 has its combo_idx");
         assert!(!s1.has_trace, "slot 1 has no trace context");
         assert_eq!(s1.url_path_len, 0);

@@ -505,7 +505,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                 all_exemplars.push((
                     snap.combo_idx,
                     Exemplar {
-                        value: snap.value_ms as f64,
+                        value: snap.value_us as f64,
                         time_unix_nano: snap.ts_unix_nano,
                         trace_id: snap.trace_id,
                         span_id: snap.span_id,

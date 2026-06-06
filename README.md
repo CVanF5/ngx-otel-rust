@@ -338,8 +338,8 @@ http {
     otel_error_log;                         # enable error-log export; floor defaults to `error`. e.g. `otel_error_log warn;`
     # otel_error_log_coalesce off;          # default on; off = best-effort verbatim streaming (lossy under load — see TELEMETRY_MODEL.md)
 
-    # High-cardinality attributes ride on exemplars/tail only, never metric dimensions:
-    # otel_metric_high_cardinality_attr url.path;
+    # url.path + user_agent.original ride on access exemplars/tail automatically
+    # (when otel_access_log_sample is set), never as metric dimensions.
 
     server { ... }
 }
@@ -493,12 +493,6 @@ ngx-otel-rust/
 - **Hot path is single-process-per-worker**; per-histogram attribute
   populations are reserved for a later iteration that needs
   multi-dimensional shm.
-- **`otel_metric_status_code_class` is accepted but not yet emitting.**  The
-  directive parses and defaults on, and the hot path buckets responses into
-  1xx–5xx classes, but `http.response.status_code.class` is not emitted yet.
-  Deferred to Phase 2 (the `fix3b` plan: emit it as a bounded, semconv-aligned
-  attribute on the duration histogram once per-data-point attributes +
-  multi-dimensional shm land).
 - **Tokio appears in `Cargo.lock`** transitively via hyper 1.x.  It is
   present at the type level but never instantiated at runtime — the
   module's "no Tokio" rule reads as "no Tokio runtime use".  See the

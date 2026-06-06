@@ -165,8 +165,6 @@ pub struct MainConfig {
     /// `otel_metric_status_code_class on | off`
     /// UNSET_FLAG (-1) = not set (treated as on/default).
     pub status_code_class: ngx_flag_t,
-    /// `otel_metric_high_cardinality_attr <attr>` — accumulated list.
-    pub high_cardinality_attrs: std::vec::Vec<ngx_str_t>,
     /// `otel_grpc_smoke_endpoint <url>` — TEST-ONLY trigger for the
     /// Phase 1.2 Item 1 in-worker gRPC viability harness.  When set
     /// (and the crate is built with the `test-support` feature),
@@ -304,7 +302,6 @@ impl Default for MainConfig {
             zone_name: ngx_str_t::default(),
             zone_size: 0,
             status_code_class: UNSET_FLAG,
-            high_cardinality_attrs: std::vec::Vec::new(),
             grpc_smoke_endpoint: ngx_str_t::default(),
             bidi_smoke_endpoint: ngx_str_t::default(),
             bidi_overload_endpoint: ngx_str_t::default(),
@@ -381,12 +378,13 @@ impl MainConfig {
         DEFAULT_RETRY_BUFFER_DEPTH
     }
 
-    /// Whether HTTP status code class bucketing is enabled (default: true).
+    /// Whether to emit the decomposed `method × status_class × protocol`
+    /// breakdown on the duration histogram (default on; `UNSET`/`on` → true).
     ///
-    /// Currently unused (`#[allow(dead_code)]`): the status-class breakdown is
-    /// already bucketed in the hot path via the multi-dimensional combo
-    /// histogram, but this gate accessor is not yet wired to emission.
-    #[allow(dead_code)]
+    /// Read in `export_loop` (`export/mod.rs`) to set
+    /// `InstrumentedSource.status_code_class_enabled` (`metric_source/instrumented.rs`);
+    /// `off` collapses the per-combo data points. The hot path always buckets
+    /// status class in the combo histogram regardless of this flag.
     pub fn status_code_class_enabled(&self) -> bool {
         self.status_code_class != 0 // UNSET_FLAG or 1 → true; explicit 0 → false
     }
@@ -1429,15 +1427,6 @@ macro_rules! production_commands {
                 offset: mem::offset_of!(MainConfig, bidi_smoke_endpoint),
                 post: ptr::null_mut(),
             },
-            // otel_metric_high_cardinality_attr <attr>;
-            ngx_command_t {
-                name: ngx_string!("otel_metric_high_cardinality_attr"),
-                type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-                set: Some(cmd_add_high_cardinality_attr),
-                conf: NGX_HTTP_MAIN_CONF_OFFSET,
-                offset: 0,
-                post: ptr::null_mut(),
-            },
             // otel_grpc_bidi_overload_endpoint <url>;  TEST-ONLY (Phase 1.2 Item 3).
             ngx_command_t {
                 name: ngx_string!("otel_grpc_bidi_overload_endpoint"),
@@ -1522,21 +1511,21 @@ macro_rules! production_commands {
     };
 }
 
-/// Production build: 17 production commands + terminator.
+/// Production build: 16 production commands + terminator.
 #[cfg(not(any(test, feature = "test-support")))]
-pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 18] = {
-    let mut cmds = [ngx_command_t::empty(); 18];
+pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 17] = {
+    let mut cmds = [ngx_command_t::empty(); 17];
     let prod = production_commands!();
     let mut i = 0;
-    while i < 17 {
+    while i < 16 {
         cmds[i] = prod[i];
         i += 1;
     }
-    // cmds[17] stays empty() — terminator
+    // cmds[16] stays empty() — terminator
     cmds
 };
 
-/// test-support build: 17 production commands + otel_status_endpoint + terminator.
+/// test-support build: 16 production commands + otel_status_endpoint + terminator.
 ///
 /// `otel_status_endpoint;` is a location-level directive (no args) that registers
 /// a content handler returning `control_shm.version` as plain text. Used by the
@@ -1544,16 +1533,16 @@ pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 18] = {
 /// process-level introspection. Absent from production builds (verified by grep
 /// on `objs-release/ngx_http_otel_module.so`).
 #[cfg(any(test, feature = "test-support"))]
-pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 19] = {
-    let mut cmds = [ngx_command_t::empty(); 19];
+pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 18] = {
+    let mut cmds = [ngx_command_t::empty(); 18];
     let prod = production_commands!();
     let mut i = 0;
-    while i < 17 {
+    while i < 16 {
         cmds[i] = prod[i];
         i += 1;
     }
-    // Index 17: otel_status_endpoint (test-support only).
-    cmds[17] = ngx_command_t {
+    // Index 16: otel_status_endpoint (test-support only).
+    cmds[16] = ngx_command_t {
         name: ngx_string!("otel_status_endpoint"),
         type_: (nginx_sys::NGX_HTTP_LOC_CONF | NGX_CONF_NOARGS) as ngx_uint_t,
         set: Some(cmd_set_otel_status_endpoint),
@@ -1561,7 +1550,7 @@ pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 19] = {
         offset: 0,
         post: ptr::null_mut(),
     };
-    // cmds[18] stays empty() — terminator.
+    // cmds[17] stays empty() — terminator.
     cmds
 };
 
@@ -1723,37 +1712,6 @@ extern "C" fn cmd_set_metric_zone(
     NGX_CONF_OK
 }
 
-extern "C" fn cmd_add_high_cardinality_attr(
-    cf: *mut ngx_conf_t,
-    _cmd: *mut ngx_command_t,
-    conf: *mut c_void,
-) -> *mut c_char {
-    // SAFETY: nginx passes the module's `MainConfig` pointer as `conf` for this
-    // MAIN_CONF directive; the cast + `as_mut` yield a valid exclusive reference.
-    let amcf = unsafe { conf.cast::<MainConfig>().as_mut().expect("main config") };
-    // SAFETY: `cf` is the valid non-null directive parse context; `args` holds the
-    // parsed tokens (TAKE1: the attr name).
-    let args = unsafe { cf_args(cf) };
-
-    let attr = args[1];
-    let valid = attr.as_bytes() == b"url.path"
-        || attr.as_bytes() == b"client.address"
-        || attr.as_bytes() == b"user_agent.original";
-
-    if !valid {
-        ngx_conf_log_error!(
-            NGX_LOG_EMERG,
-            &raw mut *cf,
-            "unknown high-cardinality attr \"{}\"; valid values: url.path, client.address, user_agent.original",
-            attr
-        );
-        return NGX_CONF_ERROR;
-    }
-
-    amcf.high_cardinality_attrs.push(attr);
-    NGX_CONF_OK
-}
-
 /// Directive callback for `otel_export_protocol otlp_http | otlp_grpc;`.
 ///
 /// Accepts `otlp_http` and `otlp_grpc`.  Rejects `arrow` with a
@@ -1862,9 +1820,11 @@ extern "C" fn cmd_set_access_sample(
     let args = unsafe { cf_args(cf) };
     let raw = args[1].as_bytes();
 
-    match parse_size_bytes(raw) {
+    // Plain integer (reservoir entry count) — NOT a byte size; `16k`/`1m` must be
+    // rejected, not silently scaled.
+    match parse_u64_ascii(raw) {
         Some(n) if n > 0 => {
-            amcf.access_sample_size = n;
+            amcf.access_sample_size = n as usize;
             NGX_CONF_OK
         }
         _ => {

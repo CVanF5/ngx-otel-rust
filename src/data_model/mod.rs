@@ -159,7 +159,7 @@ pub struct ExponentialHistogramData {
 /// Carries a representative observation with optional trace context.
 #[derive(Debug, Clone)]
 pub struct Exemplar {
-    /// The observed value (ms for request duration).
+    /// The observed value (µs for request duration).
     pub value: f64,
     /// Unix epoch nanoseconds when this observation was made.
     pub time_unix_nano: u64,
@@ -176,9 +176,9 @@ pub struct Exemplar {
 
 /// One data point in an OTel exponential histogram metric.
 ///
-/// The internal representation uses scale 0 (`EXP_HISTOGRAM_SCALE`), meaning
-/// bucket `k` covers `[2^k, 2^(k+1))` ms.  All durations are non-negative so
-/// `negative` is always empty.  Values 0 ms are counted in `zero_count`.
+/// The internal representation uses scale 3 (`EXP_HISTOGRAM_SCALE`), so bucket
+/// `k` covers approximately `(2^(k/8), 2^((k+1)/8)]` µs.  All durations are
+/// non-negative so `negative` is always empty.  Values of 0 µs go in `zero_count`.
 #[derive(Debug, Clone)]
 pub struct ExponentialHistogramDataPoint {
     /// Attributes for this data point (method, status class, protocol, route, upstream zone).
@@ -189,13 +189,13 @@ pub struct ExponentialHistogramDataPoint {
     pub time_unix_nano: u64,
     /// Total observation count (= sum of all bucket counts + zero_count).
     pub count: u64,
-    /// Sum of all observed values (in ms).
+    /// Sum of all observed values (in µs).
     pub sum: f64,
-    /// OTel exponential histogram scale (EXP_HISTOGRAM_SCALE = 0).
+    /// OTel exponential histogram scale (EXP_HISTOGRAM_SCALE = 3).
     pub scale: i32,
-    /// Count of values exactly 0 ms (or truncated to 0 from sub-ms latencies).
+    /// Count of values exactly 0 µs.
     pub zero_count: u64,
-    /// Positive-range bucket counts.  Bucket k covers [2^k, 2^(k+1)) ms.
+    /// Positive-range bucket counts.  Bucket k covers ~(2^(k/8), 2^((k+1)/8)] µs.
     /// `offset` is the index of the first entry (always 0 for scale 0 with our
     /// fixed-offset storage).
     pub positive_offset: i32,
