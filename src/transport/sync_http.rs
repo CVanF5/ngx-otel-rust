@@ -398,7 +398,7 @@ mod tests {
         });
 
         // The endpoint uses the bracketed form — this is what a real nginx config
-        // produces.  The bug (before FU1) was that this string was passed directly
+        // produces.  The bug was that this string was passed directly
         // to to_socket_addrs, which rejected it.
         let endpoint = std::format!("http://[::1]:{}/v1/metrics", port);
         let body = b"test-v6-payload";

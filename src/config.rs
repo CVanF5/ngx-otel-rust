@@ -378,11 +378,9 @@ impl MainConfig {
 
     /// Whether HTTP status code class bucketing is enabled (default: true).
     ///
-    /// Currently unused: the status-class breakdown is bucketed in the hot
-    /// path but not yet emitted (see `TODO(fix3b)` in
-    /// `metric_source/instrumented.rs`). Emission is deferred to Phase 2,
-    /// when per-data-point attributes + multi-dimensional shm land — at which
-    /// point this accessor gates the emission.
+    /// Currently unused (`#[allow(dead_code)]`): the status-class breakdown is
+    /// already bucketed in the hot path via the multi-dimensional combo
+    /// histogram, but this gate accessor is not yet wired to emission.
     #[allow(dead_code)]
     pub fn status_code_class_enabled(&self) -> bool {
         self.status_code_class != 0 // UNSET_FLAG or 1 → true; explicit 0 → false
@@ -1355,7 +1353,7 @@ macro_rules! production_commands {
                 offset: 0,
                 post: ptr::null_mut(),
             },
-            // otel_log_ring_size <size>;  (Phase 2.1 FU3)
+            // otel_log_ring_size <size>;  (Phase 2.1)
             // Per-worker ring capacity in bytes.  Memory = size × 2 × N workers.
             // Default: 512k (DEFAULT_LOG_RING_CAP).  Raise for high-RPS deployments.
             ngx_command_t {
@@ -2137,7 +2135,7 @@ mod tests {
     }
 
     /// Upstream index: no-upstream and over-cap both return UPSTREAM_IDX_OTHER.
-    /// FU1: no "(none)" slot — requests without upstream skip the upstream histogram.
+    /// No "(none)" slot — requests without upstream skip the upstream histogram.
     #[test]
     fn upstream_idx_matches_registered_zones() {
         let mut cfg = MainConfig::default();

@@ -8,7 +8,7 @@
 //! This module is the top-level home for all log-emission infrastructure:
 //!
 //! - `severity` — nginx log level → OTel SeverityNumber mapping (Step 3).
-//! - `ring`     — per-worker SPSC lock-free byte ring (Step 5 + FU3).
+//! - `ring`     — per-worker SPSC lock-free byte ring (Step 5).
 //! - `access`   — access-record formatter (Step 7).
 //! - [`LogProducer`] trait — the platform-axis API for pushing records into
 //!   the ring (Step 6).

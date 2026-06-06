@@ -522,7 +522,7 @@ mod tests {
         };
         use crate::shm::{EXP_HISTOGRAM_BUCKET_OFFSET, EXP_HISTOGRAM_SCALE, N_EXP_BUCKETS};
 
-        // Bucket counts: simulate some observations (FU2: µs input, scale 3).
+        // Bucket counts: simulate some observations (µs input, scale 3).
         // bucket[6] = 6*8 = 48? Actually bucket 6 is valid at scale 3 too.
         // We just test that the encoder round-trips arbitrary bucket indices.
         // zero_count = 3 (sub-µs latencies, effectively zero)

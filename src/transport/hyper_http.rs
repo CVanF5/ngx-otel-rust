@@ -1414,7 +1414,7 @@ mod tests {
         assert_ne!(v4_socklen, v6_socklen, "IPv4 and IPv6 socklens must differ");
     }
 
-    // ── FU1: strip_v6_brackets shared helper ─────────────────────────────────
+    // ── strip_v6_brackets shared helper ──────────────────────────────────────
 
     /// `strip_v6_brackets` removes surrounding `[` `]` from an IPv6 host string
     /// and leaves non-bracketed strings unchanged.

@@ -80,8 +80,8 @@ impl HttpRequestHandler for LogPhaseHandler {
         // Use AsRef to get a typed reference to the underlying ngx_http_request_t.
         let r = request.as_ref();
 
-        // ── request duration in MICROSECONDS (FU2 resolution fix) ────────────
-        // FU2: use SystemTime::now() for µs-precision end time, combined with
+        // ── request duration in MICROSECONDS ─────────────────────────────────
+        // Use SystemTime::now() for µs-precision end time, combined with
         // nginx's ms-precision start time.  This gives sub-ms resolution for
         // requests > 1ms and resolves the ~90–200µs regime into distinct exp-
         // histogram buckets at scale 3.  SystemTime::now() is a vDSO call on
@@ -98,7 +98,7 @@ impl HttpRequestHandler for LogPhaseHandler {
         // Keep a ms version for the is_interesting tail-latency gate (still ms-threshold).
         let duration_ms: u64 = duration_us / 1_000;
 
-        // ── request duration (Phase 2.2 DP-E FU1 — decomposed tables) ───────
+        // ── request duration (Phase 2.2 DP-E — decomposed tables) ────────────
         // Three independent histogram bumps — each O(1) fetch_add, no alloc, no lock.
         let method = HttpMethod::from_bytes(r.method_name.as_bytes());
         let status = r.headers_out.status as u16;
@@ -353,7 +353,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
         // combo_agg[idx] = ([bucket_counts; N_EXP_BUCKETS], zero_count, sum, count)
         let mut combo_agg: std::vec::Vec<([u64; N_EXP_BUCKETS], u64, u64, u64)> =
             std::vec![([0u64; N_EXP_BUCKETS], 0u64, 0u64, 0u64); N_COMBOS];
-        // FU1: separate route / upstream aggregation tables.
+        // Separate route / upstream aggregation tables.
         let mut route_agg: std::vec::Vec<([u64; N_EXP_BUCKETS], u64, u64, u64)> =
             std::vec![([0u64; N_EXP_BUCKETS], 0u64, 0u64, 0u64); N_ROUTE_SLOTS];
         let mut upstream_agg: std::vec::Vec<([u64; N_EXP_BUCKETS], u64, u64, u64)> =
@@ -388,7 +388,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                 agg.2 += bs;
                 agg.3 += bcount;
             }
-            // FU1: sum per-route histograms.
+            // Sum per-route histograms.
             for idx in 0..N_ROUTE_SLOTS {
                 let (bc, zc, bs, bcount) = slot.route_duration_combos[idx].snapshot();
                 let agg = &mut route_agg[idx];
@@ -399,7 +399,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                 agg.2 += bs;
                 agg.3 += bcount;
             }
-            // FU1: sum per-upstream histograms.
+            // Sum per-upstream histograms.
             for idx in 0..N_UPSTREAM_SLOTS {
                 let (bc, zc, bs, bcount) = slot.upstream_duration_combos[idx].snapshot();
                 let agg = &mut upstream_agg[idx];
@@ -476,7 +476,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
         // amcf provides route/upstream name strings for the attribute values.
         let amcf_ref: Option<&crate::config::MainConfig> = amcf_ref_early;
 
-        // FU1 decomposed: emit THREE separate metric series:
+        // Decomposed: emit THREE separate metric series:
         //  1. http.server.request.duration (base: method × sc × proto)
         //  2. http.server.request.duration.by_route (per http.route location)
         //  3. http.server.request.duration.by_upstream (per nginx.upstream.zone)
@@ -630,7 +630,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
             }
         };
 
-        // FU1: per-route series (http.server.request.duration.by_route).
+        // Per-route series (http.server.request.duration.by_route).
         let route_metric = {
             let mut data_points: std::vec::Vec<ExponentialHistogramDataPoint> =
                 std::vec::Vec::new();
@@ -657,7 +657,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
             }
         };
 
-        // FU1: per-upstream series (http.server.request.duration.by_upstream).
+        // Per-upstream series (http.server.request.duration.by_upstream).
         let upstream_metric = {
             let mut data_points: std::vec::Vec<ExponentialHistogramDataPoint> =
                 std::vec::Vec::new();

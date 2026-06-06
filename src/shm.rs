@@ -42,7 +42,7 @@ pub const N_DURATION_BUCKETS: usize = 15;
 
 /// OTel exponential histogram scale for `request_duration_combos`.
 ///
-/// **FU2 resolution fix:** scale 3 → base = 2^(2^-3) = 2^0.125 ≈ 1.091
+/// **Resolution:** scale 3 → base = 2^(2^-3) = 2^0.125 ≈ 1.091
 /// → 8 buckets per power-of-2 microsecond.  At this scale, 90µs, 150µs,
 /// and 200µs land in distinct buckets (indices 51, 57, 60 respectively),
 /// resolving the ~90–200µs operating regime.  Scale 0 with integer-ms input
@@ -62,7 +62,7 @@ pub const EXP_HISTOGRAM_BUCKET_OFFSET: i32 = 0;
 
 /// An OTel **exponential histogram** slot stored entirely in atomic counters.
 ///
-/// **FU2 resolution fix (scale 3, µs input):** bucket `k` covers approximately
+/// **Resolution (scale 3, µs input):** bucket `k` covers approximately
 /// [base^k, base^(k+1)) µs where base = 2^(2^-3) ≈ 1.091.
 /// 90µs → bucket 51; 150µs → 57; 200µs → 60 — all distinct.
 /// All durations are positive so `negative` is empty.
@@ -87,7 +87,7 @@ pub struct ExpHistogramSlot {
 impl ExpHistogramSlot {
     /// Record one duration observation on the hot path.
     ///
-    /// `value_us` is the duration in **microseconds**.  FU2: feeding µs
+    /// `value_us` is the duration in **microseconds**.  Feeding µs
     /// (instead of ms) with scale 3 resolves the ~90–200µs regime into
     /// distinct buckets.
     ///
@@ -184,7 +184,7 @@ impl<const BUCKETS: usize> Histogram<BUCKETS> {
     }
 }
 
-// ── Closed cardinality dimension enums (fix3b, FU4a) ────────────────────────
+// ── Closed cardinality dimension enums ──────────────────────────────────────
 //
 // Attribute keys MUST be drawn from OTel HTTP semconv ONLY (proposal §6.4).
 // All variants are WithinU8 cardinality so the OTAP classifier can
@@ -321,9 +321,9 @@ impl ProtoVersion {
     }
 }
 
-// ── Route and upstream-zone dimensions (DP-E, Phase 2.2 FU1 — DECOMPOSED) ───
+// ── Route and upstream-zone dimensions (DP-E, Phase 2.2 — DECOMPOSED) ───────
 //
-// **FU1 corrects the prior cross-product design**: route and upstream are now
+// **Decomposed, not cross-producted**: route and upstream are now
 // *separate* histogram tables alongside the base `method × status-class ×
 // protocol` (160 combos), not multiplied into it.  This:
 //   • Restores the intended caps (64/32) — the prior attempt shrunk them 4×
@@ -372,7 +372,7 @@ const _: () = assert!(
 /// Compute the combination index for the base `{method × status_class × protocol}` table.
 ///
 /// Returns a value in `0 .. N_COMBOS` (= 160).
-/// Route and upstream indices are handled by separate tables (FU1 — decomposed).
+/// Route and upstream indices are handled by separate tables (decomposed).
 #[inline]
 pub fn combo_index(method: HttpMethod, status_class: StatusClass, proto: ProtoVersion) -> usize {
     (method as usize) * N_STATUS_CLASSES * N_PROTO_VERSIONS
@@ -429,14 +429,13 @@ pub fn severity_class_index(ngx_level: u8) -> usize {
 /// the shared memory zone. A worker only ever writes to its own slot
 /// (`ngx_worker`-indexed); the export worker reads from all slots.
 ///
-/// **Phase 2.2 DP-E (FU1 — decomposed)**: three independent histogram arrays:
+/// **Phase 2.2 DP-E (decomposed)**: three independent histogram arrays:
 /// 1. `request_duration_combos[160]`: base `{method × status_class × protocol}`.
 /// 2. `route_duration_combos[65]`: per-route (`http.route` = location name).
 /// 3. `upstream_duration_combos[33]`: per-upstream zone (`nginx.upstream.zone`).
 ///
 /// Each request bumps ONE slot in each of the three arrays.  The joint
-/// route×upstream cell from the prior cross-product design is intentionally
-/// dropped (FU1 corrects that paper-over).
+/// route×upstream cell is intentionally dropped.
 ///
 /// Phase 2.2 DP-F: each slot is an `ExpHistogramSlot` (exponential histogram).
 ///
@@ -987,7 +986,7 @@ mod tests {
             unsafe { WorkerSlots::init_at(worker_slots(base, i)) };
         }
 
-        // Use GET/2xx/HTTP1.1 base combo (FU1 decomposed: 3-arg only).
+        // Use GET/2xx/HTTP1.1 base combo (decomposed: 3-arg only).
         let combo = combo_index(HttpMethod::Get, StatusClass::S2xx, ProtoVersion::Http11);
 
         let slot0 = unsafe { &*worker_slots(base, 0) };
@@ -1014,7 +1013,7 @@ mod tests {
         assert_eq!(total_sum, 1300);
 
         // Confirm no cross-write between slots.
-        // FU2 scale 3: bucket index = n*8 + frac (n = floor(log2(value))).
+        // scale 3: bucket index = n*8 + frac (n = floor(log2(value))).
         // 100µs: n=6, k=6*8+((100>>3)&7)=48+3=51.  500µs: n=8, k=8*8+((500>>5)&7)=64+15=79.
         let (buckets0, _, _, _) = slot0.request_duration_combos[combo].snapshot();
         let (buckets1, _, _, _) = slot1.request_duration_combos[combo].snapshot();
@@ -1042,7 +1041,7 @@ mod tests {
     }
 
     /// Base combo index mapping: all N_COMBOS (160) combinations must be distinct.
-    /// FU1 decomposed: combo_index is 3-arg (method × sc × proto only).
+    /// Decomposed: combo_index is 3-arg (method × sc × proto only).
     #[test]
     fn combo_index_all_unique() {
         let mut seen = std::vec![false; N_COMBOS];
@@ -1081,7 +1080,7 @@ mod tests {
         assert!(seen.iter().all(|&v| v), "all N_COMBOS combinations must be reachable");
     }
 
-    /// FU1 decomposed: route and upstream use separate independent tables.
+    /// Decomposed: route and upstream use separate independent tables.
     /// A request updates base + route-table + upstream-table independently.
     #[test]
     fn decomposed_route_upstream_tables() {
@@ -1109,7 +1108,7 @@ mod tests {
     /// The compile-time budget assert passes at restored default caps (64/32).
     #[test]
     fn worker_slots_within_memory_budget() {
-        // FU1+FU2: three separate tables, scale 3, N_EXP_BUCKETS=192.
+        // Three separate tables, scale 3, N_EXP_BUCKETS=192.
         let total_slots = N_COMBOS + N_ROUTE_SLOTS + N_UPSTREAM_SLOTS;
         let slot_size = core::mem::size_of::<ExpHistogramSlot>();
         let total_bytes = total_slots * slot_size;
@@ -1121,7 +1120,7 @@ mod tests {
             slot_size,
             SLOT_BUDGET,
         );
-        // FU2: 195 AtomicU64 = 1560 bytes per slot.
+        // 195 AtomicU64 = 1560 bytes per slot.
         assert_eq!(slot_size, (N_EXP_BUCKETS + 3) * 8, "(N_EXP_BUCKETS+3)×8 bytes per slot");
     }
 
@@ -1251,7 +1250,7 @@ mod tests {
     /// NOT as metric dimensions.
     ///
     /// This test asserts structural invariants at the TYPE level.
-    /// FU2: sub-ms values (90µs, 150µs, 200µs) must land in distinct buckets.
+    /// Sub-ms values (90µs, 150µs, 200µs) must land in distinct buckets.
     /// This directly tests the "scale 3 resolves the ~90–200µs regime" claim.
     /// Rejects the prior scale-0+ms design where all three would be zero_count.
     #[test]
@@ -1289,7 +1288,7 @@ mod tests {
     #[allow(dead_code)]
     fn high_cardinality_only_on_tail_not_metric() {
         // 1. N_COMBOS is the base 160 (method × sc × proto) ONLY.
-        //    Route and upstream are separate tables (FU1 decomposed) — NOT multiplied in.
+        //    Route and upstream are separate tables (decomposed) — NOT multiplied in.
         assert_eq!(
             N_COMBOS,
             N_HTTP_METHODS * N_STATUS_CLASSES * N_PROTO_VERSIONS,
