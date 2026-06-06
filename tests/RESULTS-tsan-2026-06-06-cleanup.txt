@@ -1,0 +1,38 @@
+ThreadSanitizer gate — between-phases hardening cleanup batch
+=============================================================
+
+Date:       2026-06-06
+Host:       debian-vm (Linux aarch64) — the project's TSAN/correctness platform
+Toolchain:  rustc 1.95.0 (59807616e 2026-04-14)
+Base:       adf2dc7 (origin/main)
+Under test: the cleanup batch applied as a working-tree patch (NOT yet committed
+            when this run was taken) — A1 (exp-histogram low-end bucketing),
+            A2 (http_post connection-error surfacing), D4 (SPSC ring `cap` →
+            AtomicU64), B1 (Transport trait removed; ExportTransport enum
+            dispatch), B4 (MetricProtocol → ExportProtocol rename), C2.
+
+Command:    make tsan-test   (full TSAN suite)
+
+Scripts run under TSAN:
+  - run_grpc_smoke.sh
+  - run_grpc_bidi_smoke.sh
+  - run_grpc_export.sh            (production gRPC export path)
+  - run_access_log.sh            (Phase 2.2 §6.6.1 rebalanced access path)
+  - run_error_log.sh             (Phase 2.3 §6.6.2 error-log path)
+  - run_signal_storm.sh          (Phase 2.3 re-entrancy gate)
+  - run_dns_dualstack.sh         (transport_dns async resolver path)
+
+Result:
+  - [PASS] assertions: 90
+  - Race reports (`WARNING: ThreadSanitizer` / `data race` / `SUMMARY`): 0
+  - Gate line: "Zero ThreadSanitizer warnings.  TSAN gate: PASS."
+  - Exit code: 0
+
+Why this run matters for this batch specifically:
+  - A1 changes the hot-path ExpHistogramSlot::record() index math (lock-free
+    atomic writes) — exercised by run_access_log.sh / run_grpc_export.sh.
+  - D4 makes the cross-process SPSC ring `cap` an AtomicU64 read on every
+    push/pop — exercised by the access + error log ring paths.
+  - B1 reworks the metrics/logs transport dispatch (enum, no trait) on both the
+    HTTP and gRPC paths — exercised by run_grpc_export.sh + access/error logs.
+  All race-clean.

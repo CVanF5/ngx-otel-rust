@@ -259,6 +259,18 @@ things, never a per-request log:
 
 A common (2xx, fast) request produces **neither** — only the histogram `fetch_add`.
 
+> **Exemplars are best-effort hints, not an authoritative record.** Each exemplar
+> slot is written lock-free from the worker hot path with no per-field commit
+> barrier (the reader gates on an atomic count, but the string fields — `url.path`,
+> `user_agent.original` — and the `trace_id` are filled with `Relaxed`/byte
+> copies). Under concurrent overwrite a reader can observe a *torn* exemplar
+> (e.g. a `url.path` spliced from two requests, or a `trace_id` paired with the
+> wrong data point). This is an intentional hot-path trade-off: exemplars are
+> sampling hints for drill-down, so a rare torn string is acceptable. Do not
+> treat an individual exemplar's high-cardinality fields as ground truth; the
+> aggregate histogram and the exception-tail `LogRecord`s are the authoritative
+> surfaces.
+
 ### Error log — coalesced `LogRecord`s (§6.6.2)
 
 Enabled by `otel_error_log [level]`. Logs-primary (the message body is the payload).

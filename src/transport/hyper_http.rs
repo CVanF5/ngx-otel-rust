@@ -69,7 +69,6 @@ use nginx_sys::{
 use ngx::core::Pool;
 
 use super::TransportError;
-use crate::transport::Transport;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -1198,26 +1197,27 @@ impl HyperHttpTransport<NgxConnector> {
     }
 }
 
-impl<C: Connector> Transport for HyperHttpTransport<C> {
-    async fn send(&mut self, bytes: std::vec::Vec<u8>) -> Result<(), TransportError> {
+#[allow(private_bounds)]
+impl<C: Connector> HyperHttpTransport<C> {
+    /// Send a batch of OTLP/HTTP protobuf metrics to the configured endpoint.
+    ///
+    /// Maintains no cached connection across calls; a failure leaves nothing to
+    /// clean up so the next call simply reconnects.
+    pub async fn send(&mut self, bytes: std::vec::Vec<u8>) -> Result<(), TransportError> {
         let io = self.connector.connect(&self.endpoint).await?;
         let authority = self.endpoint.authority();
         let http_path = std::string::String::from(self.endpoint.http_path());
         http_post(io, &authority, &http_path, &self.headers, bytes).await
     }
-}
 
-#[allow(private_bounds)]
-impl<C: Connector> HyperHttpTransport<C> {
     /// POST `bytes` to an explicit `path`, overriding the endpoint's default path.
     ///
     /// Used by the export loop to send logs to `/v1/logs` on the same host as
     /// the metrics endpoint (which uses `/v1/metrics`).  Everything else (host,
     /// port, TLS, headers) comes from the existing configured endpoint.
     ///
-    /// # Phase 2.1 note
-    /// This method is intentionally kept separate from `send` so the `Transport`
-    /// trait signature does not need to change for the signal selector.
+    /// Kept separate from `send` so the logs path can target its own endpoint
+    /// path without disturbing the metrics call.
     pub async fn send_to_path(
         &mut self,
         path: &str,
@@ -1267,13 +1267,10 @@ where
         );
         hdrs.insert(
             hyper::header::CONTENT_TYPE,
-            "application/x-protobuf".parse().expect("static value"),
+            hyper::header::HeaderValue::from_static("application/x-protobuf"),
         );
-        hdrs.insert(
-            hyper::header::CONTENT_LENGTH,
-            body_len.to_string().parse().expect("numeric string"),
-        );
-        hdrs.insert(hyper::header::CONNECTION, "close".parse().expect("static value"));
+        hdrs.insert(hyper::header::CONTENT_LENGTH, hyper::header::HeaderValue::from(body_len));
+        hdrs.insert(hyper::header::CONNECTION, hyper::header::HeaderValue::from_static("close"));
         for (k, v) in extra_headers {
             if let (Ok(name), Ok(val)) =
                 (k.parse::<hyper::header::HeaderName>(), v.parse::<hyper::header::HeaderValue>())
@@ -1295,7 +1292,12 @@ where
     let mut resp_fut = core::pin::pin!(resp_fut);
 
     let resp = future::poll_fn(|cx| {
-        let _ = conn.as_mut().poll(cx);
+        // Drive the connection task alongside the response future.  If the
+        // connection terminates with an error (TLS reset, peer RST, EOF) surface
+        // it instead of leaving resp_fut Pending until the read timeout fires.
+        if let Poll::Ready(Err(e)) = conn.as_mut().poll(cx) {
+            return Poll::Ready(Err(e));
+        }
         resp_fut.as_mut().poll(cx)
     })
     .await

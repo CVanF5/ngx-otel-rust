@@ -63,8 +63,14 @@ pub struct LogsWorkerRingHeader {
     pub read_offset: AtomicU64,
     /// Number of records dropped because the ring was full.
     pub dropped: AtomicU64,
-    /// Ring payload capacity in bytes (set at zone-init from `otel_log_ring_size`).
-    pub cap: u64,
+    /// Ring payload capacity in bytes (set once at zone-init from
+    /// `otel_log_ring_size`, before any worker forks).
+    ///
+    /// `AtomicU64` rather than a plain `u64`: the header lives in cross-process
+    /// shm and `cap` is read on every push/pop.  The write happens-before the
+    /// fork so there is no live race, but the atomic closes the memory-model
+    /// hole (a shared field read on the hot path) at zero runtime cost.
+    pub cap: AtomicU64,
 }
 
 /// Size of the header alone (without payload).
@@ -111,7 +117,7 @@ impl LogsWorkerRing {
 
     #[inline]
     fn cap(&self) -> usize {
-        unsafe { (*self.header).cap as usize }
+        unsafe { (*self.header).cap.load(Ordering::Relaxed) as usize }
     }
 
     #[inline]
@@ -257,7 +263,7 @@ pub(crate) mod tests {
         // Safety: ptr is valid and aligned for LogsWorkerRingHeader.
         unsafe {
             let hdr = ptr.cast::<LogsWorkerRingHeader>();
-            (*hdr).cap = cap as u64;
+            (*hdr).cap.store(cap as u64, Ordering::Relaxed);
         }
         let ring = unsafe { LogsWorkerRing::from_shm_ptr(ptr) };
         (buf, ring)

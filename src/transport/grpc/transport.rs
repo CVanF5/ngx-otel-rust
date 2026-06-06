@@ -43,7 +43,7 @@ use crate::encoder::opentelemetry::proto::collector::metrics::v1::{
 use crate::transport::grpc::executor::NgxExecutor;
 use crate::transport::grpc::shim::SendRequestService;
 use crate::transport::hyper_http::{Connector, NgxConnector, ParsedEndpoint};
-use crate::transport::{Transport, TransportError};
+use crate::transport::TransportError;
 
 // ── GrpcTransport<C> ─────────────────────────────────────────────────────────
 
@@ -147,8 +147,10 @@ impl<C: Connector> GrpcTransport<C> {
 
 // ── Transport impl ────────────────────────────────────────────────────────────
 
-impl<C: Connector + Send> Transport for GrpcTransport<C> {
-    async fn send(&mut self, bytes: std::vec::Vec<u8>) -> Result<(), TransportError> {
+#[allow(private_bounds)]
+impl<C: Connector + Send> GrpcTransport<C> {
+    /// Send a batch of OTLP metrics (encoded protobuf) over OTLP/gRPC unary.
+    pub async fn send(&mut self, bytes: std::vec::Vec<u8>) -> Result<(), TransportError> {
         // ── Decode bytes → typed request ──────────────────────────────────
         //
         // The encoder (OtlpHttpEncoder) emits a bare ExportMetricsServiceRequest
@@ -321,12 +323,12 @@ mod tests {
         assert!(result.is_err(), "https:// endpoints must fail (TLS not implemented)");
     }
 
-    /// `GrpcTransport<NgxConnector>` must satisfy the `Transport + Send` bounds
-    /// required by the export loop.
+    /// `GrpcTransport<NgxConnector>` must be `Send` so it can live in the
+    /// export-loop task.
     #[test]
-    fn grpc_transport_satisfies_transport_send_bounds() {
-        fn assert_transport_send<T: crate::transport::Transport + Send>() {}
-        assert_transport_send::<GrpcTransport<NgxConnector>>();
+    fn grpc_transport_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<GrpcTransport<NgxConnector>>();
     }
 
     /// A DNS-name endpoint must parse and construct a `GrpcTransport` without

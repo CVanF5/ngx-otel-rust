@@ -101,15 +101,18 @@ impl ExpHistogramSlot {
         } else {
             let n = 63u32.saturating_sub(value_us.leading_zeros()); // floor(log2(value))
             let s = EXP_HISTOGRAM_SCALE as u32; // = 3
-            let idx = if n <= s {
-                // value < 2^s: bucket index = value itself (fine-grained low end)
-                value_us as usize
+            // OTel exponential-histogram bucket index = floor(log2(value) * 2^scale),
+            // recovered from the exponent `n` plus the top `scale` mantissa bits.
+            // The encoder ships these buckets at offset=0, so the consumer decodes
+            // bucket `k` as the range (2^(k/2^scale), 2^((k+1)/2^scale)].
+            let upper = (n as usize) << s;
+            let frac = if n >= s {
+                ((value_us >> (n - s)) as usize) & ((1usize << s) - 1)
             } else {
-                // k = n * 2^s + ((value >> (n - s)) & ((1 << s) - 1))
-                let upper = (n as usize) << s;
-                let frac = ((value_us >> (n - s)) as usize) & ((1usize << s) - 1);
-                upper | frac
+                // n < s: shift the mantissa left (n - s would underflow as u32).
+                ((value_us << (s - n)) as usize) & ((1usize << s) - 1)
             };
+            let idx = upper | frac;
             self.buckets[idx.min(N_EXP_BUCKETS - 1)].fetch_add(1, Ordering::Relaxed);
         }
         self.sum.fetch_add(value_us, Ordering::Relaxed);
@@ -602,7 +605,15 @@ impl ExemplarReservoir {
             e.has_trace.store(0, Ordering::Relaxed);
         }
         // High-cardinality fields: copy bytes into the fixed-size buffers.
-        // Tearing acceptable (exemplar is a hint; uses non-atomic byte writes).
+        //
+        // There is NO per-entry commit barrier: the count is the only
+        // synchronisation point, and the individual fields above (combo_idx,
+        // trace_id, these byte buffers) are written with Relaxed / non-atomic
+        // copies.  A concurrent reader can therefore observe a *torn* exemplar —
+        // a url.path spliced from two requests, or a trace_id paired with the
+        // wrong data point.  This is an intentional hot-path trade-off:
+        // exemplars are sampling hints for drill-down, not an authoritative
+        // record (see TELEMETRY_MODEL.md "Exemplars are best-effort hints").
         let url_len = url_path.len().min(EXEMPLAR_URL_PATH_MAX) as u8;
         let ua_len = user_agent.len().min(EXEMPLAR_USER_AGENT_MAX) as u8;
         // Safety: all indices are within array bounds (len ≤ max).
@@ -943,11 +954,12 @@ pub unsafe extern "C" fn logs_shm_zone_init(
         let slot_off = w * slot_sz;
         // Access ring header.
         let access_hdr = unsafe { base.add(slot_off).cast::<LogsWorkerRingHeader>() };
-        unsafe { (*access_hdr).cap = cap as u64 };
+        // Init-time store, before any worker forks (single writer, exclusive).
+        unsafe { (*access_hdr).cap.store(cap as u64, Ordering::Relaxed) };
         // Error ring header.
         let error_hdr =
             unsafe { base.add(slot_off + ring_size_bytes(cap)).cast::<LogsWorkerRingHeader>() };
-        unsafe { (*error_hdr).cap = cap as u64 };
+        unsafe { (*error_hdr).cap.store(cap as u64, Ordering::Relaxed) };
     }
 
     Status::NGX_OK.into()
@@ -1011,14 +1023,13 @@ mod tests {
         fn bucket_idx(v: u64) -> usize {
             let n = 63u32.saturating_sub(v.leading_zeros());
             let s = EXP_HISTOGRAM_SCALE as u32;
-            let idx = if n <= s {
-                v as usize
+            let upper = (n as usize) << s;
+            let frac = if n >= s {
+                ((v >> (n - s)) as usize) & ((1usize << s) - 1)
             } else {
-                let upper = (n as usize) << s;
-                let frac = ((v >> (n - s)) as usize) & ((1usize << s) - 1);
-                upper | frac
+                ((v << (s - n)) as usize) & ((1usize << s) - 1)
             };
-            idx.min(N_EXP_BUCKETS - 1)
+            (upper | frac).min(N_EXP_BUCKETS - 1)
         }
         let bucket_100 = bucket_idx(100);
         let bucket_500 = bucket_idx(500);
@@ -1141,6 +1152,58 @@ mod tests {
         for b in &buckets[..N_EXP_BUCKETS - 1] {
             assert_eq!(*b, 0, "non-overflow bucket must be zero");
         }
+    }
+
+    /// Regression: low-end (value < 2^scale) bucket placement.
+    ///
+    /// The prior `n <= s` shortcut wrote `value` directly as the bucket index,
+    /// mis-placing every sub-16µs observation and leaving buckets 16..31
+    /// permanently empty.  The correct scale-3 index is `floor(log2(value) * 8)`,
+    /// verified here against hand-computed expectations spanning the n<s, n==s,
+    /// and n>s branches.
+    #[test]
+    fn exp_histogram_low_end_bucket_placement() {
+        // (value_us, expected scale-3 bucket index)
+        let cases = [
+            (1u64, 0usize),
+            (2, 8),
+            (4, 16),
+            (8, 24), // n == s boundary (was mis-placed at idx 8 by the old code)
+            (15, 31),
+            (16, 32), // n > s
+            (90, 51),
+        ];
+        for (value, expected) in cases {
+            let mut buf = std::vec![0u8; mem::size_of::<ExpHistogramSlot>()];
+            let slot = unsafe { &*buf.as_mut_ptr().cast::<ExpHistogramSlot>() };
+            slot.record(value);
+            let (buckets, zero, sum, count) = slot.snapshot();
+            assert_eq!(count, 1, "value {value}: count");
+            assert_eq!(sum, value, "value {value}: sum");
+            assert_eq!(zero, 0, "value {value}: nonzero must not hit zero_count");
+            assert_eq!(
+                buckets[expected], 1,
+                "value {value} must land in bucket {expected}"
+            );
+            assert_eq!(
+                buckets.iter().sum::<u64>(),
+                1,
+                "value {value}: exactly one bucket set"
+            );
+        }
+    }
+
+    /// value 0 increments `zero_count`, never a positive bucket.
+    #[test]
+    fn exp_histogram_zero_goes_to_zero_count() {
+        let mut buf = std::vec![0u8; mem::size_of::<ExpHistogramSlot>()];
+        let slot = unsafe { &*buf.as_mut_ptr().cast::<ExpHistogramSlot>() };
+        slot.record(0);
+        let (buckets, zero, sum, count) = slot.snapshot();
+        assert_eq!(zero, 1);
+        assert_eq!(count, 1);
+        assert_eq!(sum, 0);
+        assert_eq!(buckets.iter().sum::<u64>(), 0);
     }
 
     /// Exemplar reservoir is bounded, alloc-free, and fills then wraps.

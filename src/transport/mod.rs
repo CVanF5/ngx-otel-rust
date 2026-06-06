@@ -3,12 +3,14 @@
 // This source code is licensed under the Apache License, Version 2.0 license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! Step 8: `Transport` trait + hyper HTTP/1 client implementation.
+//! Transport implementations: the network seam between the export loop and a
+//! collector.
 //!
-//! The `Transport` trait is the seam between the export loop (Step 9) and the
-//! underlying network transport. `HyperHttpTransport` is the only impl in
-//! Phase 1.1; it POSTs OTLP/HTTP protobuf bytes over plain TCP or Unix
-//! sockets. HTTPS support is reserved for a later phase.
+//! [`HyperHttpTransport`] POSTs OTLP/HTTP protobuf bytes; [`GrpcTransport`]
+//! sends OTLP/gRPC unary over h2c. Each exposes an inherent `send` (metrics)
+//! plus a logs entry point; the export loop selects between them with the
+//! `ExportTransport` enum. Plaintext TCP or Unix sockets today; TLS is planned
+//! for both transports.
 
 pub mod grpc;
 pub mod hyper_http;
@@ -44,21 +46,6 @@ pub enum TransportError {
     /// TLS configuration error (bad cert path, SSL context init, etc.).
     #[error("TLS configuration error: {cause}")]
     TlsConfig { cause: std::string::String },
-}
-
-/// Sends a batch of OTLP/HTTP protobuf bytes to a collector endpoint.
-///
-/// Implementations are free to maintain a cached connection across calls.
-/// A `send` failure must drop any cached connection so the next call attempts
-/// a fresh connection.
-///
-/// # Note on `Send`
-/// The `Send` bound is required so the impl can be stored in the export-loop
-/// task (Step 9). In NGINX's single-threaded worker the bound is trivially
-/// satisfied.
-#[allow(async_fn_in_trait)]
-pub trait Transport: Send {
-    async fn send(&mut self, bytes: std::vec::Vec<u8>) -> Result<(), TransportError>;
 }
 
 pub use grpc::transport::GrpcTransport;

@@ -58,7 +58,7 @@ const DEFAULT_RETRY_BUFFER_DEPTH: usize = 4;
 /// - `otlp_grpc`:           OTLP/gRPC over HTTP/2 (`MetricsService.Export`).
 /// - `arrow` is reserved for Phase 5 and is rejected at config parse time.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum MetricProtocol {
+pub enum ExportProtocol {
     /// OTLP/HTTP protobuf — the default.  Uses `HyperHttpTransport`.
     OtlpHttp,
     /// OTLP/gRPC — new in this phase.  Uses `GrpcTransport`.
@@ -191,8 +191,8 @@ pub struct MainConfig {
     pub bidi_overload_endpoint: ngx_str_t,
     /// `otel_export_protocol otlp_http | otlp_grpc;` — selects the export
     /// transport.  `None` means the directive was not set; treated as
-    /// `OtlpHttp` (default) by [`metric_protocol`].
-    pub metric_protocol: Option<MetricProtocol>,
+    /// `OtlpHttp` (default) by [`export_protocol`].
+    pub export_protocol: Option<ExportProtocol>,
     /// The registered shared memory zone (set during postconfiguration).
     pub shm_zone: *mut nginx_sys::ngx_shm_zone_t,
     /// The registered control-plane shared memory zone (set during
@@ -303,7 +303,7 @@ impl Default for MainConfig {
             grpc_smoke_endpoint: ngx_str_t::default(),
             bidi_smoke_endpoint: ngx_str_t::default(),
             bidi_overload_endpoint: ngx_str_t::default(),
-            metric_protocol: None,
+            export_protocol: None,
             shm_zone: ptr::null_mut(),
             control_shm_zone: ptr::null_mut(),
             logs_shm_zone: ptr::null_mut(),
@@ -391,8 +391,8 @@ impl MainConfig {
     /// Effective metric export protocol.  Returns `OtlpHttp` when the
     /// `otel_export_protocol` directive was not set (preserves existing
     /// byte-identical behaviour for HTTP).
-    pub fn metric_protocol(&self) -> MetricProtocol {
-        self.metric_protocol.unwrap_or(MetricProtocol::OtlpHttp)
+    pub fn export_protocol(&self) -> ExportProtocol {
+        self.export_protocol.unwrap_or(ExportProtocol::OtlpHttp)
     }
 
     /// Obtain the main config from the previous NGINX cycle (used for SIGHUP reload).
@@ -1631,7 +1631,7 @@ extern "C" fn cmd_set_export_protocol(
 ) -> *mut c_char {
     let amcf = unsafe { conf.cast::<MainConfig>().as_mut().expect("main config") };
 
-    if amcf.metric_protocol.is_some() {
+    if amcf.export_protocol.is_some() {
         return c"is duplicate".as_ptr().cast_mut();
     }
 
@@ -1639,10 +1639,10 @@ extern "C" fn cmd_set_export_protocol(
     let value = args[1].as_bytes();
 
     if value == b"otlp_http" {
-        amcf.metric_protocol = Some(MetricProtocol::OtlpHttp);
+        amcf.export_protocol = Some(ExportProtocol::OtlpHttp);
         NGX_CONF_OK
     } else if value == b"otlp_grpc" {
-        amcf.metric_protocol = Some(MetricProtocol::OtlpGrpc);
+        amcf.export_protocol = Some(ExportProtocol::OtlpGrpc);
         NGX_CONF_OK
     } else if value == b"arrow" {
         unsafe {

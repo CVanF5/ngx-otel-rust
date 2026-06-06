@@ -44,7 +44,7 @@ use std::collections::VecDeque;
 use nginx_sys::{NGX_LOG_ERR, NGX_LOG_INFO, NGX_LOG_NOTICE};
 use pin_project_lite::pin_project;
 
-use crate::config::{MainConfig, MetricProtocol};
+use crate::config::{MainConfig, ExportProtocol};
 use crate::data_model::{
     AggregationTemporality, AnyValue, Batch, GaugeData, KeyValue, LogRecord, LogsBatch, Metric,
     MetricData, NumberDataPoint, NumberValue, Resource, Scope, SumData,
@@ -57,7 +57,7 @@ use crate::metric_source::MetricSource;
 use crate::logs::coalesce;
 use crate::shm::{logs_access_ring, logs_coalesce_table, logs_error_ring, logs_n_workers_from_zone};
 use crate::transport::hyper_http::NgxConnector;
-use crate::transport::{GrpcTransport, HyperHttpTransport, Transport};
+use crate::transport::{GrpcTransport, HyperHttpTransport};
 
 // ── Self-metric atomics ──────────────────────────────────────────────────────
 
@@ -139,10 +139,11 @@ const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Selects between the HTTP and gRPC production transports.
 ///
-/// Built once in [`export_loop`] from `amcf.metric_protocol()` and threaded
-/// through [`graceful_drain`].  An enum avoids `dyn Transport` and keeps
-/// `send` monomorphic (both variants are cold-path anyway — the export
-/// loop runs in a dedicated process that is not on the hot request path).
+/// Built once in [`export_loop`] from `amcf.export_protocol()` and threaded
+/// through [`graceful_drain`].  A concrete enum (rather than a boxed trait
+/// object) keeps `send` statically dispatched (both variants are cold-path
+/// anyway — the export loop runs in a dedicated process that is not on the hot
+/// request path).
 ///
 /// # Exit-time flush note
 ///
@@ -160,7 +161,8 @@ enum ExportTransport {
     Grpc(GrpcTransport<NgxConnector>),
 }
 
-impl Transport for ExportTransport {
+impl ExportTransport {
+    /// Send a batch of OTLP metrics, dispatching to the selected transport.
     async fn send(
         &mut self,
         bytes: std::vec::Vec<u8>,
@@ -170,19 +172,13 @@ impl Transport for ExportTransport {
             Self::Grpc(t) => t.send(bytes).await,
         }
     }
-}
 
-impl ExportTransport {
     /// Send logs bytes to the OTel logs endpoint.
     ///
     /// For HTTP: POSTs to `/v1/logs` on the same host as metrics.
     /// For gRPC: calls `LogsService/Export`.
     ///
-    /// # Phase 2.1 note — directive naming
     /// Logs ship over the same transport selected by `otel_export_protocol`.
-    /// The directive name is intentionally kept as-is for backward compatibility.
-    /// A rename to `otel_export_protocol` (with a back-compat alias) is tracked
-    /// as a future cleanup; doing it here would be a breaking change.
     async fn send_logs(
         &mut self,
         bytes: std::vec::Vec<u8>,
@@ -332,8 +328,8 @@ pub async fn export_loop(amcf: &'static MainConfig) {
     //
     // Transport selected by `otel_export_protocol` (default: otlp_http).
     // For gRPC the connection is lazy (deferred to first send).
-    let mut transport = match amcf.metric_protocol() {
-        MetricProtocol::OtlpHttp => {
+    let mut transport = match amcf.export_protocol() {
+        ExportProtocol::OtlpHttp => {
             match HyperHttpTransport::<NgxConnector>::with_ngx_log(
                 endpoint_str,
                 headers,
@@ -353,7 +349,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                 }
             }
         }
-        MetricProtocol::OtlpGrpc => {
+        ExportProtocol::OtlpGrpc => {
             match GrpcTransport::<NgxConnector>::with_ngx_log(
                 endpoint_str,
                 log,
@@ -406,9 +402,9 @@ pub async fn export_loop(amcf: &'static MainConfig) {
 
     let logs_encoder = OtlpLogsEncoder;
 
-    let protocol_str = match amcf.metric_protocol() {
-        MetricProtocol::OtlpHttp => "otlp_http",
-        MetricProtocol::OtlpGrpc => "otlp_grpc",
+    let protocol_str = match amcf.export_protocol() {
+        ExportProtocol::OtlpHttp => "otlp_http",
+        ExportProtocol::OtlpGrpc => "otlp_grpc",
     };
     ngx::ngx_log_error!(
         NGX_LOG_NOTICE,
@@ -1786,9 +1782,9 @@ mod tests {
         // Stamp cap into both ring headers (mirrors logs_shm_zone_init).
         unsafe {
             let access_hdr = slot_ptr.cast::<LogsWorkerRingHeader>();
-            (*access_hdr).cap = cap as u64;
+            (*access_hdr).cap.store(cap as u64, Ordering::Relaxed);
             let error_hdr = slot_ptr.add(ring_size_bytes(cap)).cast::<LogsWorkerRingHeader>();
-            (*error_hdr).cap = cap as u64;
+            (*error_hdr).cap.store(cap as u64, Ordering::Relaxed);
         }
 
         // Synthesize a minimal config (log_ring_cap() = DEFAULT_LOG_RING_CAP).
@@ -1871,9 +1867,9 @@ mod tests {
         let slot_ptr = unsafe { std::alloc::alloc_zeroed(layout) };
         unsafe {
             let access_hdr = slot_ptr.cast::<LogsWorkerRingHeader>();
-            (*access_hdr).cap = cap as u64;
+            (*access_hdr).cap.store(cap as u64, Ordering::Relaxed);
             let error_hdr = slot_ptr.add(ring_size_bytes(cap)).cast::<LogsWorkerRingHeader>();
-            (*error_hdr).cap = cap as u64;
+            (*error_hdr).cap.store(cap as u64, Ordering::Relaxed);
         }
         let logs_batch = collect_log_records(&amcf, slot_ptr, 1, 0);
         unsafe { std::alloc::dealloc(slot_ptr, layout) };
@@ -1939,9 +1935,9 @@ mod tests {
         let ptr = buf.as_mut_ptr();
         unsafe {
             let access_hdr = ptr.cast::<LogsWorkerRingHeader>();
-            (*access_hdr).cap = cap as u64;
+            (*access_hdr).cap.store(cap as u64, Ordering::Relaxed);
             let error_hdr = ptr.add(ring_size_bytes(cap)).cast::<LogsWorkerRingHeader>();
-            (*error_hdr).cap = cap as u64;
+            (*error_hdr).cap.store(cap as u64, Ordering::Relaxed);
         }
         (buf, ptr)
     }
