@@ -84,6 +84,10 @@ cmd_up() {
         -e "s|@PREFIX@|${PREFIX}|g" \
         "${DEMO_DIR}/nginx-demo.conf.template" > "${PREFIX}/nginx.conf"
 
+    # Raise the fd soft limit so worker_connections (1024) doesn't warn against
+    # the macOS default of 256 (harmless cap, but noisy for a demo). Best-effort.
+    ulimit -n 4096 2>/dev/null || true
+
     # Validate then launch nginx (daemon off → background it ourselves).
     "${NGINX_BIN}" -t -p "${PREFIX}" -c "${PREFIX}/nginx.conf"
     "${NGINX_BIN}" -p "${PREFIX}" -c "${PREFIX}/nginx.conf" &
