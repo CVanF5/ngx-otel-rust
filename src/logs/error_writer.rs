@@ -114,6 +114,9 @@ pub struct OtelErrorWriterState {
 // (which the busy-flag already guards).  The raw pointer field (`logs_zone`)
 // is set once before workers start and never moved.
 unsafe impl Send for OtelErrorWriterState {}
+// SAFETY: as for the `Send` impl above — access is confined to the
+// single-threaded event loop and busy-flag-guarded signal handlers, and the
+// shared state is atomics, so concurrent `&` access is sound.
 unsafe impl Sync for OtelErrorWriterState {}
 
 // ── Error-log writer ──────────────────────────────────────────────────────────
@@ -496,6 +499,8 @@ mod tests {
             // (no metrics shm available; init_process wires this at Step 2.3.5).
             error_rate_ptr: core::ptr::null_mut(),
         });
+        // SAFETY: `ngx_log_t` is a plain C struct, so an all-zero bit pattern is
+        // a valid initial value (fields are then set explicitly below).
         let mut log: nginx_sys::ngx_log_t = unsafe { core::mem::zeroed() };
         log.writer = Some(ngx_otel_error_writer);
         log.wdata = state.as_ref() as *const _ as *mut core::ffi::c_void;
@@ -512,6 +517,10 @@ mod tests {
 
         // A re-entrant call at any level must return early.
         let mut dummy_buf = [0u8; 8];
+        // SAFETY: `log` is a valid stack `ngx_log_t` whose `wdata` points to the
+        // test's `OtelErrorWriterState` (set in make_writer_state); `dummy_buf` is
+        // a valid buffer of `dummy_buf.len()` bytes — satisfies the writer's FFI
+        // contract. Single-threaded test.
         unsafe {
             ngx_otel_error_writer(
                 &mut log as *mut _,
@@ -533,6 +542,10 @@ mod tests {
         let (state, mut log) = make_writer_state(nginx_sys::NGX_LOG_WARN as ngx_uint_t);
 
         let mut dummy_buf = [0u8; 8];
+        // SAFETY: `log` is a valid stack `ngx_log_t` whose `wdata` points to the
+        // test's `OtelErrorWriterState` (set in make_writer_state); `dummy_buf` is
+        // a valid buffer of `dummy_buf.len()` bytes — satisfies the writer's FFI
+        // contract. Single-threaded test.
         unsafe {
             ngx_otel_error_writer(
                 &mut log as *mut _,
@@ -553,6 +566,10 @@ mod tests {
         state.cleanup.store(true, Ordering::SeqCst);
 
         let mut dummy_buf = [0u8; 8];
+        // SAFETY: `log` is a valid stack `ngx_log_t` whose `wdata` points to the
+        // test's `OtelErrorWriterState` (set in make_writer_state); `dummy_buf` is
+        // a valid buffer of `dummy_buf.len()` bytes — satisfies the writer's FFI
+        // contract. Single-threaded test.
         unsafe {
             ngx_otel_error_writer(
                 &mut log as *mut _,
@@ -575,6 +592,10 @@ mod tests {
         let (state, mut log) = make_writer_state(nginx_sys::NGX_LOG_WARN as ngx_uint_t);
 
         let mut dummy_buf = [0u8; 8];
+        // SAFETY: `log` is a valid stack `ngx_log_t` whose `wdata` points to the
+        // test's `OtelErrorWriterState` (set in make_writer_state); `dummy_buf` is
+        // a valid buffer of `dummy_buf.len()` bytes — satisfies the writer's FFI
+        // contract. Single-threaded test.
         unsafe {
             ngx_otel_error_writer(
                 &mut log as *mut _,
@@ -610,6 +631,9 @@ mod tests {
     /// sorted without disturbing other nodes.
     #[test]
     fn log_insert_sorted_chain() {
+        // SAFETY: all operations are on stack-local `ngx_log_t` values (zeroed C
+        // POD) linked via `otel_log_insert`; the pointers are valid for the test
+        // scope and access is single-threaded.
         unsafe {
             // Create three nodes.  We'll insert them in reverse order (low to high)
             // and verify the chain comes out sorted high→low.
@@ -682,12 +706,19 @@ mod tests {
 
         let (state, mut log) = make_writer_state(nginx_sys::NGX_LOG_DEBUG as ngx_uint_t);
         // Wire the real counter pointer into state (logs_zone stays null).
+        // SAFETY: `log.wdata` was set to the test's `OtelErrorWriterState` in
+        // make_writer_state, so the cast + field write target valid state;
+        // single-threaded test.
         unsafe {
             let s = log.wdata as *mut OtelErrorWriterState;
             (*s).error_rate_ptr = counter_ptr;
         }
 
         let mut buf = *b"connect() failed";
+        // SAFETY: `log` is a valid stack `ngx_log_t` whose `wdata` points to the
+        // test's `OtelErrorWriterState` (set in make_writer_state); `buf` is a
+        // valid buffer of `buf.len()` bytes — satisfies the writer's FFI contract.
+        // Single-threaded test.
         unsafe {
             ngx_otel_error_writer(
                 &mut log as *mut _,

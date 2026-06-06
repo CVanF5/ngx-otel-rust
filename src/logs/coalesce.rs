@@ -282,6 +282,10 @@ pub unsafe fn coalesce(
     let mut probes = 0usize;
 
     loop {
+        // SAFETY: per the fn contract `table` points to a `[CoalesceSlot;
+        // COALESCE_CAPACITY]` in shm; `probe` is masked to `& (CAPACITY - 1)`, so
+        // it is in-bounds. The writer is single-threaded (the caller's busy flag),
+        // so the shared ref does not alias a concurrent `&mut`.
         let slot = unsafe { &*table.add(probe) };
         let slot_key = slot.key_hash;
 
@@ -374,6 +378,9 @@ pub const fn coalesce_table_bytes() -> usize {
 pub unsafe fn drain_coalesce_table(table: *mut CoalesceSlot) -> std::vec::Vec<(u64, u8, u32)> {
     let mut out = std::vec::Vec::new();
     for i in 0..COALESCE_CAPACITY {
+        // SAFETY: per the fn contract `table` points to `[CoalesceSlot;
+        // COALESCE_CAPACITY]`; `i < COALESCE_CAPACITY`, so it is in-bounds. The
+        // exporter is the single draining reader.
         let slot = unsafe { &*table.add(i) };
         // Cheap pre-filter: a zero key_hash means the slot was never written.
         // (key_hash is only written once, before count; if count > 0 then
@@ -505,12 +512,16 @@ mod tests {
         let msg = b"2024/01/01 12:00:00 [error] 1#1: *1 connect() failed, client: 1.2.3.4\n";
 
         // First call: novel → EmitVerbatim.
+        // SAFETY: `ptr` is from make_table() — a valid zeroed [CoalesceSlot;
+        // COALESCE_CAPACITY]; satisfies coalesce()'s contract. Single-threaded test.
         let r1 = unsafe { coalesce(ptr, 4, msg, true) };
         assert!(matches!(r1, CoalesceResult::EmitVerbatim { .. }), "first call must emit verbatim");
 
         // Subsequent calls: coalesced → count bumped.
         let n = 99;
         for _ in 0..n {
+            // SAFETY: `ptr` is from make_table() — a valid zeroed [CoalesceSlot;
+            // COALESCE_CAPACITY]; satisfies coalesce()'s contract. Single-threaded test.
             let r = unsafe { coalesce(ptr, 4, msg, true) };
             assert!(matches!(r, CoalesceResult::Coalesced), "flood must coalesce");
         }
@@ -540,6 +551,8 @@ mod tests {
 
         let mut emitted = 0usize;
         for msg in msgs {
+            // SAFETY: `ptr` is from make_table() — a valid zeroed [CoalesceSlot;
+            // COALESCE_CAPACITY]; satisfies coalesce()'s contract. Single-threaded test.
             let r = unsafe { coalesce(ptr, 4, msg, true) };
             if matches!(r, CoalesceResult::EmitVerbatim { .. }) {
                 emitted += 1;
@@ -558,6 +571,8 @@ mod tests {
         // severity 3 = crit (≤ HIGH_SEVERITY_THRESHOLD)
 
         for _ in 0..10 {
+            // SAFETY: `ptr` is from make_table() — a valid zeroed [CoalesceSlot;
+            // COALESCE_CAPACITY]; satisfies coalesce()'s contract. Single-threaded test.
             let r = unsafe { coalesce(ptr, 3, msg, true) };
             assert!(
                 matches!(r, CoalesceResult::EmitVerbatim { .. }),
@@ -566,6 +581,8 @@ mod tests {
         }
         // Also emerg (1) and alert (2).
         let msg_emerg = b"2024/01/01 12:00:00 [emerg] 1#1: worker process exited\n";
+        // SAFETY: `ptr` is from make_table() — a valid zeroed [CoalesceSlot;
+        // COALESCE_CAPACITY]; satisfies coalesce()'s contract. Single-threaded test.
         let r = unsafe { coalesce(ptr, 1, msg_emerg, true) };
         assert!(
             matches!(r, CoalesceResult::EmitVerbatim { .. }),
@@ -588,6 +605,9 @@ mod tests {
         // We do this by directly populating table slots.
         for i in 0..COALESCE_CAPACITY {
             // Fill every slot with a non-zero key_hash so the table appears full.
+            // SAFETY: `ptr` is the base of the valid zeroed table from
+            // make_table(); `i < COALESCE_CAPACITY`, so the field projections are
+            // in-bounds. Single-threaded test, no concurrent access.
             unsafe {
                 core::ptr::write_volatile(
                     core::ptr::addr_of_mut!((*ptr.add(i)).key_hash),
@@ -602,6 +622,8 @@ mod tests {
         // A message that doesn't match any existing slot — table-full path.
         // The key for this message is unlikely to match any of the fabricated keys.
         let novel = b"2024/01/01 12:00:00 [error] 1#1: a truly novel message that is unique xyz\n";
+        // SAFETY: `ptr` is from make_table() — a valid zeroed [CoalesceSlot;
+        // COALESCE_CAPACITY]; satisfies coalesce()'s contract. Single-threaded test.
         let r = unsafe { coalesce(ptr, 4, novel, true) };
         // Must fall back to verbatim — no panic, no silent discard.
         assert!(
@@ -621,6 +643,8 @@ mod tests {
 
         let n = 20;
         for _ in 0..n {
+            // SAFETY: `ptr` is from make_table() — a valid zeroed [CoalesceSlot;
+            // COALESCE_CAPACITY]; satisfies coalesce()'s contract. Single-threaded test.
             let r = unsafe { coalesce(ptr, 4, msg, false) }; // coalesce disabled
             assert!(
                 matches!(r, CoalesceResult::EmitVerbatim { .. }),

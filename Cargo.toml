@@ -6,6 +6,12 @@ license = "Apache-2.0"
 publish = false
 rust-version = "1.85.0"
 
+# Every `unsafe` block must carry a `// SAFETY:` comment stating its invariant.
+# Enforced after a full documentation pass (2026-06-06, 309 blocks); this keeps
+# any newly-introduced `unsafe` honest. (A restriction lint, opted into here.)
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
 [lib]
 name = "ngx_http_otel_module"
 # rlib is included so that integration tests in tests/ can link against the
