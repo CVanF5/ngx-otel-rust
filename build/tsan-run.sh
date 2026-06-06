@@ -218,7 +218,9 @@ for log in /tmp/ngx-otel-grpc-smoke.*/logs/error.log \
            /tmp/ngx-otel-error-log.*/logs/error.log \
            /tmp/ngx-otel-signal-storm.*/logs/error.log \
            /tmp/ngx-otel-dns-a.*/logs/error.log \
-           /tmp/ngx-otel-dns-b.*/logs/error.log; do
+           /tmp/ngx-otel-dns-b.*/logs/error.log \
+           /tmp/ngx-otel-dns-c.*/logs/error.log \
+           /tmp/ngx-otel-dns-d.*/logs/error.log; do
     if [[ -f "${log}" ]]; then
         count=$(grep -c "WARNING: ThreadSanitizer" "${log}" 2>/dev/null || true)
         if [[ "${count}" -gt 0 ]]; then

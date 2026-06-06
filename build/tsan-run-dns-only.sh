@@ -81,7 +81,9 @@ echo ""
 echo "[tsan-dns] Checking DNS error logs for ThreadSanitizer warnings..."
 TSAN_WARNINGS=0
 for log in /tmp/ngx-otel-dns-a.*/logs/error.log \
-           /tmp/ngx-otel-dns-b.*/logs/error.log; do
+           /tmp/ngx-otel-dns-b.*/logs/error.log \
+           /tmp/ngx-otel-dns-c.*/logs/error.log \
+           /tmp/ngx-otel-dns-d.*/logs/error.log; do
     if [[ -f "${log}" ]]; then
         count=$(grep -c "WARNING: ThreadSanitizer" "${log}" 2>/dev/null || true)
         if [[ "${count}" -gt 0 ]]; then
