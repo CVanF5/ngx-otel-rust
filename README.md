@@ -362,10 +362,24 @@ Notes:
 
 ```sh
 make check       # rustfmt + clippy (zero warnings required)
-make unittest    # cargo test --lib (currently 22 tests)
+make unittest    # cargo test --lib (95 tests)
 make test        # bash integration scripts (see below)
 make all         # build + check + test
 ```
+
+Race detection runs the integration scripts under **ThreadSanitizer**
+(Linux arm64, dockerized). Results are committed as evidence
+(`tests/RESULTS-tsan-*.txt`):
+
+```sh
+make tsan-test        # full TSAN suite (all integration scripts under TSAN)
+make tsan-test-dns    # DNS / dual-stack resolver+connect path only
+make tsan-test-error  # §6.6.2 error-log path only (writer → ring → drain)
+```
+
+The path-scoped gates (`-dns`, `-error`) exist because some scripts are
+timing-flaky inside the combined suite under TSAN's slowdown; running a
+single path in isolation gives a clean race signal.
 
 `make test` requires a running OTel collector on `127.0.0.1:4318`
 (OTLP/HTTP) and `127.0.0.1:4317` (OTLP/gRPC).  The integration scripts
@@ -390,6 +404,10 @@ bash tests/integration/run_exporter_lifecycle.sh     # exporter process spawn/li
 bash tests/integration/run_exporter_crash_respawn.sh # exporter crash + respawn + dropped_records
 bash tests/integration/run_exporter_reload_overlap.sh # SIGHUP exporter overlap
 bash tests/integration/run_exporter_heartbeat.sh     # control-shm heartbeat (needs test-support)
+bash tests/integration/run_access_log.sh             # §6.6.1 access exception tail + exemplars
+bash tests/integration/run_error_log.sh              # §6.6.2 coalesced error log + rate metric
+bash tests/integration/run_dns_dualstack.sh          # DNS + IPv6 dual-stack transport
+bash tests/integration/run_signal_storm.sh           # error-writer re-entrancy under signals
 bash tests/bench/zero_cost.sh                        # zero-cost-when-disabled (~10 min)
 bash tests/bench/analyse.sh                          # re-derive tolerance check from JSON
 ```
