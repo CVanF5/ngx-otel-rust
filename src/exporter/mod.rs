@@ -147,6 +147,20 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
         //    See PHASE_1_3_RESEARCH.md §2.8.
         let _ = nginx_sys::ngx_init_signals((*cycle).log);
 
+        // 2a. Drop privileges and chdir, matching ngx_worker_process_init, which
+        //     does setgid/setuid (:799-851) and chdir (:872-879) BEFORE
+        //     sigprocmask, the module init_process fan-out, and
+        //     ngx_add_channel_event. Dropping here — rather than last — ensures
+        //     the init_process fan-out (step 5a), channel registration (step 7),
+        //     and the export-task spawn run UNPRIVILEGED, exactly as nginx
+        //     workers do (least privilege; a privileged-init third-party module
+        //     would otherwise run its init_process as root). Nothing between here
+        //     and the end of init needs root: closing fds, epoll_create via the
+        //     event module's init_process, and ngx_add_channel_event are all
+        //     unprivileged. Reads only cycle->conf_ctx (set at startup) and
+        //     cycle->log. No-op when not started as root (geteuid() != 0).
+        drop_privileges_and_chdir(cycle);
+
         // 3. Clear the blocked-signal mask inherited from master.
         //    See ngx_worker_process_init:881-886.
         let mut empty: libc::sigset_t = mem::zeroed();
@@ -218,9 +232,9 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
             std::process::exit(2);
         }
 
-        // 8. Drop privileges and chdir — parity with worker_process_init.
-        //    Must happen AFTER channel registration (see sequencing above).
-        drop_privileges_and_chdir(cycle);
+        // 8. (Privileges were already dropped + chdir done at step 2a, matching
+        //    ngx_worker_process_init's early drop — see the note there. Steps
+        //    5a/6/7 above therefore ran unprivileged.)
 
         // 9. No accept mutex — exporter doesn't accept HTTP connections.
         nginx_sys::ngx_use_accept_mutex = 0;

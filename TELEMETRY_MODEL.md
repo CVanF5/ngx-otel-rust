@@ -124,6 +124,16 @@ Each is its own `ExpHistogramSlot` table in `WorkerSlots` (`src/shm.rs`).
 - **Buckets:** `N_EXP_BUCKETS = 192`, `positive_offset = 0`, covering
   ≈ [1µs, 2^24µs ≈ 16.7s); values above clamp to the last bucket; 0µs →
   `zero_count`.
+- **Boundary convention (note):** our bucket index uses a lower-inclusive
+  boundary `[base^k, base^(k+1))`, whereas the OTel exp-histogram spec defines
+  bucket `k` as the upper-inclusive `(base^k, base^(k+1)]`. The two differ for
+  exactly one input: a value landing *precisely* on a boundary `base^k` (e.g.
+  2µs, 4µs) is counted in bucket `k` here vs `k-1` per spec — an off-by-one of
+  a single bucket only at exact powers. For general integer-µs latencies the
+  bucketing is identical, so the practical effect is negligible. We keep the
+  lower-inclusive form deliberately: it is what the verified low-end bucketing
+  fix (left-shift mantissa for `n < scale`) is built around, and changing the
+  boundary side risks reintroducing that bug. Documented, not "fixed."
 
 ---
 
