@@ -35,6 +35,13 @@ use crate::HttpOtelModule;
 /// `ngx_process()`). The flag is set once and never cleared.
 pub(crate) static IS_OTEL_EXPORTER: AtomicBool = AtomicBool::new(false);
 
+/// Upper bound on the graceful-drain wait after `ngx_quit` before the exporter
+/// force-exits. The export loop normally signals `EXPORT_LOOP_DONE` within
+/// ~`SHUTDOWN_POLL_INTERVAL` (250 ms) of `ngx_quit`; this backstop only caps the
+/// pathological case (a wedged send). It is deliberately not tied to a configured
+/// interval; honoring `worker_shutdown_timeout` is a possible future refinement.
+const GRACEFUL_DRAIN_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Process identity as seen from inside the `ngx-otel-rust` crate.
 ///
 /// Mirrors [`nginx-acme/src/util.rs`](../../../nginx-acme/src/util.rs)
@@ -160,6 +167,10 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
         //     Our own module's init_process (ngx_otel_init_process) is safe:
         //     it returns early because ngx_process = NGX_PROCESS_HELPER (not
         //     WORKER or SINGLE), so it never spawns the export task here.
+        //     Fanning out to ALL modules (not a curated subset) is intentional:
+        //     it mirrors nginx's own ngx_worker_process_init, which calls every
+        //     module's init_process and relies on each one self-gating on
+        //     ngx_process — the same contract this process depends on.
         let mut i = 0usize;
         let modules: *mut *mut nginx_sys::ngx_module_t = (*cycle).modules;
         while !(*modules.add(i)).is_null() {
@@ -272,7 +283,12 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
                 // workers. Dedup via time_unix_nano (cumulative-counter model).
                 // Phase 2 (logs) reopens this when log-drain semantics force
                 // ordered handoff.
-                let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+                // Drive the event loop until the export loop signals it finished
+                // draining, or the backstop elapses. `ngx_process_events_and_timers`
+                // BLOCKS on epoll/kqueue (the same call as the main loop below) —
+                // this is not a busy-spin; the deadline just prevents a wedged send
+                // from stalling shutdown forever.
+                let drain_deadline = std::time::Instant::now() + GRACEFUL_DRAIN_BACKSTOP;
                 while !crate::export::EXPORT_LOOP_DONE.load(Ordering::Acquire)
                     && std::time::Instant::now() < drain_deadline
                 {

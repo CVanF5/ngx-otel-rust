@@ -420,6 +420,9 @@ pub unsafe fn wire_error_writer_state(
 ///
 /// The head address is kept stable: when `new_log.log_level > head.log_level`,
 /// we swap the two nodes' *contents* (not pointers) and update `head->next`.
+/// This is exactly what nginx's own `ngx_log_insert` does — the head is an
+/// embedded value in `ngx_cycle_t::new_log`, so its address must not move —
+/// i.e. it matches core's chain semantics, not a novel/fragile trick.
 ///
 /// # Safety
 /// - `head` must be a valid, non-null pointer to the chain head (an embedded
