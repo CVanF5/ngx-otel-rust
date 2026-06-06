@@ -30,7 +30,7 @@ http {
         # The demo stack's collector listens on gRPC at host port 14317.
         endpoint http://127.0.0.1:14317;
     }
-    otel_service_name ngx-otel-rust-demo;
+    otel_service_name nginx-otel;
     otel_metric_interval 2s;
     # Ship OTLP/gRPC to the collector (Phase 2 grpc_transport).
     # Default is otlp_http; this directive promotes the demo to gRPC.
