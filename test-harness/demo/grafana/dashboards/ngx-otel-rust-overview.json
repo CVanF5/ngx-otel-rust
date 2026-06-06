@@ -6,7 +6,7 @@
     "otel",
     "ngx-otel-rust"
   ],
-  "schemaVersion": 39,
+  "schemaVersion": 41,
   "version": 1,
   "editable": true,
   "time": {
@@ -37,9 +37,12 @@
       }
     ]
   },
+  "annotations": {
+    "list": []
+  },
   "panels": [
     {
-      "id": 1,
+      "id": 26,
       "type": "row",
       "title": "Default NGINX (stub_status) \u2014 everything vanilla nginx exposes",
       "collapsed": false,
@@ -52,16 +55,17 @@
       "panels": []
     },
     {
-      "id": 2,
-      "type": "timeseries",
-      "title": "Request Rate",
+      "id": 1,
+      "type": "stat",
+      "title": "Requests / s",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
       },
+      "description": "nginx stub_status total request rate \u2014 the only request signal vanilla nginx exposes.",
       "gridPos": {
-        "h": 8,
-        "w": 12,
+        "h": 5,
+        "w": 6,
         "x": 0,
         "y": 1
       },
@@ -71,19 +75,98 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(rate(nginx_requests_total_sum{service_name=\"$service\"}[$__rate_interval]))",
           "refId": "A",
-          "legendFormat": "requests/s"
+          "expr": "sum(rate(nginx_requests_total_sum{service_name=\"$service\"}[$__rate_interval]))"
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "reqps"
+          "unit": "reqps",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
         },
         "overrides": []
       },
-      "options": {},
-      "description": "nginx stub_status: total requests/s. The only request signal default nginx exposes."
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "graphMode": "area",
+        "colorMode": "value",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Active Connections",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": null,
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 6,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "sum(nginx_connections_active_sum{service_name=\"$service\"})"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "graphMode": "area",
+        "colorMode": "value",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      }
     },
     {
       "id": 3,
@@ -93,6 +176,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
+      "description": null,
       "gridPos": {
         "h": 5,
         "w": 6,
@@ -105,56 +189,51 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(nginx_requests_total_sum{service_name=\"$service\"})",
           "refId": "A",
-          "legendFormat": ""
+          "expr": "sum(nginx_requests_total_sum{service_name=\"$service\"})"
         }
       ],
       "fieldConfig": {
-        "defaults": {},
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
         "overrides": []
       },
-      "options": {}
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "graphMode": "none",
+        "colorMode": "value",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      }
     },
     {
       "id": 4,
-      "type": "stat",
-      "title": "Active Connections",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "gridPos": {
-        "h": 5,
-        "w": 6,
-        "x": 18,
-        "y": 1
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "expr": "sum(nginx_connections_active_sum{service_name=\"$service\"})",
-          "refId": "A",
-          "legendFormat": ""
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {},
-        "overrides": []
-      },
-      "options": {}
-    },
-    {
-      "id": 5,
       "type": "timeseries",
       "title": "Connection State",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
       },
+      "description": null,
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -167,8 +246,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(nginx_connections_reading_sum{service_name=\"$service\"})",
           "refId": "A",
+          "expr": "sum(nginx_connections_reading_sum{service_name=\"$service\"})",
           "legendFormat": "reading"
         },
         {
@@ -176,8 +255,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(nginx_connections_writing_sum{service_name=\"$service\"})",
           "refId": "B",
+          "expr": "sum(nginx_connections_writing_sum{service_name=\"$service\"})",
           "legendFormat": "writing"
         },
         {
@@ -185,25 +264,65 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(nginx_connections_waiting_sum{service_name=\"$service\"})",
           "refId": "C",
+          "expr": "sum(nginx_connections_waiting_sum{service_name=\"$service\"})",
           "legendFormat": "waiting"
         }
       ],
       "fieldConfig": {
-        "defaults": {},
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 25,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal"
+            },
+            "axisLabel": "",
+            "gradientMode": "opacity"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
         "overrides": []
       },
-      "options": {}
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
     },
     {
-      "id": 6,
+      "id": 5,
       "type": "timeseries",
       "title": "Connection Churn",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
       },
+      "description": null,
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -216,8 +335,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(rate(nginx_connections_accepted_sum{service_name=\"$service\"}[$__rate_interval]))",
           "refId": "A",
+          "expr": "sum(rate(nginx_connections_accepted_sum{service_name=\"$service\"}[$__rate_interval]))",
           "legendFormat": "accepted/s"
         },
         {
@@ -225,23 +344,60 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(rate(nginx_connections_handled_sum{service_name=\"$service\"}[$__rate_interval]))",
           "refId": "B",
+          "expr": "sum(rate(nginx_connections_handled_sum{service_name=\"$service\"}[$__rate_interval]))",
           "legendFormat": "handled/s"
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "cps"
+          "unit": "cps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none"
+            },
+            "axisLabel": "",
+            "gradientMode": "opacity"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
         },
         "overrides": []
       },
-      "options": {}
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
     },
     {
-      "id": 7,
+      "id": 27,
       "type": "row",
-      "title": "Enhanced by ngx-otel-rust \u2014 Traffic & Latency (routes \u00b7 upstreams \u00b7 status \u00b7 histograms)",
+      "title": "Enhanced by ngx-otel-rust \u2014 Traffic & Latency",
       "collapsed": true,
       "gridPos": {
         "h": 1,
@@ -251,13 +407,14 @@
       },
       "panels": [
         {
-          "id": 8,
+          "id": 6,
           "type": "stat",
           "title": "Avg Latency",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
+          "description": "Avg request duration (\u00b5s metric \u2192 ms). Per-route/upstream breakdowns below \u2014 dimensions stub_status cannot produce.",
           "gridPos": {
             "h": 5,
             "w": 6,
@@ -270,30 +427,63 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "sum(rate(http_server_request_duration_sum{service_name=\"$service\"}[$__rate_interval])) / sum(rate(http_server_request_duration_count{service_name=\"$service\"}[$__rate_interval])) / 1000",
               "refId": "A",
-              "legendFormat": ""
+              "expr": "sum(rate(http_server_request_duration_sum{service_name=\"$service\"}[$__rate_interval])) / sum(rate(http_server_request_duration_count{service_name=\"$service\"}[$__rate_interval])) / 1000"
             }
           ],
           "fieldConfig": {
             "defaults": {
-              "unit": "ms"
+              "unit": "ms",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "yellow",
+                    "value": 50
+                  },
+                  {
+                    "color": "red",
+                    "value": 250
+                  }
+                ]
+              },
+              "color": {
+                "mode": "thresholds"
+              },
+              "decimals": 2
             },
             "overrides": []
           },
-          "options": {}
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "graphMode": "area",
+            "colorMode": "value",
+            "textMode": "auto",
+            "justifyMode": "auto"
+          }
         },
         {
-          "id": 9,
-          "type": "timeseries",
-          "title": "Request Duration (avg, over time)",
+          "id": 7,
+          "type": "stat",
+          "title": "5xx Rate",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
+          "description": null,
           "gridPos": {
-            "h": 8,
-            "w": 12,
+            "h": 5,
+            "w": 6,
             "x": 6,
             "y": 15
           },
@@ -303,32 +493,60 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "sum(rate(http_server_request_duration_sum{service_name=\"$service\"}[$__rate_interval])) / sum(rate(http_server_request_duration_count{service_name=\"$service\"}[$__rate_interval])) / 1000",
               "refId": "A",
-              "legendFormat": "avg ms"
+              "expr": "sum(rate(http_server_request_duration_count{service_name=\"$service\",http_response_status_code=\"500\"}[$__rate_interval]))"
             }
           ],
           "fieldConfig": {
             "defaults": {
-              "unit": "ms"
+              "unit": "reqps",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 1
+                  }
+                ]
+              },
+              "color": {
+                "mode": "thresholds"
+              }
             },
             "overrides": []
           },
-          "options": {}
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "graphMode": "area",
+            "colorMode": "background",
+            "textMode": "auto",
+            "justifyMode": "auto"
+          }
         },
         {
-          "id": 10,
+          "id": 8,
           "type": "timeseries",
           "title": "Requests by Status Class",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
+          "description": null,
           "gridPos": {
             "h": 8,
             "w": 12,
-            "x": 0,
-            "y": 23
+            "x": 12,
+            "y": 15
           },
           "targets": [
             {
@@ -336,29 +554,214 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "sum(rate(http_server_request_duration_count{service_name=\"$service\"}[$__rate_interval])) by (http_response_status_code)",
               "refId": "A",
+              "expr": "sum(rate(http_server_request_duration_count{service_name=\"$service\"}[$__rate_interval])) by (http_response_status_code)",
               "legendFormat": "{{http_response_status_code}}"
             }
           ],
           "fieldConfig": {
             "defaults": {
-              "unit": "reqps"
+              "unit": "reqps",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 40,
+                "showPoints": "never",
+                "stacking": {
+                  "mode": "normal"
+                },
+                "axisLabel": "",
+                "gradientMode": "opacity"
+              },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "color": {
+                "mode": "palette-classic"
+              }
             },
-            "overrides": []
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "200"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "green"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "300"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "blue"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "400"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "orange"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "500"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "red"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "100"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "purple"
+                    }
+                  }
+                ]
+              }
+            ]
           },
-          "options": {}
+          "options": {
+            "legend": {
+              "calcs": [
+                "mean",
+                "max",
+                "last"
+              ],
+              "displayMode": "table",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
         },
         {
-          "id": 11,
+          "id": 9,
           "type": "timeseries",
           "title": "Requests by Method",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
+          "description": null,
           "gridPos": {
             "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 23
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "refId": "A",
+              "expr": "sum(rate(http_server_request_duration_count{service_name=\"$service\"}[$__rate_interval])) by (http_request_method)",
+              "legendFormat": "{{http_request_method}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 40,
+                "showPoints": "never",
+                "stacking": {
+                  "mode": "normal"
+                },
+                "axisLabel": "",
+                "gradientMode": "opacity"
+              },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "color": {
+                "mode": "palette-classic"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "calcs": [
+                "mean",
+                "max",
+                "last"
+              ],
+              "displayMode": "table",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 10,
+          "type": "heatmap",
+          "title": "Request Duration Distribution",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "description": "Exp-histogram latency distribution (\u00b5s). The shape \u2014 not just an average \u2014 is the OTel value-add.",
+          "gridPos": {
+            "h": 9,
             "w": 12,
             "x": 12,
             "y": 23
@@ -369,32 +772,50 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "sum(rate(http_server_request_duration_count{service_name=\"$service\"}[$__rate_interval])) by (http_request_method)",
               "refId": "A",
-              "legendFormat": "{{http_request_method}}"
+              "expr": "sum(rate(http_server_request_duration_bucket{service_name=\"$service\"}[$__rate_interval])) by (le)",
+              "format": "heatmap",
+              "legendFormat": "{{le}}"
             }
           ],
-          "fieldConfig": {
-            "defaults": {
-              "unit": "reqps"
+          "options": {
+            "calculate": false,
+            "cellGap": 1,
+            "color": {
+              "scheme": "Oranges",
+              "mode": "scheme",
+              "steps": 64
             },
-            "overrides": []
+            "yAxis": {
+              "unit": "\u00b5s"
+            },
+            "tooltip": {
+              "mode": "single",
+              "yHistogram": true
+            },
+            "legend": {
+              "show": true
+            }
           },
-          "options": {}
+          "fieldConfig": {
+            "defaults": {},
+            "overrides": []
+          }
         },
         {
-          "id": 12,
+          "id": 11,
           "type": "timeseries",
           "title": "Avg Duration by Status Class",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
+          "description": null,
           "gridPos": {
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 31
+            "y": 32
           },
           "targets": [
             {
@@ -402,32 +823,212 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "sum(rate(http_server_request_duration_sum{service_name=\"$service\"}[$__rate_interval])) by (http_response_status_code) / sum(rate(http_server_request_duration_count{service_name=\"$service\"}[$__rate_interval])) by (http_response_status_code) / 1000",
               "refId": "A",
+              "expr": "sum(rate(http_server_request_duration_sum{service_name=\"$service\"}[$__rate_interval])) by (http_response_status_code) / sum(rate(http_server_request_duration_count{service_name=\"$service\"}[$__rate_interval])) by (http_response_status_code) / 1000",
               "legendFormat": "{{http_response_status_code}}"
             }
           ],
           "fieldConfig": {
             "defaults": {
-              "unit": "ms"
+              "unit": "ms",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "stacking": {
+                  "mode": "none"
+                },
+                "axisLabel": "",
+                "gradientMode": "opacity"
+              },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "color": {
+                "mode": "palette-classic"
+              }
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "200"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "green"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "300"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "blue"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "400"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "orange"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "500"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "red"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "100"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "purple"
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "calcs": [
+                "mean",
+                "max",
+                "last"
+              ],
+              "displayMode": "table",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 12,
+          "type": "bargauge",
+          "title": "Slowest Routes (avg ms \u00b7 http.route)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "description": "Per-route latency (location name) \u2014 only possible because the module emits a per-route histogram.",
+          "gridPos": {
+            "h": 9,
+            "w": 12,
+            "x": 12,
+            "y": 32
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "refId": "A",
+              "expr": "topk(10, sum(rate(http_server_request_duration_by_route_sum{service_name=\"$service\"}[$__rate_interval])) by (http_route) / sum(rate(http_server_request_duration_by_route_count{service_name=\"$service\"}[$__rate_interval])) by (http_route) / 1000)",
+              "legendFormat": "{{http_route}}",
+              "instant": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ms",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "yellow",
+                    "value": 50
+                  },
+                  {
+                    "color": "red",
+                    "value": 250
+                  }
+                ]
+              },
+              "color": {
+                "mode": "thresholds"
+              }
             },
             "overrides": []
           },
-          "options": {}
+          "options": {
+            "displayMode": "gradient",
+            "orientation": "horizontal",
+            "valueMode": "color",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            }
+          }
         },
         {
           "id": 13,
-          "type": "timeseries",
-          "title": "Slowest Routes by Avg Duration (http.route)",
+          "type": "bargauge",
+          "title": "Avg Duration by Upstream Zone (ms \u00b7 nginx.upstream.zone)",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
+          "description": null,
           "gridPos": {
-            "h": 8,
+            "h": 9,
             "w": 12,
-            "x": 12,
-            "y": 31
+            "x": 0,
+            "y": 41
           },
           "targets": [
             {
@@ -435,66 +1036,65 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "topk(12, sum(rate(http_server_request_duration_by_route_sum{service_name=\"$service\"}[$__rate_interval])) by (http_route) / sum(rate(http_server_request_duration_by_route_count{service_name=\"$service\"}[$__rate_interval])) by (http_route) / 1000)",
               "refId": "A",
-              "legendFormat": "{{http_route}}"
+              "expr": "sum(rate(http_server_request_duration_by_upstream_sum{service_name=\"$service\"}[$__rate_interval])) by (nginx_upstream_zone) / sum(rate(http_server_request_duration_by_upstream_count{service_name=\"$service\"}[$__rate_interval])) by (nginx_upstream_zone) / 1000",
+              "legendFormat": "{{nginx_upstream_zone}}",
+              "instant": true
             }
           ],
           "fieldConfig": {
             "defaults": {
-              "unit": "ms"
+              "unit": "ms",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "yellow",
+                    "value": 50
+                  },
+                  {
+                    "color": "red",
+                    "value": 250
+                  }
+                ]
+              },
+              "color": {
+                "mode": "thresholds"
+              }
             },
             "overrides": []
           },
-          "options": {},
-          "description": "Per-route latency \u2014 a dimension default nginx has no way to produce."
+          "options": {
+            "displayMode": "gradient",
+            "orientation": "horizontal",
+            "valueMode": "color",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            }
+          }
         },
         {
           "id": 14,
-          "type": "timeseries",
-          "title": "Avg Duration by Upstream Zone (nginx.upstream.zone)",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "gridPos": {
-            "h": 8,
-            "w": 12,
-            "x": 0,
-            "y": 39
-          },
-          "targets": [
-            {
-              "datasource": {
-                "type": "prometheus",
-                "uid": "prometheus"
-              },
-              "expr": "sum(rate(http_server_request_duration_by_upstream_sum{service_name=\"$service\"}[$__rate_interval])) by (nginx_upstream_zone) / sum(rate(http_server_request_duration_by_upstream_count{service_name=\"$service\"}[$__rate_interval])) by (nginx_upstream_zone) / 1000",
-              "refId": "A",
-              "legendFormat": "{{nginx_upstream_zone}}"
-            }
-          ],
-          "fieldConfig": {
-            "defaults": {
-              "unit": "ms"
-            },
-            "overrides": []
-          },
-          "options": {}
-        },
-        {
-          "id": 15,
           "type": "timeseries",
           "title": "Body Size p95",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
+          "description": null,
           "gridPos": {
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 39
+            "y": 41
           },
           "targets": [
             {
@@ -502,8 +1102,8 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "histogram_quantile(0.95, sum(rate(http_server_request_body_size_bucket{service_name=\"$service\"}[$__rate_interval])) by (le))",
               "refId": "A",
+              "expr": "histogram_quantile(0.95, sum(rate(http_server_request_body_size_bucket{service_name=\"$service\"}[$__rate_interval])) by (le))",
               "legendFormat": "request p95"
             },
             {
@@ -511,32 +1111,70 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "histogram_quantile(0.95, sum(rate(http_server_response_body_size_bucket{service_name=\"$service\"}[$__rate_interval])) by (le))",
               "refId": "B",
+              "expr": "histogram_quantile(0.95, sum(rate(http_server_response_body_size_bucket{service_name=\"$service\"}[$__rate_interval])) by (le))",
               "legendFormat": "response p95"
             }
           ],
           "fieldConfig": {
             "defaults": {
-              "unit": "bytes"
+              "unit": "bytes",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "stacking": {
+                  "mode": "none"
+                },
+                "axisLabel": "",
+                "gradientMode": "opacity"
+              },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "color": {
+                "mode": "palette-classic"
+              }
             },
             "overrides": []
           },
-          "options": {}
+          "options": {
+            "legend": {
+              "calcs": [
+                "mean",
+                "max",
+                "last"
+              ],
+              "displayMode": "table",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
         },
         {
-          "id": 16,
+          "id": 15,
           "type": "timeseries",
           "title": "Body Throughput",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
+          "description": null,
           "gridPos": {
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 47
+            "y": 50
           },
           "targets": [
             {
@@ -544,8 +1182,8 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "sum(rate(http_server_request_body_size_sum{service_name=\"$service\"}[$__rate_interval]))",
               "refId": "A",
+              "expr": "sum(rate(http_server_request_body_size_sum{service_name=\"$service\"}[$__rate_interval]))",
               "legendFormat": "request"
             },
             {
@@ -553,32 +1191,70 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "sum(rate(http_server_response_body_size_sum{service_name=\"$service\"}[$__rate_interval]))",
               "refId": "B",
+              "expr": "sum(rate(http_server_response_body_size_sum{service_name=\"$service\"}[$__rate_interval]))",
               "legendFormat": "response"
             }
           ],
           "fieldConfig": {
             "defaults": {
-              "unit": "Bps"
+              "unit": "Bps",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "stacking": {
+                  "mode": "none"
+                },
+                "axisLabel": "",
+                "gradientMode": "opacity"
+              },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "color": {
+                "mode": "palette-classic"
+              }
             },
             "overrides": []
           },
-          "options": {}
+          "options": {
+            "legend": {
+              "calcs": [
+                "mean",
+                "max",
+                "last"
+              ],
+              "displayMode": "table",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
         },
         {
-          "id": 17,
+          "id": 16,
           "type": "timeseries",
           "title": "Upstream Timing p95",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
+          "description": null,
           "gridPos": {
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 47
+            "y": 50
           },
           "targets": [
             {
@@ -586,8 +1262,8 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "histogram_quantile(0.95, sum(rate(http_server_upstream_connect_duration_bucket{service_name=\"$service\"}[$__rate_interval])) by (le))",
               "refId": "A",
+              "expr": "histogram_quantile(0.95, sum(rate(http_server_upstream_connect_duration_bucket{service_name=\"$service\"}[$__rate_interval])) by (le))",
               "legendFormat": "connect"
             },
             {
@@ -595,8 +1271,8 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "histogram_quantile(0.95, sum(rate(http_server_upstream_header_duration_bucket{service_name=\"$service\"}[$__rate_interval])) by (le))",
               "refId": "B",
+              "expr": "histogram_quantile(0.95, sum(rate(http_server_upstream_header_duration_bucket{service_name=\"$service\"}[$__rate_interval])) by (le))",
               "legendFormat": "header"
             },
             {
@@ -604,32 +1280,70 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "histogram_quantile(0.95, sum(rate(http_server_upstream_response_duration_bucket{service_name=\"$service\"}[$__rate_interval])) by (le))",
               "refId": "C",
+              "expr": "histogram_quantile(0.95, sum(rate(http_server_upstream_response_duration_bucket{service_name=\"$service\"}[$__rate_interval])) by (le))",
               "legendFormat": "response"
             }
           ],
           "fieldConfig": {
             "defaults": {
-              "unit": "ms"
+              "unit": "ms",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "stacking": {
+                  "mode": "none"
+                },
+                "axisLabel": "",
+                "gradientMode": "opacity"
+              },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "color": {
+                "mode": "palette-classic"
+              }
             },
             "overrides": []
           },
-          "options": {}
+          "options": {
+            "legend": {
+              "calcs": [
+                "mean",
+                "max",
+                "last"
+              ],
+              "displayMode": "table",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
         },
         {
-          "id": 18,
+          "id": 17,
           "type": "timeseries",
           "title": "Upstream Throughput",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
+          "description": null,
           "gridPos": {
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 55
+            "y": 58
           },
           "targets": [
             {
@@ -637,8 +1351,8 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "sum(rate(http_server_upstream_bytes_received_sum{service_name=\"$service\"}[$__rate_interval]))",
               "refId": "A",
+              "expr": "sum(rate(http_server_upstream_bytes_received_sum{service_name=\"$service\"}[$__rate_interval]))",
               "legendFormat": "received"
             },
             {
@@ -646,25 +1360,62 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "sum(rate(http_server_upstream_bytes_sent_sum{service_name=\"$service\"}[$__rate_interval]))",
               "refId": "B",
+              "expr": "sum(rate(http_server_upstream_bytes_sent_sum{service_name=\"$service\"}[$__rate_interval]))",
               "legendFormat": "sent"
             }
           ],
           "fieldConfig": {
             "defaults": {
-              "unit": "Bps"
+              "unit": "Bps",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "stacking": {
+                  "mode": "none"
+                },
+                "axisLabel": "",
+                "gradientMode": "opacity"
+              },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "color": {
+                "mode": "palette-classic"
+              }
             },
             "overrides": []
           },
-          "options": {}
+          "options": {
+            "legend": {
+              "calcs": [
+                "mean",
+                "max",
+                "last"
+              ],
+              "displayMode": "table",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
         }
       ]
     },
     {
-      "id": 19,
+      "id": 28,
       "type": "row",
-      "title": "Enhanced by ngx-otel-rust \u2014 Logs (Loki: per-request detail enriching the metrics)",
+      "title": "Enhanced by ngx-otel-rust \u2014 Logs (Loki)",
       "collapsed": true,
       "gridPos": {
         "h": 1,
@@ -674,16 +1425,17 @@
       },
       "panels": [
         {
-          "id": 20,
+          "id": 18,
           "type": "timeseries",
           "title": "Log Rate",
           "datasource": {
-            "type": "loki",
-            "uid": "loki"
+            "type": "prometheus",
+            "uid": "prometheus"
           },
+          "description": null,
           "gridPos": {
-            "h": 8,
-            "w": 12,
+            "h": 6,
+            "w": 24,
             "x": 0,
             "y": 16
           },
@@ -693,109 +1445,70 @@
                 "type": "loki",
                 "uid": "loki"
               },
-              "expr": "sum(rate({service_name=\"$service\"}[$__interval]))",
               "refId": "A",
-              "legendFormat": "logs/s",
-              "queryType": "range"
+              "expr": "sum(rate({service_name=\"$service\"}[$__interval]))",
+              "legendFormat": "logs/s"
             }
           ],
           "fieldConfig": {
             "defaults": {
-              "unit": "logs"
+              "unit": "logs",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "stacking": {
+                  "mode": "none"
+                },
+                "axisLabel": "",
+                "gradientMode": "opacity"
+              },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "color": {
+                "mode": "palette-classic"
+              }
             },
             "overrides": []
           },
-          "options": {}
-        },
-        {
-          "id": 21,
-          "type": "logs",
-          "title": "Interesting Access Logs (4xx/5xx)",
-          "datasource": {
-            "type": "loki",
-            "uid": "loki"
-          },
-          "gridPos": {
-            "h": 9,
-            "w": 24,
-            "x": 0,
-            "y": 25
-          },
-          "targets": [
-            {
-              "datasource": {
-                "type": "loki",
-                "uid": "loki"
-              },
-              "expr": "{service_name=\"$service\"} | http_response_status_code=~\"4..|5..\" | line_format \"{{.http_response_status_code}} {{.http_request_method}} {{.url_path}}\"",
-              "refId": "A",
-              "legendFormat": "",
-              "queryType": "range"
-            }
-          ],
-          "fieldConfig": {
-            "defaults": {},
-            "overrides": []
-          },
           "options": {
-            "showTime": true,
-            "wrapLogMessage": false,
-            "dedupStrategy": "none",
-            "enableLogDetails": true
-          },
-          "description": "Log data enriching the metrics: per-request detail (status, method, url.path) you cannot get from stub_status."
-        },
-        {
-          "id": 22,
-          "type": "logs",
-          "title": "Sampled Access Logs (tail)",
-          "datasource": {
-            "type": "loki",
-            "uid": "loki"
-          },
-          "gridPos": {
-            "h": 9,
-            "w": 24,
-            "x": 0,
-            "y": 34
-          },
-          "targets": [
-            {
-              "datasource": {
-                "type": "loki",
-                "uid": "loki"
-              },
-              "expr": "{service_name=\"$service\", http_response_status_code=~\".+\"} | line_format \"{{.severity_text}} {{.http_request_method}} {{.http_response_status_code}} {{.url_path}} (client {{.client_address}})\"",
-              "refId": "A",
-              "legendFormat": "",
-              "queryType": "range"
+            "legend": {
+              "calcs": [
+                "mean",
+                "max",
+                "last"
+              ],
+              "displayMode": "table",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
             }
-          ],
-          "fieldConfig": {
-            "defaults": {},
-            "overrides": []
-          },
-          "options": {
-            "showTime": true,
-            "wrapLogMessage": false,
-            "dedupStrategy": "none",
-            "enableLogDetails": true
           }
         },
         {
-          "id": 28,
+          "id": 19,
           "type": "logs",
           "title": "Error Log (nginx.error \u2014 coalesced)",
-          "description": "OTel error-log signal: coalesced nginx error LogRecords (severity >= warn). Body is the verbatim nginx message; distinct from the access tail above.",
           "datasource": {
             "type": "loki",
             "uid": "loki"
           },
+          "description": "OTel error-log signal: coalesced nginx error LogRecords (severity \u2265 warn). Body = verbatim message; nginx.error.coalesced_count = flood size.",
           "gridPos": {
             "h": 9,
             "w": 24,
             "x": 0,
-            "y": 43
+            "y": 22
           },
           "targets": [
             {
@@ -812,7 +1525,84 @@
             "showTime": true,
             "wrapLogMessage": true,
             "dedupStrategy": "none",
-            "enableLogDetails": true
+            "enableLogDetails": true,
+            "sortOrder": "Descending"
+          },
+          "fieldConfig": {
+            "defaults": {},
+            "overrides": []
+          }
+        },
+        {
+          "id": 20,
+          "type": "logs",
+          "title": "Interesting Access Logs (4xx/5xx)",
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "description": null,
+          "gridPos": {
+            "h": 9,
+            "w": 24,
+            "x": 0,
+            "y": 31
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "loki",
+                "uid": "loki"
+              },
+              "refId": "A",
+              "queryType": "range",
+              "expr": "{service_name=\"$service\"} | http_response_status_code=~\"4..|5..\" | line_format \"{{.http_response_status_code}} {{.http_request_method}} {{.url_path}} (client {{.client_address}})\""
+            }
+          ],
+          "options": {
+            "showTime": true,
+            "wrapLogMessage": true,
+            "dedupStrategy": "none",
+            "enableLogDetails": true,
+            "sortOrder": "Descending"
+          },
+          "fieldConfig": {
+            "defaults": {},
+            "overrides": []
+          }
+        },
+        {
+          "id": 21,
+          "type": "logs",
+          "title": "Sampled Access Logs (tail)",
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "description": null,
+          "gridPos": {
+            "h": 9,
+            "w": 24,
+            "x": 0,
+            "y": 40
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "loki",
+                "uid": "loki"
+              },
+              "refId": "A",
+              "queryType": "range",
+              "expr": "{service_name=\"$service\", http_response_status_code=~\".+\"} | line_format \"{{.severity_text}} {{.http_request_method}} {{.http_response_status_code}} {{.url_path}}\""
+            }
+          ],
+          "options": {
+            "showTime": true,
+            "wrapLogMessage": true,
+            "dedupStrategy": "none",
+            "enableLogDetails": true,
+            "sortOrder": "Descending"
           },
           "fieldConfig": {
             "defaults": {},
@@ -822,7 +1612,7 @@
       ]
     },
     {
-      "id": 23,
+      "id": 29,
       "type": "row",
       "title": "Exporter Health (ngx-otel-rust self-metrics)",
       "collapsed": true,
@@ -834,13 +1624,14 @@
       },
       "panels": [
         {
-          "id": 24,
+          "id": 22,
           "type": "stat",
-          "title": "Configured Export Interval",
+          "title": "Export Interval",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
+          "description": null,
           "gridPos": {
             "h": 5,
             "w": 6,
@@ -853,27 +1644,52 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "ngx_otel_export_interval{service_name=\"$service\"} / 1000",
               "refId": "A",
-              "legendFormat": ""
+              "expr": "ngx_otel_export_interval{service_name=\"$service\"} / 1000"
             }
           ],
           "fieldConfig": {
             "defaults": {
-              "unit": "s"
+              "unit": "s",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "color": {
+                "mode": "thresholds"
+              },
+              "decimals": 0
             },
             "overrides": []
           },
-          "options": {}
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "graphMode": "none",
+            "colorMode": "value",
+            "textMode": "auto",
+            "justifyMode": "auto"
+          }
         },
         {
-          "id": 25,
+          "id": 23,
           "type": "stat",
-          "title": "Export Failures (increase)",
+          "title": "Send Failures (rate)",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
+          "description": null,
           "gridPos": {
             "h": 5,
             "w": 6,
@@ -886,28 +1702,58 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "sum(increase(ngx_otel_send_failures{service_name=\"$service\"}[$__rate_interval]))",
               "refId": "A",
-              "legendFormat": ""
+              "expr": "sum(rate(ngx_otel_send_failures{service_name=\"$service\"}[$__rate_interval])) + sum(rate(ngx_otel_logs_send_failures{service_name=\"$service\"}[$__rate_interval]))"
             }
           ],
           "fieldConfig": {
-            "defaults": {},
+            "defaults": {
+              "unit": "short",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 1
+                  }
+                ]
+              },
+              "color": {
+                "mode": "thresholds"
+              }
+            },
             "overrides": []
           },
-          "options": {}
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "graphMode": "area",
+            "colorMode": "background",
+            "textMode": "auto",
+            "justifyMode": "auto"
+          }
         },
         {
-          "id": 26,
-          "type": "timeseries",
-          "title": "Send Failures",
+          "id": 24,
+          "type": "stat",
+          "title": "Dropped (rate)",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
+          "description": null,
           "gridPos": {
-            "h": 8,
-            "w": 12,
+            "h": 5,
+            "w": 6,
             "x": 12,
             "y": 17
           },
@@ -917,39 +1763,60 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "sum(rate(ngx_otel_send_failures{service_name=\"$service\"}[$__rate_interval]))",
               "refId": "A",
-              "legendFormat": "metrics"
-            },
-            {
-              "datasource": {
-                "type": "prometheus",
-                "uid": "prometheus"
-              },
-              "expr": "sum(rate(ngx_otel_logs_send_failures{service_name=\"$service\"}[$__rate_interval]))",
-              "refId": "B",
-              "legendFormat": "logs"
+              "expr": "sum(rate(ngx_otel_dropped_records{service_name=\"$service\"}[$__rate_interval])) + sum(rate(ngx_otel_logs_access_dropped_records{service_name=\"$service\"}[$__rate_interval])) + sum(rate(ngx_otel_logs_error_dropped_records{service_name=\"$service\"}[$__rate_interval]))"
             }
           ],
           "fieldConfig": {
-            "defaults": {},
+            "defaults": {
+              "unit": "short",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 1
+                  }
+                ]
+              },
+              "color": {
+                "mode": "thresholds"
+              }
+            },
             "overrides": []
           },
-          "options": {}
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "graphMode": "area",
+            "colorMode": "background",
+            "textMode": "auto",
+            "justifyMode": "auto"
+          }
         },
         {
-          "id": 27,
+          "id": 25,
           "type": "timeseries",
-          "title": "Dropped Records",
+          "title": "Drops & Failures over time",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
+          "description": null,
           "gridPos": {
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 25
+            "y": 22
           },
           "targets": [
             {
@@ -957,17 +1824,17 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "sum(rate(ngx_otel_dropped_records{service_name=\"$service\"}[$__rate_interval]))",
               "refId": "A",
-              "legendFormat": "metrics points"
+              "expr": "sum(rate(ngx_otel_dropped_records{service_name=\"$service\"}[$__rate_interval]))",
+              "legendFormat": "metric points"
             },
             {
               "datasource": {
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "sum(rate(ngx_otel_logs_access_dropped_records{service_name=\"$service\"}[$__rate_interval]))",
               "refId": "B",
+              "expr": "sum(rate(ngx_otel_logs_access_dropped_records{service_name=\"$service\"}[$__rate_interval]))",
               "legendFormat": "access logs"
             },
             {
@@ -975,21 +1842,66 @@
                 "type": "prometheus",
                 "uid": "prometheus"
               },
-              "expr": "sum(rate(ngx_otel_logs_error_dropped_records{service_name=\"$service\"}[$__rate_interval]))",
               "refId": "C",
+              "expr": "sum(rate(ngx_otel_logs_error_dropped_records{service_name=\"$service\"}[$__rate_interval]))",
               "legendFormat": "error logs"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "refId": "D",
+              "expr": "sum(rate(ngx_otel_send_failures{service_name=\"$service\"}[$__rate_interval]))",
+              "legendFormat": "send failures"
             }
           ],
           "fieldConfig": {
-            "defaults": {},
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "stacking": {
+                  "mode": "none"
+                },
+                "axisLabel": "",
+                "gradientMode": "opacity"
+              },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "color": {
+                "mode": "palette-classic"
+              }
+            },
             "overrides": []
           },
-          "options": {}
+          "options": {
+            "legend": {
+              "calcs": [
+                "mean",
+                "max",
+                "last"
+              ],
+              "displayMode": "table",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
         }
       ]
     }
-  ],
-  "annotations": {
-    "list": []
-  }
+  ]
 }
