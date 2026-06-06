@@ -189,12 +189,20 @@ struct OwnedNgxPool(Pool);
 
 impl OwnedNgxPool {
     fn new(size: usize, log: core::ptr::NonNull<ngx_log_t>) -> Result<Self, TransportError> {
+        // SAFETY: plain FFI into nginx's pool allocator. `log` is a valid
+        // `ngx_log_t` (the caller holds a `NonNull`, kept alive for the
+        // exporter's lifetime); `size` is a byte count. The returned pointer is
+        // null-checked below before being wrapped.
         let pool = unsafe { ngx_create_pool(size, log.as_ptr()) };
         if pool.is_null() {
             return Err(TransportError::Connection {
                 cause: std::string::String::from("ngx_create_pool failed"),
             });
         }
+        // SAFETY: `pool` is non-null here (checked above) and was just returned
+        // by `ngx_create_pool`, so it satisfies `from_ngx_pool`'s contract of a
+        // valid, live `ngx_pool_t`. `OwnedNgxPool` takes sole ownership and
+        // frees it via `ngx_destroy_pool` in `Drop`.
         Ok(Self(unsafe { Pool::from_ngx_pool(pool) }))
     }
 }
@@ -214,6 +222,9 @@ impl DerefMut for OwnedNgxPool {
 
 impl Drop for OwnedNgxPool {
     fn drop(&mut self) {
+        // SAFETY: `self.0` was constructed in `new` from a live pool and this
+        // wrapper has sole ownership of it, so the pointer is still valid and
+        // unfreed. `Drop` runs exactly once, so the pool is destroyed once.
         unsafe { ngx_destroy_pool(self.0.as_ptr()) };
     }
 }
@@ -251,6 +262,10 @@ impl NgxConnIo {
     fn new(log: core::ptr::NonNull<ngx_log_t>) -> Result<Self, TransportError> {
         let pool = OwnedNgxPool::new(NGX_DEFAULT_POOL_SIZE as usize, log)?;
 
+        // SAFETY: `ngx_peer_connection_t` is a `#[repr(C)]` plain-old-data
+        // struct of integers, pointers and bitfields; an all-zero bit pattern is
+        // a valid initial value (null pointers, cleared flags) — the same state
+        // nginx itself expects before `ngx_event_connect_peer`.
         let mut pc: ngx_peer_connection_t = unsafe { core::mem::zeroed() };
         pc.get = Some(ngx_event_get_peer);
         pc.log = log.as_ptr();
@@ -266,6 +281,11 @@ impl NgxConnIo {
     fn connect_peer(self: Pin<&mut Self>) -> ngx_int_t {
         // NgxConnIo: Unpin, so get_mut() is safe.
         let this = self.get_mut();
+        // SAFETY: `&mut this.pc` is a valid, uniquely-borrowed
+        // `ngx_peer_connection_t` initialised in `new` (with `get` and `log`
+        // set). `ngx_event_connect_peer` is the nginx FFI that allocates the
+        // connection and stores it in `pc.connection`; called on the worker's
+        // event-loop thread as the contract requires.
         let rc = unsafe { ngx_event_connect_peer(&mut this.pc) };
 
         // NGX_ERROR = -1, NGX_BUSY = -3, NGX_DECLINED = -4
@@ -275,6 +295,12 @@ impl NgxConnIo {
 
         // rc is NGX_OK (0) or NGX_AGAIN (-2): connection is allocated.
         let c: *mut ngx_connection_t = this.pc.connection;
+        // SAFETY: `rc` was NGX_OK/NGX_AGAIN, so `ngx_event_connect_peer`
+        // allocated and populated `pc.connection`; `c` is therefore a valid,
+        // live `ngx_connection_t` (plus its `read`/`write`/`log` sub-objects)
+        // owned by nginx for the connection's lifetime. `this` is pinned, so the
+        // `&mut NgxConnIo` stored in `c.data` stays valid until the connection
+        // closes; the pool we assign outlives the connection (owned by `this`).
         unsafe {
             // Store self so C handlers can wake the right task.
             (*c).data = (this as *mut NgxConnIo).cast();
@@ -297,6 +323,12 @@ impl NgxConnIo {
         // If already connected, check for timeout or other errors.
         if !self.pc.connection.is_null() {
             let c = self.pc.connection;
+            // SAFETY: `c` is non-null here (checked above), so it is a live
+            // `ngx_connection_t` from a prior `connect_peer`; its `read`/`write`
+            // fields point to nginx-owned `ngx_event_t`s valid for the
+            // connection's lifetime. We read the `timedout` bitfield and (on
+            // timeout) hand `c` back to `ngx_close_connection`, or re-install our
+            // handlers on the still-open connection.
             let rv = unsafe {
                 if (*(*c).read).timedout() != 0 || (*(*c).write).timedout() != 0 {
                     nginx_sys::ngx_close_connection(c);
@@ -319,9 +351,15 @@ impl NgxConnIo {
                 // waker.  C handler fires wake() on connect completion.
                 let this = self.get_mut();
                 if !this.pc.connection.is_null() {
+                    // SAFETY: `pc.connection` is non-null here (checked), so it
+                    // is a live nginx connection whose `read` event pointer is
+                    // valid; `ngx_add_timer` is the nginx FFI for arming that
+                    // event's timer with a millisecond delay.
                     unsafe {
                         nginx_sys::ngx_add_timer((*this.pc.connection).read, DEFAULT_READ_TIMEOUT_MS);
                     }
+                    // SAFETY: same non-null, live connection; reading its `log`
+                    // pointer field for the debug log below.
                     let log = unsafe { (*this.pc.connection).log };
                     ngx::ngx_log_debug!(
                         log,
@@ -338,6 +376,10 @@ impl NgxConnIo {
 
     fn close(&mut self) {
         if !self.pc.connection.is_null() {
+            // SAFETY: `pc.connection` is non-null (checked), so it is a live
+            // nginx connection from `connect_peer`; `ngx_close_connection` is
+            // the matching nginx FFI to release it. We immediately null the
+            // field so a later `close`/`Drop` cannot double-free.
             unsafe { nginx_sys::ngx_close_connection(self.pc.connection) };
             self.pc.connection = core::ptr::null_mut();
         }
@@ -355,14 +397,25 @@ impl hyper::rt::Read for NgxConnIo {
         }
 
         let c = self.pc.connection;
+        // SAFETY: `c` is non-null here (checked above), a live nginx connection;
+        // its `read` field points to the nginx-owned `ngx_event_t` valid for the
+        // connection's lifetime.
         let rev: *mut ngx_event_t = unsafe { (*c).read };
 
+        // SAFETY: `rev` is the connection's live read event (just read from `c`);
+        // `timedout` is a bitfield accessor on it.
         if unsafe { (*rev).timedout() } != 0 {
             return Poll::Ready(Err(io::ErrorKind::TimedOut.into()));
         }
 
         // Call the NGINX recv function pointer (fills MaybeUninit bytes).
+        // SAFETY: hyper guarantees `buf`'s uninitialised region is a valid,
+        // writable `[MaybeUninit<u8>]` for this call; `as_mut` exposes it.
         let uninit: &mut [MaybeUninit<u8>] = unsafe { buf.as_mut() };
+        // SAFETY: a connected nginx connection always has `recv` set (the event
+        // layer installs it on connect), so `unwrap_unchecked` is sound; we pass
+        // `c` plus the `uninit` slice's pointer/len, an in-bounds writable
+        // buffer, matching the `ngx_recv_pt` contract.
         let n: isize = unsafe {
             ((*c).recv.unwrap_unchecked())(c, uninit.as_mut_ptr().cast::<u8>(), uninit.len())
         };
@@ -372,11 +425,16 @@ impl hyper::rt::Read for NgxConnIo {
         }
 
         // Re-arm the read event so epoll/kqueue monitors the fd again.
+        // SAFETY: `rev` is the connection's live read event; `ngx_handle_read_event`
+        // is the nginx FFI that re-registers it with the event mechanism (flags 0).
         if unsafe { ngx_handle_read_event(rev, 0) } != NGX_OK as ngx_int_t {
             return Poll::Ready(Err(io::ErrorKind::UnexpectedEof.into()));
         }
 
         // Timer management (mirror of nginx-acme's PeerConnection).
+        // SAFETY: `rev` is the connection's live read event; we read its
+        // `active`/`timer_set` bitfields and call the matching nginx timer FFI
+        // (`ngx_add_timer`/`ngx_del_timer`) on it.
         unsafe {
             if (*rev).active() != 0 {
                 nginx_sys::ngx_add_timer(rev, DEFAULT_READ_TIMEOUT_MS);
@@ -400,6 +458,8 @@ impl hyper::rt::Read for NgxConnIo {
             // internal mutex, which ngx-rust's old `schedule()` would resolve
             // by synchronously re-polling — see the corresponding ngx-rust
             // patch on the `ngx-otel-rust-deadlock-fix` branch).
+            // SAFETY: `c` is the live nginx connection from this poll; reading
+            // its `log` pointer field for the debug log below.
             let log = unsafe { (*c).log };
             let this = self.get_mut();
             let prev_was_some = this.rev.is_some();
@@ -413,6 +473,10 @@ impl hyper::rt::Read for NgxConnIo {
         }
 
         if n > 0 {
+            // SAFETY: `recv` returned `n > 0` bytes, and it wrote them into the
+            // front of the `uninit` region exposed from `buf`; those `n` bytes
+            // are now initialised, so advancing the cursor by `n` is sound and
+            // `n <= uninit.len()` (recv never returns more than requested).
             unsafe { buf.advance(n as usize) };
         }
         Poll::Ready(Ok(()))
@@ -430,11 +494,18 @@ impl hyper::rt::Write for NgxConnIo {
         }
 
         let c = self.pc.connection;
+        // SAFETY: `c` is non-null (checked above), a live nginx connection. A
+        // connected connection always has `send` installed by the event layer,
+        // so `unwrap_unchecked` is sound; `ngx_send_pt` only reads `buf.len()`
+        // bytes from the pointer (the `cast_mut` is for the C signature), and
+        // `buf` is a valid initialised slice for the duration of the call.
         let n: isize =
             unsafe { ((*c).send.unwrap_unchecked())(c, buf.as_ptr().cast_mut(), buf.len()) };
 
         if n == NGX_AGAIN as isize {
             // Store waker; C handler fires wake() when fd is write-ready.
+            // SAFETY: `c` is the live nginx connection from this poll; reading
+            // its `log` pointer field for the debug log below.
             let log = unsafe { (*c).log };
             let this = self.get_mut();
             let prev_was_some = this.wev.is_some();
@@ -478,10 +549,19 @@ impl Drop for NgxConnIo {
 /// NGINX calls this when the connection fd is read-ready.
 /// We wake the stored read-waker so the async task is rescheduled.
 unsafe extern "C" fn ngx_otel_conn_read_handler(ev: *mut ngx_event_t) {
+    // SAFETY: nginx invokes this handler with a valid `ngx_event_t` whose `data`
+    // is the owning `ngx_connection_t` (nginx's own convention); the reference
+    // does not outlive the call.
     let c: *mut ngx_connection_t = unsafe { (*ev).data.cast() };
+    // SAFETY: `c` is the live nginx connection; `connect_peer` stored our
+    // pinned `&mut NgxConnIo` in `c.data`, which stays valid until the
+    // connection (and thus this `NgxConnIo`) is dropped.
     let this: *mut NgxConnIo = unsafe { (*c).data.cast() };
+    // SAFETY: `this` is that valid, pinned `NgxConnIo`; taking the stored read
+    // waker is a plain field access on it, single-threaded on the worker.
     let waker_opt = unsafe { (*this).rev.take() };
     let rev_was_some = waker_opt.is_some();
+    // SAFETY: `c` is the live connection; reading its `log` pointer field.
     let log = unsafe { (*c).log };
     ngx::ngx_log_debug!(log, "ngx_otel_conn_read_handler: rev_was_some={}", rev_was_some);
     if let Some(waker) = waker_opt {
@@ -492,16 +572,25 @@ unsafe extern "C" fn ngx_otel_conn_read_handler(ev: *mut ngx_event_t) {
 /// NGINX calls this when the connection fd is write-ready.
 /// We wake the stored write-waker so the async task is rescheduled.
 unsafe extern "C" fn ngx_otel_conn_write_handler(ev: *mut ngx_event_t) {
+    // SAFETY: nginx invokes this handler with a valid `ngx_event_t` whose `data`
+    // is the owning `ngx_connection_t`; the reference does not outlive the call.
     let c: *mut ngx_connection_t = unsafe { (*ev).data.cast() };
+    // SAFETY: `c` is the live nginx connection; `connect_peer` stored our pinned
+    // `&mut NgxConnIo` in `c.data`, valid until the connection is dropped.
     let this: *mut NgxConnIo = unsafe { (*c).data.cast() };
+    // SAFETY: `this` is that valid, pinned `NgxConnIo`; taking the stored write
+    // waker is a plain field access, single-threaded on the worker.
     let waker_opt = unsafe { (*this).wev.take() };
     let wev_was_some = waker_opt.is_some();
+    // SAFETY: `c` is the live connection; reading its `log` pointer field.
     let log = unsafe { (*c).log };
     ngx::ngx_log_debug!(log, "ngx_otel_conn_write_handler: wev_was_some={}", wev_was_some);
     if let Some(waker) = waker_opt {
         waker.wake();
     } else {
         // No pending write-waker: just re-arm (mirrors nginx-acme).
+        // SAFETY: `ev` is the valid write `ngx_event_t` nginx handed us;
+        // `ngx_handle_write_event` is the nginx FFI to re-register it (flags 0).
         let _ = unsafe { ngx_handle_write_event(ev, 0) };
     }
 }
@@ -538,15 +627,22 @@ impl hyper::rt::Read for SpinTcpIo {
         cx: &mut Context<'_>,
         mut buf: hyper::rt::ReadBufCursor<'_>,
     ) -> Poll<Result<(), io::Error>> {
+        // SAFETY: hyper guarantees `buf`'s uninitialised region is a valid,
+        // writable `[MaybeUninit<u8>]` for this call.
         let uninit = unsafe { buf.as_mut() };
         let len = uninit.len();
         if len == 0 {
             return Poll::Ready(Ok(()));
         }
+        // SAFETY: `uninit` is a valid writable region of `len` `MaybeUninit<u8>`;
+        // reinterpreting it as `&mut [u8]` of the same len/ptr is sound for
+        // passing to `Read::read`, which only writes (never reads) the bytes.
         let slice =
             unsafe { core::slice::from_raw_parts_mut(uninit.as_mut_ptr().cast::<u8>(), len) };
         match self.0.read(slice) {
             Ok(n) => {
+                // SAFETY: `read` initialised the first `n <= len` bytes of the
+                // region, so advancing the cursor by `n` is sound.
                 unsafe { buf.advance(n) };
                 Poll::Ready(Ok(()))
             }
@@ -597,15 +693,22 @@ impl hyper::rt::Read for SpinUnixIo {
         cx: &mut Context<'_>,
         mut buf: hyper::rt::ReadBufCursor<'_>,
     ) -> Poll<Result<(), io::Error>> {
+        // SAFETY: hyper guarantees `buf`'s uninitialised region is a valid,
+        // writable `[MaybeUninit<u8>]` for this call.
         let uninit = unsafe { buf.as_mut() };
         let len = uninit.len();
         if len == 0 {
             return Poll::Ready(Ok(()));
         }
+        // SAFETY: `uninit` is a valid writable region of `len` `MaybeUninit<u8>`;
+        // reinterpreting it as `&mut [u8]` of the same len/ptr is sound for
+        // passing to `Read::read`, which only writes (never reads) the bytes.
         let slice =
             unsafe { core::slice::from_raw_parts_mut(uninit.as_mut_ptr().cast::<u8>(), len) };
         match self.0.read(slice) {
             Ok(n) => {
+                // SAFETY: `read` initialised the first `n <= len` bytes of the
+                // region, so advancing the cursor by `n` is sound.
                 unsafe { buf.advance(n) };
                 Poll::Ready(Ok(()))
             }
@@ -943,6 +1046,11 @@ impl NgxConnector {
             // Set the destination port on the resolved sockaddr.
             // ngx_inet_set_port takes port in HOST byte order and calls htons()
             // internally (nginx/src/core/ngx_inet.c:1436).
+            // SAFETY: `addr` is one of the `ngx_addr_t`s the resolver wrote into
+            // `resolve_pool`, so `addr.sockaddr` is a valid, live sockaddr (v4 or
+            // v6 family, as the resolver set) for the pool's lifetime;
+            // `ngx_inet_set_port` is the nginx FFI that sets the port field for
+            // whichever family that sockaddr carries.
             unsafe {
                 nginx_sys::ngx_inet_set_port(addr.sockaddr, port as nginx_sys::in_port_t);
             }
@@ -1005,14 +1113,22 @@ fn build_pc_name(
     let bytes = s.as_bytes();
     let len = bytes.len();
 
+    // SAFETY: `pool` is a valid, live `ngx_pool_t` (borrowed from the caller's
+    // `NgxConnIo`); `ngx_palloc` returns `len` bytes from it. Null-checked below.
     let data_ptr = unsafe { ngx_palloc(pool.as_ptr(), len) } as *mut u8;
     if data_ptr.is_null() {
         return Err(TransportError::Connection {
             cause: std::string::String::from("pool alloc for pc.name data failed"),
         });
     }
+    // SAFETY: `data_ptr` points to a fresh, non-null `len`-byte pool allocation;
+    // `bytes` is a `len`-byte source slice. The two regions don't overlap (one is
+    // the format-string buffer, the other a fresh pool block), so the copy of
+    // exactly `len` bytes stays in-bounds of both.
     unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), data_ptr, len) };
 
+    // SAFETY: same valid pool; `ngx_palloc` returns space for one `ngx_str_t`.
+    // Null-checked below.
     let name_ptr =
         unsafe { ngx_palloc(pool.as_ptr(), core::mem::size_of::<nginx_sys::ngx_str_t>()) }
             as *mut nginx_sys::ngx_str_t;
@@ -1021,6 +1137,10 @@ fn build_pc_name(
             cause: std::string::String::from("pool alloc for pc.name struct failed"),
         });
     }
+    // SAFETY: `name_ptr` is a fresh, non-null, suitably-sized/aligned pool
+    // allocation for an `ngx_str_t`; writing its `len`/`data` fields initialises
+    // it. `data_ptr` (its new `data`) lives in the same pool, so the two share a
+    // lifetime.
     unsafe {
         (*name_ptr).len = len;
         (*name_ptr).data = data_ptr;
@@ -1044,6 +1164,10 @@ fn build_ipv4_sockaddr(
     port: u16,
 ) -> Result<*mut nginx_sys::sockaddr, TransportError> {
     let size = core::mem::size_of::<libc::sockaddr_in>();
+    // SAFETY: `pool` is a valid, live `ngx_pool_t`; `ngx_palloc` returns
+    // `size_of::<sockaddr_in>()` bytes from it, enough for one `sockaddr_in`.
+    // Pool allocations are pointer-aligned, satisfying the struct's alignment.
+    // Null-checked below.
     let ptr = unsafe { ngx_palloc(pool.as_ptr(), size) } as *mut libc::sockaddr_in;
 
     if ptr.is_null() {
@@ -1052,6 +1176,10 @@ fn build_ipv4_sockaddr(
         });
     }
 
+    // SAFETY: `ptr` is a fresh, non-null, correctly-sized/aligned allocation for
+    // one `sockaddr_in`. `write_bytes(_, 0, 1)` zero-initialises it (a valid
+    // all-zero POD state), then `&mut *ptr` is the only reference to it while we
+    // set the family/port/addr fields.
     unsafe {
         core::ptr::write_bytes(ptr, 0u8, 1);
         let sa = &mut *ptr;
@@ -1080,6 +1208,10 @@ fn build_ipv6_sockaddr(
     port: u16,
 ) -> Result<*mut nginx_sys::sockaddr, TransportError> {
     let size = core::mem::size_of::<libc::sockaddr_in6>();
+    // SAFETY: `pool` is a valid, live `ngx_pool_t`; `ngx_palloc` returns
+    // `size_of::<sockaddr_in6>()` bytes from it, enough for one `sockaddr_in6`.
+    // Pool allocations are pointer-aligned, satisfying the struct's alignment.
+    // Null-checked below.
     let ptr = unsafe { ngx_palloc(pool.as_ptr(), size) } as *mut libc::sockaddr_in6;
 
     if ptr.is_null() {
@@ -1088,6 +1220,10 @@ fn build_ipv6_sockaddr(
         });
     }
 
+    // SAFETY: `ptr` is a fresh, non-null, correctly-sized/aligned allocation for
+    // one `sockaddr_in6`. `write_bytes(_, 0, 1)` zero-initialises it (valid
+    // all-zero POD, also zeroing `sin6_flowinfo`/`sin6_scope_id`), then `&mut
+    // *ptr` is the only reference while we set family/port/addr.
     unsafe {
         core::ptr::write_bytes(ptr, 0u8, 1);
         let sa = &mut *ptr;
@@ -1336,6 +1472,8 @@ mod tests {
         let port: u16 = 4317;
 
         // Reproduce the layout build_ipv4_sockaddr would produce.
+        // SAFETY: `sockaddr_in` is a POD struct of integers; an all-zero bit
+        // pattern is a valid, fully-initialised value to start from.
         let mut sa: libc::sockaddr_in = unsafe { core::mem::zeroed() };
         sa.sin_family = libc::AF_INET as libc::sa_family_t;
         sa.sin_port = port.to_be();
@@ -1360,6 +1498,8 @@ mod tests {
         let v6: std::net::Ipv6Addr = "::1".parse().unwrap();
         let port: u16 = 4317;
 
+        // SAFETY: `sockaddr_in6` is a POD struct of integers; an all-zero bit
+        // pattern is a valid, fully-initialised value to start from.
         let mut sa: libc::sockaddr_in6 = unsafe { core::mem::zeroed() };
         sa.sin6_family = libc::AF_INET6 as libc::sa_family_t;
         sa.sin6_port = port.to_be();

@@ -32,10 +32,15 @@ use crate::HttpOtelModule;
 /// Caller must ensure `cf` is a valid, non-null pointer and that `cf.args`
 /// points to an initialized `ngx_array_t` of `ngx_str_t` elements.
 unsafe fn cf_args(cf: *const ngx_conf_t) -> &'static [ngx_str_t] {
+    // SAFETY: the fn contract requires `cf` to be a valid non-null pointer, so
+    // reading its `args` field is well-defined.
     let arr: *const ngx_array_t = unsafe { (*cf).args };
     if arr.is_null() {
         return &[];
     }
+    // SAFETY: `arr` is non-null (checked above) and, per the fn contract, points
+    // to an initialized `ngx_array_t` of `ngx_str_t`; `as_slice` reinterprets it
+    // as a `[ngx_str_t]` of `nelts` length, which nginx keeps valid for the parse.
     unsafe { (*arr).as_slice::<ngx_str_t>() }
 }
 
@@ -413,6 +418,9 @@ impl MainConfig {
     /// Phase 1.2 will use this hook for TLS connection reuse and related cross-cycle
     /// state transfer. In Phase 1.1 the hook is read-only: we log and return.
     pub fn old_config<'a>(cf: &mut ngx_conf_t) -> Option<&'a MainConfig> {
+        // SAFETY: `cf` is a live `&mut ngx_conf_t`; nginx keeps `cf.cycle` and the
+        // chained `old_cycle` either null (handled by `as_ref()?`) or pointing at
+        // valid cycle structs in config-pool memory during parsing.
         let old_cycle = unsafe { cf.cycle.as_ref()?.old_cycle.as_ref()? };
         if old_cycle.conf_ctx.is_null() {
             return None;
@@ -476,8 +484,12 @@ impl MainConfig {
         // Check for SIGHUP reload: look for the previous cycle's config.
         // Phase 1.2 will use this hook for TLS connection reuse and related
         // cross-cycle state transfer. In Phase 1.1 we only log.
+        // SAFETY: nginx invokes `postconfiguration` with a valid non-null `cf`,
+        // so `&mut *cf` is a sound exclusive borrow for the call to `old_config`.
         if let Some(old) = unsafe { Self::old_config(&mut *cf) } {
             if self.is_configured() {
+                // SAFETY: `cf` is the valid non-null parse context; `&mut *cf`
+                // gives `ngx_conf_log_error!` the exclusive borrow it needs.
                 unsafe {
                     ngx_conf_log_error!(
                         NGX_LOG_DEBUG,
@@ -488,6 +500,7 @@ impl MainConfig {
                     );
                 }
             } else {
+                // SAFETY: as above — `cf` is the valid non-null parse context.
                 unsafe {
                     ngx_conf_log_error!(
                         NGX_LOG_DEBUG,
@@ -509,6 +522,8 @@ impl MainConfig {
             ep.starts_with(b"unix:") || ep.starts_with(b"http://") || ep.starts_with(b"https://");
 
         if !valid_scheme {
+            // SAFETY: `cf` is the valid non-null parse context nginx passed to
+            // `postconfiguration`; `&mut *cf` is a sound exclusive borrow.
             unsafe {
                 ngx_conf_log_error!(
                     NGX_LOG_EMERG,
@@ -534,6 +549,8 @@ impl MainConfig {
                     nginx_sys::NGX_CONF_UNSET as nginx_sys::ngx_msec_t;
                 const DEFAULT_RESOLVER_TIMEOUT_MS: nginx_sys::ngx_msec_t = 5_000;
 
+                // SAFETY: `cf` is the valid non-null parse context; `&*cf` is a
+                // sound shared borrow used only to read the core location conf.
                 let cf_ref = unsafe { &*cf };
                 // Collect resolver pointer and timeout from clcf, dropping the
                 // borrow on clcf before we potentially use `&mut *cf` for logging.
@@ -542,6 +559,9 @@ impl MainConfig {
                     // A resolver with zero connections means it was not
                     // properly configured (matches acme's connections.nelts
                     // guard, `issuer.rs:212-216`).
+                    // SAFETY: `nn` is non-null (just constructed via `NonNull::new`)
+                    // and points to the `ngx_resolver_t` nginx allocated in the conf
+                    // pool for `clcf->resolver`; reading `connections.nelts` is sound.
                     if unsafe { nn.as_ref() }.connections.nelts == 0 {
                         return None;
                     }
@@ -559,6 +579,9 @@ impl MainConfig {
                         self.resolver_timeout = timeout;
                     }
                     None => {
+                        // SAFETY: `cf` is the valid non-null parse context; the
+                        // earlier `&*cf` borrow has been dropped, so `&mut *cf`
+                        // here is a sound exclusive borrow for logging.
                         unsafe {
                             ngx_conf_log_error!(
                                 NGX_LOG_EMERG,
@@ -596,7 +619,12 @@ impl MainConfig {
         // workers fork, so all workers see identical tables.
         // Safety: cf is valid; nginx guarantees postconfiguration runs after
         // all location and upstream configs are parsed and merged.
+        // SAFETY: `cf` is the valid non-null parse context, and nginx runs
+        // `postconfiguration` only after every location/upstream conf is parsed
+        // and merged, satisfying `build_route_table`'s contract.
         unsafe { self.build_route_table(cf) };
+        // SAFETY: same as above — valid `cf` at postconfiguration time satisfies
+        // `build_upstream_table`'s contract.
         unsafe { self.build_upstream_table(cf) };
 
         Ok(())
@@ -611,6 +639,10 @@ impl MainConfig {
         // Determine the number of worker processes from ngx_core_conf_t.
         // ngx_get_conf(cycle->conf_ctx, ngx_core_module) = conf_ctx[ngx_core_module.index]
         // is a void* pointing to ngx_core_conf_t (typed as void*** in the binding).
+        // SAFETY: `cf` is the valid non-null parse context. `cf.cycle` is nginx's
+        // live cycle; `conf_ctx[core_idx]` is the populated module-conf slot for
+        // the core module (its index is in-bounds for `conf_ctx`), and the pointer
+        // it holds is the `ngx_core_conf_t*`, null-checked before deref.
         let n_workers: usize = unsafe {
             let cycle = (*cf).cycle.as_ref().ok_or(Status::NGX_ERROR)?;
             let core_idx = nginx_sys::ngx_core_module.index;
@@ -638,8 +670,11 @@ impl MainConfig {
             if self.zone_size > 0 { self.zone_size.max(required_size) } else { required_size };
 
         // Register the zone.
+        // SAFETY: `cf` and `module` are the valid non-null pointers nginx passed
+        // to `postconfiguration`, satisfying `register_zone`'s contract.
         let Some(zone) = (unsafe { shm::register_zone(cf, &mut zone_name, zone_size, module) })
         else {
+            // SAFETY: `cf` is the valid non-null parse context for logging.
             unsafe {
                 ngx_conf_log_error!(
                     NGX_LOG_EMERG,
@@ -651,6 +686,9 @@ impl MainConfig {
         };
 
         // Configure the zone init callback.
+        // SAFETY: `register_zone` returned a non-null `ngx_shm_zone_t*` that nginx
+        // owns in the conf pool; writing its `init`/`data` fields is sound, and
+        // `self` outlives the zone (it lives in the same conf pool).
         unsafe {
             (*zone).init = Some(shm::otel_shm_zone_init);
             (*zone).data = ptr::from_mut(self).cast();
@@ -674,8 +712,11 @@ impl MainConfig {
         let mut zone_name = ngx::ngx_string!("ngx_http_otel_control_zone");
         let zone_size = crate::exporter::control_shm::ControlShm::ZONE_SIZE;
 
+        // SAFETY: `cf` and `module` are the valid non-null pointers nginx passed
+        // to `postconfiguration`, satisfying `register_zone`'s contract.
         let Some(zone) = (unsafe { shm::register_zone(cf, &mut zone_name, zone_size, module) })
         else {
+            // SAFETY: `cf` is the valid non-null parse context for logging.
             unsafe {
                 ngx_conf_log_error!(
                     NGX_LOG_EMERG,
@@ -686,6 +727,9 @@ impl MainConfig {
             return Err(Status::NGX_ERROR);
         };
 
+        // SAFETY: `register_zone` returned a non-null `ngx_shm_zone_t*` owned by
+        // nginx in the conf pool; writing its `init`/`data` fields is sound, and
+        // `self` outlives the zone (same conf pool).
         unsafe {
             (*zone).init = Some(crate::exporter::control_shm::control_shm_zone_init);
             (*zone).data = ptr::from_mut(self).cast();
@@ -706,6 +750,9 @@ impl MainConfig {
         cf: *mut ngx_conf_t,
         module: *mut ngx_module_t,
     ) -> Result<(), Status> {
+        // SAFETY: identical to `register_shm_zone` — `cf` is valid, `cf.cycle` is
+        // the live cycle, the core module's `conf_ctx` slot is in-bounds, and the
+        // `ngx_core_conf_t*` it holds is null-checked before deref.
         let n_workers: usize = unsafe {
             let cycle = (*cf).cycle.as_ref().ok_or(Status::NGX_ERROR)?;
             let core_idx = nginx_sys::ngx_core_module.index;
@@ -722,8 +769,11 @@ impl MainConfig {
         let zone_size = shm::logs_zone_size_for(n_workers, cap);
         let mut zone_name = ngx::ngx_string!("ngx_http_otel_logs_zone");
 
+        // SAFETY: `cf` and `module` are the valid non-null pointers nginx passed
+        // to `postconfiguration`, satisfying `register_zone`'s contract.
         let Some(zone) = (unsafe { shm::register_zone(cf, &mut zone_name, zone_size, module) })
         else {
+            // SAFETY: `cf` is the valid non-null parse context for logging.
             unsafe {
                 ngx_conf_log_error!(
                     NGX_LOG_EMERG,
@@ -734,6 +784,9 @@ impl MainConfig {
             return Err(Status::NGX_ERROR);
         };
 
+        // SAFETY: `register_zone` returned a non-null `ngx_shm_zone_t*` owned by
+        // nginx in the conf pool; writing its `init`/`data` fields is sound. `cap`
+        // is stored as a tagged-pointer value (usize fits in a pointer).
         unsafe {
             (*zone).init = Some(shm::logs_shm_zone_init);
             // Store `cap` as a tagged pointer in `zone.data` so the init
@@ -751,11 +804,17 @@ impl MainConfig {
     /// Parallels [`shm_base`].  Returns `None` if the logs zone was not
     /// registered (access log disabled) or not yet mapped.
     pub fn logs_shm_base(&self) -> Option<*mut u8> {
+        // SAFETY: `logs_shm_zone` is either null (handled by `as_ref()?`) or the
+        // `ngx_shm_zone_t*` returned by `register_logs_zone`, which nginx keeps
+        // valid for the cycle; reading `shm.addr` through it is sound.
         let zone = unsafe { self.logs_shm_zone.as_ref()? };
         let addr = zone.shm.addr;
         if addr.is_null() {
             return None;
         }
+        // SAFETY: `addr` is the non-null mapped zone start; `data_offset()` bytes
+        // (the slab-pool header) lie within the zone, so the offset pointer is
+        // in-bounds — it is only formed here, not dereferenced.
         Some(unsafe { addr.cast::<u8>().add(crate::shm::data_offset()) })
     }
 
@@ -869,6 +928,8 @@ impl MainConfig {
             ngx_http_core_loc_conf_t, ngx_http_core_main_conf_t, ngx_http_core_srv_conf_t,
         };
         // Get HTTP core main conf → servers array.
+        // SAFETY: per the fn contract `cf` is a valid non-null parse context at
+        // postconfiguration; `&*cf` is a sound shared borrow.
         let cf_ref = unsafe { &*cf };
         let cmcf: Option<&ngx_http_core_main_conf_t> = NgxHttpCoreModule::main_conf(cf_ref);
         let cmcf = match cmcf {
@@ -880,27 +941,43 @@ impl MainConfig {
         let n_servers = cmcf.servers.nelts;
         let srv_ptr = cmcf.servers.elts.cast::<*mut ngx_http_core_srv_conf_t>();
         for i in 0..n_servers {
+            // SAFETY: `srv_ptr` is `cmcf.servers.elts` viewed as a `*mut *mut
+            // ngx_http_core_srv_conf_t` and `i < n_servers = servers.nelts`, so
+            // `srv_ptr.add(i)` is an in-bounds element of nginx's servers array.
             let cscf: *mut ngx_http_core_srv_conf_t = unsafe { *srv_ptr.add(i) };
             if cscf.is_null() {
                 continue;
             }
             // Get the server block's root location conf.
+            // SAFETY: `cscf` is a non-null server-conf pointer from nginx's array
+            // (checked above), valid in conf-pool memory; reading `ctx` is sound.
             let ctx = unsafe { (*cscf).ctx };
             if ctx.is_null() {
                 continue;
             }
+            // SAFETY: the core HTTP module's `ctx_index` is a static module field
+            // nginx initialises before config parsing; reading it is sound.
             let core_ctx_idx = unsafe { nginx_sys::ngx_http_core_module.ctx_index };
+            // SAFETY: `ctx` is non-null (checked above) and points to the server's
+            // `ngx_http_conf_ctx_t`; reading its `loc_conf` array pointer is sound.
             let loc_conf_arr = unsafe { (*ctx).loc_conf };
             if loc_conf_arr.is_null() {
                 continue;
             }
+            // SAFETY: `loc_conf_arr` is nginx's per-context loc_conf array and
+            // `core_ctx_idx` is the core module's slot within it (always in-bounds
+            // for a server ctx); the slot holds the root `ngx_http_core_loc_conf_t*`.
             let root_clcf: *mut ngx_http_core_loc_conf_t =
                 unsafe { (*loc_conf_arr.add(core_ctx_idx)).cast() };
             if root_clcf.is_null() {
                 continue;
             }
             // Walk the static location tree rooted here.
+            // SAFETY: `root_clcf` is non-null (checked above) and valid in conf-pool
+            // memory; reading its `static_locations` tree-root pointer is sound.
             let static_locs = unsafe { (*root_clcf).static_locations };
+            // SAFETY: `static_locs` is null or a valid location-tree node within
+            // nginx config memory, satisfying `walk_location_tree`'s contract.
             unsafe { self.walk_location_tree(static_locs) };
         }
     }
@@ -914,22 +991,32 @@ impl MainConfig {
         if node.is_null() {
             return;
         }
+        // SAFETY: `node` is non-null (checked above) and, per the fn contract, a
+        // valid `ngx_http_location_tree_node_t` in nginx config memory.
         let n = unsafe { &*node };
 
         // Register the exact-match location at this node (if any).
         if !n.exact.is_null() {
+            // SAFETY: `n.exact` is non-null (checked) and a valid
+            // `ngx_http_core_loc_conf_t*`, satisfying `try_register_route`.
             unsafe { self.try_register_route(n.exact) };
         }
         // Register the inclusive (prefix-match) location if different from exact.
         if !n.inclusive.is_null() && n.inclusive != n.exact {
+            // SAFETY: `n.inclusive` is non-null (checked) and a valid
+            // `ngx_http_core_loc_conf_t*`, satisfying `try_register_route`.
             unsafe { self.try_register_route(n.inclusive) };
         }
 
         // Recurse into sub-locations (the `tree` subtree = inner `location {}` blocks
         // that share the current prefix).
+        // SAFETY: `n.tree` is null or a valid sibling/child tree node owned by
+        // nginx, satisfying `walk_location_tree`'s contract.
         unsafe { self.walk_location_tree(n.tree) };
         // Recurse into sibling nodes.
+        // SAFETY: `n.left` is null or a valid tree node, per the contract.
         unsafe { self.walk_location_tree(n.left) };
+        // SAFETY: `n.right` is null or a valid tree node, per the contract.
         unsafe { self.walk_location_tree(n.right) };
     }
 
@@ -954,6 +1041,8 @@ impl MainConfig {
             return;
         }
 
+        // SAFETY: per the fn contract `clcf_ptr` is a valid non-null
+        // `ngx_http_core_loc_conf_t*` in conf-pool memory; `&*` reads it soundly.
         let clcf = unsafe { &*clcf_ptr };
         let name = clcf.name; // ngx_str_t
         let len = name.len.min(ROUTE_NAME_MAX);
@@ -962,6 +1051,9 @@ impl MainConfig {
         self.route_table[idx].clcf_ptr = ptr_val;
         self.route_table[idx].name_len = len as u8;
         if len > 0 && !name.data.is_null() {
+            // SAFETY: `name.data` is non-null (checked) and points to `name.len`
+            // valid name bytes in conf memory; `len` is clamped to `name.len`, so
+            // the slice of `len` bytes is in-bounds.
             let src = unsafe { core::slice::from_raw_parts(name.data, len) };
             self.route_table[idx].name[..len].copy_from_slice(src);
         }
@@ -975,14 +1067,20 @@ impl MainConfig {
     unsafe fn build_upstream_table(&mut self, cf: *mut ngx_conf_t) {
         use nginx_sys::ngx_http_upstream_srv_conf_t;
 
+        // SAFETY: per the fn contract `cf` is a valid non-null parse context.
         let _cf_ref = unsafe { &*cf };
 
         // Access the upstream module's main conf via its ctx_index.
         // `ngx_http_upstream_module.ctx_index` is the position in the HTTP
         // main_conf array.  We navigate the same way as for the core module.
+        // SAFETY: `ngx_http_upstream_module.ctx_index` is a static module field
+        // nginx initialises before config parsing; reading it is sound.
         let ctx_index = unsafe { nginx_sys::ngx_http_upstream_module.ctx_index };
 
         // Get the HTTP conf ctx from cf (same approach used by NgxHttpCoreModule).
+        // SAFETY: `cf` is valid; `cf.cycle` is the live cycle (null handled below),
+        // the HTTP module's `conf_ctx` slot is in-bounds, and the pointer it holds
+        // is the `ngx_http_conf_ctx_t*`, null-checked before use.
         let http_conf_ctx = unsafe {
             let cf_inner = &*(cf as *const nginx_sys::ngx_conf_t);
             // cf->cycle->conf_ctx[ngx_http_module.index] → ngx_http_conf_ctx_t *
@@ -998,24 +1096,37 @@ impl MainConfig {
             }
             raw as *const nginx_sys::ngx_http_conf_ctx_t
         };
+        // SAFETY: `http_conf_ctx` is the non-null HTTP `ngx_http_conf_ctx_t*`
+        // computed above; reading its `main_conf` array pointer is sound.
         let main_conf_arr = unsafe { (*http_conf_ctx).main_conf };
         if main_conf_arr.is_null() {
             return;
         }
 
+        // SAFETY: `main_conf_arr` is nginx's HTTP main_conf array and `ctx_index`
+        // is the upstream module's slot within it (in-bounds by construction);
+        // the slot holds the `ngx_http_upstream_main_conf_t*`.
         let umcf_ptr = unsafe { *main_conf_arr.add(ctx_index) };
         if umcf_ptr.is_null() {
             return;
         }
         let umcf: *const nginx_sys::ngx_http_upstream_main_conf_t = umcf_ptr.cast();
 
+        // SAFETY: `umcf` is the non-null upstream main conf (checked above), valid
+        // in conf-pool memory; reading its `upstreams` array fields is sound.
         let n_upstreams = unsafe { (*umcf).upstreams.nelts };
+        // SAFETY: as above — reading `upstreams.elts` and casting it to the element
+        // pointer type is sound.
         let up_ptr = unsafe { (*umcf).upstreams.elts.cast::<*mut ngx_http_upstream_srv_conf_t>() };
         for i in 0..n_upstreams {
+            // SAFETY: `up_ptr` is the `upstreams.elts` array and `i < n_upstreams =
+            // upstreams.nelts`, so `up_ptr.add(i)` is an in-bounds element.
             let uscf: *mut ngx_http_upstream_srv_conf_t = unsafe { *up_ptr.add(i) };
             if uscf.is_null() {
                 continue;
             }
+            // SAFETY: `uscf` is a non-null upstream-srv-conf pointer (checked) valid
+            // in conf-pool memory; reading its `shm_zone` field is sound.
             let shm_zone = unsafe { (*uscf).shm_zone };
             if shm_zone.is_null() {
                 continue;
@@ -1037,12 +1148,17 @@ impl MainConfig {
                 break;
             } // over cap
 
+            // SAFETY: `shm_zone` is non-null (checked above) and a valid
+            // `ngx_shm_zone_t*` in conf memory; reading its `shm.name` is sound.
             let name = unsafe { (*shm_zone).shm.name }; // ngx_str_t
             let len = name.len.min(UPSTREAM_NAME_MAX);
             let idx = self.n_upstreams;
             self.upstream_table[idx].shm_zone_ptr = zone_ptr;
             self.upstream_table[idx].name_len = len as u8;
             if len > 0 && !name.data.is_null() {
+                // SAFETY: `name.data` is non-null (checked) and points to `name.len`
+                // valid bytes; `len` is clamped to `name.len`, so the slice is
+                // in-bounds.
                 let src = unsafe { core::slice::from_raw_parts(name.data, len) };
                 self.upstream_table[idx].name[..len].copy_from_slice(src);
             }
@@ -1073,11 +1189,17 @@ impl MainConfig {
     /// - `shm_zone.shm.addr` is null (zone declared but not yet mapped — the
     ///   window between `ngx_shared_memory_add` and `ngx_init_zone`).
     pub fn shm_base(&self) -> Option<*mut u8> {
+        // SAFETY: `shm_zone` is either null (handled by `as_ref()?`) or the
+        // `ngx_shm_zone_t*` from `register_shm_zone`, kept valid by nginx for the
+        // cycle; reading `shm.addr` through it is sound.
         let zone = unsafe { self.shm_zone.as_ref()? };
         let addr = zone.shm.addr;
         if addr.is_null() {
             return None;
         }
+        // SAFETY: `addr` is the non-null mapped zone start; `data_offset()` bytes
+        // (slab-pool header) lie within the zone, so the offset pointer is
+        // in-bounds — only formed here, not dereferenced.
         Some(unsafe { addr.cast::<u8>().add(crate::shm::data_offset()) })
     }
 
@@ -1098,12 +1220,18 @@ impl MainConfig {
     /// `None`-returning path (module disabled) is a null pointer check,
     /// which is a single branch — zero allocations, zero syscalls.
     pub fn control_shm_ptr(&self) -> Option<*const crate::exporter::control_shm::ControlShm> {
+        // SAFETY: `control_shm_zone` is null (handled by `as_ref()?`) or the
+        // `ngx_shm_zone_t*` from `register_control_shm_zone`, valid for the cycle;
+        // reading `shm.addr` through it is sound.
         let zone = unsafe { self.control_shm_zone.as_ref()? };
         let addr = zone.shm.addr;
         if addr.is_null() {
             return None;
         }
         let offset = crate::shm::data_offset();
+        // SAFETY: `addr` is the non-null mapped zone start; the `ControlShm` lives
+        // at `data_offset()` bytes in (past the slab-pool header), so the offset
+        // pointer is in-bounds — only formed here, not dereferenced.
         Some(unsafe {
             addr.cast::<u8>().add(offset).cast::<crate::exporter::control_shm::ControlShm>()
         })
@@ -1138,12 +1266,17 @@ extern "C" fn cmd_exporter_set_endpoint(
     _cmd: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
+    // SAFETY: nginx passes the directive's conf pointer, which for the
+    // `otel_exporter` block was set to `&amcf.exporter` (an `ExporterConfig` in
+    // the conf pool); casting and `as_mut` yield a valid exclusive reference.
     let ecf = unsafe { conf.cast::<ExporterConfig>().as_mut().expect("exporter config") };
 
     if !ecf.endpoint.is_empty() {
         return c"is duplicate".as_ptr().cast_mut();
     }
 
+    // SAFETY: `cf` is the valid non-null parse context nginx passes to a directive
+    // handler, and its `args` array holds the parsed directive tokens.
     let args = unsafe { cf_args(cf) };
     ecf.endpoint = args[1];
     NGX_CONF_OK
@@ -1154,12 +1287,17 @@ extern "C" fn cmd_exporter_set_trusted_cert(
     _cmd: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
+    // SAFETY: `conf` is the `otel_exporter` block's conf pointer, set to
+    // `&amcf.exporter` (an `ExporterConfig` in the conf pool); the cast + `as_mut`
+    // yield a valid exclusive reference.
     let ecf = unsafe { conf.cast::<ExporterConfig>().as_mut().expect("exporter config") };
 
     if !ecf.trusted_cert.is_empty() {
         return c"is duplicate".as_ptr().cast_mut();
     }
 
+    // SAFETY: `cf` is the valid non-null directive parse context; its `args` array
+    // holds the parsed tokens.
     let args = unsafe { cf_args(cf) };
     ecf.trusted_cert = args[1];
     NGX_CONF_OK
@@ -1172,8 +1310,13 @@ extern "C" fn cmd_exporter_block_handler(
     _cmd: *mut ngx_command_t,
     _dummy: *mut c_void,
 ) -> *mut c_char {
+    // SAFETY: `cf` is the valid non-null block-parse context; its `args` array
+    // holds the inner directive's tokens.
     let args = unsafe { cf_args(cf) };
 
+    // SAFETY: `NGX_HTTP_OTEL_EXPORTER_COMMANDS` is a module-private `static mut`
+    // touched only during single-threaded config parsing (no concurrent access),
+    // so taking a `&mut` slice of it here is sound.
     let commands = unsafe { &mut NGX_HTTP_OTEL_EXPORTER_COMMANDS[..] };
     for cmd in commands {
         if cmd.name.is_empty() {
@@ -1184,6 +1327,7 @@ extern "C" fn cmd_exporter_block_handler(
         }
         let expected = cmd_nargs(cmd);
         if args.len() < expected.0 || args.len() > expected.1 {
+            // SAFETY: `cf` is the valid non-null parse context for logging.
             unsafe {
                 ngx_conf_log_error!(
                     NGX_LOG_EMERG,
@@ -1195,9 +1339,14 @@ extern "C" fn cmd_exporter_block_handler(
             return NGX_CONF_ERROR;
         }
         let handler = cmd.set.expect("command handler");
+        // SAFETY: `handler` is a valid directive callback fn pointer; `cf` is the
+        // valid parse context, and `(*cf).handler_conf` is the block's conf pointer
+        // (set by `cmd_set_exporter_block` to `&amcf.exporter`) that the inner
+        // handlers expect.
         return unsafe { handler(cf, cmd, (*cf).handler_conf) };
     }
 
+    // SAFETY: `cf` is the valid non-null parse context for logging.
     unsafe {
         ngx_conf_log_error!(
             NGX_LOG_EMERG,
@@ -1454,19 +1603,26 @@ extern "C" fn cmd_set_exporter_block(
     _cmd: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
+    // SAFETY: for a MAIN_CONF directive nginx passes the module's `MainConfig`
+    // pointer as `conf`; the cast + `as_mut` yield a valid exclusive reference.
     let amcf = unsafe { conf.cast::<MainConfig>().as_mut().expect("main config") };
 
     if amcf.exporter.is_set() {
+        // SAFETY: `cf` is the valid non-null parse context for logging.
         unsafe {
             ngx_conf_log_error!(NGX_LOG_EMERG, &mut *cf, "\"otel_exporter\" is duplicate");
         }
         return NGX_CONF_ERROR;
     }
 
+    // SAFETY: `cf` is a valid non-null parse context; `*cf` copies the current
+    // `ngx_conf_t` by value to derive a block-scoped parse context.
     let mut block_cf: ngx_conf_t = unsafe { *cf };
     block_cf.handler = Some(cmd_exporter_block_handler);
     block_cf.handler_conf = ptr::addr_of_mut!(amcf.exporter).cast();
 
+    // SAFETY: `block_cf` is a valid in-scope parse context with our block handler
+    // installed; `ngx_conf_parse` recurses into the `otel_exporter { ... }` body.
     unsafe { ngx_conf_parse(&mut block_cf, ptr::null_mut()) }
 }
 
@@ -1475,7 +1631,11 @@ extern "C" fn cmd_add_resource_attr(
     _cmd: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
+    // SAFETY: nginx passes the module's `MainConfig` pointer as `conf` for this
+    // MAIN_CONF directive; the cast + `as_mut` yield a valid exclusive reference.
     let amcf = unsafe { conf.cast::<MainConfig>().as_mut().expect("main config") };
+    // SAFETY: `cf` is the valid non-null directive parse context; `args` holds the
+    // parsed tokens (TAKE2: name + value).
     let args = unsafe { cf_args(cf) };
     amcf.resource_attrs.push(KvPair { key: args[1], value: args[2] });
     NGX_CONF_OK
@@ -1486,7 +1646,11 @@ extern "C" fn cmd_add_exporter_header(
     _cmd: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
+    // SAFETY: nginx passes the module's `MainConfig` pointer as `conf` for this
+    // MAIN_CONF directive; the cast + `as_mut` yield a valid exclusive reference.
     let amcf = unsafe { conf.cast::<MainConfig>().as_mut().expect("main config") };
+    // SAFETY: `cf` is the valid non-null directive parse context; `args` holds the
+    // parsed tokens (TAKE2: name + value).
     let args = unsafe { cf_args(cf) };
     amcf.exporter_headers.push(KvPair { key: args[1], value: args[2] });
     NGX_CONF_OK
@@ -1497,12 +1661,16 @@ extern "C" fn cmd_set_metric_interval(
     _cmd: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
+    // SAFETY: nginx passes the module's `MainConfig` pointer as `conf` for this
+    // MAIN_CONF directive; the cast + `as_mut` yield a valid exclusive reference.
     let amcf = unsafe { conf.cast::<MainConfig>().as_mut().expect("main config") };
 
     if amcf.metric_interval_ms != UNSET_U64 {
         return c"is duplicate".as_ptr().cast_mut();
     }
 
+    // SAFETY: `cf` is the valid non-null directive parse context; `args` holds the
+    // parsed tokens (TAKE1: the duration).
     let args = unsafe { cf_args(cf) };
     match parse_duration_ms(args[1].as_bytes()) {
         Some(ms) if ms > 0 => {
@@ -1510,6 +1678,7 @@ extern "C" fn cmd_set_metric_interval(
             NGX_CONF_OK
         }
         _ => {
+            // SAFETY: `cf` is the valid non-null parse context for logging.
             unsafe {
                 ngx_conf_log_error!(
                     NGX_LOG_EMERG,
@@ -1528,12 +1697,16 @@ extern "C" fn cmd_set_metric_batch_size(
     _cmd: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
+    // SAFETY: nginx passes the module's `MainConfig` pointer as `conf` for this
+    // MAIN_CONF directive; the cast + `as_mut` yield a valid exclusive reference.
     let amcf = unsafe { conf.cast::<MainConfig>().as_mut().expect("main config") };
 
     if amcf.metric_batch_size != UNSET_U64 {
         return c"is duplicate".as_ptr().cast_mut();
     }
 
+    // SAFETY: `cf` is the valid non-null directive parse context; `args` holds the
+    // parsed tokens (TAKE1: the count).
     let args = unsafe { cf_args(cf) };
     match parse_u64_ascii(args[1].as_bytes()) {
         Some(n) if n > 0 => {
@@ -1541,6 +1714,7 @@ extern "C" fn cmd_set_metric_batch_size(
             NGX_CONF_OK
         }
         _ => {
+            // SAFETY: `cf` is the valid non-null parse context for logging.
             unsafe {
                 ngx_conf_log_error!(
                     NGX_LOG_EMERG,
@@ -1559,17 +1733,22 @@ extern "C" fn cmd_set_metric_zone(
     _cmd: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
+    // SAFETY: nginx passes the module's `MainConfig` pointer as `conf` for this
+    // MAIN_CONF directive; the cast + `as_mut` yield a valid exclusive reference.
     let amcf = unsafe { conf.cast::<MainConfig>().as_mut().expect("main config") };
 
     if amcf.zone_size > 0 {
         return c"is duplicate".as_ptr().cast_mut();
     }
 
+    // SAFETY: `cf` is the valid non-null directive parse context; `args` holds the
+    // parsed tokens (TAKE2: name + size).
     let args = unsafe { cf_args(cf) };
     // args[1] = name, args[2] = size (e.g. "10m", "1g")
     let size = match parse_size_bytes(args[2].as_bytes()) {
         Some(s) if s > 0 => s,
         _ => {
+            // SAFETY: `cf` is the valid non-null parse context for logging.
             unsafe {
                 ngx_conf_log_error!(
                     NGX_LOG_EMERG,
@@ -1592,7 +1771,11 @@ extern "C" fn cmd_add_high_cardinality_attr(
     _cmd: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
+    // SAFETY: nginx passes the module's `MainConfig` pointer as `conf` for this
+    // MAIN_CONF directive; the cast + `as_mut` yield a valid exclusive reference.
     let amcf = unsafe { conf.cast::<MainConfig>().as_mut().expect("main config") };
+    // SAFETY: `cf` is the valid non-null directive parse context; `args` holds the
+    // parsed tokens (TAKE1: the attr name).
     let args = unsafe { cf_args(cf) };
 
     let attr = args[1];
@@ -1601,6 +1784,7 @@ extern "C" fn cmd_add_high_cardinality_attr(
         || attr.as_bytes() == b"user_agent.original";
 
     if !valid {
+        // SAFETY: `cf` is the valid non-null parse context for logging.
         unsafe {
             ngx_conf_log_error!(
                 NGX_LOG_EMERG,
@@ -1626,12 +1810,16 @@ extern "C" fn cmd_set_export_protocol(
     _cmd: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
+    // SAFETY: nginx passes the module's `MainConfig` pointer as `conf` for this
+    // MAIN_CONF directive; the cast + `as_mut` yield a valid exclusive reference.
     let amcf = unsafe { conf.cast::<MainConfig>().as_mut().expect("main config") };
 
     if amcf.export_protocol.is_some() {
         return c"is duplicate".as_ptr().cast_mut();
     }
 
+    // SAFETY: `cf` is the valid non-null directive parse context; `args` holds the
+    // parsed tokens (TAKE1: the protocol name).
     let args = unsafe { cf_args(cf) };
     let value = args[1].as_bytes();
 
@@ -1642,6 +1830,7 @@ extern "C" fn cmd_set_export_protocol(
         amcf.export_protocol = Some(ExportProtocol::OtlpGrpc);
         NGX_CONF_OK
     } else if value == b"arrow" {
+        // SAFETY: `cf` is the valid non-null parse context for logging.
         unsafe {
             ngx_conf_log_error!(
                 NGX_LOG_EMERG,
@@ -1651,6 +1840,7 @@ extern "C" fn cmd_set_export_protocol(
         }
         NGX_CONF_ERROR
     } else {
+        // SAFETY: `cf` is the valid non-null parse context for logging.
         unsafe {
             ngx_conf_log_error!(
                 NGX_LOG_EMERG,
@@ -1672,12 +1862,16 @@ extern "C" fn cmd_set_log_ring_size(
     _cmd: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
+    // SAFETY: nginx passes the module's `MainConfig` pointer as `conf` for this
+    // MAIN_CONF directive; the cast + `as_mut` yield a valid exclusive reference.
     let amcf = unsafe { conf.cast::<MainConfig>().as_mut().expect("main config") };
 
     if amcf.log_ring_size > 0 {
         return c"is duplicate".as_ptr().cast_mut();
     }
 
+    // SAFETY: `cf` is the valid non-null directive parse context; `args` holds the
+    // parsed tokens (TAKE1: the size).
     let args = unsafe { cf_args(cf) };
     let raw = args[1].as_bytes();
 
@@ -1687,6 +1881,7 @@ extern "C" fn cmd_set_log_ring_size(
             NGX_CONF_OK
         }
         _ => {
+            // SAFETY: `cf` is the valid non-null parse context for logging.
             unsafe {
                 ngx_conf_log_error!(
                     NGX_LOG_EMERG,
@@ -1709,12 +1904,16 @@ extern "C" fn cmd_set_access_sample(
     _cmd: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
+    // SAFETY: nginx passes the module's `MainConfig` pointer as `conf` for this
+    // MAIN_CONF directive; the cast + `as_mut` yield a valid exclusive reference.
     let amcf = unsafe { conf.cast::<MainConfig>().as_mut().expect("main config") };
 
     if amcf.access_sample_size > 0 {
         return c"is duplicate".as_ptr().cast_mut();
     }
 
+    // SAFETY: `cf` is the valid non-null directive parse context; `args` holds the
+    // parsed tokens (TAKE1: the reservoir size).
     let args = unsafe { cf_args(cf) };
     let raw = args[1].as_bytes();
 
@@ -1724,6 +1923,7 @@ extern "C" fn cmd_set_access_sample(
             NGX_CONF_OK
         }
         _ => {
+            // SAFETY: `cf` is the valid non-null parse context for logging.
             unsafe {
                 ngx_conf_log_error!(
                     NGX_LOG_EMERG,
@@ -1756,15 +1956,20 @@ extern "C" fn cmd_set_error_log(
     _cmd: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
+    // SAFETY: nginx passes the module's `MainConfig` pointer as `conf` for this
+    // MAIN_CONF directive; the cast + `as_mut` yield a valid exclusive reference.
     let amcf = unsafe { conf.cast::<MainConfig>().as_mut().expect("main config") };
 
     if amcf.error_log_enabled {
+        // SAFETY: `cf` is the valid non-null parse context for logging.
         unsafe {
             ngx_conf_log_error!(NGX_LOG_EMERG, &mut *cf, "\"otel_error_log\" is duplicate");
         }
         return NGX_CONF_ERROR;
     }
 
+    // SAFETY: `cf` is the valid non-null parse context. `cf_args(cf)` reads the
+    // parsed tokens, and the inner `ngx_conf_log_error!` uses the same valid `cf`.
     let level_floor: ngx_uint_t = unsafe {
         let args = cf_args(cf);
         if args.len() > 1 {
@@ -1794,6 +1999,10 @@ extern "C" fn cmd_set_error_log(
     // Allocate the ngx_log_t node and OtelErrorWriterState from the config pool.
     // ngx_pcalloc zero-initialises both — AtomicBool(false), null ptr, 0 level
     // are the correct "unset" defaults.
+    // SAFETY: `cf` is the valid non-null parse context; `cf.pool` is nginx's conf
+    // pool (null-checked below). `ngx_pcalloc` returns zeroed, suitably-aligned
+    // memory of the requested size for `ngx_log_t` / `OtelErrorWriterState`, and
+    // the `ngx_conf_log_error!` calls use the same valid `cf`.
     let (new_log, state) = unsafe {
         let pool = (*cf).pool;
         if pool.is_null() {
@@ -1825,6 +2034,9 @@ extern "C" fn cmd_set_error_log(
 
     // Fill the log node.  Writer-only: no `file` set (so this node never writes
     // to any file; the core file node still writes via chain continuation).
+    // SAFETY: `new_log` and `state` are the non-null, zeroed pool allocations from
+    // the block above; writing their fields is sound and they outlive the cycle
+    // (conf-pool lifetime).
     unsafe {
         (*new_log).log_level = level_floor;
         (*new_log).writer = Some(ngx_otel_error_writer);
@@ -1840,6 +2052,9 @@ extern "C" fn cmd_set_error_log(
     // Insert into cycle->new_log chain (sorted descending by log_level).
     // cycle->new_log is an embedded ngx_log_t value (never null); confirmed:
     // ngx_cycle.h:43-44: `ngx_log_t *log; ngx_log_t new_log;` — `new_log` is a value.
+    // SAFETY: `cf` is valid; `cf.cycle` is the live cycle and `new_log` (per
+    // ngx_cycle.h) is an embedded `ngx_log_t` value, so `&mut (*cycle).new_log` is
+    // a valid chain head for `otel_log_insert`; `new_log` is our valid pool node.
     unsafe {
         let cycle = (*cf).cycle;
         otel_log_insert(ptr::addr_of_mut!((*cycle).new_log), new_log);
@@ -1861,13 +2076,18 @@ extern "C" fn cmd_set_error_log_coalesce(
     _cmd: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
+    // SAFETY: nginx passes the module's `MainConfig` pointer as `conf` for this
+    // MAIN_CONF directive; the cast + `as_mut` yield a valid exclusive reference.
     let amcf = unsafe { conf.cast::<MainConfig>().as_mut().expect("main config") };
+    // SAFETY: `cf` is the valid non-null directive parse context; `args` holds the
+    // parsed tokens (FLAG: on|off).
     let args = unsafe { cf_args(cf) };
     let val = args[1].as_bytes();
     match val {
         b"on" => amcf.error_log_coalesce = true,
         b"off" => amcf.error_log_coalesce = false,
         _ => {
+            // SAFETY: `cf` is the valid non-null parse context for logging.
             unsafe {
                 ngx_conf_log_error!(
                     NGX_LOG_EMERG,
@@ -1898,10 +2118,13 @@ extern "C" fn cmd_set_otel_status_endpoint(
 ) -> *mut c_char {
     use ngx::http::{HttpModuleLocationConf, NgxHttpCoreModule};
 
+    // SAFETY: `cf` is the valid non-null directive parse context nginx passes to
+    // a LOC_CONF handler; `&*cf` is a sound shared borrow.
     let cf_ref = unsafe { &*cf };
     let clcf = match NgxHttpCoreModule::location_conf_mut(cf_ref) {
         Some(c) => c,
         None => {
+            // SAFETY: `cf` is the valid non-null parse context for logging.
             unsafe {
                 ngx_conf_log_error!(
                     NGX_LOG_EMERG,

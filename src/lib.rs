@@ -88,6 +88,10 @@ ngx::ngx_modules!(ngx_http_otel_module);
 #[cfg_attr(not(feature = "export-modules"), no_mangle)]
 pub static mut ngx_http_otel_module: ngx_module_t = ngx_module_t {
     ctx: ptr::addr_of!(NGX_HTTP_OTEL_MODULE_CTX).cast_mut().cast(),
+    // SAFETY: indexing `[0]` of the static `mut NGX_HTTP_OTEL_COMMANDS` array via
+    // `addr_of_mut!` only forms a pointer to its first element — it never reads or
+    // writes the static, so there is no data race even though it is a `static mut`.
+    // The array is a fixed-size const-initialised command table, so element 0 exists.
     commands: unsafe { ptr::addr_of_mut!(NGX_HTTP_OTEL_COMMANDS[0]) },
     type_: NGX_HTTP_MODULE as ngx_uint_t,
 
@@ -102,6 +106,11 @@ pub static mut ngx_http_otel_module: ngx_module_t = ngx_module_t {
     ..ngx_module_t::default()
 };
 
+// SAFETY: the `MainConf` associated type matches the `create_main_conf` /
+// `init_main_conf` hooks in `NGX_HTTP_OTEL_MODULE_CTX`, which allocate and
+// initialise a `config::MainConfig` in this module's main-conf slot. The trait
+// contract — that `MainConf` is the exact type nginx stores at our module's
+// `ctx_index` — therefore holds, so the downcast in `main_conf()` is valid.
 unsafe impl HttpModuleMainConf for HttpOtelModule {
     type MainConf = config::MainConfig;
 }
@@ -116,6 +125,10 @@ fn spawn_exporter_for_cycle(
     cycle: *mut nginx_sys::ngx_cycle_t,
     is_reload: bool,
 ) -> nginx_sys::ngx_int_t {
+    // SAFETY: `cycle` is the cycle pointer nginx passes into `init_module`, which
+    // is always non-null and valid for the duration of the hook; this hook runs
+    // only in the single master/single process, so there is no concurrent aliasing
+    // of the cycle through this `&mut`.
     let cycle_ref = unsafe { &mut *cycle };
 
     let respawn_flag: nginx_sys::ngx_int_t = if is_reload {
@@ -127,6 +140,10 @@ fn spawn_exporter_for_cycle(
         nginx_sys::NGX_PROCESS_RESPAWN as nginx_sys::ngx_int_t
     };
 
+    // SAFETY: `cycle` is valid (see above); `otel_exporter_cycle` is our own
+    // `extern "C"` process entry point with a matching signature; the name is a
+    // 'static NUL-terminated C string and `respawn_flag` is a valid NGX_PROCESS_*
+    // constant. `ngx_spawn_process` is only ever called here from the master.
     let pid = unsafe {
         nginx_sys::ngx_spawn_process(
             cycle,
@@ -177,16 +194,24 @@ fn spawn_exporter_for_cycle(
 ///
 /// See `PHASE_1_3_RESEARCH.md` §2.7–2.9, §5.2 and Q4 for design decisions.
 extern "C" fn ngx_otel_init_module(cycle: *mut nginx_sys::ngx_cycle_t) -> nginx_sys::ngx_int_t {
+    // SAFETY: `ngx_process` is a nginx global written once by the master before
+    // any module init hook runs and thereafter read-only within a process, so this
+    // plain read of the `static mut` cannot race.
     let process = unsafe { nginx_sys::ngx_process } as u32;
     if process != nginx_sys::NGX_PROCESS_MASTER && process != nginx_sys::NGX_PROCESS_SINGLE {
         return Status::NGX_OK.into();
     }
 
     // Don't spawn an exporter during `nginx -t` (config-test mode).
+    // SAFETY: `ngx_test_config` is a nginx global set from the command line before
+    // module init and not mutated afterwards, so this read of the `static mut` is
+    // race-free.
     if unsafe { nginx_sys::ngx_test_config } != 0 {
         return Status::NGX_OK.into();
     }
 
+    // SAFETY: `cycle` is the non-null, valid cycle nginx passes to `init_module`;
+    // this hook runs only in the master/single process so the `&mut` does not alias.
     let cycle_ref = unsafe { &mut *cycle };
     let Some(amcf) = HttpOtelModule::main_conf(cycle_ref) else {
         return Status::NGX_OK.into();
@@ -197,6 +222,9 @@ extern "C" fn ngx_otel_init_module(cycle: *mut nginx_sys::ngx_cycle_t) -> nginx_
 
     // Detect SIGHUP reload vs initial start via old_cycle->conf_ctx.
     // See existing comment above for the IMPORTANT note about ngx_is_init_cycle.
+    // SAFETY: `cycle` is valid (above). `old_cycle` is a pointer nginx initialises
+    // for every cycle (null on first start, the prior cycle on SIGHUP); both it and
+    // its `conf_ctx` are null-checked before any further deref, so no invalid read.
     let is_reload = unsafe {
         let old = (*cycle).old_cycle;
         !old.is_null() && !(*old).conf_ctx.is_null()
@@ -208,10 +236,17 @@ extern "C" fn ngx_otel_init_module(cycle: *mut nginx_sys::ngx_cycle_t) -> nginx_
 
 impl HttpModule for HttpOtelModule {
     fn module() -> &'static ngx_module_t {
+        // SAFETY: `ngx_http_otel_module` is a `static mut` with process lifetime,
+        // const-initialised above. After config load nginx treats the module
+        // descriptor as read-only, and we only hand out a shared `&` to it, so the
+        // resulting `'static` reference does not alias any live `&mut`.
         unsafe { &*::core::ptr::addr_of!(ngx_http_otel_module) }
     }
 
     unsafe extern "C" fn postconfiguration(cf: *mut ngx_conf_t) -> nginx_sys::ngx_int_t {
+        // SAFETY: nginx calls `postconfiguration` with a non-null, valid `ngx_conf_t`
+        // during single-threaded config parsing, so this exclusive borrow is the only
+        // live reference to the conf for the duration of the call.
         let cf_ref = unsafe { &mut *cf };
         let amcf = HttpOtelModule::main_conf_mut(cf_ref).expect("otel main conf");
         let module_ptr = ::core::ptr::addr_of_mut!(ngx_http_otel_module);
@@ -254,30 +289,54 @@ extern "C" fn ngx_otel_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
     // ngx_otel_error_writer enforces this at call time; the null pointers here
     // are the belt to that suspenders.
     {
+        // SAFETY: `cycle` is the non-null, valid cycle nginx passes into
+        // `init_process`; the worker is single-threaded at this point so the `&mut`
+        // is the sole live reference to the cycle.
         let cycle_ref = unsafe { &mut *cycle };
         if let Some(amcf) = HttpOtelModule::main_conf(cycle_ref) {
             if amcf.error_log_enabled {
                 // Process-role gate: Worker only (not master/exporter/config-load).
                 if matches!(crate::exporter::ngx_process(), crate::exporter::NgxProcess::Worker(_))
                 {
+                    // SAFETY: `ngx_worker` is this worker's id, set by the master
+                    // before the fork and read-only thereafter, so the `static mut`
+                    // read is race-free.
                     let worker_id = unsafe { nginx_sys::ngx_worker };
                     let cap = amcf.log_ring_cap();
 
                     if let Some(logs_base) = amcf.logs_shm_base() {
+                        // SAFETY: `logs_base` is the start of the logs shm zone (from
+                        // `logs_shm_base()`), `worker_id < worker_count`, and `cap`
+                        // is the configured ring capacity — exactly the contract
+                        // `logs_coalesce_table` requires to index this worker's slot.
                         let coalesce_table =
                             unsafe { crate::shm::logs_coalesce_table(logs_base, worker_id, cap) };
+                        // SAFETY: same zone/worker_id/cap contract as above; yields a
+                        // pointer to this worker's error-ring header within the zone.
                         let error_ring_ptr =
                             unsafe { crate::shm::logs_error_ring_ptr(logs_base, worker_id, cap) };
 
                         // Error-rate counters live in the metrics shm (WorkerSlots).
                         let error_rate_ptr = amcf.shm_base().map(|metrics_base| {
+                            // SAFETY: `metrics_base` is the metrics shm zone start
+                            // (from `shm_base()`) and `worker_id` is in range, so this
+                            // returns a valid pointer to this worker's `WorkerSlots`.
                             let ws = unsafe { crate::shm::worker_slots(metrics_base, worker_id) };
+                            // SAFETY: `ws` is the valid `WorkerSlots` pointer just
+                            // obtained; `error_rate_counters` is an inline array field
+                            // of that struct, so `.as_ptr()` is in-bounds and aligned.
                             unsafe {
                                 (*ws).error_rate_counters.as_ptr()
                                     as *mut core::sync::atomic::AtomicU64
                             }
                         });
 
+                        // SAFETY: all pointers passed are valid for this worker —
+                        // `cycle` is the valid cycle, `logs_shm_zone` the registered
+                        // zone, and `coalesce_table` / `error_ring_ptr` /
+                        // `error_rate_ptr` point into shm slots owned by this worker
+                        // (null error-rate falls back via `unwrap_or(null)`, which the
+                        // writer treats as "no rate counter"). Called once per worker.
                         unsafe {
                             crate::logs::error_writer::wire_error_writer_state(
                                 cycle as *const _,
@@ -305,16 +364,27 @@ extern "C" fn ngx_otel_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
     // `tests/integration/run_grpc_smoke.sh` greps for the success line.
     #[cfg(any(test, feature = "test-support"))]
     {
+        // SAFETY: `ngx_process` is set by the master before the fork and read-only
+        // afterwards, so this `static mut` read cannot race.
         let process_type = unsafe { nginx_sys::ngx_process } as u32;
+        // SAFETY: `ngx_worker` is set by the master before the fork and read-only
+        // afterwards, so this `static mut` read cannot race.
         let worker_num = unsafe { nginx_sys::ngx_worker };
+        // SAFETY: `cycle` is the non-null, valid cycle nginx passes to init_process;
+        // `log` is a plain pointer field we only copy out, not dereference here.
         let log = unsafe { (*cycle).log };
         let is_designated = matches!(
             (process_type, worker_num as u32),
             (nginx_sys::NGX_PROCESS_WORKER, 0) | (nginx_sys::NGX_PROCESS_SINGLE, _)
         );
         if is_designated {
+            // SAFETY: `cycle` is the valid cycle from init_process; the worker is
+            // single-threaded here so this `&mut` is the only live cycle reference.
             let cycle_ref = unsafe { &mut *cycle };
             if let Some(amcf) = HttpOtelModule::main_conf(cycle_ref) {
+                // SAFETY: `cycle` is valid; `(*cycle).pool` is the worker's
+                // process-lifetime pool created by nginx, the contract
+                // `Pool::from_ngx_pool` requires.
                 let pool = unsafe { Pool::from_ngx_pool((*cycle).pool) };
                 // `log` is shared by all three harnesses; guard it once.
                 let Some(log_nn) = core::ptr::NonNull::new(log) else {
@@ -512,6 +582,10 @@ unsafe extern "C" fn ngx_otel_exit_process(cycle: *mut ngx_cycle_t) {
     // This mirrors `ngx_syslog_cleanup`: stop producer emissions before the
     // cycle tears down the log chain.
     if !cycle.is_null() {
+        // SAFETY: `cycle` is non-null (just checked) and is the valid cycle nginx
+        // passes to `exit_process`; `set_cleanup_flag` only reads our writer node
+        // reachable from the cycle and sets an atomic flag, with no aliasing concern
+        // as the worker is single-threaded during teardown.
         unsafe {
             crate::logs::error_writer::set_cleanup_flag(cycle as *const _);
         }
@@ -539,9 +613,15 @@ pub(crate) unsafe extern "C" fn otel_status_content_handler(
 
     // Read control_shm version via the request's module conf (one Relaxed load).
     // ngx_http_request_t implements HttpModuleConfExt, so main_conf() works directly.
+    // SAFETY: nginx invokes a content handler with a non-null, valid request `r`;
+    // `as_ref()` additionally null-checks, yielding a shared borrow valid for the
+    // handler's duration.
     let version = unsafe { r.as_ref() }
         .and_then(HttpOtelModule::main_conf)
         .and_then(|amcf| amcf.control_shm_ptr())
+        // SAFETY: `ctrl` is the control-shm pointer returned by `control_shm_ptr()`,
+        // which points to a live `ControlShm` in the mapped zone; `version` is an
+        // atomic field read with a relaxed load, so cross-process access is sound.
         .map(|ctrl| unsafe { (*ctrl).version.load(Ordering::Relaxed) })
         .unwrap_or(0);
 
@@ -550,6 +630,8 @@ pub(crate) unsafe extern "C" fn otel_status_content_handler(
     let body_len = body.len();
 
     // Set response headers.
+    // SAFETY: `r` is the valid request; `headers_out` is an inline field, and the
+    // request is processed single-threaded so this exclusive borrow does not alias.
     let headers_out = unsafe { &mut (*r).headers_out };
     headers_out.status = 200;
     headers_out.content_length_n = body_len as nginx_sys::off_t;
@@ -560,16 +642,22 @@ pub(crate) unsafe extern "C" fn otel_status_content_handler(
     headers_out.content_type_len = CONTENT_TYPE_BYTES.len();
 
     // Send response header.
+    // SAFETY: `r` is the valid request; `ngx_http_send_header` is the nginx API for
+    // emitting the response header line and is sound to call with a live request.
     let rc = unsafe { nginx_sys::ngx_http_send_header(r) };
     if rc == nginx_sys::NGX_ERROR as nginx_sys::ngx_int_t {
         return rc;
     }
     // HEAD requests need no body.
+    // SAFETY: `r` is the valid request; `header_only()` reads a bitfield accessor on
+    // the live request struct.
     if unsafe { (*r).header_only() } != 0 {
         return nginx_sys::NGX_OK as nginx_sys::ngx_int_t;
     }
 
     // Allocate body buffer from request pool.
+    // SAFETY: `r` is the valid request; `(*r).pool` is its request-scoped pool, the
+    // contract `Pool::from_ngx_pool` requires.
     let pool = unsafe { Pool::from_ngx_pool((*r).pool) };
     let Some(mut buf) = pool.create_buffer_from_str(&body) else {
         return nginx_sys::NGX_HTTP_INTERNAL_SERVER_ERROR as nginx_sys::ngx_int_t;
@@ -582,10 +670,16 @@ pub(crate) unsafe extern "C" fn otel_status_content_handler(
     if chain_ptr.is_null() {
         return nginx_sys::NGX_HTTP_INTERNAL_SERVER_ERROR as nginx_sys::ngx_int_t;
     }
+    // SAFETY: `chain_ptr` is a freshly pool-allocated, zeroed `ngx_chain_t` (null-
+    // checked above), so writing its `buf`/`next` fields is in-bounds; `buf` outlives
+    // the call as it is allocated from the same request pool.
     unsafe {
         (*chain_ptr).buf = buf.as_ngx_buf_mut();
         (*chain_ptr).next = core::ptr::null_mut();
     }
+    // SAFETY: `r` is the valid request and `chain_ptr` is a valid single-link output
+    // chain just constructed; `ngx_http_output_filter` consumes it via the nginx
+    // filter chain.
     unsafe { nginx_sys::ngx_http_output_filter(r, chain_ptr) }
 }
 
@@ -644,6 +738,9 @@ mod nginx_test_stubs {
     // stubbed too — otherwise macOS dyld aborts loading the debug
     // `cargo test --lib` binary on the unresolved `_ngx_cached_time`. Points at
     // a zeroed `ngx_time_t` (sec = msec = 0 → duration clamps to 0 in tests).
+    // SAFETY: `ngx_time_t` is a plain `#[repr(C)]` struct of integer fields, for
+    // which the all-zero bit pattern is a valid inhabitant; this stub is only ever
+    // read (sec = msec = 0) by tests, never written.
     static mut STUB_CACHED_TIME: nginx_sys::ngx_time_t = unsafe { core::mem::zeroed() };
 
     #[no_mangle]
@@ -700,6 +797,9 @@ mod nginx_test_stubs {
     // close_sibling_channels iterates 0..ngx_last_process (=0), so it never
     // touches this array in tests.
     #[no_mangle]
+    // SAFETY: `ngx_process_t` is a `#[repr(C)]` POD struct (pids, fds, raw pointers,
+    // bitflags) whose all-zero bit pattern is valid (null pointers, zero fds); the
+    // stub array is only iterated 0..ngx_last_process (=0) in tests, so never read.
     pub static mut ngx_processes: [nginx_sys::ngx_process_t; 1024] = unsafe { core::mem::zeroed() };
 
     // nginx global cycle pointer (used by ngx::log::ngx_cycle_log).
