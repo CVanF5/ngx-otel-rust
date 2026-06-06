@@ -174,10 +174,8 @@ pub unsafe extern "C" fn ngx_otel_error_writer(
     //    The exporter is NGX_PROCESS_HELPER + IS_OTEL_EXPORTER — NOT Worker — so it
     //    is excluded even though it also maps the logs shm.  A shm-presence check
     //    alone would NOT exclude it.
-    if !matches!(
-        crate::exporter::ngx_process(),
-        crate::exporter::NgxProcess::Worker(_)
-    ) || (*state).logs_zone.is_null()
+    if !matches!(crate::exporter::ngx_process(), crate::exporter::NgxProcess::Worker(_))
+        || (*state).logs_zone.is_null()
     {
         (*state).busy.store(false, Ordering::Release);
         return;
@@ -202,12 +200,8 @@ pub unsafe extern "C" fn ngx_otel_error_writer(
     if !coalesce_table.is_null() {
         // SAFETY: buf is valid for `len` bytes per ngx_log_error_core contract.
         let buf_slice = core::slice::from_raw_parts(buf as *const u8, len);
-        match coalesce::coalesce(
-            coalesce_table,
-            level as u8,
-            buf_slice,
-            (*state).coalesce_enabled,
-        ) {
+        match coalesce::coalesce(coalesce_table, level as u8, buf_slice, (*state).coalesce_enabled)
+        {
             CoalesceResult::Coalesced => {
                 // Duplicate suppressed. The coalescer already bumped the count.
                 (*state).busy.store(false, Ordering::Release);
@@ -324,14 +318,18 @@ pub unsafe fn set_cleanup_flag(cycle: *const nginx_sys::ngx_cycle_t) {
     }
     // new_log is an *embedded* ngx_log_t (head of the chain).
     // Take a raw pointer to it so we can walk the chain via ->next.
-    let mut log_ptr: *mut nginx_sys::ngx_log_t =
-        core::ptr::addr_of!((*cycle).new_log) as *mut _;
+    let mut log_ptr: *mut nginx_sys::ngx_log_t = core::ptr::addr_of!((*cycle).new_log) as *mut _;
 
     // Compare function pointers as usize to identify our writer node.
     // Direct function-pointer equality triggers a compiler lint
     // (unpredictable_function_pointer_comparisons); casting via a fn-pointer
     // binding avoids the "direct cast of function item" lint too.
-    let our_writer: unsafe extern "C" fn(*mut nginx_sys::ngx_log_t, ngx_uint_t, *mut nginx_sys::u_char, usize) = ngx_otel_error_writer;
+    let our_writer: unsafe extern "C" fn(
+        *mut nginx_sys::ngx_log_t,
+        ngx_uint_t,
+        *mut nginx_sys::u_char,
+        usize,
+    ) = ngx_otel_error_writer;
     let our_writer_addr = our_writer as usize;
 
     while !log_ptr.is_null() {
@@ -391,8 +389,7 @@ pub unsafe fn wire_error_writer_state(
     ) = ngx_otel_error_writer;
     let our_writer_addr = our_writer as usize;
 
-    let mut log_ptr: *mut nginx_sys::ngx_log_t =
-        core::ptr::addr_of!((*cycle).new_log) as *mut _;
+    let mut log_ptr: *mut nginx_sys::ngx_log_t = core::ptr::addr_of!((*cycle).new_log) as *mut _;
     while !log_ptr.is_null() {
         let log = &*log_ptr;
         if log.writer.map(|f| f as usize) == Some(our_writer_addr) {
@@ -426,10 +423,7 @@ pub unsafe fn wire_error_writer_state(
 ///   `ngx_log_t` value in `ngx_cycle_t::new_log`, never null).
 /// - `new_log` must be a valid, non-null pointer to a freshly `ngx_pcalloc`'d
 ///   `ngx_log_t`, not yet part of any chain (`next` is null).
-pub unsafe fn otel_log_insert(
-    head: *mut nginx_sys::ngx_log_t,
-    new_log: *mut nginx_sys::ngx_log_t,
-) {
+pub unsafe fn otel_log_insert(head: *mut nginx_sys::ngx_log_t, new_log: *mut nginx_sys::ngx_log_t) {
     if (*new_log).log_level > (*head).log_level {
         // New node has higher level: it should be the new head.
         // The head address is permanent (it's an embedded value in ngx_cycle_t),
@@ -571,7 +565,10 @@ mod tests {
         }
 
         // Busy must NOT have been set: cleanup check fires before busy swap.
-        assert!(!state.busy.load(Ordering::SeqCst), "busy must not be set when cleanup fires first");
+        assert!(
+            !state.busy.load(Ordering::SeqCst),
+            "busy must not be set when cleanup fires first"
+        );
     }
 
     /// Verify that a level equal to the floor IS accepted (not dropped).
@@ -627,23 +624,23 @@ mod tests {
 
             // Insert a lower-level node — should go after head.
             mid.log_level = 3; // crit (lower numeric = more severe, inserted after warn)
-            // Wait, nginx levels: 1=emerg(highest priority)...8=debug(lowest).
-            // ngx_log_insert sorts DESCENDING by log_level number, which means
-            // debug (8) first? Let me re-read the nginx source.
-            //
-            // Actually: from ngx_log.c:677-707, "if new_log->log_level > head->log_level"
-            // ⇒ new_log gets inserted before (i.e., closer to head). So higher
-            // numeric log_level = inserted earlier = processed first.
-            // debug (8) > warn (5) > crit (3) → chain: debug → warn → crit
-            //
-            // This means the chain is sorted largest-number-first, and
-            // ngx_log_error_core breaks when `log->log_level < level`, i.e.
-            // when the node's threshold is lower than the message level.
-            // So: higher log_level node = wider threshold = processed first.
+                               // Wait, nginx levels: 1=emerg(highest priority)...8=debug(lowest).
+                               // ngx_log_insert sorts DESCENDING by log_level number, which means
+                               // debug (8) first? Let me re-read the nginx source.
+                               //
+                               // Actually: from ngx_log.c:677-707, "if new_log->log_level > head->log_level"
+                               // ⇒ new_log gets inserted before (i.e., closer to head). So higher
+                               // numeric log_level = inserted earlier = processed first.
+                               // debug (8) > warn (5) > crit (3) → chain: debug → warn → crit
+                               //
+                               // This means the chain is sorted largest-number-first, and
+                               // ngx_log_error_core breaks when `log->log_level < level`, i.e.
+                               // when the node's threshold is lower than the message level.
+                               // So: higher log_level node = wider threshold = processed first.
 
             // Reset: head=3(crit), then insert 5(warn) and 8(debug).
             head.log_level = 3;
-            mid.log_level = 5;  // warn > crit, should move to head
+            mid.log_level = 5; // warn > crit, should move to head
             tail.log_level = 8; // debug > warn > crit, should move to head
 
             // Insert mid (5) into chain rooted at head (3).
@@ -681,9 +678,8 @@ mod tests {
     fn process_role_guard_does_not_reach_metric_or_coalescer() {
         use crate::shm::N_SEVERITY_CLASSES;
         // Allocate a real counter array — a bump would be visible.
-        let counters: std::vec::Vec<AtomicU64> = (0..N_SEVERITY_CLASSES)
-            .map(|_| AtomicU64::new(0))
-            .collect();
+        let counters: std::vec::Vec<AtomicU64> =
+            (0..N_SEVERITY_CLASSES).map(|_| AtomicU64::new(0)).collect();
         let counter_ptr = counters[0].as_ptr() as *mut AtomicU64;
 
         let (state, mut log) = make_writer_state(nginx_sys::NGX_LOG_DEBUG as ngx_uint_t);
@@ -726,16 +722,9 @@ mod tests {
         assert_eq!(super::cached_unix_nanos(core::ptr::null()), 0);
 
         // A realistic cached wall-clock: 2023-11-14T22:13:20Z + 500 ms.
-        let tp = nginx_sys::ngx_time_t {
-            sec: 1_700_000_000,
-            msec: 500,
-            gmtoff: 0,
-        };
+        let tp = nginx_sys::ngx_time_t { sec: 1_700_000_000, msec: 500, gmtoff: 0 };
         let ns = super::cached_unix_nanos(&tp as *const _);
-        assert_eq!(
-            ns, 1_700_000_000_500_000_000,
-            "must be sec*1e9 + msec*1e6 (Unix-epoch ns)"
-        );
+        assert_eq!(ns, 1_700_000_000_500_000_000, "must be sec*1e9 + msec*1e6 (Unix-epoch ns)");
 
         // The bug's signature: a monotonic uptime (~a few days of seconds) read as
         // epoch lands in Jan 1970. Assert our value is firmly past 2020, i.e. it

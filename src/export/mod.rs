@@ -44,18 +44,20 @@ use std::collections::VecDeque;
 use nginx_sys::{NGX_LOG_ERR, NGX_LOG_INFO, NGX_LOG_NOTICE};
 use pin_project_lite::pin_project;
 
-use crate::config::{MainConfig, ExportProtocol};
+use crate::config::{ExportProtocol, MainConfig};
 use crate::data_model::{
     AggregationTemporality, AnyValue, Batch, GaugeData, KeyValue, LogRecord, LogsBatch, Metric,
     MetricData, NumberDataPoint, NumberValue, Resource, Scope, SumData,
 };
 use crate::encoder::{Encoder, OtlpHttpEncoder, OtlpLogsEncoder};
+use crate::logs::coalesce;
 use crate::logs::severity::nginx_to_otel;
 use crate::metric_source::instrumented::InstrumentedSource;
 use crate::metric_source::stub_status::StubStatusSource;
 use crate::metric_source::MetricSource;
-use crate::logs::coalesce;
-use crate::shm::{logs_access_ring, logs_coalesce_table, logs_error_ring, logs_n_workers_from_zone};
+use crate::shm::{
+    logs_access_ring, logs_coalesce_table, logs_error_ring, logs_n_workers_from_zone,
+};
 use crate::transport::hyper_http::NgxConnector;
 use crate::transport::{GrpcTransport, HyperHttpTransport};
 
@@ -1501,11 +1503,7 @@ fn gauge_metric(name: &str, desc: &str, unit: &str, value: i64, time_ns: u64) ->
 /// # Safety
 /// `base` must point to the start of the metrics shm zone (past the slab header).
 /// `n_workers` must be ≤ number of slots the zone was sized for.
-fn collect_error_rate_metric(
-    base: *mut u8,
-    n_workers: usize,
-    start_time_ns: u64,
-) -> Metric {
+fn collect_error_rate_metric(base: *mut u8, n_workers: usize, start_time_ns: u64) -> Metric {
     use crate::shm::{worker_slots, N_SEVERITY_CLASSES, SEVERITY_CLASS_NAMES};
     use core::sync::atomic::Ordering;
 
@@ -1949,8 +1947,8 @@ mod tests {
     /// and one `nginx.error`.
     #[test]
     fn error_drain_alongside_access_drain() {
-        use crate::logs::ring::DEFAULT_LOG_RING_CAP;
         use crate::logs::error_writer::KIND_ERROR;
+        use crate::logs::ring::DEFAULT_LOG_RING_CAP;
         use crate::shm::logs_error_ring;
 
         let cap = DEFAULT_LOG_RING_CAP;
@@ -2022,10 +2020,10 @@ mod tests {
     /// the single ring record must carry `coalesced_count = N`.
     #[test]
     fn coalesced_count_attached_to_sample() {
-        use crate::logs::ring::DEFAULT_LOG_RING_CAP;
-        use crate::logs::error_writer::KIND_ERROR;
         use crate::logs::coalesce::COALESCE_CAPACITY;
-        use crate::shm::{logs_error_ring, logs_coalesce_table};
+        use crate::logs::error_writer::KIND_ERROR;
+        use crate::logs::ring::DEFAULT_LOG_RING_CAP;
+        use crate::shm::{logs_coalesce_table, logs_error_ring};
 
         let cap = DEFAULT_LOG_RING_CAP;
         let (mut slot_buf, slot_ptr) = make_logs_slot(cap);
@@ -2158,7 +2156,10 @@ mod tests {
                 SEVERITY_CLASS_NAMES.contains(&class_name),
                 "severity_class '{class_name}' must be in SEVERITY_CLASS_NAMES"
             );
-            assert!(seen_classes.insert(std::string::String::from(class_name)), "duplicate severity_class");
+            assert!(
+                seen_classes.insert(std::string::String::from(class_name)),
+                "duplicate severity_class"
+            );
 
             // All zero on fresh-start shm.
             assert_eq!(dp.value, crate::data_model::NumberValue::AsInt(0));
@@ -2185,10 +2186,12 @@ mod tests {
         unsafe {
             let slots = &*worker_slots(data_base, 0);
             for _ in 0..10 {
-                slots.error_rate_counters[severity_class_index(4)].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                slots.error_rate_counters[severity_class_index(4)]
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
             for _ in 0..5 {
-                slots.error_rate_counters[severity_class_index(5)].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                slots.error_rate_counters[severity_class_index(5)]
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
         }
 
@@ -2196,10 +2199,12 @@ mod tests {
         unsafe {
             let slots = &*worker_slots(data_base, 1);
             for _ in 0..3 {
-                slots.error_rate_counters[severity_class_index(1)].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                slots.error_rate_counters[severity_class_index(1)]
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
             for _ in 0..10 {
-                slots.error_rate_counters[severity_class_index(4)].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                slots.error_rate_counters[severity_class_index(4)]
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
         }
 
@@ -2222,7 +2227,12 @@ mod tests {
 
         // Only severity_class is a metric dimension (DP-B: no route/zone/trace_id).
         for dp in &sum.data_points {
-            assert_eq!(dp.attributes.len(), 1, "only severity_class dim; count={}", dp.attributes.len());
+            assert_eq!(
+                dp.attributes.len(),
+                1,
+                "only severity_class dim; count={}",
+                dp.attributes.len()
+            );
         }
     }
 }

@@ -258,29 +258,23 @@ extern "C" fn ngx_otel_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
         if let Some(amcf) = HttpOtelModule::main_conf(cycle_ref) {
             if amcf.error_log_enabled {
                 // Process-role gate: Worker only (not master/exporter/config-load).
-                if matches!(
-                    crate::exporter::ngx_process(),
-                    crate::exporter::NgxProcess::Worker(_)
-                ) {
-                    let worker_id =
-                        unsafe { nginx_sys::ngx_worker as usize };
+                if matches!(crate::exporter::ngx_process(), crate::exporter::NgxProcess::Worker(_))
+                {
+                    let worker_id = unsafe { nginx_sys::ngx_worker as usize };
                     let cap = amcf.log_ring_cap();
 
                     if let Some(logs_base) = amcf.logs_shm_base() {
-                        let coalesce_table = unsafe {
-                            crate::shm::logs_coalesce_table(logs_base, worker_id, cap)
-                        };
-                        let error_ring_ptr = unsafe {
-                            crate::shm::logs_error_ring_ptr(logs_base, worker_id, cap)
-                        };
+                        let coalesce_table =
+                            unsafe { crate::shm::logs_coalesce_table(logs_base, worker_id, cap) };
+                        let error_ring_ptr =
+                            unsafe { crate::shm::logs_error_ring_ptr(logs_base, worker_id, cap) };
 
                         // Error-rate counters live in the metrics shm (WorkerSlots).
                         let error_rate_ptr = amcf.shm_base().and_then(|metrics_base| {
-                            let ws = unsafe {
-                                crate::shm::worker_slots(metrics_base, worker_id)
-                            };
+                            let ws = unsafe { crate::shm::worker_slots(metrics_base, worker_id) };
                             Some(unsafe {
-                                (*ws).error_rate_counters.as_ptr() as *mut core::sync::atomic::AtomicU64
+                                (*ws).error_rate_counters.as_ptr()
+                                    as *mut core::sync::atomic::AtomicU64
                             })
                         });
 
@@ -996,11 +990,7 @@ mod nginx_test_stubs {
     // OwnedNgxPool::new → Err before any resolver call).
 
     #[no_mangle]
-    pub unsafe extern "C" fn ngx_inet_set_port(
-        _sa: *mut libc::sockaddr,
-        _port: libc::c_ushort,
-    ) {
-    }
+    pub unsafe extern "C" fn ngx_inet_set_port(_sa: *mut libc::sockaddr, _port: libc::c_ushort) {}
 
     #[no_mangle]
     pub unsafe extern "C" fn ngx_resolve_start(
@@ -1018,10 +1008,7 @@ mod nginx_test_stubs {
     }
 
     #[no_mangle]
-    pub unsafe extern "C" fn ngx_resolve_name_done(
-        _ctx: *mut nginx_sys::ngx_resolver_ctx_t,
-    ) {
-    }
+    pub unsafe extern "C" fn ngx_resolve_name_done(_ctx: *mut nginx_sys::ngx_resolver_ctx_t) {}
 
     // nginx pool allocator (ngx::core::Pool as Allocator, used by the resolver
     // Vec<ngx_addr_t, Pool> return type).

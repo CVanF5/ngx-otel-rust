@@ -220,7 +220,11 @@ pub fn coalesce_key(severity: u8, core: &[u8]) -> u64 {
         h = h.wrapping_mul(PRIME);
     }
     // Avoid the empty-slot sentinel (0).
-    if h == 0 { 1 } else { h }
+    if h == 0 {
+        1
+    } else {
+        h
+    }
 }
 
 // ── Coalescer main entry point ────────────────────────────────────────────────
@@ -419,8 +423,7 @@ mod tests {
 
         assert_eq!(core1, core2, "same core message must extract identically");
         assert_eq!(
-            core1,
-            b"connect() failed (111: Connection refused)",
+            core1, b"connect() failed (111: Connection refused)",
             "core must be the message up to ' while '"
         );
 
@@ -564,7 +567,10 @@ mod tests {
         // Also emerg (1) and alert (2).
         let msg_emerg = b"2024/01/01 12:00:00 [emerg] 1#1: worker process exited\n";
         let r = unsafe { coalesce(ptr, 1, msg_emerg, true) };
-        assert!(matches!(r, CoalesceResult::EmitVerbatim { .. }), "emerg must always emit verbatim");
+        assert!(
+            matches!(r, CoalesceResult::EmitVerbatim { .. }),
+            "emerg must always emit verbatim"
+        );
     }
 
     /// Table-full degrades to verbatim, never panics.
@@ -587,10 +593,7 @@ mod tests {
                     core::ptr::addr_of_mut!((*ptr.add(i)).key_hash),
                     (i + 1) as u64,
                 );
-                core::ptr::write_volatile(
-                    core::ptr::addr_of_mut!((*ptr.add(i)).severity),
-                    4u8,
-                );
+                core::ptr::write_volatile(core::ptr::addr_of_mut!((*ptr.add(i)).severity), 4u8);
             }
             table[i].count.store(1, Ordering::Relaxed);
             table[i].sample_emitted.store(true, Ordering::Relaxed);
@@ -629,9 +632,6 @@ mod tests {
         let core = stable_core(msg);
         let key = coalesce_key(4, core);
         let slot_idx = (key as usize) & (COALESCE_CAPACITY - 1);
-        assert_eq!(
-            table[slot_idx].key_hash, 0,
-            "coalesce=off must not write to the table"
-        );
+        assert_eq!(table[slot_idx].key_hash, 0, "coalesce=off must not write to the table");
     }
 }

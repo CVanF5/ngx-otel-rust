@@ -7,13 +7,13 @@ use core::ffi::{c_char, c_void};
 use core::ptr::NonNull;
 use core::{mem, ptr};
 
+use crate::logs::error_writer::{
+    ngx_otel_error_writer, otel_log_insert, parse_error_log_level, OtelErrorWriterState,
+};
 use nginx_sys::{
     ngx_array_t, ngx_command_t, ngx_conf_parse, ngx_conf_t, ngx_flag_t, ngx_module_t, ngx_str_t,
     ngx_uint_t, NGX_CONF_BLOCK, NGX_CONF_FLAG, NGX_CONF_NOARGS, NGX_CONF_TAKE1, NGX_CONF_TAKE2,
     NGX_HTTP_MAIN_CONF, NGX_HTTP_MAIN_CONF_OFFSET, NGX_LOG_DEBUG, NGX_LOG_EMERG,
-};
-use crate::logs::error_writer::{
-    ngx_otel_error_writer, otel_log_insert, parse_error_log_level, OtelErrorWriterState,
 };
 use ngx::core::{Status, NGX_CONF_ERROR, NGX_CONF_OK};
 use ngx::http::{HttpModuleLocationConf, HttpModuleMainConf, NgxHttpCoreModule};
@@ -539,22 +539,21 @@ impl MainConfig {
                 let cf_ref = unsafe { &*cf };
                 // Collect resolver pointer and timeout from clcf, dropping the
                 // borrow on clcf before we potentially use `&mut *cf` for logging.
-                let resolver_info =
-                    NgxHttpCoreModule::location_conf(cf_ref).and_then(|clcf| {
-                        let nn = NonNull::new(clcf.resolver)?;
-                        // A resolver with zero connections means it was not
-                        // properly configured (matches acme's connections.nelts
-                        // guard, `issuer.rs:212-216`).
-                        if unsafe { nn.as_ref() }.connections.nelts == 0 {
-                            return None;
-                        }
-                        let timeout = if clcf.resolver_timeout != NGX_CONF_UNSET_MSEC {
-                            clcf.resolver_timeout
-                        } else {
-                            DEFAULT_RESOLVER_TIMEOUT_MS
-                        };
-                        Some((nn, timeout))
-                    });
+                let resolver_info = NgxHttpCoreModule::location_conf(cf_ref).and_then(|clcf| {
+                    let nn = NonNull::new(clcf.resolver)?;
+                    // A resolver with zero connections means it was not
+                    // properly configured (matches acme's connections.nelts
+                    // guard, `issuer.rs:212-216`).
+                    if unsafe { nn.as_ref() }.connections.nelts == 0 {
+                        return None;
+                    }
+                    let timeout = if clcf.resolver_timeout != NGX_CONF_UNSET_MSEC {
+                        clcf.resolver_timeout
+                    } else {
+                        DEFAULT_RESOLVER_TIMEOUT_MS
+                    };
+                    Some((nn, timeout))
+                });
 
                 match resolver_info {
                     Some((resolver, timeout)) => {
@@ -1763,11 +1762,7 @@ extern "C" fn cmd_set_error_log(
 
     if amcf.error_log_enabled {
         unsafe {
-            ngx_conf_log_error!(
-                NGX_LOG_EMERG,
-                &mut *cf,
-                "\"otel_error_log\" is duplicate"
-            );
+            ngx_conf_log_error!(NGX_LOG_EMERG, &mut *cf, "\"otel_error_log\" is duplicate");
         }
         return NGX_CONF_ERROR;
     }
@@ -1810,14 +1805,21 @@ extern "C" fn cmd_set_error_log(
         let log_ptr = nginx_sys::ngx_pcalloc(pool, mem::size_of::<nginx_sys::ngx_log_t>())
             as *mut nginx_sys::ngx_log_t;
         if log_ptr.is_null() {
-            ngx_conf_log_error!(NGX_LOG_EMERG, &mut *cf, "otel_error_log: ngx_pcalloc failed for log node");
+            ngx_conf_log_error!(
+                NGX_LOG_EMERG,
+                &mut *cf,
+                "otel_error_log: ngx_pcalloc failed for log node"
+            );
             return NGX_CONF_ERROR;
         }
-        let state_ptr =
-            nginx_sys::ngx_pcalloc(pool, mem::size_of::<OtelErrorWriterState>())
-                as *mut OtelErrorWriterState;
+        let state_ptr = nginx_sys::ngx_pcalloc(pool, mem::size_of::<OtelErrorWriterState>())
+            as *mut OtelErrorWriterState;
         if state_ptr.is_null() {
-            ngx_conf_log_error!(NGX_LOG_EMERG, &mut *cf, "otel_error_log: ngx_pcalloc failed for writer state");
+            ngx_conf_log_error!(
+                NGX_LOG_EMERG,
+                &mut *cf,
+                "otel_error_log: ngx_pcalloc failed for writer state"
+            );
             return NGX_CONF_ERROR;
         }
         (log_ptr, state_ptr)
@@ -2019,7 +2021,7 @@ mod tests {
         assert_eq!(cfg.interval_ms(), DEFAULT_INTERVAL_MS);
         assert_eq!(cfg.batch_size(), DEFAULT_BATCH_SIZE);
         assert!(cfg.status_code_class_enabled()); // UNSET treated as on
-        // exception-tail / exemplar sampling is off by default (Phase 2.2)
+                                                  // exception-tail / exemplar sampling is off by default (Phase 2.2)
         assert!(!cfg.is_access_sample_enabled(), "access sample must default to off");
         // error-log export is off by default (Phase 2.3)
         assert!(!cfg.error_log_enabled, "error_log_enabled must default to false");
@@ -2052,7 +2054,7 @@ mod tests {
         let mut cfg = MainConfig::default();
         assert!(!cfg.error_log_enabled);
         assert!(cfg.error_log_coalesce); // default on
-        // Simulate cmd_set_error_log TAKE1 setting an explicit level.
+                                         // Simulate cmd_set_error_log TAKE1 setting an explicit level.
         cfg.error_log_enabled = true;
         cfg.error_log_level = nginx_sys::NGX_LOG_WARN as ngx_uint_t;
         assert!(cfg.error_log_enabled);
@@ -2252,8 +2254,7 @@ mod tests {
             "resolver must default to None (wired only for DNS endpoints at postconfiguration)"
         );
         assert_eq!(
-            cfg.resolver_timeout,
-            0,
+            cfg.resolver_timeout, 0,
             "resolver_timeout must default to 0 (set only when resolver is wired)"
         );
     }

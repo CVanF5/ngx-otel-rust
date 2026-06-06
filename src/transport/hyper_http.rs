@@ -826,27 +826,22 @@ impl Connector for NgxConnector {
 
                 // Branch on address family.  DNS names fall through to the
                 // error arm below; resolution is wired in Item 3 (transport_dns).
-                let (sockaddr_ptr, socklen) =
-                    match host_str.parse::<std::net::IpAddr>() {
-                        Ok(std::net::IpAddr::V4(v4)) => (
-                            build_ipv4_sockaddr(&io.pool, v4, *port)?,
-                            core::mem::size_of::<libc::sockaddr_in>()
-                                as nginx_sys::socklen_t,
-                        ),
-                        Ok(std::net::IpAddr::V6(v6)) => (
-                            // ⚠️ socklen MUST match the family — sockaddr_in6 (28)
-                            // ≠ sockaddr_in (16); mismatch corrupts the connect.
-                            build_ipv6_sockaddr(&io.pool, v6, *port)?,
-                            core::mem::size_of::<libc::sockaddr_in6>()
-                                as nginx_sys::socklen_t,
-                        ),
-                        Err(_) => {
-                            // DNS name — resolve using the nginx async resolver.
-                            return self
-                                .connect_dns(host, host_str, *port)
-                                .await;
-                        }
-                    };
+                let (sockaddr_ptr, socklen) = match host_str.parse::<std::net::IpAddr>() {
+                    Ok(std::net::IpAddr::V4(v4)) => (
+                        build_ipv4_sockaddr(&io.pool, v4, *port)?,
+                        core::mem::size_of::<libc::sockaddr_in>() as nginx_sys::socklen_t,
+                    ),
+                    Ok(std::net::IpAddr::V6(v6)) => (
+                        // ⚠️ socklen MUST match the family — sockaddr_in6 (28)
+                        // ≠ sockaddr_in (16); mismatch corrupts the connect.
+                        build_ipv6_sockaddr(&io.pool, v6, *port)?,
+                        core::mem::size_of::<libc::sockaddr_in6>() as nginx_sys::socklen_t,
+                    ),
+                    Err(_) => {
+                        // DNS name — resolve using the nginx async resolver.
+                        return self.connect_dns(host, host_str, *port).await;
+                    }
+                };
 
                 // Build and install pc.name.  REQUIRED under `--with-debug`:
                 // `ngx_event_connect_peer` logs `"connect to %V, fd:%d #%uA"`
@@ -900,8 +895,8 @@ impl NgxConnector {
     /// These are the resolver-lifetime / UAF concerns from the loop doc.
     async fn connect_dns(
         &self,
-        host: &str,        // original host string (may have brackets for v6)
-        host_str: &str,    // bracket-stripped host string
+        host: &str,     // original host string (may have brackets for v6)
+        host_str: &str, // bracket-stripped host string
         port: u16,
     ) -> Result<Pin<Box<NgxConnIo>>, TransportError> {
         use ngx::async_::resolver::Resolver;
@@ -927,17 +922,12 @@ impl NgxConnector {
         //
         // Safety: cast *const u8 → *mut u8 — nginx reads the name bytes but
         // never writes to them.
-        let host_ngx_str = nginx_sys::ngx_str_t {
-            len: host_str.len(),
-            data: host_str.as_ptr() as *mut u8,
-        };
+        let host_ngx_str =
+            nginx_sys::ngx_str_t { len: host_str.len(), data: host_str.as_ptr() as *mut u8 };
 
-        let addrs = resolver
-            .resolve_name(&host_ngx_str, &*resolve_pool)
-            .await
-            .map_err(|e| TransportError::Connection {
-                cause: std::format!("DNS resolve '{}': {}", host_str, e),
-            })?;
+        let addrs = resolver.resolve_name(&host_ngx_str, &*resolve_pool).await.map_err(|e| {
+            TransportError::Connection { cause: std::format!("DNS resolve '{}': {}", host_str, e) }
+        })?;
 
         if addrs.is_empty() {
             return Err(TransportError::Connection {
@@ -953,10 +943,7 @@ impl NgxConnector {
             // ngx_inet_set_port takes port in HOST byte order and calls htons()
             // internally (nginx/src/core/ngx_inet.c:1436).
             unsafe {
-                nginx_sys::ngx_inet_set_port(
-                    addr.sockaddr,
-                    port as nginx_sys::in_port_t,
-                );
+                nginx_sys::ngx_inet_set_port(addr.sockaddr, port as nginx_sys::in_port_t);
             }
 
             let mut io = Box::pin(NgxConnIo::new(self.log)?);
@@ -1381,8 +1368,7 @@ mod tests {
         assert_eq!(sa.sin6_family as libc::c_int, libc::AF_INET6, "family must be AF_INET6");
         assert_eq!(sa.sin6_port, port.to_be(), "port must be in network byte order");
         // ::1 → all-zero except last byte = 1.
-        let expected: [u8; 16] =
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let expected: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
         assert_eq!(sa.sin6_addr.s6_addr, expected, "IPv6 address bytes must be in network order");
         assert_eq!(sa.sin6_flowinfo, 0, "flowinfo must be 0");
         assert_eq!(sa.sin6_scope_id, 0, "scope_id must be 0 (global addresses)");
@@ -1416,13 +1402,11 @@ mod tests {
     #[test]
     fn socklen_is_family_matched() {
         // IPv4 → 16
-        let v4_socklen =
-            core::mem::size_of::<libc::sockaddr_in>() as nginx_sys::socklen_t;
+        let v4_socklen = core::mem::size_of::<libc::sockaddr_in>() as nginx_sys::socklen_t;
         assert_eq!(v4_socklen, 16, "IPv4 pc.socklen must be 16");
 
         // IPv6 → 28
-        let v6_socklen =
-            core::mem::size_of::<libc::sockaddr_in6>() as nginx_sys::socklen_t;
+        let v6_socklen = core::mem::size_of::<libc::sockaddr_in6>() as nginx_sys::socklen_t;
         assert_eq!(v6_socklen, 28, "IPv6 pc.socklen must be 28");
 
         // Confirm they differ (the key invariant — mismatch corrupts connect).

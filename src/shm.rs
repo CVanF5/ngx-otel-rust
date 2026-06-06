@@ -101,10 +101,10 @@ impl ExpHistogramSlot {
         } else {
             let n = 63u32.saturating_sub(value_us.leading_zeros()); // floor(log2(value))
             let s = EXP_HISTOGRAM_SCALE as u32; // = 3
-            // OTel exponential-histogram bucket index = floor(log2(value) * 2^scale),
-            // recovered from the exponent `n` plus the top `scale` mantissa bits.
-            // The encoder ships these buckets at offset=0, so the consumer decodes
-            // bucket `k` as the range (2^(k/2^scale), 2^((k+1)/2^scale)].
+                                                // OTel exponential-histogram bucket index = floor(log2(value) * 2^scale),
+                                                // recovered from the exponent `n` plus the top `scale` mantissa bits.
+                                                // The encoder ships these buckets at offset=0, so the consumer decodes
+                                                // bucket `k` as the range (2^(k/2^scale), 2^((k+1)/2^scale)].
             let upper = (n as usize) << s;
             let frac = if n >= s {
                 ((value_us >> (n - s)) as usize) & ((1usize << s) - 1)
@@ -415,11 +415,11 @@ pub const SEVERITY_CLASS_NAMES: [&str; N_SEVERITY_CLASSES] =
 pub fn severity_class_index(ngx_level: u8) -> usize {
     match ngx_level {
         1 | 2 | 3 => 0, // fatal: emerg / alert / crit
-        4 => 1,          // error
-        5 => 2,          // warn
-        6 | 7 => 3,      // info: notice / info
-        8 => 4,          // debug
-        _ => 0,          // clamp unknown to fatal (conservative; never OOB)
+        4 => 1,         // error
+        5 => 2,         // warn
+        6 | 7 => 3,     // info: notice / info
+        8 => 4,         // debug
+        _ => 0,         // clamp unknown to fatal (conservative; never OOB)
     }
 }
 
@@ -1181,15 +1181,8 @@ mod tests {
             assert_eq!(count, 1, "value {value}: count");
             assert_eq!(sum, value, "value {value}: sum");
             assert_eq!(zero, 0, "value {value}: nonzero must not hit zero_count");
-            assert_eq!(
-                buckets[expected], 1,
-                "value {value} must land in bucket {expected}"
-            );
-            assert_eq!(
-                buckets.iter().sum::<u64>(),
-                1,
-                "value {value}: exactly one bucket set"
-            );
+            assert_eq!(buckets[expected], 1, "value {value} must land in bucket {expected}");
+            assert_eq!(buckets.iter().sum::<u64>(), 1, "value {value}: exactly one bucket set");
         }
     }
 

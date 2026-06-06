@@ -132,12 +132,9 @@ pub fn sync_post(
             // `ParsedEndpoint::parse` stores `"[::1]"` for `http://[::1]:PORT/`;
             // `to_socket_addrs` rejects the bracketed form.  The async path uses
             // the same `strip_v6_brackets` helper (hyper_http.rs).
-            let bare_host =
-                crate::transport::hyper_http::strip_v6_brackets(host.as_str());
-            let addrs: std::vec::Vec<_> = (bare_host, port)
-                .to_socket_addrs()
-                .map_err(SyncSendError::Connect)?
-                .collect();
+            let bare_host = crate::transport::hyper_http::strip_v6_brackets(host.as_str());
+            let addrs: std::vec::Vec<_> =
+                (bare_host, port).to_socket_addrs().map_err(SyncSendError::Connect)?.collect();
             if addrs.is_empty() {
                 return Err(SyncSendError::Connect(std::io::Error::new(
                     std::io::ErrorKind::AddrNotAvailable,
@@ -151,8 +148,8 @@ pub fn sync_post(
             // acceptable in exit_process (blocking is fine there); the outer
             // backstop is worker_shutdown_timeout.  Sequential iteration is
             // intentional — no happy-eyeballs (same policy as the async path).
-            let mut stream = connect_first_reachable(&addrs, CONNECT_TIMEOUT)
-                .map_err(SyncSendError::Connect)?;
+            let mut stream =
+                connect_first_reachable(&addrs, CONNECT_TIMEOUT).map_err(SyncSendError::Connect)?;
             stream.set_write_timeout(Some(WRITE_TIMEOUT)).map_err(SyncSendError::Write)?;
             stream.set_read_timeout(Some(READ_TIMEOUT)).map_err(SyncSendError::Read)?;
 
