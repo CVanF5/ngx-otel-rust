@@ -51,7 +51,6 @@ const UNSET_U64: u64 = u64::MAX;
 // Default export interval: 10 s in milliseconds
 const DEFAULT_INTERVAL_MS: u64 = 10_000;
 // Default batch size
-const DEFAULT_BATCH_SIZE: u64 = 100;
 /// Default retry-buffer depth used by [`MainConfig::retry_buffer_depth`].
 /// See the spec-inconsistency note on that method.
 const DEFAULT_RETRY_BUFFER_DEPTH: usize = 4;
@@ -84,7 +83,9 @@ pub struct ExporterConfig {
     /// The OTLP/HTTP endpoint URL.
     /// Accepted schemes: `unix:`, `http://`, `https://`
     pub endpoint: ngx_str_t,
-    /// Path to a trusted CA certificate for HTTPS (optional).
+    /// Path to a trusted CA certificate for HTTPS. RESERVED: parsed and stored,
+    /// but has no effect until TLS (`https://`) is implemented — `https://` is
+    /// rejected at parse today, so this is inert until then.
     pub trusted_cert: ngx_str_t,
 }
 
@@ -156,8 +157,6 @@ pub struct MainConfig {
     pub exporter_headers: std::vec::Vec<KvPair>,
     /// `otel_metric_interval` — stored in milliseconds; UNSET_U64 until configured.
     pub metric_interval_ms: u64,
-    /// `otel_metric_batch_size` — UNSET_U64 until configured.
-    pub metric_batch_size: u64,
     /// `otel_metric_zone <name> <size>` — name part.
     pub zone_name: ngx_str_t,
     /// `otel_metric_zone <name> <size>` — size in bytes; 0 = not configured.
@@ -298,7 +297,6 @@ impl Default for MainConfig {
             resource_attrs: std::vec::Vec::new(),
             exporter_headers: std::vec::Vec::new(),
             metric_interval_ms: UNSET_U64,
-            metric_batch_size: UNSET_U64,
             zone_name: ngx_str_t::default(),
             zone_size: 0,
             status_code_class: UNSET_FLAG,
@@ -352,28 +350,9 @@ impl MainConfig {
 
     /// Effective batch size (max data points per encoded batch).
     ///
-    /// **NOTE — currently unused.** The export loop emits one batch per
-    /// interval regardless of size; the directive is reserved for a future
-    /// iteration that chunks large collections. Do not remove without
-    /// updating the directive table.
-    #[allow(dead_code)]
-    pub fn batch_size(&self) -> u64 {
-        if self.metric_batch_size == UNSET_U64 {
-            DEFAULT_BATCH_SIZE
-        } else {
-            self.metric_batch_size
-        }
-    }
-
     /// Maximum number of *unsent* batches the export loop holds in its retry
     /// buffer on send failure. Older entries are evicted oldest-first.
-    ///
-    /// Distinct from [`batch_size`](Self::batch_size), which is points-per-batch.
-    /// The Step 9 spec's claim that "depth from otel_metric_batch_size, default
-    /// reasonable 4-8 batches" is internally inconsistent (batch_size defaults
-    /// to 100, which would buffer 10k+ points). The "reasonable default" reading
-    /// wins here. Currently a constant; promotable to a directive if operators
-    /// need to tune it.
+    /// Currently a constant; promotable to a directive if operators need it.
     pub fn retry_buffer_depth(&self) -> usize {
         DEFAULT_RETRY_BUFFER_DEPTH
     }
@@ -509,14 +488,24 @@ impl MainConfig {
 
         // Validate endpoint scheme.
         let ep = self.exporter.endpoint.as_bytes();
-        let valid_scheme =
-            ep.starts_with(b"unix:") || ep.starts_with(b"http://") || ep.starts_with(b"https://");
+        // https:// is recognised but TLS is not yet implemented. Reject at parse
+        // (fail-fast — the nginx idiom) instead of accepting it and failing every
+        // export at runtime. Re-enable here when TLS lands for both transports.
+        if ep.starts_with(b"https://") {
+            ngx_conf_log_error!(
+                NGX_LOG_EMERG,
+                &raw mut *cf,
+                "otel_exporter: https:// (TLS) is not yet implemented; use http:// or unix:"
+            );
+            return Err(Status::NGX_ERROR);
+        }
+        let valid_scheme = ep.starts_with(b"unix:") || ep.starts_with(b"http://");
 
         if !valid_scheme {
             ngx_conf_log_error!(
                 NGX_LOG_EMERG,
                 &raw mut *cf,
-                "otel_exporter: \"endpoint\" must start with unix:, http://, or https://"
+                "otel_exporter: \"endpoint\" must start with http:// or unix:"
             );
             return Err(Status::NGX_ERROR);
         }
@@ -1381,15 +1370,6 @@ macro_rules! production_commands {
                 offset: 0,
                 post: ptr::null_mut(),
             },
-            // otel_metric_batch_size <count>;
-            ngx_command_t {
-                name: ngx_string!("otel_metric_batch_size"),
-                type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-                set: Some(cmd_set_metric_batch_size),
-                conf: NGX_HTTP_MAIN_CONF_OFFSET,
-                offset: 0,
-                post: ptr::null_mut(),
-            },
             // otel_metric_zone <name> <size>;
             ngx_command_t {
                 name: ngx_string!("otel_metric_zone"),
@@ -1511,17 +1491,17 @@ macro_rules! production_commands {
     };
 }
 
-/// Production build: 16 production commands + terminator.
+/// Production build: 15 production commands + terminator.
 #[cfg(not(any(test, feature = "test-support")))]
-pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 17] = {
-    let mut cmds = [ngx_command_t::empty(); 17];
+pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 16] = {
+    let mut cmds = [ngx_command_t::empty(); 16];
     let prod = production_commands!();
     let mut i = 0;
-    while i < 16 {
+    while i < 15 {
         cmds[i] = prod[i];
         i += 1;
     }
-    // cmds[16] stays empty() — terminator
+    // cmds[15] stays empty() — terminator
     cmds
 };
 
@@ -1533,16 +1513,16 @@ pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 17] = {
 /// process-level introspection. Absent from production builds (verified by grep
 /// on `objs-release/ngx_http_otel_module.so`).
 #[cfg(any(test, feature = "test-support"))]
-pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 18] = {
-    let mut cmds = [ngx_command_t::empty(); 18];
+pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 17] = {
+    let mut cmds = [ngx_command_t::empty(); 17];
     let prod = production_commands!();
     let mut i = 0;
-    while i < 16 {
+    while i < 15 {
         cmds[i] = prod[i];
         i += 1;
     }
-    // Index 16: otel_status_endpoint (test-support only).
-    cmds[16] = ngx_command_t {
+    // Index 15: otel_status_endpoint (test-support only).
+    cmds[15] = ngx_command_t {
         name: ngx_string!("otel_status_endpoint"),
         type_: (nginx_sys::NGX_HTTP_LOC_CONF | NGX_CONF_NOARGS) as ngx_uint_t,
         set: Some(cmd_set_otel_status_endpoint),
@@ -1550,7 +1530,7 @@ pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 18] = {
         offset: 0,
         post: ptr::null_mut(),
     };
-    // cmds[17] stays empty() — terminator.
+    // cmds[16] stays empty() — terminator.
     cmds
 };
 
@@ -1653,39 +1633,6 @@ extern "C" fn cmd_set_metric_interval(
                 NGX_LOG_EMERG,
                 &raw mut *cf,
                 "invalid duration in \"otel_metric_interval\": \"{}\"",
-                args[1]
-            );
-            NGX_CONF_ERROR
-        }
-    }
-}
-
-extern "C" fn cmd_set_metric_batch_size(
-    cf: *mut ngx_conf_t,
-    _cmd: *mut ngx_command_t,
-    conf: *mut c_void,
-) -> *mut c_char {
-    // SAFETY: nginx passes the module's `MainConfig` pointer as `conf` for this
-    // MAIN_CONF directive; the cast + `as_mut` yield a valid exclusive reference.
-    let amcf = unsafe { conf.cast::<MainConfig>().as_mut().expect("main config") };
-
-    if amcf.metric_batch_size != UNSET_U64 {
-        return c"is duplicate".as_ptr().cast_mut();
-    }
-
-    // SAFETY: `cf` is the valid non-null directive parse context; `args` holds the
-    // parsed tokens (TAKE1: the count).
-    let args = unsafe { cf_args(cf) };
-    match parse_u64_ascii(args[1].as_bytes()) {
-        Some(n) if n > 0 => {
-            amcf.metric_batch_size = n;
-            NGX_CONF_OK
-        }
-        _ => {
-            ngx_conf_log_error!(
-                NGX_LOG_EMERG,
-                &raw mut *cf,
-                "invalid value in \"otel_metric_batch_size\": \"{}\"",
                 args[1]
             );
             NGX_CONF_ERROR
@@ -2149,7 +2096,6 @@ mod tests {
         let cfg = MainConfig::default();
         assert!(!cfg.is_configured());
         assert_eq!(cfg.interval_ms(), DEFAULT_INTERVAL_MS);
-        assert_eq!(cfg.batch_size(), DEFAULT_BATCH_SIZE);
         assert!(cfg.status_code_class_enabled()); // UNSET treated as on
                                                   // exception-tail / exemplar sampling is off by default (Phase 2.2)
         assert!(!cfg.is_access_sample_enabled(), "access sample must default to off");
