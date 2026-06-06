@@ -11,6 +11,10 @@ rust-version = "1.85.0"
 # any newly-introduced `unsafe` honest. (A restriction lint, opted into here.)
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"
+# Prefer `&raw const/mut place` over `&place as *const/*mut T` — the latter forms
+# a transient reference (an aliasing assertion) just to cast it away, which is a
+# footgun at the FFI boundary. Enforced after the full conversion (2026-06-06).
+borrow_as_ptr = "deny"
 
 [lib]
 name = "ngx_http_otel_module"

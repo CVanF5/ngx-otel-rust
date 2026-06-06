@@ -488,26 +488,19 @@ impl MainConfig {
         // so `&mut *cf` is a sound exclusive borrow for the call to `old_config`.
         if let Some(old) = unsafe { Self::old_config(&mut *cf) } {
             if self.is_configured() {
-                // SAFETY: `cf` is the valid non-null parse context; `&mut *cf`
-                // gives `ngx_conf_log_error!` the exclusive borrow it needs.
-                unsafe {
-                    ngx_conf_log_error!(
-                        NGX_LOG_DEBUG,
-                        &mut *cf,
-                        "otel: SIGHUP reload detected (old endpoint={}, new endpoint={})",
-                        old.exporter.endpoint,
-                        self.exporter.endpoint
-                    );
-                }
+                ngx_conf_log_error!(
+                    NGX_LOG_DEBUG,
+                    &raw mut *cf,
+                    "otel: SIGHUP reload detected (old endpoint={}, new endpoint={})",
+                    old.exporter.endpoint,
+                    self.exporter.endpoint
+                );
             } else {
-                // SAFETY: as above — `cf` is the valid non-null parse context.
-                unsafe {
-                    ngx_conf_log_error!(
-                        NGX_LOG_DEBUG,
-                        &mut *cf,
-                        "otel: SIGHUP reload detected: new config has no otel_exporter block"
-                    );
-                }
+                ngx_conf_log_error!(
+                    NGX_LOG_DEBUG,
+                    &raw mut *cf,
+                    "otel: SIGHUP reload detected: new config has no otel_exporter block"
+                );
             }
         }
 
@@ -522,15 +515,11 @@ impl MainConfig {
             ep.starts_with(b"unix:") || ep.starts_with(b"http://") || ep.starts_with(b"https://");
 
         if !valid_scheme {
-            // SAFETY: `cf` is the valid non-null parse context nginx passed to
-            // `postconfiguration`; `&mut *cf` is a sound exclusive borrow.
-            unsafe {
-                ngx_conf_log_error!(
-                    NGX_LOG_EMERG,
-                    &mut *cf,
-                    "otel_exporter: \"endpoint\" must start with unix:, http://, or https://"
-                );
-            }
+            ngx_conf_log_error!(
+                NGX_LOG_EMERG,
+                &raw mut *cf,
+                "otel_exporter: \"endpoint\" must start with unix:, http://, or https://"
+            );
             return Err(Status::NGX_ERROR);
         }
 
@@ -579,20 +568,15 @@ impl MainConfig {
                         self.resolver_timeout = timeout;
                     }
                     None => {
-                        // SAFETY: `cf` is the valid non-null parse context; the
-                        // earlier `&*cf` borrow has been dropped, so `&mut *cf`
-                        // here is a sound exclusive borrow for logging.
-                        unsafe {
-                            ngx_conf_log_error!(
-                                NGX_LOG_EMERG,
-                                &mut *cf,
-                                "otel_exporter: endpoint \"{}\" is a DNS name but nginx's \
-                                 \"resolver\" directive is not configured; add \"resolver \
-                                 <nameserver>;\" to the http block to use a DNS name in \
-                                 otel_exporter",
-                                ep_str
-                            );
-                        }
+                        ngx_conf_log_error!(
+                            NGX_LOG_EMERG,
+                            &raw mut *cf,
+                            "otel_exporter: endpoint \"{}\" is a DNS name but nginx's \
+                             \"resolver\" directive is not configured; add \"resolver \
+                             <nameserver>;\" to the http block to use a DNS name in \
+                             otel_exporter",
+                            ep_str
+                        );
                         return Err(Status::NGX_ERROR);
                     }
                 }
@@ -674,14 +658,11 @@ impl MainConfig {
         // to `postconfiguration`, satisfying `register_zone`'s contract.
         let Some(zone) = (unsafe { shm::register_zone(cf, &mut zone_name, zone_size, module) })
         else {
-            // SAFETY: `cf` is the valid non-null parse context for logging.
-            unsafe {
-                ngx_conf_log_error!(
-                    NGX_LOG_EMERG,
-                    &mut *cf,
-                    "otel: failed to register shared memory zone"
-                );
-            }
+            ngx_conf_log_error!(
+                NGX_LOG_EMERG,
+                &raw mut *cf,
+                "otel: failed to register shared memory zone"
+            );
             return Err(Status::NGX_ERROR);
         };
 
@@ -716,14 +697,11 @@ impl MainConfig {
         // to `postconfiguration`, satisfying `register_zone`'s contract.
         let Some(zone) = (unsafe { shm::register_zone(cf, &mut zone_name, zone_size, module) })
         else {
-            // SAFETY: `cf` is the valid non-null parse context for logging.
-            unsafe {
-                ngx_conf_log_error!(
-                    NGX_LOG_EMERG,
-                    &mut *cf,
-                    "otel: failed to register control shared memory zone"
-                );
-            }
+            ngx_conf_log_error!(
+                NGX_LOG_EMERG,
+                &raw mut *cf,
+                "otel: failed to register control shared memory zone"
+            );
             return Err(Status::NGX_ERROR);
         };
 
@@ -773,14 +751,11 @@ impl MainConfig {
         // to `postconfiguration`, satisfying `register_zone`'s contract.
         let Some(zone) = (unsafe { shm::register_zone(cf, &mut zone_name, zone_size, module) })
         else {
-            // SAFETY: `cf` is the valid non-null parse context for logging.
-            unsafe {
-                ngx_conf_log_error!(
-                    NGX_LOG_EMERG,
-                    &mut *cf,
-                    "otel: failed to register logs shared memory zone"
-                );
-            }
+            ngx_conf_log_error!(
+                NGX_LOG_EMERG,
+                &raw mut *cf,
+                "otel: failed to register logs shared memory zone"
+            );
             return Err(Status::NGX_ERROR);
         };
 
@@ -1327,15 +1302,12 @@ extern "C" fn cmd_exporter_block_handler(
         }
         let expected = cmd_nargs(cmd);
         if args.len() < expected.0 || args.len() > expected.1 {
-            // SAFETY: `cf` is the valid non-null parse context for logging.
-            unsafe {
-                ngx_conf_log_error!(
-                    NGX_LOG_EMERG,
-                    &mut *cf,
-                    "invalid number of arguments in \"{}\" directive",
-                    args[0]
-                );
-            }
+            ngx_conf_log_error!(
+                NGX_LOG_EMERG,
+                &raw mut *cf,
+                "invalid number of arguments in \"{}\" directive",
+                args[0]
+            );
             return NGX_CONF_ERROR;
         }
         let handler = cmd.set.expect("command handler");
@@ -1346,15 +1318,12 @@ extern "C" fn cmd_exporter_block_handler(
         return unsafe { handler(cf, cmd, (*cf).handler_conf) };
     }
 
-    // SAFETY: `cf` is the valid non-null parse context for logging.
-    unsafe {
-        ngx_conf_log_error!(
-            NGX_LOG_EMERG,
-            &mut *cf,
-            "unknown directive \"{}\" in otel_exporter block",
-            args[0]
-        );
-    }
+    ngx_conf_log_error!(
+        NGX_LOG_EMERG,
+        &raw mut *cf,
+        "unknown directive \"{}\" in otel_exporter block",
+        args[0]
+    );
     NGX_CONF_ERROR
 }
 
@@ -1608,10 +1577,7 @@ extern "C" fn cmd_set_exporter_block(
     let amcf = unsafe { conf.cast::<MainConfig>().as_mut().expect("main config") };
 
     if amcf.exporter.is_set() {
-        // SAFETY: `cf` is the valid non-null parse context for logging.
-        unsafe {
-            ngx_conf_log_error!(NGX_LOG_EMERG, &mut *cf, "\"otel_exporter\" is duplicate");
-        }
+        ngx_conf_log_error!(NGX_LOG_EMERG, &raw mut *cf, "\"otel_exporter\" is duplicate");
         return NGX_CONF_ERROR;
     }
 
@@ -1623,7 +1589,7 @@ extern "C" fn cmd_set_exporter_block(
 
     // SAFETY: `block_cf` is a valid in-scope parse context with our block handler
     // installed; `ngx_conf_parse` recurses into the `otel_exporter { ... }` body.
-    unsafe { ngx_conf_parse(&mut block_cf, ptr::null_mut()) }
+    unsafe { ngx_conf_parse(&raw mut block_cf, ptr::null_mut()) }
 }
 
 extern "C" fn cmd_add_resource_attr(
@@ -1678,15 +1644,12 @@ extern "C" fn cmd_set_metric_interval(
             NGX_CONF_OK
         }
         _ => {
-            // SAFETY: `cf` is the valid non-null parse context for logging.
-            unsafe {
-                ngx_conf_log_error!(
-                    NGX_LOG_EMERG,
-                    &mut *cf,
-                    "invalid duration in \"otel_metric_interval\": \"{}\"",
-                    args[1]
-                );
-            }
+            ngx_conf_log_error!(
+                NGX_LOG_EMERG,
+                &raw mut *cf,
+                "invalid duration in \"otel_metric_interval\": \"{}\"",
+                args[1]
+            );
             NGX_CONF_ERROR
         }
     }
@@ -1714,15 +1677,12 @@ extern "C" fn cmd_set_metric_batch_size(
             NGX_CONF_OK
         }
         _ => {
-            // SAFETY: `cf` is the valid non-null parse context for logging.
-            unsafe {
-                ngx_conf_log_error!(
-                    NGX_LOG_EMERG,
-                    &mut *cf,
-                    "invalid value in \"otel_metric_batch_size\": \"{}\"",
-                    args[1]
-                );
-            }
+            ngx_conf_log_error!(
+                NGX_LOG_EMERG,
+                &raw mut *cf,
+                "invalid value in \"otel_metric_batch_size\": \"{}\"",
+                args[1]
+            );
             NGX_CONF_ERROR
         }
     }
@@ -1748,15 +1708,12 @@ extern "C" fn cmd_set_metric_zone(
     let size = match parse_size_bytes(args[2].as_bytes()) {
         Some(s) if s > 0 => s,
         _ => {
-            // SAFETY: `cf` is the valid non-null parse context for logging.
-            unsafe {
-                ngx_conf_log_error!(
-                    NGX_LOG_EMERG,
-                    &mut *cf,
-                    "invalid size in \"otel_metric_zone\": \"{}\"",
-                    args[2]
-                );
-            }
+            ngx_conf_log_error!(
+                NGX_LOG_EMERG,
+                &raw mut *cf,
+                "invalid size in \"otel_metric_zone\": \"{}\"",
+                args[2]
+            );
             return NGX_CONF_ERROR;
         }
     };
@@ -1784,15 +1741,12 @@ extern "C" fn cmd_add_high_cardinality_attr(
         || attr.as_bytes() == b"user_agent.original";
 
     if !valid {
-        // SAFETY: `cf` is the valid non-null parse context for logging.
-        unsafe {
-            ngx_conf_log_error!(
-                NGX_LOG_EMERG,
-                &mut *cf,
-                "unknown high-cardinality attr \"{}\"; valid values: url.path, client.address, user_agent.original",
-                attr
-            );
-        }
+        ngx_conf_log_error!(
+            NGX_LOG_EMERG,
+            &raw mut *cf,
+            "unknown high-cardinality attr \"{}\"; valid values: url.path, client.address, user_agent.original",
+            attr
+        );
         return NGX_CONF_ERROR;
     }
 
@@ -1830,25 +1784,19 @@ extern "C" fn cmd_set_export_protocol(
         amcf.export_protocol = Some(ExportProtocol::OtlpGrpc);
         NGX_CONF_OK
     } else if value == b"arrow" {
-        // SAFETY: `cf` is the valid non-null parse context for logging.
-        unsafe {
-            ngx_conf_log_error!(
-                NGX_LOG_EMERG,
-                &mut *cf,
-                "otel_export_protocol: \"arrow\" is not yet implemented (Phase 5)"
-            );
-        }
+        ngx_conf_log_error!(
+            NGX_LOG_EMERG,
+            &raw mut *cf,
+            "otel_export_protocol: \"arrow\" is not yet implemented (Phase 5)"
+        );
         NGX_CONF_ERROR
     } else {
-        // SAFETY: `cf` is the valid non-null parse context for logging.
-        unsafe {
-            ngx_conf_log_error!(
-                NGX_LOG_EMERG,
-                &mut *cf,
-                "otel_export_protocol: unknown value \"{}\"; valid values: otlp_http, otlp_grpc",
-                args[1]
-            );
-        }
+        ngx_conf_log_error!(
+            NGX_LOG_EMERG,
+            &raw mut *cf,
+            "otel_export_protocol: unknown value \"{}\"; valid values: otlp_http, otlp_grpc",
+            args[1]
+        );
         NGX_CONF_ERROR
     }
 }
@@ -1881,14 +1829,11 @@ extern "C" fn cmd_set_log_ring_size(
             NGX_CONF_OK
         }
         _ => {
-            // SAFETY: `cf` is the valid non-null parse context for logging.
-            unsafe {
-                ngx_conf_log_error!(
-                    NGX_LOG_EMERG,
-                    &mut *cf,
-                    "otel_log_ring_size: invalid size (use e.g. \"512k\" or \"1m\")"
-                );
-            }
+            ngx_conf_log_error!(
+                NGX_LOG_EMERG,
+                &raw mut *cf,
+                "otel_log_ring_size: invalid size (use e.g. \"512k\" or \"1m\")"
+            );
             NGX_CONF_ERROR
         }
     }
@@ -1923,14 +1868,11 @@ extern "C" fn cmd_set_access_sample(
             NGX_CONF_OK
         }
         _ => {
-            // SAFETY: `cf` is the valid non-null parse context for logging.
-            unsafe {
-                ngx_conf_log_error!(
-                    NGX_LOG_EMERG,
-                    &mut *cf,
-                    "otel_access_log_sample: invalid size; must be a positive integer (e.g. \"16\")"
-                );
-            }
+            ngx_conf_log_error!(
+                NGX_LOG_EMERG,
+                &raw mut *cf,
+                "otel_access_log_sample: invalid size; must be a positive integer (e.g. \"16\")"
+            );
             NGX_CONF_ERROR
         }
     }
@@ -1961,10 +1903,7 @@ extern "C" fn cmd_set_error_log(
     let amcf = unsafe { conf.cast::<MainConfig>().as_mut().expect("main config") };
 
     if amcf.error_log_enabled {
-        // SAFETY: `cf` is the valid non-null parse context for logging.
-        unsafe {
-            ngx_conf_log_error!(NGX_LOG_EMERG, &mut *cf, "\"otel_error_log\" is duplicate");
-        }
+        ngx_conf_log_error!(NGX_LOG_EMERG, &raw mut *cf, "\"otel_error_log\" is duplicate");
         return NGX_CONF_ERROR;
     }
 
@@ -1980,7 +1919,7 @@ extern "C" fn cmd_set_error_log(
                 None => {
                     ngx_conf_log_error!(
                         NGX_LOG_EMERG,
-                        &mut *cf,
+                        &raw mut *cf,
                         "otel_error_log: unknown level; use emerg|alert|crit|error|warn|notice|info|debug"
                     );
                     return NGX_CONF_ERROR;
@@ -2006,7 +1945,7 @@ extern "C" fn cmd_set_error_log(
     let (new_log, state) = unsafe {
         let pool = (*cf).pool;
         if pool.is_null() {
-            ngx_conf_log_error!(NGX_LOG_EMERG, &mut *cf, "otel_error_log: null pool");
+            ngx_conf_log_error!(NGX_LOG_EMERG, &raw mut *cf, "otel_error_log: null pool");
             return NGX_CONF_ERROR;
         }
         let log_ptr = nginx_sys::ngx_pcalloc(pool, mem::size_of::<nginx_sys::ngx_log_t>())
@@ -2014,7 +1953,7 @@ extern "C" fn cmd_set_error_log(
         if log_ptr.is_null() {
             ngx_conf_log_error!(
                 NGX_LOG_EMERG,
-                &mut *cf,
+                &raw mut *cf,
                 "otel_error_log: ngx_pcalloc failed for log node"
             );
             return NGX_CONF_ERROR;
@@ -2024,7 +1963,7 @@ extern "C" fn cmd_set_error_log(
         if state_ptr.is_null() {
             ngx_conf_log_error!(
                 NGX_LOG_EMERG,
-                &mut *cf,
+                &raw mut *cf,
                 "otel_error_log: ngx_pcalloc failed for writer state"
             );
             return NGX_CONF_ERROR;
@@ -2087,14 +2026,11 @@ extern "C" fn cmd_set_error_log_coalesce(
         b"on" => amcf.error_log_coalesce = true,
         b"off" => amcf.error_log_coalesce = false,
         _ => {
-            // SAFETY: `cf` is the valid non-null parse context for logging.
-            unsafe {
-                ngx_conf_log_error!(
-                    NGX_LOG_EMERG,
-                    &mut *cf,
-                    "otel_error_log_coalesce: invalid value; use on or off"
-                );
-            }
+            ngx_conf_log_error!(
+                NGX_LOG_EMERG,
+                &raw mut *cf,
+                "otel_error_log_coalesce: invalid value; use on or off"
+            );
             return NGX_CONF_ERROR;
         }
     }
@@ -2124,14 +2060,11 @@ extern "C" fn cmd_set_otel_status_endpoint(
     let clcf = match NgxHttpCoreModule::location_conf_mut(cf_ref) {
         Some(c) => c,
         None => {
-            // SAFETY: `cf` is the valid non-null parse context for logging.
-            unsafe {
-                ngx_conf_log_error!(
-                    NGX_LOG_EMERG,
-                    &mut *cf,
-                    "otel_status_endpoint: failed to get core location conf"
-                );
-            }
+            ngx_conf_log_error!(
+                NGX_LOG_EMERG,
+                &raw mut *cf,
+                "otel_status_endpoint: failed to get core location conf"
+            );
             return NGX_CONF_ERROR;
         }
     };

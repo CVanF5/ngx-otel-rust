@@ -523,7 +523,7 @@ mod tests {
         // contract. Single-threaded test.
         unsafe {
             ngx_otel_error_writer(
-                &mut log as *mut _,
+                &raw mut log,
                 nginx_sys::NGX_LOG_ERR as ngx_uint_t,
                 dummy_buf.as_mut_ptr(),
                 dummy_buf.len(),
@@ -548,7 +548,7 @@ mod tests {
         // contract. Single-threaded test.
         unsafe {
             ngx_otel_error_writer(
-                &mut log as *mut _,
+                &raw mut log,
                 nginx_sys::NGX_LOG_INFO as ngx_uint_t, // level 7 > floor 5 ⇒ drop
                 dummy_buf.as_mut_ptr(),
                 dummy_buf.len(),
@@ -572,7 +572,7 @@ mod tests {
         // contract. Single-threaded test.
         unsafe {
             ngx_otel_error_writer(
-                &mut log as *mut _,
+                &raw mut log,
                 nginx_sys::NGX_LOG_EMERG as ngx_uint_t,
                 dummy_buf.as_mut_ptr(),
                 dummy_buf.len(),
@@ -598,7 +598,7 @@ mod tests {
         // contract. Single-threaded test.
         unsafe {
             ngx_otel_error_writer(
-                &mut log as *mut _,
+                &raw mut log,
                 nginx_sys::NGX_LOG_WARN as ngx_uint_t, // level == floor ⇒ pass
                 dummy_buf.as_mut_ptr(),
                 dummy_buf.len(),
@@ -666,12 +666,12 @@ mod tests {
             tail.log_level = 8; // debug > warn > crit, should move to head
 
             // Insert mid (5) into chain rooted at head (3).
-            otel_log_insert(&mut head as *mut _, &mut mid as *mut _);
+            otel_log_insert(&raw mut head, &raw mut mid);
             // Expected: head=5(warn), head.next→ old-head-storage(3)
             assert_eq!(head.log_level, 5, "head should become warn (5 > 3)");
 
             // Insert tail (8) into chain.
-            otel_log_insert(&mut head as *mut _, &mut tail as *mut _);
+            otel_log_insert(&raw mut head, &raw mut tail);
             // Expected: head=8(debug), head.next→ warn(5) → crit(3)
             assert_eq!(head.log_level, 8, "head should become debug (8 > 5)");
 
@@ -721,7 +721,7 @@ mod tests {
         // Single-threaded test.
         unsafe {
             ngx_otel_error_writer(
-                &mut log as *mut _,
+                &raw mut log,
                 nginx_sys::NGX_LOG_ERR as ngx_uint_t, // passes the debug floor
                 buf.as_mut_ptr(),
                 buf.len(),
@@ -752,7 +752,7 @@ mod tests {
 
         // A realistic cached wall-clock: 2023-11-14T22:13:20Z + 500 ms.
         let tp = nginx_sys::ngx_time_t { sec: 1_700_000_000, msec: 500, gmtoff: 0 };
-        let ns = super::cached_unix_nanos(&tp as *const _);
+        let ns = super::cached_unix_nanos(&raw const tp);
         assert_eq!(ns, 1_700_000_000_500_000_000, "must be sec*1e9 + msec*1e6 (Unix-epoch ns)");
 
         // The bug's signature: a monotonic uptime (~a few days of seconds) read as

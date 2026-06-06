@@ -143,8 +143,8 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
         // 3. Clear the blocked-signal mask inherited from master.
         //    See ngx_worker_process_init:881-886.
         let mut empty: libc::sigset_t = mem::zeroed();
-        libc::sigemptyset(&mut empty);
-        libc::sigprocmask(libc::SIG_SETMASK, &empty, ptr::null_mut());
+        libc::sigemptyset(&raw mut empty);
+        libc::sigprocmask(libc::SIG_SETMASK, &raw const empty, ptr::null_mut());
 
         // 4. We don't accept connections. Close the listening sockets.
         nginx_sys::ngx_close_listening_sockets(cycle);

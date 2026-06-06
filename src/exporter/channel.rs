@@ -54,7 +54,7 @@ pub unsafe extern "C" fn otel_exporter_channel_handler(ev: *mut ngx_event_t) {
         // open fd; `&mut ch` is a buffer of exactly `size_of::<ngx_channel_t>()`
         // bytes; `(*ev).log` is the event's log. Plain FFI read into `ch`.
         let n: ngx_int_t = unsafe {
-            ngx_read_channel((*c).fd, &mut ch as *mut _, mem::size_of::<ngx_channel_t>(), (*ev).log)
+            ngx_read_channel((*c).fd, &raw mut ch, mem::size_of::<ngx_channel_t>(), (*ev).log)
         };
 
         if n == NGX_AGAIN as ngx_int_t {

@@ -286,7 +286,7 @@ impl NgxConnIo {
         // set). `ngx_event_connect_peer` is the nginx FFI that allocates the
         // connection and stores it in `pc.connection`; called on the worker's
         // event-loop thread as the contract requires.
-        let rc = unsafe { ngx_event_connect_peer(&mut this.pc) };
+        let rc = unsafe { ngx_event_connect_peer(&raw mut this.pc) };
 
         // NGX_ERROR = -1, NGX_BUSY = -3, NGX_DECLINED = -4
         if rc == NGX_ERROR as ngx_int_t || rc == -3 || rc == -4 {
