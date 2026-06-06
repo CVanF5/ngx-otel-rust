@@ -1518,7 +1518,7 @@
               },
               "refId": "A",
               "queryType": "range",
-              "expr": "{service_name=\"$service\"} | severity_number >= 13"
+              "expr": "{service_name=\"$service\"} | severity_number >= 13 | line_format \"×{{if .nginx_error_coalesced_count}}{{.nginx_error_coalesced_count}}{{else}}1{{end}} │ {{ __line__ }}\""
             }
           ],
           "options": {
