@@ -143,9 +143,29 @@ fn counter_metric(name: &str, desc: &str, unit: &str, value: u64, time_ns: u64) 
     scalar_histogram(name, desc, unit, value, time_ns, AggregationTemporality::Cumulative)
 }
 
-/// Build a gauge metric from a scalar value.
+/// Build a gauge metric (instantaneous value) from a scalar.
+///
+/// Emitted as a real OTLP `Gauge` — NOT a single-bucket histogram. The
+/// stub_status connection counts (active/reading/writing/waiting) are
+/// instantaneous gauges; modelling them as `count=1` histograms is
+/// semantically wrong and is silently dropped by Prometheus remote-write
+/// (a histogram whose `_count` never increases is non-monotonic). A proper
+/// Gauge round-trips through every OTLP backend.
 fn gauge_metric(name: &str, desc: &str, unit: &str, value: u64, time_ns: u64) -> Metric {
-    scalar_histogram(name, desc, unit, value, time_ns, AggregationTemporality::Unspecified)
+    use crate::data_model::{GaugeData, NumberDataPoint, NumberValue};
+    Metric {
+        name: name.into(),
+        description: desc.into(),
+        unit: unit.into(),
+        data: MetricData::Gauge(GaugeData {
+            data_points: std::vec![NumberDataPoint {
+                attributes: std::vec![],
+                start_time_unix_nano: 0,
+                time_unix_nano: time_ns,
+                value: NumberValue::AsInt(value as i64),
+            }],
+        }),
+    }
 }
 
 fn scalar_histogram(
@@ -199,15 +219,28 @@ mod tests {
         assert!(names.contains(&"nginx.connections.writing"));
         assert!(names.contains(&"nginx.connections.waiting"));
 
-        // Each metric has exactly one data point (stub_status only emits histograms).
+        // Counters (accepted/handled/requests) are cumulative single-bucket
+        // histograms; the connection GAUGES (active/reading/writing/waiting) are
+        // real OTLP Gauges (not fake histograms — see gauge_metric). Each has
+        // exactly one data point.
+        let gauges = [
+            "nginx.connections.active",
+            "nginx.connections.reading",
+            "nginx.connections.writing",
+            "nginx.connections.waiting",
+        ];
         for m in &metrics {
-            let MetricData::Histogram(ref h) = m.data else {
-                panic!(
-                    "stub_status must only emit histogram metrics; got non-histogram for {}",
-                    m.name
-                );
-            };
-            assert_eq!(h.data_points.len(), 1, "metric {} has wrong #points", m.name);
+            if gauges.contains(&m.name.as_str()) {
+                let MetricData::Gauge(ref g) = m.data else {
+                    panic!("stub_status connection gauge {} must be a Gauge", m.name);
+                };
+                assert_eq!(g.data_points.len(), 1, "gauge {} has wrong #points", m.name);
+            } else {
+                let MetricData::Histogram(ref h) = m.data else {
+                    panic!("stub_status counter {} must be a histogram", m.name);
+                };
+                assert_eq!(h.data_points.len(), 1, "metric {} has wrong #points", m.name);
+            }
         }
     }
 }

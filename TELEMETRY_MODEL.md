@@ -147,8 +147,12 @@ metrics only when an upstream was used (from `ngx_http_upstream_state_t`).
 ## NGINX connection / request metrics
 
 Read from nginx's `stub_status` globals each export interval
-(`src/metric_source/stub_status.rs`). Emitted as single-bucket histograms
-today; semantically counters (monotonic Sum) and gauges.
+(`src/metric_source/stub_status.rs`). The connection **gauges**
+(active/reading/writing/waiting) are emitted as real OTLP **Gauge** metrics;
+the **counters** (accepted/handled/requests) are still single-bucket
+cumulative histograms today (semantically a monotonic Sum). Modelling a gauge
+as a `count=1` histogram is dropped by Prometheus remote-write, so the gauges
+were corrected to true Gauges (the counters round-trip fine as-is).
 
 | Name | Instrument | Unit (UCUM) | Temporality | Stability |
 |---|---|---|---|---|
