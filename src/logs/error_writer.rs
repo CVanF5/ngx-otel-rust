@@ -363,7 +363,7 @@ pub unsafe fn set_cleanup_flag(cycle: *const nginx_sys::ngx_cycle_t) {
 /// # Pointer meanings
 /// - `logs_zone`: the `ngx_shm_zone_t *` for the logs shm; stored so the
 ///   process-role guard can confirm the zone is live.
-/// - `coalesce_table`: `*mut CoalesceSlot` for this worker's 1024-entry table.
+/// - `coalesce_table`: `*mut CoalesceSlot` for this worker's 256-entry table.
 /// - `error_ring_ptr`: `*mut u8` pointing to the error ring header for this worker.
 /// - `error_rate_ptr`: `*mut AtomicU64` = `&WorkerSlots::error_rate_counters[0]`
 ///   for this worker in the metrics shm zone.

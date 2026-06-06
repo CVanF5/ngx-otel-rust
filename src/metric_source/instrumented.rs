@@ -88,11 +88,16 @@ impl HttpRequestHandler for LogPhaseHandler {
         let r = request.as_ref();
 
         // ── request duration in MICROSECONDS ─────────────────────────────────
-        // Use SystemTime::now() for µs-precision end time, combined with
-        // nginx's ms-precision start time.  This gives sub-ms resolution for
-        // requests > 1ms and resolves the ~90–200µs regime into distinct exp-
-        // histogram buckets at scale 3.  SystemTime::now() is a vDSO call on
-        // Linux (not a kernel syscall) — acceptable on the request path.
+        // CONSCIOUS EXCEPTION to nginx's cached-clock discipline. We read
+        // SystemTime::now() per request (a vDSO clock_gettime on Linux, not a
+        // kernel syscall) for a µs-precision end time, combined with nginx's
+        // cached ms-precision start time, so the ~90–200µs regime resolves into
+        // distinct scale-3 exp-histogram buckets — the point of the µs histogram.
+        // Tradeoffs accepted: (1) it deviates from nginx's per-tick cached time;
+        // (2) wall-clock subtraction is not monotonic — a backward NTP step
+        // saturates to 0 (saturating_sub below), a rare forward step inflates a
+        // single data point. Acceptable for a sampling-grade latency histogram;
+        // revisit if a monotonic per-request start ever becomes available.
         let duration_us: u64 = {
             use std::time::{SystemTime, UNIX_EPOCH};
             let end_us = SystemTime::now()

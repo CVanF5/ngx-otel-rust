@@ -1578,7 +1578,23 @@ extern "C" fn cmd_set_exporter_block(
 
     // SAFETY: `block_cf` is a valid in-scope parse context with our block handler
     // installed; `ngx_conf_parse` recurses into the `otel_exporter { ... }` body.
-    unsafe { ngx_conf_parse(&raw mut block_cf, ptr::null_mut()) }
+    let rc = unsafe { ngx_conf_parse(&raw mut block_cf, ptr::null_mut()) };
+    if !rc.is_null() {
+        return rc; // a sub-directive already reported its own error
+    }
+    // A present `otel_exporter` block must carry an `endpoint`. Silently dropping
+    // to zero-cost/disabled mode when the operator clearly intended export is a
+    // config error, not a default (nginx idiom: a required sub-directive is
+    // mandatory when its block is present).
+    if amcf.exporter.endpoint.as_bytes().is_empty() {
+        ngx_conf_log_error!(
+            NGX_LOG_EMERG,
+            &raw mut *cf,
+            "\"endpoint\" is mandatory in the \"otel_exporter\" block"
+        );
+        return NGX_CONF_ERROR;
+    }
+    NGX_CONF_OK
 }
 
 extern "C" fn cmd_add_resource_attr(
