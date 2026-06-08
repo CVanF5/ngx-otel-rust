@@ -80,7 +80,7 @@ flowchart LR
             W3["Worker N"]:::data
         end
         SHM[("<b>Per-worker shm</b><br/>histograms · log/span rings · counters")]:::tel
-        subgraph Exporter["<b>nginx: otel exporter</b> — single cold path · all signals"]
+        subgraph Exporter["<b>nginx: otel exporter</b>"]
             direction LR
             Drain["drain"]:::tel --> Proc["processor"]:::tel --> Encode["encode<br/>OTLP / OTAP"]:::tel --> Tx["transport<br/>HTTP/1 · gRPC/h2"]:::tel
         end
@@ -93,8 +93,9 @@ flowchart LR
     Workers -->|"bump &amp; defer"| SHM
     SHM -->|"drain"| Drain
     Tx --> Coll
-    Ctl -.->|"control"| Workers
-    Coll -.-> Ctl
+    Coll -.->|"control · Phase 5"| Tx
+    Tx -.-> Ctl
+    Ctl -.->|"flags"| Workers
 
     classDef data fill:#e8e8e8,stroke:#000000,stroke-width:2px,color:#000000;
     classDef tel fill:#d0e2ff,stroke:#648FFF,stroke-width:2px,color:#000000;
@@ -103,10 +104,10 @@ flowchart LR
 
     linkStyle 0,1,2,4,5,6 stroke:#648FFF,stroke-width:2px;
     linkStyle 3 stroke:#000000,stroke-width:2px;
-    linkStyle 7,8 stroke:#FFB000,stroke-width:2px;
+    linkStyle 7,8,9 stroke:#FFB000,stroke-width:2px;
 ```
 
-*Colour = plane: **user traffic** (black) · **telemetry** (blue `#648FFF`) · **control** (amber `#FFB000`) — applied to both nodes and the edges between them. Cylinders = shared memory; rounded = external systems.*
+*Colour = plane: **user traffic** (black) · **telemetry** (blue `#648FFF`) · **control** (amber `#FFB000`) — on nodes and edges. Cylinders = shared memory; rounded = external. The single cold-path exporter handles all signals; Phase-5 control feedback lands at the **exporter** (which owns the gRPC connection), and the exporter publishes flags that workers read on the hot path.*
 
 Per-worker shm counter slots for instrumented metrics; atomic increments
 from a Log-phase handler write to the worker's own slot only (no
