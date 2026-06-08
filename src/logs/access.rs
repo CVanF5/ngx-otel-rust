@@ -152,7 +152,10 @@ pub struct SampledRequest<'a> {
 }
 
 /// HTTP access record kind byte.
-const KIND_ACCESS: u8 = 0x00;
+///
+/// `pub` so the exporter's `parse_access_record` can reference the same constant
+/// rather than an independent `0x00` literal — binding producer and parser by name.
+pub const KIND_ACCESS: u8 = 0x00;
 
 /// nginx info level (7) — all access records use this severity.
 const NGX_LEVEL_INFO: u8 = 7;

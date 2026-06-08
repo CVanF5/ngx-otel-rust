@@ -1258,8 +1258,8 @@ fn parse_access_record(buf: &[u8], observed_now_ns: u64) -> Option<LogRecord> {
 
     let mut pos = 0usize;
 
-    // kind must be 0x00 (access)
-    if buf[pos] != 0x00 {
+    // kind must be KIND_ACCESS (access)
+    if buf[pos] != crate::logs::access::KIND_ACCESS {
         return None;
     }
     pos += 1;
