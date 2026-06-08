@@ -1,0 +1,59 @@
+ThreadSanitizer gate — sampled-request-unify (S1 + S2)
+=======================================================
+
+Date:       2026-06-08
+Host:       debian-vm (Linux aarch64) — the project's TSAN/correctness platform
+Toolchain:  rust nightly inside build/Dockerfile.tsan (TSAN requires
+            -Zsanitizer=thread + -Zbuild-std, hence an explicit --target;
+            cargo writes the cdylib to target/<triple>/release/)
+Base:       4492843 (origin/main)
+Commits under test:
+  - 8811e49 refactor(S1): canonical SampledRequest struct + single-homed caps
+  - 4492843 feat(S2): add http.server.request.duration to exception-tail LogRecord
+
+Under test (concurrency-relevant items):
+  - S1: SampledRequest<'a'> struct, single-homed MAX_URL_PATH/MAX_USER_AGENT caps;
+        both sinks (log ring + exemplar reservoir) project from one record.
+        ExemplarReservoir::write now takes &SampledRequest; UnsafeCell buffers
+        exercised by the access/exemplar path under TSAN.
+  - S2: 8-byte duration_us appended to ring wire format (big-endian, backward-
+        compatible); decoded as http.server.request.duration (double, seconds)
+        on exception-tail LogRecords. TSAN exercises the ring push + drain.
+
+Commands:   make tsan-test   (full gRPC + access + error + signal-storm + DNS)
+
+Note on collector path: the existing collector (from a tsan-gate clone) was
+mounted from the wrong path; it was restarted (make collector-down && make
+tsan-test) so the volume mount uses project-nginx-otel/test-harness/logs.
+This is a test-infrastructure issue, not a code bug.
+
+Scripts run under TSAN:
+  - run_grpc_smoke.sh        (in-worker unary gRPC)
+  - run_grpc_bidi_smoke.sh   (bidi gRPC stream)
+  - run_grpc_export.sh       (production gRPC export E2E)
+  - run_access_log.sh        (Phase 2.2 access path; S1/S2 exercised)
+  - run_error_log.sh         (Phase 2.3 §6.6.2 error-log path)
+  - run_signal_storm.sh      (re-entrancy gate)
+  - run_dns_dualstack.sh     (async resolver path)
+
+Result:
+  - [PASS] assertions: 91
+  - [FAIL] assertions: 0
+  - Race reports (WARNING: ThreadSanitizer / data race / SUMMARY: ...): 0
+  - Gate line:
+      "Zero ThreadSanitizer warnings.  TSAN gate: PASS."
+  - Exit code: tsan-test=0
+
+Key S1/S2 assertions passed:
+  - [PASS] logs.json: http.server.request.duration key present (S2)
+  - [PASS] metrics.json: http.server.request.duration present
+  - [PASS] metrics.json delta contains http.server.request.duration
+  - [PASS] metrics.json: http.server.request.duration is exponentialHistogram (DP-F)
+  - [PASS] metrics.json: trace_id carried in exemplar (exemplar reservoir S1 path)
+  - [PASS] logs.json: trace_id carried on tail LogRecord (log ring S1 path)
+
+Notes:
+  - ExemplarReservoir::write exercised with &SampledRequest (S1); no races.
+  - Ring push (emit_access_record) and drain both exercised with duration_us (S2); no races.
+  - 96 unit tests pass on Linux arm64 (make unittest, CARGO_TARGET_DIR=/tmp/ngx-otel-s3-gate).
+  - No ThreadSanitizer warnings across all scripts.
