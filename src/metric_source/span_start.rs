@@ -152,14 +152,17 @@ impl HttpRequestHandler for SpanStartHandler {
         }
 
         // ── Worker-side sampling decision ────────────────────────────────────
+        // Ratio/head sampling is already handled by Gate 2 above: the `otel_trace`
+        // complex value (which can reference a `split_clients` variable) was
+        // evaluated there; reaching this point means the request passed the
+        // sampling check and IS supposed to produce a span.
+        //
         // Parent flag path: inbound traceparent present → honour the W3C sampled bit.
-        // Ratio/head path:  no inbound traceparent → Phase 3.5 will evaluate the
-        //                   `otel_trace` complex value here for ratio-based sampling;
-        //                   for now default to sampled=true (sample all).
+        // Root span path:   no inbound traceparent → sample all (Gate 2 is the guard).
         let sampled = if have_traceparent {
             (inbound_flags & 0x01) != 0
         } else {
-            true // default: sample all (Phase 3.5 wires the otel_trace complex value)
+            true // Gate 2 (otel_trace complex value / split_clients) is the sampling guard
         };
 
         // ── Assign trace/span IDs ────────────────────────────────────────────

@@ -70,7 +70,7 @@ pub trait ProcessorImpl {
 
 /// Passthrough processor — leaves the payload unchanged.
 ///
-/// This is the default [`SpanProcessor`] variant.  It adds no overhead beyond
+/// This is the default [`Processor`] variant.  It adds no overhead beyond
 /// a function call; no clone or move of the data.
 pub struct NoopProcessor;
 
