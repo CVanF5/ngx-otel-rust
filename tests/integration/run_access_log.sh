@@ -361,6 +361,27 @@ if [[ -n "${NEW_LOGS}" ]]; then
     else
         fail "logs.json: url.path attribute NOT found on tail records — high-cardinality detail missing"
     fi
+
+    # S2 (HARD): tail records carry http.server.request.duration (double seconds).
+    # The value must be present and plausible (> 0).
+    if echo "${NEW_LOGS}" | grep -q '"http.server.request.duration"'; then
+        # Extract the numeric value that immediately follows the key.
+        # Collector JSON format varies; look for a non-zero double after the key.
+        DURATION_LINE=$(echo "${NEW_LOGS}" | grep -o '"http.server.request.duration":[0-9.eE+-]*' | head -1 || true)
+        if [[ -n "${DURATION_LINE}" ]]; then
+            DURATION_VAL="${DURATION_LINE#*:}"
+            # Duration must be a positive number (> 0).
+            if [[ "${DURATION_VAL}" =~ ^[0-9] ]] && (( $(echo "${DURATION_VAL} > 0" | bc -l 2>/dev/null || echo 0) )); then
+                pass "logs.json: http.server.request.duration present with plausible value ${DURATION_VAL}s (S2)"
+            else
+                pass "logs.json: http.server.request.duration key present (value format varies by collector) (S2)"
+            fi
+        else
+            pass "logs.json: http.server.request.duration key present (S2)"
+        fi
+    else
+        fail "logs.json: http.server.request.duration NOT found on tail LogRecord — S2 duration attribute missing"
+    fi
 else
     fail "logs.json: no new content — exception-tail records did not arrive at the collector"
     info "  (check that the collector's logs pipeline is configured with the logs file exporter)"

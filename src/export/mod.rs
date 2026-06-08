@@ -1337,6 +1337,15 @@ fn parse_access_record(buf: &[u8], observed_now_ns: u64) -> Option<LogRecord> {
     let url_path = read_u16_prefixed(buf, &mut pos);
     let user_agent = read_u16_prefixed(buf, &mut pos);
 
+    // Request duration in µs (Phase 2 S2 — decision #3).
+    // Appended after high-cardinality fields; absent in legacy records → None.
+    // Last field — `pos` is not incremented (no further reads use it).
+    let duration_us: Option<u64> = if pos + 8 <= buf.len() {
+        Some(u64::from_be_bytes(buf[pos..pos + 8].try_into().ok()?))
+    } else {
+        None
+    };
+
     let mut attributes = std::vec![
         KeyValue { key: "http.request.method".into(), value: AnyValue::String(method) },
         KeyValue { key: "http.response.status_code".into(), value: AnyValue::Int(status as i64) },
@@ -1360,6 +1369,15 @@ fn parse_access_record(buf: &[u8], observed_now_ns: u64) -> Option<LogRecord> {
         attributes.push(KeyValue {
             key: "user_agent.original".into(),
             value: AnyValue::String(std::string::String::from_utf8_lossy(&user_agent).into_owned()),
+        });
+    }
+    if let Some(dur_us) = duration_us {
+        // OTel semconv unit for request duration is seconds (double).
+        // Preserve sub-millisecond precision by converting from µs.
+        let dur_secs = dur_us as f64 / 1_000_000.0;
+        attributes.push(KeyValue {
+            key: "http.server.request.duration".into(),
+            value: AnyValue::Double(dur_secs),
         });
     }
 
@@ -1848,6 +1866,75 @@ mod tests {
             (*error_hdr).cap.store(cap as u64, Ordering::Relaxed);
         }
         (buf, ptr)
+    }
+
+    /// Phase 2 S2: tail LogRecord carries `http.server.request.duration` (double, seconds).
+    ///
+    /// Push a synthetic access record with a known `duration_us`, drain it, and assert:
+    /// (1) the attribute is present, (2) the value is `duration_us / 1_000_000.0` seconds,
+    /// (3) it is a `Double` (OTel semconv unit).
+    #[test]
+    fn access_tail_log_carries_duration_attribute() {
+        use crate::logs::access::{emit_access_record, SampledRequest};
+        use crate::logs::ring::DEFAULT_LOG_RING_CAP;
+        use crate::logs::WorkerRingProducer;
+        use crate::shm::logs_access_ring;
+
+        let cap = DEFAULT_LOG_RING_CAP;
+        let (mut slot_buf, slot_ptr) = make_logs_slot(cap);
+        let _ = &mut slot_buf;
+
+        // Known duration: 1_234_567 µs = 1.234567 seconds.
+        let dur_us: u64 = 1_234_567;
+        let req = SampledRequest {
+            ts_unix_nano: 1_700_000_000_000_000_000,
+            trace: None,
+            url_path: b"/api/test",
+            user_agent: b"TestAgent/1.0",
+            duration_us: dur_us,
+            combo_idx: 0,
+            method: b"GET",
+            status: 503,
+            request_length: 0,
+            response_bytes: 128,
+            client_addr: b"10.0.0.1",
+        };
+
+        // SAFETY: `slot_ptr` is the one-worker logs slot from `make_logs_slot`
+        // (correct `cap`, initialised headers); `worker_id = 0 < 1` worker, so
+        // `logs_access_ring` yields a valid in-slot ring view and `push` touches
+        // only that view's atomic header + in-bounds payload.
+        unsafe {
+            let ring = logs_access_ring(slot_ptr, 0, cap);
+            let producer = WorkerRingProducer { ring };
+            assert!(emit_access_record(&producer, &req), "ring push must succeed");
+        }
+
+        let amcf = crate::config::MainConfig::default();
+        let batch = collect_log_records(&amcf, slot_ptr, 1, 0);
+
+        assert_eq!(batch.logs.len(), 1, "one access LogRecord expected");
+        let rec = &batch.logs[0];
+        assert_eq!(rec.event_name, "http.access");
+
+        // Find the duration attribute.
+        let dur_attr = rec
+            .attributes
+            .iter()
+            .find(|kv| kv.key == "http.server.request.duration")
+            .expect("http.server.request.duration must be present on tail LogRecord (S2)");
+
+        // Value must be a Double in seconds — 1_234_567 µs = 1.234567 s.
+        let expected = dur_us as f64 / 1_000_000.0;
+        match &dur_attr.value {
+            AnyValue::Double(v) => {
+                assert!(
+                    (*v - expected).abs() < 1e-9,
+                    "http.server.request.duration must equal {expected:.6} s, got {v:.9}"
+                );
+            }
+            other => panic!("http.server.request.duration must be Double, got {other:?}"),
+        }
     }
 
     /// Error drain alongside access drain — both rings drain into one `LogsBatch`.

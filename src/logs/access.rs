@@ -27,6 +27,13 @@
 //! if has_trace == 1:
 //!   [16 bytes trace_id            ]
 //!   [8  bytes span_id (parent_id) ]
+//! --- Phase 2.2 Step 2.2.5: high-cardinality detail ---
+//! [u16 url_path_len big-endian   ]
+//! [url_path_len bytes of url.path]
+//! [u16 user_agent_len big-endian ]
+//! [user_agent_len bytes          ]
+//! --- Phase 2 S2: request duration ---
+//! [u64 duration_us big-endian    ]  (µs; same unit as exp-histogram)
 //! ```
 //!
 //! The `has_trace = 0` case costs nothing beyond one extra byte in the record.
@@ -60,7 +67,11 @@ use super::LogProducer;
 /// - 2  (url_path_len) + 64 (url.path, truncated to 64 bytes)
 /// - 2  (user_agent_len) + 128 (user_agent.original, truncated to 128 bytes)
 ///
-/// Total worst case: 95 + 2+64 + 2+128 = 291 bytes → round to 320.
+/// Phase 2 S2 — request duration:
+///
+/// - 8  (duration_us, big-endian u64 — µs precision, same unit as exp-histogram)
+///
+/// Total worst case: 95 + 2+64 + 2+128 + 8 = 299 bytes → round to 320.
 pub const MAX_ACCESS_RECORD: usize = 320;
 
 /// Maximum `url.path` bytes stored in the record.
@@ -197,6 +208,11 @@ pub fn emit_access_record(producer: &dyn LogProducer, req: &SampledRequest<'_>) 
     // NEVER promoted to metric dimensions (plan §DP-E; keeps combo index WithinU8).
     write_bytes_with_u16_len!(req.url_path, MAX_URL_PATH);
     write_bytes_with_u16_len!(req.user_agent, MAX_USER_AGENT);
+
+    // Request duration (Phase 2 S2 — decision #3): carries µs duration so the
+    // tail LogRecord can surface `http.server.request.duration` without a second
+    // time read on the export path.
+    write_u64_be!(req.duration_us);
 
     producer.push(&buf[..pos])
 }

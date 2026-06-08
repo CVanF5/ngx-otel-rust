@@ -264,8 +264,19 @@ things, never a per-request log:
   encoder `Exemplar`.)
 - **Exception-tail `LogRecord`s**: emitted ONLY for "interesting" requests (status
   ≥ 4xx, latency outliers — an is-interesting gate), carrying the same high-cardinality
-  attributes + `trace_id`/`span_id`. Substrate is the per-worker SPSC ring.
+  attributes + `trace_id`/`span_id` + request duration. Substrate is the per-worker SPSC ring.
   (`src/logs/access.rs`, `src/logs/ring.rs`.)
+
+  | Attribute key | Type | Value |
+  |---|---|---|
+  | `http.request.method` | string | HTTP method (e.g. `GET`) |
+  | `http.response.status_code` | int | HTTP status code |
+  | `http.server.request.body.size` | int | bytes |
+  | `http.server.response.body.size` | int | bytes |
+  | `client.address` | string | client IP / address text |
+  | `url.path` | string | request path (truncated to 64 bytes) |
+  | `user_agent.original` | string | User-Agent value (truncated to 128 bytes) |
+  | `http.server.request.duration` | double | request duration **in seconds** (OTel semconv unit; derived from µs measurement, sub-ms precision) |
 
 A common (2xx, fast) request produces **neither** — only the histogram `fetch_add`.
 
