@@ -62,11 +62,14 @@ exporters:
     tls:
       insecure: true
 
-  # ── FUTURE: traces ────────────────────────────────────────────────────
-  # otlp/tempo:
-  #   endpoint: tempo:4317
-  #   tls:
-  #     insecure: true
+  # ── Traces (Phase 3) — ship nginx server spans to Tempo ───────────────
+  # Enabled when the `traces` compose profile is active (starts Tempo).
+  # The module sends spans to /v1/traces (OTLP/HTTP) or the gRPC endpoint;
+  # this exporter forwards them to Tempo's internal OTLP/gRPC receiver.
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
 
 service:
   telemetry:
@@ -81,8 +84,12 @@ service:
       receivers: [otlp]
       processors: [batch]
       exporters: [otlphttp/loki, debug]
-    # ── FUTURE: traces ────────────────────────────────────────────────────
-    # traces:
-    #   receivers: [otlp]
-    #   processors: [batch]
-    #   exporters: [otlp/tempo, debug]
+    # ── Traces (Phase 3): nginx server spans → Tempo ───────────────────
+    # Tempo is started by `--profile traces`; the otlp/tempo exporter is
+    # always declared but only reachable when Tempo is running.  If Tempo
+    # is down, the collector logs an export error and retries — the rest
+    # of the pipeline (metrics, logs) is unaffected.
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/tempo, debug]

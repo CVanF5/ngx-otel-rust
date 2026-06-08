@@ -186,7 +186,12 @@ design proposal to integrate. In brief:
   `LogRecord`s for status ≥ 4xx / latency outliers. Not a per-request log.
 - **Logs — error** (`otel_error_log [level]`): coalesced `nginx.error` `LogRecord`s
   (one sample + count per template) with a companion error-rate metric.
-- **Traces**: Phase 3 (not yet emitted).
+- **Traces** (`otel_trace <expr>` per location): OTel server spans. W3C
+  `traceparent` propagation (`otel_trace_context`); parent-based or ratio
+  sampling; per-location span name + custom attrs; `$otel_trace_id` /
+  `$otel_parent_sampled` nginx variables. Exemplars on the duration histogram
+  now carry `trace_id`/`span_id` from the module's own spans, completing the
+  metric→exemplar→Tempo drill-down (§6.6.5).
 
 A ready-made Grafana dashboard is provided at
 [`test-harness/demo/grafana/dashboards/ngx-otel-rust-overview.json`](test-harness/demo/grafana/dashboards/ngx-otel-rust-overview.json).
@@ -366,7 +371,26 @@ http {
     # url.path + user_agent.original ride on access exemplars/tail automatically
     # (when otel_access_log_sample is set), never as metric dimensions.
 
-    server { ... }
+    server {
+        # Traces (Phase 3): per-location / per-server control.
+        # otel_trace, otel_trace_context, otel_span_name, otel_span_attr are
+        # valid in http, server, and location blocks; inner location wins.
+        otel_trace on;                      # complex value: literal / $var / split_clients
+        otel_trace_context propagate;       # ignore | extract (default) | inject | propagate
+
+        location /api {
+            otel_span_name "API $request_method"; # per-location span name override
+            otel_span_attr deployment.environment production; # custom span attribute
+
+            proxy_pass http://backend;
+        }
+
+        location /healthz {
+            # Health checks: disable tracing entirely (zero cost).
+            otel_trace off;
+            return 200 "ok\n";
+        }
+    }
 }
 ```
 

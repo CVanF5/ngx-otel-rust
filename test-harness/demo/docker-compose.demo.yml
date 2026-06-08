@@ -88,7 +88,7 @@ services:
       - "127.0.0.1:13100:3100"
     restart: unless-stopped
 
-  # ── FUTURE: traces — `--profile traces` ───────────────────────────────
+  # ── Traces (Phase 3) — `--profile traces` ─────────────────────────────
   tempo:
     image: grafana/tempo:2.7.0
     container_name: ngx-otel-demo-tempo

@@ -1,0 +1,54 @@
+# ngx-otel-rust — custom semconv attribute registry: ngx_otel.* namespace
+#
+# Self-observability metrics and attributes emitted by the ngx-otel-rust module's
+# own instrumentation (not request-traffic metrics).
+#
+# Extends OTel semconv v1.29.0 (pinned; see weaver.yaml).
+# Machine-readable companion to TELEMETRY_MODEL.md.
+#
+# Lint: weaver registry check --registry semconv/registry
+
+groups:
+
+  # ── ngx_otel.* self-observability attributes ─────────────────────────────────
+  - id: registry.ngx_otel
+    type: attribute_group
+    display_name: ngx-otel-rust self-observability attributes
+    brief: >
+      Attributes used by the ngx-otel-rust exporter's own metrics
+      (`ngx_otel.*`), which measure the module's own health and throughput
+      rather than request traffic.
+    attributes:
+      - id: ngx_otel.severity_class
+        type:
+          allow_custom_values: false
+          members:
+            - id: fatal
+              value: 'fatal'
+              stability: experimental
+              brief: 'nginx levels emerg, alert, crit (1–3)'
+            - id: error
+              value: 'error'
+              stability: experimental
+              brief: 'nginx level error (4)'
+            - id: warn
+              value: 'warn'
+              stability: experimental
+              brief: 'nginx level warn (5)'
+            - id: info
+              value: 'info'
+              stability: experimental
+              brief: 'nginx levels notice, info (6–7)'
+            - id: debug
+              value: 'debug'
+              stability: experimental
+              brief: 'nginx level debug (8)'
+        stability: experimental
+        brief: >
+          Severity class of the error-log events counted by the
+          `ngx_otel.error_log.events` metric.
+        note: >
+          Five closed-cardinality buckets mapping nginx's 8 severity levels.
+          Used as the sole dimension on `ngx_otel.error_log.events`
+          (TELEMETRY_MODEL.md §Phase 2.3).
+        examples: ['error', 'fatal', 'warn']

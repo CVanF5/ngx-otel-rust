@@ -16,7 +16,7 @@ is meant to be self-describing for *what it emits*; the proposal covers *why*.
 | **Metrics** | shipped (1.1–2.2) | on by default (`otel_metrics`) | [Metrics](#metrics) |
 | **Logs — access (tail + exemplars)** | shipped (2.1–2.2) | `otel_access_log_sample <n>` | [Logs](#logs) |
 | **Logs — error (coalesced + rate metric)** | shipped (2.3) | `otel_error_log [level]` | [Logs](#logs) |
-| **Traces** | Phase 3 (not yet emitted) | — | [Traces](#traces-phase-3--not-yet-emitted) |
+| **Traces** | shipped (Phase 3) | `otel_trace <expr>` per location | [Traces](#traces-phase-3) |
 
 **Conventions shared by all signals:** the [Resource and scope](#resource-and-scope)
 below applies to every signal; all attributes are drawn from OTel semconv and kept
@@ -319,14 +319,107 @@ Floods of identical lines are collapsed at the producer.
   errors fall through to nginx's own `error_log` (structural; not exported over OTel).
 - Source: `src/logs/error_writer.rs`, `src/logs/coalesce.rs`, drain in `src/export/mod.rs`.
 
-## Traces (Phase 3 — not yet emitted)
+## Traces (Phase 3)
 
-No spans are emitted today. Phase 3 will emit OTel **server spans**, parsing the
-inbound `traceparent` once at span-context setup and reusing it for the span + the
-access exemplars/tail. Until then, the `trace_id`/`span_id` that appear on access
-exemplars and tail records come from the **caller's propagated `traceparent`**, not
-from module-emitted spans — so a backend correlates exemplars to *upstream-of-nginx*
-traces, and per-hop nginx server spans arrive in Phase 3. (proposal §6.6.3, §3.)
+OTel **server spans** are emitted for requests where `otel_trace` is configured.
+Source: `src/metric_source/span_start.rs` (REWRITE phase), `src/metric_source/instrumented.rs`
+(LOG phase), `src/traces/mod.rs` (ring + drain), `src/transport/`.
+
+### Enabling and controlling traces
+
+All trace directives are valid in `http`, `server`, and `location` blocks; the inner
+location wins on merge.
+
+| Directive | Default | Purpose |
+|---|---|---|
+| `otel_trace <expr>` | absent (tracing disabled) | Enable tracing for this location. A complex value — use a literal `on`/`1`/`$var` or a `split_clients` variable for ratio sampling. Absent ⇒ zero-cost: the REWRITE handler does nothing. |
+| `otel_trace_context ignore\|extract\|inject\|propagate` | `extract` | W3C `traceparent` propagation mode. `extract` = read inbound, don't write outbound. `inject` = write outbound (fresh trace), don't read. `propagate` = both. `ignore` = neither. |
+| `otel_span_name <expr>` | `"METHOD location_name"` | Per-location span name override; evaluated as a complex value (supports nginx variables). |
+| `otel_span_attr <key> <value>` | (none) | Add a custom attribute to every span emitted from this location. Repeatable. |
+
+### nginx variables (registered in `preconfiguration`)
+
+| Variable | Type | Value |
+|---|---|---|
+| `$otel_trace_id` | string (32-char hex) | trace ID from the current request's `SpanCtx`, or empty string when tracing is disabled. |
+| `$otel_parent_sampled` | string `"1"` / `"0"` | `"1"` when the inbound `traceparent` has the sampled flag set; `"0"` otherwise (empty when no traceparent). |
+
+### Span shape
+
+One OTel **server span** per sampled request.
+
+| Field | Value | Source |
+|---|---|---|
+| `name` | `"METHOD route_name"` or `otel_span_name` override | `src/traces/mod.rs` |
+| `start_time_unix_nano` | wall-clock at REWRITE phase entry (vDSO `SystemTime::now()`) | `src/metric_source/span_start.rs` |
+| `end_time_unix_nano` | wall-clock at LOG phase entry | `src/metric_source/instrumented.rs` |
+| `trace_id` | extracted from inbound `traceparent` (propagate/extract), or freshly generated | `src/traces/ctx.rs` |
+| `span_id` | freshly generated per request | `src/traces/ctx.rs` |
+| `parent_span_id` | from inbound `traceparent` (when `extract` or `propagate`), else zero | `src/metric_source/span_start.rs` |
+| `flags` | W3C trace flags byte (propagated from inbound header, or `0x01` for root spans) | `src/metric_source/span_start.rs` |
+| `kind` | `SERVER` | `src/traces/mod.rs` |
+| `status` | `OK` (2xx) or `ERROR` (≥ 4xx) | `src/metric_source/instrumented.rs` |
+
+### Span attributes
+
+Standard OTel HTTP semconv attributes recorded on every span:
+
+| Attribute | Value | Source |
+|---|---|---|
+| `http.request.method` | HTTP method string | `r->method_name` |
+| `url.path` | request URI path (≤ `MAX_SPAN_URL_PATH` bytes) | `r->unparsed_uri` |
+| `http.response.status_code` | raw status code | `r->headers_out.status` |
+| `http.route` | matched location name | `clcf->name` via `route_from_location` |
+| `network.protocol.version` | `"1.0"` / `"1.1"` / `"2.0"` / `"3.0"` | `r->http_version` |
+| `user_agent.original` | User-Agent header value (≤ `MAX_SPAN_USER_AGENT` bytes) | `headers_in.user_agent` |
+| Custom attrs | from `otel_span_attr` directives | `src/metric_source/location_conf.rs` |
+
+### Sampling
+
+**Worker-side only; no tail sampling.**
+
+- **Parent-based:** when an inbound `traceparent` header is present (and `trace_context`
+  is `extract` or `propagate`), the W3C `sampled` flag (`flags & 0x01`) is honoured.
+  Sampled → emit span record. Unsampled → allocate `SpanCtx` (for `traceparent` propagation,
+  if `inject`/`propagate`) but **no span record, no ring push**.
+- **Ratio / head-sampling:** when no inbound `traceparent` is present, the `otel_trace`
+  complex value is re-read at decision time. A `split_clients`-managed variable (e.g.
+  `$otel_trace_sample`) returning `"1"` → sampled; `"0"` / `"off"` → unsampled.
+  Currently defaults to `sampled=true` for any truthy value.
+- **Probe / health-check drop:** a configurable `probe_drop` pipeline `Processor`
+  (`src/processor/mod.rs`) drops spans whose `url.path` matches the configured set
+  (defaults: `/healthz`, `/readyz`, `/livez`, `/ping`, `/metrics`). Configured via the
+  exporter `processor` block (independent of sampling).
+
+### Hot-path budget
+
+- **Zero cost when disabled:** `otel_trace` absent on a location ⇒ REWRITE handler
+  returns immediately — no allocation, no header scan.
+- **Bounded when unsampled:** `otel_trace on` + unsampled ⇒ `SpanCtx` pool-alloc
+  (bump pointer, effectively free) + one header scan + sampling branch +
+  optional `traceparent` inject. **No span record, no spans-ring push, no second scan.**
+- **LOG phase:** sampled requests push a `SpanRecord` to the worker-local spans SPSC ring
+  (`src/shm.rs`, drain in `src/export/mod.rs`). The exporter builds the OTLP proto in the
+  cold path.
+
+### Trace–metric–log correlation
+
+- **Exemplars** on `http.server.request.duration` now carry `trace_id`/`span_id` from the
+  module's own spans (when `otel_access_log_sample` + `otel_trace` are both configured).
+  This is the metric→exemplar→**Tempo trace** drill-down pivot (proposal §6.6.5).
+- **Access tail `LogRecord`s** carry the same `trace_id`/`span_id` as the span.
+- **Error `LogRecord`s** do NOT carry trace context (the `ngx_log_writer_pt` seam can't
+  reach request context — see the error-log scope note in [Logs](#logs)).
+
+### Transport
+
+OTLP via the same dedicated `nginx: otel exporter` process as metrics and logs.
+Spans are sent to `/v1/traces` (OTLP/HTTP) or on the traces gRPC endpoint
+(`otlp_grpc`). All span encoding and I/O happen on the cold path.
+
+> **Structural correctness verified (Phase 3 S5).** The TSAN gate
+> (`tests/RESULTS-tsan-2026-06-08-traces.txt`) exercises the spans-ring writer + REWRITE
+> `SpanCtx` shared state on Linux/arm64 with zero races.
 
 ---
 
@@ -362,8 +455,12 @@ counters); and a Loki panel for 4xx/5xx access logs.
   (`histogram_quantile(0.99, sum(rate(metric[range])))`, no `le`) or an exp→classic
   bucket conversion. Wiring this is what validates DP-F's sub-ms quantile benefit
   (tied to the §6.6.5 demo plan). Until then, averages can hide the tail.
-- **Exemplars** are not yet wired (no metric→trace pivot) — lands with traces (Phase 3).
-- **Error-rate panel** (`ngx_otel.error_log.events`) to add once Phase 2.3 closes.
+- **Exemplar → Tempo pivot** (Phase 3, wired): `exemplarTraceIdDestinations` is now
+  configured in the Tempo datasource in the demo dashboard; clicking an exemplar on the
+  `http.server.request.duration` panel opens the corresponding nginx server span in Tempo.
+  Requires the demo Tempo instance to receive spans from the module.
+- **Traces panel** added to the dashboard pointing at the Tempo datasource (service = `otel_service_name`).
+- **Error-rate panel** (`ngx_otel.error_log.events`): present in the dashboard since Phase 2.3.
 - **Provisioning reconciliation:** the committed file uses the new Grafana **dynamic
   dashboard schema** (`elements`/`layout`); set a stable `uid` (`ngx-otel-rust-overview`),
   a generic title, and reconcile datasource UIDs with the demo provisioning + confirm
@@ -391,7 +488,7 @@ serve the §6.6.3 "drill-down without SSH" story:
 - Shared-memory layout + histograms: `src/shm.rs`
 - Metrics emission + attributes: `src/metric_source/instrumented.rs`, `src/encoder/mod.rs`
 - Logs: `src/logs/{access,ring,error_writer,coalesce,severity}.rs`; drain in `src/export/mod.rs`
-- Traces: Phase 3 (not yet implemented)
+- Traces: `src/metric_source/span_start.rs` (REWRITE), `src/metric_source/instrumented.rs` (LOG), `src/traces/mod.rs`, `src/metric_source/location_conf.rs`
 - Configuration directives: see the project `README.md`
 
 [semconv]: https://opentelemetry.io/docs/specs/semconv/http/http-metrics/

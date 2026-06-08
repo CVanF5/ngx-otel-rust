@@ -1,6 +1,6 @@
 # Grafana datasource provisioning for the ngx-otel-rust demo.
 #
-# Prometheus is live today. Loki (logs, Phase 2) and Tempo (traces, future)
+# Prometheus is live today. Loki (logs, Phase 2+) and Tempo (traces, Phase 3)
 # are pre-provisioned so the dashboards/explore views are ready the moment
 # those compose profiles are enabled — until then they simply report
 # "unreachable" if queried, which is harmless.
@@ -17,21 +17,27 @@ datasources:
       httpMethod: POST
       # Match the collector exporter scrape cadence for sane $__rate_interval.
       timeInterval: 5s
-      # Exemplar drill-down: the request-duration histogram carries exemplars
-      # tagged with the W3C trace_id (when a traceparent came in). Clicking an
-      # exemplar diamond jumps to the matching access tail LogRecord in Loki,
-      # joined by trace_id. (Traces/Tempo are Phase 3; the log is the target here.)
-      # Clicking an exemplar diamond navigates to this dashboard with the
-      # `trace_id` variable set to the exemplar's trace_id, which filters the
-      # "Exemplar → Request Log" Loki panel to that exact request. (datasourceUid
-      # links only work for trace datasources like Tempo; Loki isn't one, so we
-      # drive an on-dashboard variable instead — the whole flow stays on screen.)
+      # Exemplar drill-down (Phase 3 — now live):
+      # The request-duration histogram carries exemplars tagged with trace_id
+      # from the module's own nginx server spans. Two destinations:
+      #
+      # 1. Native Tempo link (primary, Phase 3): clicking an exemplar diamond
+      #    opens the corresponding nginx server span directly in Tempo.
+      #    Requires the `traces` compose profile enabled.
+      #
+      # 2. Dashboard variable filter (fallback): also sets the `trace_id`
+      #    variable so the "Exemplar → Request Log" Loki panel filters to the
+      #    same request — useful even without Tempo.
       exemplarTraceIdDestinations:
+        - name: traceID
+          datasourceUid: tempo
+        - name: trace_id
+          datasourceUid: tempo
         - name: trace_id
           url: "/d/ngx-otel-rust-overview?var-trace_id=${__value.raw}"
           urlDisplayLabel: "Show this request's log ↓"
 
-  # ── FUTURE: logs (Phase 2). Brought online by `--profile logs`. ────────
+  # ── Logs (Phase 2). Brought online by `--profile logs`. ────────────────
   - name: Loki
     uid: loki
     type: loki
@@ -39,10 +45,23 @@ datasources:
     url: http://loki:3100
     isDefault: false
 
-  # ── FUTURE: traces. Brought online by `--profile traces`. ──────────────
+  # ── Traces (Phase 3). Brought online by `--profile traces`. ────────────
   - name: Tempo
     uid: tempo
     type: tempo
     access: proxy
     url: http://tempo:3200
     isDefault: false
+    jsonData:
+      # Service graph / rate-error-duration panels (future).
+      serviceMap:
+        datasourceUid: prometheus
+      # Trace-to-logs correlation: clicking "Logs for this span" in Tempo
+      # opens Loki filtered by the same trace_id — completes the
+      # metric → exemplar → Tempo → Loki drill-down chain.
+      tracesToLogsV2:
+        datasourceUid: loki
+        tags: ['service_name']
+        filterByTraceID: true
+        filterBySpanID: false
+        customQuery: false

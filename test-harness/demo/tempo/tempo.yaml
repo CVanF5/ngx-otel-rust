@@ -1,4 +1,4 @@
-# Minimal single-binary Tempo config for the FUTURE `traces` profile.
+# Minimal single-binary Tempo config for the `traces` compose profile (Phase 3).
 # Receives OTLP from the demo collector (otlp/tempo exporter) over gRPC.
 server:
   http_listen_port: 3200
