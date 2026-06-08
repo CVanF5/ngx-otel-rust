@@ -1457,7 +1457,7 @@
                 "uid": "loki"
               },
               "refId": "A",
-              "expr": "{service_name=\"$service\"} | trace_id=~\"$trace_id\" | line_format \"{{.severity_text}} trace={{.trace_id}} {{.http_request_method}} {{.http_response_status_code}} {{.url_path}}\""
+              "expr": "{service_name=\"$service\"} | trace_id=~\"$trace_id\" | line_format \"{{.severity_text}} trace={{.trace_id}} {{.http_request_method}} {{.http_response_status_code}} {{.url_path}} dur={{.http_server_request_duration}}s\""
             }
           ],
           "options": {
