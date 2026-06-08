@@ -79,12 +79,16 @@ flowchart LR
             W2["Worker 2"]:::data
             W3["Worker N"]:::data
         end
-        SHM[("<b>Per-worker shm</b><br/>histograms · log/span rings · counters")]:::tel
+        subgraph Shm["Shared memory"]
+            direction TB
+            SHM[("<b>Per-worker shm</b><br/>histograms · log/span rings · counters")]:::tel
+            Ctl[("control shm<br/>flags · heartbeat")]:::ctl
+            SHM ~~~ Ctl
+        end
         subgraph Exporter["<b>nginx: otel exporter</b>"]
             direction LR
             Drain["drain"]:::tel --> Proc["processor"]:::tel --> Encode["encode<br/>OTLP / OTAP"]:::tel --> Tx["transport<br/>HTTP/1 · gRPC/h2"]:::tel
         end
-        Ctl[("control shm<br/>flags · heartbeat")]:::ctl
     end
 
     Coll["<b>OTel Collector</b>"]:::ext
@@ -94,7 +98,6 @@ flowchart LR
     SHM -->|"drain"| Drain
     Tx --> Coll
     Coll -.->|"control · Phase 5"| Tx
-    Tx -.-> Ctl
     Ctl -.->|"flags"| Workers
 
     classDef data fill:#e8e8e8,stroke:#000000,stroke-width:2px,color:#000000;
@@ -102,9 +105,9 @@ flowchart LR
     classDef ctl fill:#ffe8cc,stroke:#FFB000,stroke-width:2px,color:#000000;
     classDef ext fill:#ffffff,stroke:#000000,stroke-width:2px,color:#000000;
 
-    linkStyle 0,1,2,4,5,6 stroke:#648FFF,stroke-width:2px;
-    linkStyle 3 stroke:#000000,stroke-width:2px;
-    linkStyle 7,8,9 stroke:#FFB000,stroke-width:2px;
+    linkStyle 1,2,3,5,6,7 stroke:#648FFF,stroke-width:2px;
+    linkStyle 4 stroke:#000000,stroke-width:2px;
+    linkStyle 8,9 stroke:#FFB000,stroke-width:2px;
 ```
 
 *Colour = plane: **user traffic** (black) · **telemetry** (blue `#648FFF`) · **control** (amber `#FFB000`) — on nodes and edges. Cylinders = shared memory; rounded = external. The single cold-path exporter handles all signals; Phase-5 control feedback lands at the **exporter** (which owns the gRPC connection), and the exporter publishes flags that workers read on the hot path.*
