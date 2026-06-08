@@ -1042,6 +1042,123 @@ pub unsafe extern "C" fn logs_shm_zone_init(
     Status::NGX_OK.into()
 }
 
+// ── Spans shm zone (Phase 3.2) ───────────────────────────────────────────────
+//
+// The spans shm zone holds one `LogsWorkerRing` per worker (one ring per slot,
+// unlike the logs zone which holds two rings + a coalescer table per slot).
+// The ring is the same `LogsWorkerRingHeader` + payload layout reused from logs.
+//
+// Layout per worker slot:
+//   slot_i = base + i × spans_slot_size(cap)
+//   spans_ring_header  = slot_i + 0
+//   spans_ring_payload = slot_i + RING_HEADER_SIZE
+//
+// Memory per worker = `cap + RING_HEADER_SIZE` bytes.
+// Total spans shm = `slab_pool_header + n_workers × spans_slot_size(cap)`.
+
+/// Default spans ring capacity per worker in bytes.
+///
+/// 256 KiB per worker — spans are small records (~100 bytes), so this handles
+/// ~2 500 queued spans per worker before dropping.  Raise via a future
+/// `otel_trace_ring_size` directive if needed.
+pub const DEFAULT_SPAN_RING_CAP: usize = 256 * 1024;
+
+/// Total bytes required for one spans slot with ring capacity `cap`.
+#[inline]
+pub fn spans_slot_size(cap: usize) -> usize {
+    ring_size_bytes(cap)
+}
+
+/// Minimum spans zone size for `n_workers` worker processes with ring `cap`.
+#[inline]
+pub fn spans_zone_size_for(n_workers: usize, cap: usize) -> usize {
+    data_offset() + n_workers * spans_slot_size(cap)
+}
+
+/// Infer worker count from the spans zone metadata.
+///
+/// `cap` must match the value used at zone registration.
+#[inline]
+pub fn spans_n_workers_from_zone(zone_data_bytes: usize, cap: usize) -> usize {
+    let slot = spans_slot_size(cap);
+    (zone_data_bytes.checked_div(slot).unwrap_or(0)).max(1)
+}
+
+/// Obtain a [`LogsWorkerRing`] view of the spans ring for `worker_id`.
+///
+/// Reuses the same ring type as the logs zone (same `LogsWorkerRingHeader`
+/// layout and atomic SPSC semantics).
+///
+/// # Safety
+/// - `base_addr` must point past the slab-pool header (`shm.addr + data_offset()`).
+/// - `worker_id < n_workers` and `cap` must match the zone registration.
+/// - The returned ring must not outlive the zone mapping.
+#[inline]
+pub unsafe fn spans_ring(base_addr: *mut u8, worker_id: usize, cap: usize) -> LogsWorkerRing {
+    let slot_off = worker_id * spans_slot_size(cap);
+    // SAFETY: per the fn contract `base_addr` is `shm.addr + data_offset()`,
+    // `worker_id < n_workers`, and `cap` matches registration, so `slot_off` is
+    // within the zone.  The spans ring header begins at slot offset 0.
+    unsafe { LogsWorkerRing::from_shm_ptr(base_addr.add(slot_off)) }
+}
+
+/// NGINX zone-init callback for the spans shm zone.
+///
+/// Called by nginx when the spans zone is first mapped (fresh start).  On
+/// SIGHUP (old_data non-null) the pages are re-used as-is — ring offsets survive.
+///
+/// Stores `cap` (recovered from `zone.data`) into every ring header.
+///
+/// # Safety
+/// Follows the same contract as `logs_shm_zone_init` (called by nginx with a
+/// valid `ngx_shm_zone_t*`; single exclusive caller at zone-init time before
+/// any worker forks).
+pub unsafe extern "C" fn spans_shm_zone_init(
+    shm_zone: *mut ngx_shm_zone_t,
+    old_data: *mut core::ffi::c_void,
+) -> ngx_int_t {
+    if !old_data.is_null() {
+        // SIGHUP: same physical pages re-mapped; ring offsets survive.
+        return Status::NGX_OK.into();
+    }
+
+    // SAFETY: nginx calls this with a valid non-null `ngx_shm_zone_t`.
+    let zone = unsafe { &*shm_zone };
+    let offset = data_offset();
+    let zone_data_bytes = zone.shm.size.saturating_sub(offset);
+    if zone_data_bytes == 0 {
+        return Status::NGX_OK.into();
+    }
+
+    // SAFETY: `zone_data_bytes > 0` implies the mapped region covers `offset`
+    // bytes, so `addr + offset` is within the zone.
+    let base: *mut u8 = unsafe { zone.shm.addr.cast::<u8>().add(offset) };
+
+    // Recover `cap` from the tagged pointer stored at zone registration.
+    let cap = zone.data as usize;
+    let slot_sz = spans_slot_size(cap);
+    if slot_sz == 0 {
+        return Status::NGX_OK.into();
+    }
+
+    // Zero the whole slot area.
+    // SAFETY: `base` to `base + zone_data_bytes` is within the mapped zone.
+    unsafe { ptr::write_bytes(base, 0, zone_data_bytes) };
+
+    // Stamp `cap` into every ring header.
+    let n_workers = (zone_data_bytes / slot_sz).max(1);
+    for w in 0..n_workers {
+        let slot_off = w * slot_sz;
+        // SAFETY: `slot_off = w * slot_sz` with `w < n_workers`, so `base + slot_off`
+        // is within the just-zeroed slot area; the ring header lives at slot offset 0.
+        let hdr = unsafe { base.add(slot_off).cast::<LogsWorkerRingHeader>() };
+        // SAFETY: valid just-zeroed header; exclusive init-time write.
+        unsafe { (*hdr).cap.store(cap as u64, Ordering::Relaxed) };
+    }
+
+    Status::NGX_OK.into()
+}
+
 /* ──────────────────────── unit tests ──────────────────────── */
 
 #[cfg(test)]

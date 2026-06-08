@@ -62,6 +62,7 @@ pub(crate) mod exporter;
 pub(crate) mod logs;
 mod metric_source;
 mod shm;
+pub(crate) mod traces;
 pub mod transport;
 pub(crate) mod util;
 

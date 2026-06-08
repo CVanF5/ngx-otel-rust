@@ -207,6 +207,11 @@ pub struct MainConfig {
     /// two rings per slot (access + error), each of `log_ring_cap` bytes.
     /// Memory = `log_ring_cap × 2 × N` + slab-pool header overhead.
     pub logs_shm_zone: *mut nginx_sys::ngx_shm_zone_t,
+    /// The registered spans shm zone (set during postconfiguration; always
+    /// registered when the module is loaded).  One ring per worker slot,
+    /// `DEFAULT_SPAN_RING_CAP` bytes per ring.  The hot path is gated in
+    /// the exporter by checking `spans_shm_base()` is non-null.
+    pub spans_shm_zone: *mut nginx_sys::ngx_shm_zone_t,
     /// `otel_access_log_sample <size>` — reservoir size for the exception-tail
     /// exemplar reservoir.  `0` = not configured (default off).
     /// Presence ⇒ exception tail + exemplar sampling on; absent ⇒ off.
@@ -307,6 +312,7 @@ impl Default for MainConfig {
             shm_zone: ptr::null_mut(),
             control_shm_zone: ptr::null_mut(),
             logs_shm_zone: ptr::null_mut(),
+            spans_shm_zone: ptr::null_mut(),
             // 0 = not configured (off by default).
             access_sample_size: 0,
             log_ring_size: 0,
@@ -585,6 +591,11 @@ impl MainConfig {
             self.register_logs_zone(cf, module)?;
         }
 
+        // Register the dedicated spans shm zone (Phase 3.2).  Always registered
+        // when the module is loaded so the exporter can drain it even before any
+        // trace directive is configured (the ring is just empty in that case).
+        self.register_spans_zone(cf, module)?;
+
         // Build the route and upstream-zone lookup tables (Phase 2.2 DP-E).
         // This walks the nginx location tree and upstream list ONCE before
         // workers fork, so all workers see identical tables.
@@ -759,6 +770,69 @@ impl MainConfig {
 
         self.logs_shm_zone = zone;
         Ok(())
+    }
+
+    /// Register the dedicated spans shm zone.
+    ///
+    /// One ring per worker, `DEFAULT_SPAN_RING_CAP` bytes per ring.
+    /// Called unconditionally from `postconfiguration` when the module is active.
+    pub fn register_spans_zone(
+        &mut self,
+        cf: *mut ngx_conf_t,
+        module: *mut ngx_module_t,
+    ) -> Result<(), Status> {
+        // SAFETY: same as `register_logs_zone` — `cf` is valid, `cf.cycle` is live.
+        let n_workers: usize = unsafe {
+            let cycle = (*cf).cycle.as_ref().ok_or(Status::NGX_ERROR)?;
+            let core_idx = nginx_sys::ngx_core_module.index;
+            let raw_conf: *mut *mut *mut core::ffi::c_void = *cycle.conf_ctx.add(core_idx);
+            let core_conf: *const nginx_sys::ngx_core_conf_t = raw_conf.cast();
+            if core_conf.is_null() {
+                1
+            } else {
+                (*core_conf).worker_processes.max(1) as usize
+            }
+        };
+
+        let cap = shm::DEFAULT_SPAN_RING_CAP;
+        let zone_size = shm::spans_zone_size_for(n_workers, cap);
+        let mut zone_name = ngx::ngx_string!("ngx_http_otel_spans_zone");
+
+        // SAFETY: same contract as `register_logs_zone`.
+        let Some(zone) = (unsafe { shm::register_zone(cf, &mut zone_name, zone_size, module) })
+        else {
+            ngx_conf_log_error!(
+                NGX_LOG_EMERG,
+                &raw mut *cf,
+                "otel: failed to register spans shared memory zone"
+            );
+            return Err(Status::NGX_ERROR);
+        };
+
+        // SAFETY: same contract as `register_logs_zone`.
+        unsafe {
+            (*zone).init = Some(shm::spans_shm_zone_init);
+            (*zone).data = cap as *mut core::ffi::c_void;
+        }
+
+        self.spans_shm_zone = zone;
+        Ok(())
+    }
+
+    /// Returns the base address of the spans ring data in the spans shm zone.
+    ///
+    /// Returns `None` if the zone was not registered or not yet mapped.
+    pub fn spans_shm_base(&self) -> Option<*mut u8> {
+        // SAFETY: `spans_shm_zone` is either null or the `ngx_shm_zone_t*`
+        // returned by `register_spans_zone`; reading `shm.addr` is sound.
+        let zone = unsafe { self.spans_shm_zone.as_ref()? };
+        let addr = zone.shm.addr;
+        if addr.is_null() {
+            return None;
+        }
+        // SAFETY: `addr` is the non-null mapped zone start; offset past the
+        // slab-pool header is in-bounds (only formed, not dereferenced).
+        Some(unsafe { addr.cast::<u8>().add(crate::shm::data_offset()) })
     }
 
     /// Returns the base address of our LogsWorkerSlot data within the logs shm zone.

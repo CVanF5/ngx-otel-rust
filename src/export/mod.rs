@@ -47,11 +47,9 @@ use pin_project_lite::pin_project;
 use crate::config::{ExportProtocol, MainConfig};
 use crate::data_model::{
     AggregationTemporality, AnyValue, Batch, GaugeData, KeyValue, LogRecord, LogsBatch, Metric,
-    MetricData, NumberDataPoint, NumberValue, Resource, Scope, SumData,
+    MetricData, NumberDataPoint, NumberValue, SumData,
 };
-// OtlpTracesEncoder is imported here for S2 (spans drain). The import will be
-// used when collect_span_records is added; the explicit allow keeps the S1 commit clean.
-#[allow(unused_imports)]
+use crate::data_model::{Resource, Scope, Span, SpansBatch};
 use crate::encoder::{Encoder, OtlpHttpEncoder, OtlpLogsEncoder, OtlpTracesEncoder};
 use crate::logs::coalesce;
 use crate::logs::severity::nginx_to_otel;
@@ -60,6 +58,7 @@ use crate::metric_source::stub_status::StubStatusSource;
 use crate::metric_source::MetricSource;
 use crate::shm::{
     logs_access_ring, logs_coalesce_table, logs_error_ring, logs_n_workers_from_zone,
+    spans_n_workers_from_zone, spans_ring, DEFAULT_SPAN_RING_CAP,
 };
 use crate::transport::hyper_http::NgxConnector;
 use crate::transport::{GrpcTransport, HyperHttpTransport};
@@ -92,6 +91,15 @@ pub static ERROR_LOGS_DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Cumulative logs transport send failures since exporter startup.
 pub static LOGS_SEND_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+// ── Traces self-metric atomics (Phase 3.2) ───────────────────────────────────
+
+/// Span records dropped by the producer because the spans ring was full.
+/// Sum of per-worker `ring.drop_count()` snapshots at each drain cycle.
+pub static TRACES_DROPPED_RECORDS: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative traces transport send failures since exporter startup.
+pub static TRACES_SEND_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 /// Master (parent) PID captured once at exporter startup via `nginx_sys::ngx_parent`.
 ///
@@ -186,7 +194,6 @@ impl ExportTransport {
     /// Traces ship over the same transport selected by `otel_export_protocol`.
     /// Called by the spans drain (S2). Added here in S1 alongside the encoder
     /// so the transport interface is complete before the ring plumbing lands.
-    #[allow(dead_code)]
     async fn send_traces(
         &mut self,
         bytes: std::vec::Vec<u8>,
@@ -405,7 +412,11 @@ pub async fn export_loop(amcf: &'static MainConfig) {
     // evict metric batches (and vice versa).
     let mut logs_retry_queue: VecDeque<(std::vec::Vec<u8>, u64)> = VecDeque::new();
 
+    // Separate retry queue for span batches (Phase 3.2).
+    let mut spans_retry_queue: VecDeque<(std::vec::Vec<u8>, u64)> = VecDeque::new();
+
     let logs_encoder = OtlpLogsEncoder;
+    let traces_encoder = OtlpTracesEncoder;
 
     let protocol_str = match amcf.export_protocol() {
         ExportProtocol::OtlpHttp => "otlp_http",
@@ -453,6 +464,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                 &mut transport,
                 &mut retry_queue,
                 &mut logs_retry_queue,
+                &mut spans_retry_queue,
                 &encoder,
                 amcf,
                 worker_start_ns,
@@ -590,6 +602,90 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                     }
                 }
             }
+
+            // ── Span drain: every sub-interval wake ─────────────────────────
+            // Drain the spans retry queue first (best-effort; stop on failure).
+            {
+                let mut spans_queue_snap = core::mem::take(&mut spans_retry_queue);
+                let mut spans_retry_failed = false;
+                while let Some((bytes, n_spans)) = spans_queue_snap.pop_front() {
+                    if spans_retry_failed {
+                        enqueue_with_eviction(
+                            &mut spans_retry_queue,
+                            bytes,
+                            n_spans,
+                            retry_buffer_depth,
+                            log.as_ptr(),
+                        );
+                        continue;
+                    }
+                    match transport.send_traces(bytes.clone()).await {
+                        Ok(()) => {}
+                        Err(ref e) => {
+                            ngx::ngx_log_error!(
+                                NGX_LOG_ERR,
+                                log.as_ptr(),
+                                "otel export: spans retry send failed ({}); re-queuing",
+                                e
+                            );
+                            TRACES_SEND_FAILURES.fetch_add(1, Ordering::Relaxed);
+                            enqueue_with_eviction(
+                                &mut spans_retry_queue,
+                                bytes,
+                                n_spans,
+                                retry_buffer_depth,
+                                log.as_ptr(),
+                            );
+                            spans_retry_failed = true;
+                        }
+                    }
+                }
+            }
+
+            // Drain fresh span records from all workers' rings and ship them.
+            if let Some(spans_base) = amcf.spans_shm_base() {
+                // SAFETY: `spans_shm_base()` returned `Some`, so the spans zone
+                // was registered and mapped; `amcf.spans_shm_zone` therefore
+                // points to a live `ngx_shm_zone_t` valid for the exporter's
+                // lifetime. The `&*` borrow does not escape this block, and
+                // `shm.size` is a plain field read.
+                let n_workers = unsafe {
+                    let zone = &*amcf.spans_shm_zone;
+                    let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
+                    spans_n_workers_from_zone(avail, DEFAULT_SPAN_RING_CAP)
+                };
+                let spans_batch = collect_span_records(amcf, spans_base, n_workers);
+                if !spans_batch.spans.is_empty() {
+                    let n_spans = spans_batch.spans.len() as u64;
+                    let spans_bytes = traces_encoder.encode(&spans_batch);
+                    match transport.send_traces(spans_bytes.clone()).await {
+                        Ok(()) => {
+                            ngx::ngx_log_error!(
+                                NGX_LOG_INFO,
+                                log.as_ptr(),
+                                "otel export: sent {} span records to collector",
+                                n_spans
+                            );
+                        }
+                        Err(ref e) => {
+                            ngx::ngx_log_error!(
+                                NGX_LOG_ERR,
+                                log.as_ptr(),
+                                "otel export: spans send failed ({}); queuing for retry",
+                                e
+                            );
+                            enqueue_with_eviction(
+                                &mut spans_retry_queue,
+                                spans_bytes,
+                                n_spans,
+                                retry_buffer_depth,
+                                log.as_ptr(),
+                            );
+                            TRACES_SEND_FAILURES.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
         }
 
         // ── Re-check shutdown flags after sleep ───────────────────────────
@@ -614,6 +710,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                 &mut transport,
                 &mut retry_queue,
                 &mut logs_retry_queue,
+                &mut spans_retry_queue,
                 &encoder,
                 amcf,
                 worker_start_ns,
@@ -773,6 +870,7 @@ async fn graceful_drain(
     transport: &mut ExportTransport,
     retry_queue: &mut VecDeque<(std::vec::Vec<u8>, u64)>,
     logs_retry_queue: &mut VecDeque<(std::vec::Vec<u8>, u64)>,
+    spans_retry_queue: &mut VecDeque<(std::vec::Vec<u8>, u64)>,
     encoder: &OtlpHttpEncoder,
     amcf: &'static MainConfig,
     worker_start_ns: u64,
@@ -931,6 +1029,82 @@ async fn graceful_drain(
                             "otel export: drain: final logs batch timed out"
                         );
                     }
+                }
+            }
+        }
+    }
+
+    // Drain pending spans retry queue (one bounded attempt each).
+    while let Some((bytes, n_spans)) = spans_retry_queue.pop_front() {
+        match with_deadline(transport.send_traces(bytes), GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                ngx::ngx_log_error!(
+                    NGX_LOG_ERR,
+                    log.as_ptr(),
+                    "otel export: drain: spans queued batch ({} records) send failed: {}",
+                    n_spans,
+                    e
+                );
+                spans_retry_queue.clear();
+                break;
+            }
+            Err(DeadlineExceeded) => {
+                ngx::ngx_log_error!(
+                    NGX_LOG_NOTICE,
+                    log.as_ptr(),
+                    "otel export: drain: spans queued batch ({} records) timed out",
+                    n_spans
+                );
+                spans_retry_queue.clear();
+                break;
+            }
+        }
+    }
+
+    // Final freshly-collected spans batch.
+    if let Some(spans_base) = amcf.spans_shm_base() {
+        // SAFETY: `spans_shm_base()` returned `Some`, so the spans zone is
+        // registered and mapped; `amcf.spans_shm_zone` points to a live
+        // `ngx_shm_zone_t` valid for the exporter's lifetime. The `&*`
+        // borrow does not escape this block; `shm.size` is a plain read.
+        let n_workers = unsafe {
+            let zone = &*amcf.spans_shm_zone;
+            let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
+            spans_n_workers_from_zone(avail, DEFAULT_SPAN_RING_CAP)
+        };
+        let spans_batch = collect_span_records(amcf, spans_base, n_workers);
+        if !spans_batch.spans.is_empty() {
+            let n_spans = spans_batch.spans.len() as u64;
+            let spans_bytes = OtlpTracesEncoder.encode(&spans_batch);
+            match with_deadline(
+                transport.send_traces(spans_bytes),
+                GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET,
+            )
+            .await
+            {
+                Ok(Ok(())) => {
+                    ngx::ngx_log_error!(
+                        NGX_LOG_NOTICE,
+                        log.as_ptr(),
+                        "otel export: drain: final spans batch sent ({} records)",
+                        n_spans
+                    );
+                }
+                Ok(Err(e)) => {
+                    ngx::ngx_log_error!(
+                        NGX_LOG_ERR,
+                        log.as_ptr(),
+                        "otel export: drain: final spans batch failed: {}",
+                        e
+                    );
+                }
+                Err(DeadlineExceeded) => {
+                    ngx::ngx_log_error!(
+                        NGX_LOG_NOTICE,
+                        log.as_ptr(),
+                        "otel export: drain: final spans batch timed out"
+                    );
                 }
             }
         }
@@ -1262,6 +1436,53 @@ fn collect_log_records(
         resource: Resource { attributes: build_resource_attrs(amcf) },
         scope: Scope { name: "ngx-otel-rust".into(), version: env!("CARGO_PKG_VERSION").into() },
         logs,
+    }
+}
+
+/// Drain all worker spans rings and assemble a [`SpansBatch`].
+///
+/// Called once per sub-interval tick (every [`SHUTDOWN_POLL_INTERVAL`])
+/// when the spans shm zone is mapped.  Mirrors [`collect_log_records`].
+///
+/// Updates `TRACES_DROPPED_RECORDS` from each ring's `drop_count()`.
+fn collect_span_records(amcf: &MainConfig, spans_base: *mut u8, n_workers: usize) -> SpansBatch {
+    let now = crate::util::now_unix_nano();
+
+    let mut spans: std::vec::Vec<Span> = std::vec::Vec::new();
+    let mut total_dropped: u64 = 0;
+
+    let cap = DEFAULT_SPAN_RING_CAP;
+
+    // Per-ring span drain cap. Mirrors the access-log cap sizing rationale:
+    // at ~200 bytes/record serialised to protobuf, 2 500 records/worker
+    // fits comfortably within the collector's default 20 MB request limit
+    // for up to ~4 workers. Remaining records stay in the ring for the
+    // next SHUTDOWN_POLL_INTERVAL wake.
+    const MAX_SPAN_RECORDS_PER_WORKER_PER_DRAIN: usize = 2_500;
+
+    for w in 0..n_workers {
+        // SAFETY: spans zone was sized for n_workers at registration; w < n_workers.
+        let ring = unsafe { spans_ring(spans_base, w, cap) };
+
+        total_dropped += ring.drop_count();
+
+        let mut record_buf: std::vec::Vec<u8> = std::vec::Vec::new();
+        let mut drained = 0usize;
+        while drained < MAX_SPAN_RECORDS_PER_WORKER_PER_DRAIN && ring.pop_into(&mut record_buf) {
+            if let Some(span) = crate::traces::parse_span_record(&record_buf, now) {
+                spans.push(span);
+            }
+            record_buf.clear();
+            drained += 1;
+        }
+    }
+
+    TRACES_DROPPED_RECORDS.store(total_dropped, Ordering::Relaxed);
+
+    SpansBatch {
+        resource: Resource { attributes: build_resource_attrs(amcf) },
+        scope: Scope { name: "ngx-otel-rust".into(), version: env!("CARGO_PKG_VERSION").into() },
+        spans,
     }
 }
 
