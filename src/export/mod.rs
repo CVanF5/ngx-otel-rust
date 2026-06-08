@@ -56,6 +56,7 @@ use crate::logs::severity::nginx_to_otel;
 use crate::metric_source::instrumented::InstrumentedSource;
 use crate::metric_source::stub_status::StubStatusSource;
 use crate::metric_source::MetricSource;
+use crate::processor::SpanProcessor;
 use crate::shm::{
     logs_access_ring, logs_coalesce_table, logs_error_ring, logs_n_workers_from_zone,
     spans_n_workers_from_zone, spans_ring, DEFAULT_SPAN_RING_CAP,
@@ -417,6 +418,12 @@ pub async fn export_loop(amcf: &'static MainConfig) {
 
     let logs_encoder = OtlpLogsEncoder;
     let traces_encoder = OtlpTracesEncoder;
+    // Processor stage: drain → [process] → encode → send.  Constructed once at
+    // exporter startup from a JSON config blob.  Currently always empty (→ Noop
+    // passthrough); wired to operator directives in a follow-on phase.
+    // The `from_config` API is designed for future bidi-driven remote
+    // reconfiguration (control-shm §1.3.3 + bidi §1.2) — a staged follow-on.
+    let span_processor = SpanProcessor::from_config(&serde_json::Value::Object(Default::default()));
 
     let protocol_str = match amcf.export_protocol() {
         ExportProtocol::OtlpHttp => "otlp_http",
@@ -462,12 +469,15 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             );
             graceful_drain(
                 &mut transport,
-                &mut retry_queue,
-                &mut logs_retry_queue,
-                &mut spans_retry_queue,
+                &mut DrainQueues {
+                    metrics: &mut retry_queue,
+                    logs: &mut logs_retry_queue,
+                    spans: &mut spans_retry_queue,
+                },
                 &encoder,
                 amcf,
                 worker_start_ns,
+                &span_processor,
             )
             .await;
             EXPORT_LOOP_DONE.store(true, Ordering::Release);
@@ -654,7 +664,8 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                     let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
                     spans_n_workers_from_zone(avail, DEFAULT_SPAN_RING_CAP)
                 };
-                let spans_batch = collect_span_records(amcf, spans_base, n_workers);
+                let spans_batch =
+                    span_processor.process(collect_span_records(amcf, spans_base, n_workers));
                 if !spans_batch.spans.is_empty() {
                     let n_spans = spans_batch.spans.len() as u64;
                     let spans_bytes = traces_encoder.encode(&spans_batch);
@@ -708,12 +719,15 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             );
             graceful_drain(
                 &mut transport,
-                &mut retry_queue,
-                &mut logs_retry_queue,
-                &mut spans_retry_queue,
+                &mut DrainQueues {
+                    metrics: &mut retry_queue,
+                    logs: &mut logs_retry_queue,
+                    spans: &mut spans_retry_queue,
+                },
                 &encoder,
                 amcf,
                 worker_start_ns,
+                &span_processor,
             )
             .await;
             EXPORT_LOOP_DONE.store(true, Ordering::Release);
@@ -821,6 +835,20 @@ pub async fn export_loop(amcf: &'static MainConfig) {
 
 // ── Graceful drain ────────────────────────────────────────────────────────────
 
+/// Retry queues for all three signal transports — metrics, logs, and spans.
+///
+/// Bundled into a single argument to keep [`graceful_drain`]'s signature
+/// concise.  Each field is a mutable borrow of the queue owned by
+/// [`export_loop`], so the queues are drained in-place during the flush.
+struct DrainQueues<'a> {
+    /// Retry queue for OTLP metrics batches.
+    metrics: &'a mut VecDeque<(std::vec::Vec<u8>, u64)>,
+    /// Retry queue for OTLP logs batches.
+    logs: &'a mut VecDeque<(std::vec::Vec<u8>, u64)>,
+    /// Retry queue for OTLP spans batches.
+    spans: &'a mut VecDeque<(std::vec::Vec<u8>, u64)>,
+}
+
 /// Called when `ngx_quit` is detected from inside [`export_loop`].
 ///
 /// Phase 1.3.2: runs on the **exporter's** `ngx_quit` path, not a worker's
@@ -868,15 +896,14 @@ pub async fn export_loop(amcf: &'static MainConfig) {
 /// Phase 2 (logs) reopens this when log-drain semantics force ordered handoff.
 async fn graceful_drain(
     transport: &mut ExportTransport,
-    retry_queue: &mut VecDeque<(std::vec::Vec<u8>, u64)>,
-    logs_retry_queue: &mut VecDeque<(std::vec::Vec<u8>, u64)>,
-    spans_retry_queue: &mut VecDeque<(std::vec::Vec<u8>, u64)>,
+    queues: &mut DrainQueues<'_>,
     encoder: &OtlpHttpEncoder,
     amcf: &'static MainConfig,
     worker_start_ns: u64,
+    span_processor: &SpanProcessor,
 ) {
     let log = ngx::log::ngx_cycle_log();
-    let queued = retry_queue.len();
+    let queued = queues.metrics.len();
     ngx::ngx_log_error!(
         NGX_LOG_NOTICE,
         log.as_ptr(),
@@ -884,8 +911,8 @@ async fn graceful_drain(
         queued
     );
 
-    // Flush retry queue (one bounded attempt each, ignore errors).
-    while let Some((bytes, n_pts)) = retry_queue.pop_front() {
+    // Flush metrics retry queue (one bounded attempt each, ignore errors).
+    while let Some((bytes, n_pts)) = queues.metrics.pop_front() {
         match with_deadline(transport.send(bytes), GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
@@ -898,11 +925,11 @@ async fn graceful_drain(
                 );
                 // Other queued batches likely fail too; stop and let the
                 // remainder be dropped when the loop returns.
-                let remaining: u64 = retry_queue.iter().map(|(_, n)| n).sum();
+                let remaining: u64 = queues.metrics.iter().map(|(_, n)| n).sum();
                 if remaining > 0 {
                     DROPPED_RECORDS.fetch_add(remaining, Ordering::Relaxed);
                 }
-                retry_queue.clear();
+                queues.metrics.clear();
                 break;
             }
             Err(DeadlineExceeded) => {
@@ -913,11 +940,11 @@ async fn graceful_drain(
                     n_pts,
                     GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET
                 );
-                let remaining: u64 = retry_queue.iter().map(|(_, n)| n).sum();
+                let remaining: u64 = queues.metrics.iter().map(|(_, n)| n).sum();
                 if remaining > 0 {
                     DROPPED_RECORDS.fetch_add(remaining, Ordering::Relaxed);
                 }
-                retry_queue.clear();
+                queues.metrics.clear();
                 break;
             }
         }
@@ -957,7 +984,7 @@ async fn graceful_drain(
     }
 
     // Drain pending logs retry queue (one bounded attempt each).
-    while let Some((bytes, n_logs)) = logs_retry_queue.pop_front() {
+    while let Some((bytes, n_logs)) = queues.logs.pop_front() {
         match with_deadline(transport.send_logs(bytes), GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
@@ -968,7 +995,7 @@ async fn graceful_drain(
                     n_logs,
                     e
                 );
-                logs_retry_queue.clear();
+                queues.logs.clear();
                 break;
             }
             Err(DeadlineExceeded) => {
@@ -978,7 +1005,7 @@ async fn graceful_drain(
                     "otel export: drain: logs queued batch ({} records) timed out",
                     n_logs
                 );
-                logs_retry_queue.clear();
+                queues.logs.clear();
                 break;
             }
         }
@@ -1035,7 +1062,7 @@ async fn graceful_drain(
     }
 
     // Drain pending spans retry queue (one bounded attempt each).
-    while let Some((bytes, n_spans)) = spans_retry_queue.pop_front() {
+    while let Some((bytes, n_spans)) = queues.spans.pop_front() {
         match with_deadline(transport.send_traces(bytes), GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
@@ -1046,7 +1073,7 @@ async fn graceful_drain(
                     n_spans,
                     e
                 );
-                spans_retry_queue.clear();
+                queues.spans.clear();
                 break;
             }
             Err(DeadlineExceeded) => {
@@ -1056,7 +1083,7 @@ async fn graceful_drain(
                     "otel export: drain: spans queued batch ({} records) timed out",
                     n_spans
                 );
-                spans_retry_queue.clear();
+                queues.spans.clear();
                 break;
             }
         }
@@ -1073,7 +1100,7 @@ async fn graceful_drain(
             let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
             spans_n_workers_from_zone(avail, DEFAULT_SPAN_RING_CAP)
         };
-        let spans_batch = collect_span_records(amcf, spans_base, n_workers);
+        let spans_batch = span_processor.process(collect_span_records(amcf, spans_base, n_workers));
         if !spans_batch.spans.is_empty() {
             let n_spans = spans_batch.spans.len() as u64;
             let spans_bytes = OtlpTracesEncoder.encode(&spans_batch);
