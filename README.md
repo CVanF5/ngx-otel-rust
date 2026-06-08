@@ -142,15 +142,21 @@ in shm in a **protocol-neutral shape**, moving OTLP → OTAP is an encoder
 swap inside one cold-path process and never reaches a worker or the
 request path.
 
-Two invariants follow.  **(1) The request path does zero wire-format
+Three invariants follow.  **(1) The request path does zero wire-format
 work** — it copies raw facts (atomic bumps + bounded memcpys into shm)
 and never serialises; anything that shapes bytes for a wire format is
-pushed to the cold path.  **(2) "Zero wire-byte change" is the bar for
-refactoring telemetry code** — a change that leaves the emitted OTLP
-bytes byte-for-byte identical is a pure refactor (gated by the existing
-tests); a change that alters them is a behaviour change, treated as
-such.  The first governs *what a worker does*; the second governs *how
-we change the code that produces bytes*.
+pushed to the cold path.  **(2) Read once, derive many** — each request
+datum is read once, at the phase that owns it (inbound trace context at
+the `rewrite` phase, parsed once and cached on the per-request context;
+request outcome at the `log` phase, in one pass), and **every** signal
+(metric, log, span) is derived from those captured reads — no signal
+re-reads or re-scans a field another already read.  **(3) "Zero
+wire-byte change" is the bar for refactoring telemetry code** — a change
+that leaves the emitted OTLP bytes byte-for-byte identical is a pure
+refactor (gated by the existing tests); a change that alters them is a
+behaviour change, treated as such.  Invariants (1)–(2) govern *what a
+worker does* per request; (3) governs *how we change the code that
+produces bytes*.
 
 This one dedicated exporter is deliberately the **single cold path for all
 three signals** — metrics today, logs and traces in Phases 2–3 — so per-signal
