@@ -64,50 +64,50 @@ README.  See the Confluence proposal (link below) for the full phase plan.
 
 ## Architecture
 
+<!-- Context diagram per F5 Architecture Diagram Guidelines §1: left→right = origin→destination;
+     IBM-palette traffic colors (data=black, telemetry=blue, control=amber); cylinders = shared
+     memory; labelled edges; legend at the bottom. -->
 ```mermaid
 flowchart LR
-    Req((HTTP<br/>requests))
+    Client(["HTTP clients"]):::ext
 
-    subgraph workers["NGINX worker processes (hot path)"]
+    subgraph NGINX["NGINX — one instance"]
         direction TB
-        W0[Worker 0]
-        W1[Worker 1]
-        WN[Worker N]
+        Workers["<b>Worker processes</b> — hot path<br/><i>copy raw facts, never encode</i><br/>per-worker · no cross-worker writes"]:::data
+        SHM[("<b>Per-worker shm</b><br/>histograms · log/span rings · counters")]:::store
+        subgraph Exporter["<b>nginx: otel exporter</b> — single cold path · all signals"]
+            direction LR
+            Drain["drain"]:::tel --> Proc["processor"]:::tel --> Encode["encode<br/>OTLP · OTAP → Phase 5"]:::tel --> Tx["transport<br/>HTTP/1 · gRPC/h2"]:::tel
+        end
+        Ctl[("control shm<br/>flags · heartbeat")]:::ctl
     end
 
-    subgraph shm["Per-worker shm — no cross-worker writes"]
-        direction TB
-        S0[("Slot 0<br/>counters + log/trace ring")]
-        S1[("Slot 1<br/>counters + log/trace ring")]
-        SN[("Slot N<br/>counters + log/trace ring")]
-    end
+    Coll["<b>OTel Collector</b>"]:::ext
 
-    subgraph exporter["nginx: otel exporter process — single cold path for ALL signals<br/>(metrics now; logs + traces Phase 2/3)"]
+    Client -->|"HTTP requests"| Workers
+    Workers -->|"bump &amp; defer<br/>1 atomic + bounded memcpy"| SHM
+    SHM -->|"drain · read-only"| Drain
+    Tx -->|"OTLP → /v1/metrics · /v1/logs · /v1/traces"| Coll
+    Ctl -.->|"flags · 1 relaxed load/req"| Workers
+    Coll -.->|"bidi control · Phase 5"| Ctl
+
+    subgraph Legend [" "]
         direction LR
-        Src["Metric source +<br/>log/trace drain"] --> Enc["Encoder<br/>OTLP protobuf"] --> Tx["Transport<br/>HTTP/1 or gRPC/h2"]
+        L1["data / user traffic"]:::data
+        L2["telemetry"]:::tel
+        L3["control"]:::ctl
+        L4[("shared memory")]:::store
     end
 
-    Ctl[("Control shm<br/>flags + heartbeat")]
-    NS[("ngx_stat_*<br/>atomics")]
-    Coll[("OTel<br/>Collector")]
+    classDef data fill:#f4f4f4,stroke:#000000,stroke-width:2px,color:#000000;
+    classDef tel fill:#e8efff,stroke:#648FFF,stroke-width:2px,color:#000000;
+    classDef ctl fill:#fff8e6,stroke:#FFB000,stroke-width:2px,color:#000000;
+    classDef store fill:#ffffff,stroke:#525252,stroke-width:1px,color:#000000;
+    classDef ext fill:#ffffff,stroke:#000000,stroke-width:2px,color:#000000;
 
-    Req --> W0
-    Req --> W1
-    Req --> WN
-
-    W0 -->|"log-phase: atomic += (metrics)<br/>+ push record (logs/traces, Phase 2/3)"| S0
-    W1 --> S1
-    WN --> SN
-
-    W0 -.flags load.-> Ctl
-    Ctl -.heartbeat.-> exporter
-
-    S0 -.read.-> Src
-    S1 -.read.-> Src
-    SN -.read.-> Src
-    NS -.read.-> Src
-
-    Tx -->|"OTLP/HTTP or gRPC<br/>/v1/metrics (now) · /v1/logs · /v1/traces (Phase 2/3)"| Coll
+    linkStyle 0,1,2,4,5,6 stroke:#648FFF,stroke-width:2px;
+    linkStyle 3 stroke:#000000,stroke-width:2px;
+    linkStyle 7,8 stroke:#FFB000,stroke-width:2px;
 ```
 
 Per-worker shm counter slots for instrumented metrics; atomic increments
