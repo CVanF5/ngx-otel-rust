@@ -65,8 +65,8 @@ README.  See the Confluence proposal (link below) for the full phase plan.
 ## Architecture
 
 <!-- Context diagram per F5 Architecture Diagram Guidelines §1: left→right = origin→destination;
-     IBM-palette traffic colors (data=black, telemetry=blue, control=amber); cylinders = shared
-     memory; labelled edges; legend at the bottom. -->
+     IBM-palette plane colours (user traffic=black, telemetry=#648FFF, control=#FFB000) on both nodes
+     and edges; cylinders = shared memory; labelled edges; colour key in the caption below. -->
 ```mermaid
 flowchart LR
     Client(["HTTP clients"]):::ext
@@ -74,7 +74,7 @@ flowchart LR
     subgraph NGINX["NGINX — one instance"]
         direction TB
         Workers["<b>Worker processes</b> — hot path<br/><i>copy raw facts, never encode</i><br/>per-worker · no cross-worker writes"]:::data
-        SHM[("<b>Per-worker shm</b><br/>histograms · log/span rings · counters")]:::store
+        SHM[("<b>Per-worker shm</b><br/>histograms · log/span rings · counters")]:::tel
         subgraph Exporter["<b>nginx: otel exporter</b> — single cold path · all signals"]
             direction LR
             Drain["drain"]:::tel --> Proc["processor"]:::tel --> Encode["encode<br/>OTLP · OTAP → Phase 5"]:::tel --> Tx["transport<br/>HTTP/1 · gRPC/h2"]:::tel
@@ -91,24 +91,17 @@ flowchart LR
     Ctl -.->|"flags · 1 relaxed load/req"| Workers
     Coll -.->|"bidi control · Phase 5"| Ctl
 
-    subgraph Legend [" "]
-        direction LR
-        L1["data / user traffic"]:::data
-        L2["telemetry"]:::tel
-        L3["control"]:::ctl
-        L4[("shared memory")]:::store
-    end
-
-    classDef data fill:#f4f4f4,stroke:#000000,stroke-width:2px,color:#000000;
-    classDef tel fill:#e8efff,stroke:#648FFF,stroke-width:2px,color:#000000;
-    classDef ctl fill:#fff8e6,stroke:#FFB000,stroke-width:2px,color:#000000;
-    classDef store fill:#ffffff,stroke:#525252,stroke-width:1px,color:#000000;
+    classDef data fill:#e8e8e8,stroke:#000000,stroke-width:2px,color:#000000;
+    classDef tel fill:#d0e2ff,stroke:#648FFF,stroke-width:2px,color:#000000;
+    classDef ctl fill:#ffe8cc,stroke:#FFB000,stroke-width:2px,color:#000000;
     classDef ext fill:#ffffff,stroke:#000000,stroke-width:2px,color:#000000;
 
     linkStyle 0,1,2,4,5,6 stroke:#648FFF,stroke-width:2px;
     linkStyle 3 stroke:#000000,stroke-width:2px;
     linkStyle 7,8 stroke:#FFB000,stroke-width:2px;
 ```
+
+*Colour = plane: **user traffic** (black) · **telemetry** (blue `#648FFF`) · **control** (amber `#FFB000`) — applied to both nodes and the edges between them. Cylinders = shared memory; rounded = external systems.*
 
 Per-worker shm counter slots for instrumented metrics; atomic increments
 from a Log-phase handler write to the worker's own slot only (no
