@@ -122,9 +122,24 @@ NGINX's event handlers for I/O readiness wakeup (no spinning, no
 blocking).  Workers never open a collector connection.  A small control
 shm carries a liveness heartbeat plus a flags word the workers load on
 the request path (one `Relaxed` atomic read — the sole hot-path branch,
-reserved for Phase 5 dynamic reconfiguration).  Three trait boundaries —
-`MetricSource`, `Encoder`, `Transport` — keep an eventual OTAP /
-columnar migration a swap, not a rewrite.
+reserved for Phase 5 dynamic reconfiguration).  The `MetricSource` and
+`Encoder` trait boundaries — plus the `ExportTransport` enum that
+dispatches OTLP/HTTP vs OTLP/gRPC — keep an eventual OTAP / columnar
+migration a swap, not a rewrite.
+
+**Design principle: workers do a bounded amount of format-independent
+work; the exporter does everything format-specific.**  On the request
+path a worker only *aggregates and defers* — a fixed set of `Relaxed`
+atomic increments into its own shm histogram slots, plus, for the
+sampled exception tail only, a single bounded, allocation-free copy into
+its own ring.  That work is constant per request, lock-free, and
+syscall-free, and its cost does **not** depend on the telemetry wire
+format.  Everything that *does* depend on the wire format — assembling
+OTel records, OTLP protobuf encoding today, OTAP / columnar later — runs
+only in the dedicated exporter on the cold path.  Because the data sits
+in shm in a **protocol-neutral shape**, moving OTLP → OTAP is an encoder
+swap inside one cold-path process and never reaches a worker or the
+request path.
 
 This one dedicated exporter is deliberately the **single cold path for all
 three signals** — metrics today, logs and traces in Phases 2–3 — so per-signal
