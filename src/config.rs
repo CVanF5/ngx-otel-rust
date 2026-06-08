@@ -11,9 +11,11 @@ use crate::logs::error_writer::{
     ngx_otel_error_writer, otel_log_insert, parse_error_log_level, OtelErrorWriterState,
 };
 use nginx_sys::{
-    ngx_array_t, ngx_command_t, ngx_conf_parse, ngx_conf_t, ngx_flag_t, ngx_module_t, ngx_str_t,
+    ngx_array_t, ngx_command_t, ngx_conf_parse, ngx_conf_t, ngx_flag_t,
+    ngx_http_compile_complex_value_t, ngx_http_complex_value_t, ngx_module_t, ngx_str_t,
     ngx_uint_t, NGX_CONF_BLOCK, NGX_CONF_FLAG, NGX_CONF_NOARGS, NGX_CONF_TAKE1, NGX_CONF_TAKE2,
-    NGX_HTTP_MAIN_CONF, NGX_HTTP_MAIN_CONF_OFFSET, NGX_LOG_DEBUG, NGX_LOG_EMERG,
+    NGX_HTTP_LOC_CONF, NGX_HTTP_LOC_CONF_OFFSET, NGX_HTTP_MAIN_CONF, NGX_HTTP_MAIN_CONF_OFFSET,
+    NGX_HTTP_SRV_CONF, NGX_LOG_DEBUG, NGX_LOG_EMERG,
 };
 use ngx::core::{Status, NGX_CONF_ERROR, NGX_CONF_OK};
 use ngx::http::{HttpModuleLocationConf, HttpModuleMainConf, NgxHttpCoreModule};
@@ -1561,25 +1563,75 @@ macro_rules! production_commands {
                 offset: 0,
                 post: ptr::null_mut(),
             },
+            // otel_trace <complex-value>;  (Phase 3.5 S3)
+            // Per-location trace enable/disable.  The complex value allows
+            // `split_clients`-based ratio sampling.  Absent ⇒ tracing disabled
+            // for this location (zero cost — REWRITE handler exits immediately).
+            // Valid in main, server, and location blocks; inner wins on merge.
+            ngx_command_t {
+                name: ngx_string!("otel_trace"),
+                type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1)
+                    as ngx_uint_t,
+                set: Some(cmd_set_otel_trace),
+                conf: NGX_HTTP_LOC_CONF_OFFSET,
+                offset: 0,
+                post: ptr::null_mut(),
+            },
+            // otel_trace_context ignore|extract|inject|propagate;  (Phase 3.5 S3)
+            // W3C traceparent propagation mode.  Default: extract (read inbound,
+            // do not inject outbound).
+            ngx_command_t {
+                name: ngx_string!("otel_trace_context"),
+                type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1)
+                    as ngx_uint_t,
+                set: Some(cmd_set_otel_trace_context),
+                conf: NGX_HTTP_LOC_CONF_OFFSET,
+                offset: 0,
+                post: ptr::null_mut(),
+            },
+            // otel_span_name <complex-value>;  (Phase 3.5 S3)
+            // Per-location span name override.  Absent ⇒ built-in
+            // "METHOD route_name" format.
+            ngx_command_t {
+                name: ngx_string!("otel_span_name"),
+                type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1)
+                    as ngx_uint_t,
+                set: Some(cmd_set_otel_span_name),
+                conf: NGX_HTTP_LOC_CONF_OFFSET,
+                offset: 0,
+                post: ptr::null_mut(),
+            },
+            // otel_span_attr <key> <value>;  (Phase 3.5 S3)
+            // Add a custom attribute to every span emitted from this location.
+            // Multiple directives accumulate; child location wins (no inheritance).
+            ngx_command_t {
+                name: ngx_string!("otel_span_attr"),
+                type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE2)
+                    as ngx_uint_t,
+                set: Some(cmd_add_otel_span_attr),
+                conf: NGX_HTTP_LOC_CONF_OFFSET,
+                offset: 0,
+                post: ptr::null_mut(),
+            },
         ]
     };
 }
 
-/// Production build: 15 production commands + terminator.
+/// Production build: 19 production commands + terminator.
 #[cfg(not(any(test, feature = "test-support")))]
-pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 16] = {
-    let mut cmds = [ngx_command_t::empty(); 16];
+pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 20] = {
+    let mut cmds = [ngx_command_t::empty(); 20];
     let prod = production_commands!();
     let mut i = 0;
-    while i < 15 {
+    while i < 19 {
         cmds[i] = prod[i];
         i += 1;
     }
-    // cmds[15] stays empty() — terminator
+    // cmds[19] stays empty() — terminator
     cmds
 };
 
-/// test-support build: 16 production commands + otel_status_endpoint + terminator.
+/// test-support build: 19 production commands + otel_status_endpoint + terminator.
 ///
 /// `otel_status_endpoint;` is a location-level directive (no args) that registers
 /// a content handler returning `control_shm.version` as plain text. Used by the
@@ -1587,16 +1639,16 @@ pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 16] = {
 /// process-level introspection. Absent from production builds (verified by grep
 /// on `objs-release/ngx_http_otel_module.so`).
 #[cfg(any(test, feature = "test-support"))]
-pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 17] = {
-    let mut cmds = [ngx_command_t::empty(); 17];
+pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 21] = {
+    let mut cmds = [ngx_command_t::empty(); 21];
     let prod = production_commands!();
     let mut i = 0;
-    while i < 15 {
+    while i < 19 {
         cmds[i] = prod[i];
         i += 1;
     }
-    // Index 15: otel_status_endpoint (test-support only).
-    cmds[15] = ngx_command_t {
+    // Index 19: otel_status_endpoint (test-support only).
+    cmds[19] = ngx_command_t {
         name: ngx_string!("otel_status_endpoint"),
         type_: (nginx_sys::NGX_HTTP_LOC_CONF | NGX_CONF_NOARGS) as ngx_uint_t,
         set: Some(cmd_set_otel_status_endpoint),
@@ -1604,7 +1656,7 @@ pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 17] = {
         offset: 0,
         post: ptr::null_mut(),
     };
-    // cmds[16] stays empty() — terminator.
+    // cmds[20] stays empty() — terminator.
     cmds
 };
 
@@ -2066,6 +2118,176 @@ extern "C" fn cmd_set_otel_status_endpoint(
         }
     };
     clcf.handler = Some(crate::otel_status_content_handler);
+    NGX_CONF_OK
+}
+
+/* ─────────────────── Phase 3.5 S3: trace directive handlers ────────────────── */
+
+/// Compile a directive argument into a `ngx_http_complex_value_t` on the conf pool.
+///
+/// Allocates `ngx_http_complex_value_t` via `ngx_pcalloc`, fills
+/// `ngx_http_compile_complex_value_t`, and calls `ngx_http_compile_complex_value`.
+///
+/// Returns the allocated pointer on success, `null_mut()` on allocation or
+/// compilation failure (caller must log and return `NGX_CONF_ERROR`).
+///
+/// # Safety
+/// `cf` must be a valid non-null `ngx_conf_t` parse context.
+/// `value` must point to the directive's `ngx_str_t` argument for the duration
+/// of the call; `ngx_http_compile_complex_value` may modify it temporarily.
+unsafe fn compile_complex_value(
+    cf: *mut ngx_conf_t,
+    value: *mut ngx_str_t,
+) -> *mut ngx_http_complex_value_t {
+    // Allocate a zeroed complex value on the nginx conf pool.
+    // SAFETY: `cf` is a valid non-null parse context; `(*cf).pool` is the live
+    // conf pool nginx manages for config-parse time allocations.
+    let cv_ptr =
+        unsafe { nginx_sys::ngx_pcalloc((*cf).pool, mem::size_of::<ngx_http_complex_value_t>()) }
+            as *mut ngx_http_complex_value_t;
+    if cv_ptr.is_null() {
+        return ptr::null_mut();
+    }
+    // SAFETY: `mem::zeroed()` is valid for `ngx_http_compile_complex_value_t`
+    // because it is a `#[repr(C)]` POD struct (all-zero is a valid starting state
+    // before filling the mandatory fields below).
+    let mut ccv: ngx_http_compile_complex_value_t = unsafe { mem::zeroed() };
+    ccv.cf = cf;
+    ccv.value = value;
+    ccv.complex_value = cv_ptr;
+    // zero, conf_prefix, root_prefix bitfields stay 0 — no special prefix handling.
+    // SAFETY: `ccv` is fully initialised; `ngx_http_compile_complex_value` reads
+    // the `value` ngx_str_t (possibly modifying it temporarily) and writes into
+    // `complex_value` (our pool allocation, valid for the conf lifetime).
+    let rc = unsafe { nginx_sys::ngx_http_compile_complex_value(&raw mut ccv) };
+    if rc != nginx_sys::NGX_OK as nginx_sys::ngx_int_t {
+        return ptr::null_mut();
+    }
+    cv_ptr
+}
+
+/// Directive callback for `otel_trace <complex-value>;` (Phase 3.5 S3).
+///
+/// The complex value is evaluated at request time: truthy (non-empty, not `"0"`,
+/// not `"off"`) ⇒ tracing enabled; falsy ⇒ disabled.  Absence of the directive
+/// leaves `otel_trace` null — zero-cost, no REWRITE handler work.
+extern "C" fn cmd_set_otel_trace(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    use crate::metric_source::location_conf::LocationConf;
+
+    // SAFETY: nginx passes our module's `LocationConf*` as `conf` for a
+    // `NGX_HTTP_LOC_CONF_OFFSET` directive; the cast + `as_mut` yield a valid
+    // exclusive reference.
+    let lcf = unsafe { conf.cast::<LocationConf>().as_mut().expect("location config") };
+    if !lcf.otel_trace.is_null() {
+        return c"is duplicate".as_ptr().cast_mut();
+    }
+    // SAFETY: `cf` is the valid non-null directive parse context.
+    let args = unsafe { cf_args(cf) };
+    let mut value = args[1]; // ngx_str_t is Copy — we need a mutable local for ccv.value
+                             // SAFETY: `cf` is valid; `value` is a local ngx_str_t holding the directive arg.
+    let cv = unsafe { compile_complex_value(cf, &raw mut value) };
+    if cv.is_null() {
+        ngx_conf_log_error!(
+            NGX_LOG_EMERG,
+            &raw mut *cf,
+            "otel_trace: failed to compile complex value expression"
+        );
+        return NGX_CONF_ERROR;
+    }
+    lcf.otel_trace = cv;
+    NGX_CONF_OK
+}
+
+/// Directive callback for `otel_trace_context ignore|extract|inject|propagate;`
+/// (Phase 3.5 S3).
+extern "C" fn cmd_set_otel_trace_context(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    use crate::metric_source::location_conf::{LocationConf, TraceContextMode};
+
+    // SAFETY: nginx passes our `LocationConf*` as `conf`; the cast is valid.
+    let lcf = unsafe { conf.cast::<LocationConf>().as_mut().expect("location config") };
+    if lcf.trace_context_is_set() {
+        return c"is duplicate".as_ptr().cast_mut();
+    }
+    // SAFETY: `cf` is the valid non-null directive parse context.
+    let args = unsafe { cf_args(cf) };
+    let mode = match args[1].as_bytes() {
+        b"ignore" => TraceContextMode::Ignore,
+        b"extract" => TraceContextMode::Extract,
+        b"inject" => TraceContextMode::Inject,
+        b"propagate" => TraceContextMode::Propagate,
+        _ => {
+            ngx_conf_log_error!(
+                NGX_LOG_EMERG,
+                &raw mut *cf,
+                "otel_trace_context: unknown value \"{}\"; valid: ignore, extract, inject, propagate",
+                args[1]
+            );
+            return NGX_CONF_ERROR;
+        }
+    };
+    lcf.set_trace_context(mode);
+    NGX_CONF_OK
+}
+
+/// Directive callback for `otel_span_name <complex-value>;` (Phase 3.5 S3).
+///
+/// Per-location span name override.  The complex value is evaluated at request
+/// time.  Absent ⇒ built-in `"METHOD route_name"` format.
+extern "C" fn cmd_set_otel_span_name(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    use crate::metric_source::location_conf::LocationConf;
+
+    // SAFETY: nginx passes our `LocationConf*` as `conf`; the cast is valid.
+    let lcf = unsafe { conf.cast::<LocationConf>().as_mut().expect("location config") };
+    if !lcf.span_name_cv.is_null() {
+        return c"is duplicate".as_ptr().cast_mut();
+    }
+    // SAFETY: `cf` is the valid non-null directive parse context.
+    let args = unsafe { cf_args(cf) };
+    let mut value = args[1]; // ngx_str_t is Copy
+                             // SAFETY: `cf` is valid; `value` is a local ngx_str_t copy of the directive arg.
+    let cv = unsafe { compile_complex_value(cf, &raw mut value) };
+    if cv.is_null() {
+        ngx_conf_log_error!(
+            NGX_LOG_EMERG,
+            &raw mut *cf,
+            "otel_span_name: failed to compile complex value expression"
+        );
+        return NGX_CONF_ERROR;
+    }
+    lcf.span_name_cv = cv;
+    NGX_CONF_OK
+}
+
+/// Directive callback for `otel_span_attr <key> <value>;` (Phase 3.5 S3).
+///
+/// Appends a static key/value pair to this location's span attribute list.
+/// Multiple directives accumulate; child locations define their own independent
+/// set (no inheritance from parent — mirrors the C++ `addSpanAttr` behaviour).
+extern "C" fn cmd_add_otel_span_attr(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    use crate::metric_source::location_conf::LocationConf;
+
+    // SAFETY: nginx passes our `LocationConf*` as `conf`; the cast is valid.
+    let lcf = unsafe { conf.cast::<LocationConf>().as_mut().expect("location config") };
+    // SAFETY: `cf` is the valid non-null directive parse context; `args` holds the
+    // TAKE2 tokens: name=args[1], value=args[2].
+    let args = unsafe { cf_args(cf) };
+    lcf.span_attrs.push((args[1], args[2]));
     NGX_CONF_OK
 }
 

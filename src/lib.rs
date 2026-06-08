@@ -49,7 +49,7 @@ use nginx_sys::{
     NGX_HTTP_MODULE,
 };
 use ngx::core::Status;
-use ngx::http::{add_phase_handler, HttpModule, HttpModuleMainConf};
+use ngx::http::{add_phase_handler, HttpModule, HttpModuleLocationConf, HttpModuleMainConf};
 // Pool is only needed for the test-support gRPC smoke harnesses in init_process.
 #[cfg(any(test, feature = "test-support"))]
 use ngx::core::Pool;
@@ -73,14 +73,14 @@ use config::NGX_HTTP_OTEL_COMMANDS;
 pub(crate) struct HttpOtelModule;
 
 static NGX_HTTP_OTEL_MODULE_CTX: ngx_http_module_t = ngx_http_module_t {
-    preconfiguration: None,
+    preconfiguration: Some(HttpOtelModule::preconfiguration),
     postconfiguration: Some(HttpOtelModule::postconfiguration),
     create_main_conf: Some(HttpOtelModule::create_main_conf),
     init_main_conf: Some(HttpOtelModule::init_main_conf),
     create_srv_conf: None,
     merge_srv_conf: None,
-    create_loc_conf: None,
-    merge_loc_conf: None,
+    create_loc_conf: Some(HttpOtelModule::create_loc_conf),
+    merge_loc_conf: Some(HttpOtelModule::merge_loc_conf),
 };
 
 #[cfg(feature = "export-modules")]
@@ -116,6 +116,15 @@ pub static mut ngx_http_otel_module: ngx_module_t = ngx_module_t {
 // `ctx_index` — therefore holds, so the downcast in `main_conf()` is valid.
 unsafe impl HttpModuleMainConf for HttpOtelModule {
     type MainConf = config::MainConfig;
+}
+
+// SAFETY: the `LocationConf` associated type matches the `create_loc_conf` /
+// `merge_loc_conf` hooks wired in `NGX_HTTP_OTEL_MODULE_CTX`, which allocate
+// and default-initialize a `metric_source::location_conf::LocationConf` in this
+// module's loc-conf slot.  The trait contract — exact type at `ctx_index` —
+// holds, so the downcast in `location_conf()` / `location_conf_mut()` is valid.
+unsafe impl HttpModuleLocationConf for HttpOtelModule {
+    type LocationConf = metric_source::location_conf::LocationConf;
 }
 
 // ── Shared exporter spawn helper ─────────────────────────────────────────────
@@ -246,6 +255,49 @@ impl HttpModule for HttpOtelModule {
         unsafe { &*::core::ptr::addr_of!(ngx_http_otel_module) }
     }
 
+    /// Register `$otel_trace_id` and `$otel_parent_sampled` nginx variables.
+    ///
+    /// Both are marked `NGX_HTTP_VAR_NOCACHEABLE` — they are populated at
+    /// REWRITE time from the `SpanCtx` request context and may differ from
+    /// request to request.
+    ///
+    /// # Safety
+    /// nginx calls this with a valid non-null `ngx_conf_t` during single-threaded
+    /// config parsing.
+    unsafe extern "C" fn preconfiguration(cf: *mut ngx_conf_t) -> nginx_sys::ngx_int_t {
+        let flags = nginx_sys::NGX_HTTP_VAR_NOCACHEABLE as nginx_sys::ngx_uint_t;
+
+        // $otel_trace_id — 32-char lowercase hex trace ID from SpanCtx.
+        let mut name_trace_id: nginx_sys::ngx_str_t = ngx::ngx_string!("otel_trace_id");
+        // SAFETY: `cf` is the valid non-null parse context; `name_trace_id` is a local
+        // ngx_str_t with the variable name, valid for this call (nginx copies it into
+        // the variable hash table during parsing); `flags` is a valid VAR_ bitfield.
+        let var_trace_id =
+            unsafe { nginx_sys::ngx_http_add_variable(cf, &raw mut name_trace_id, flags) };
+        if var_trace_id.is_null() {
+            return nginx_sys::NGX_ERROR as nginx_sys::ngx_int_t;
+        }
+        // SAFETY: `var_trace_id` is the non-null `ngx_http_variable_t*` returned
+        // by `ngx_http_add_variable`; writing its `get_handler` is sound (it lives
+        // in the http main conf variable hash, valid for the cycle).
+        unsafe { (*var_trace_id).get_handler = Some(otel_var_get_trace_id) };
+
+        // $otel_parent_sampled — "1" if the W3C sampled bit is set, else "0".
+        let mut name_sampled: nginx_sys::ngx_str_t = ngx::ngx_string!("otel_parent_sampled");
+        // SAFETY: same contract as the `name_trace_id` call above — `cf` valid,
+        // `name_sampled` is a local ngx_str_t valid for this call.
+        let var_sampled =
+            unsafe { nginx_sys::ngx_http_add_variable(cf, &raw mut name_sampled, flags) };
+        if var_sampled.is_null() {
+            return nginx_sys::NGX_ERROR as nginx_sys::ngx_int_t;
+        }
+        // SAFETY: `var_sampled` is the non-null `ngx_http_variable_t*` returned by
+        // `ngx_http_add_variable`; writing its `get_handler` is sound (same conf pool).
+        unsafe { (*var_sampled).get_handler = Some(otel_var_get_parent_sampled) };
+
+        nginx_sys::NGX_OK as nginx_sys::ngx_int_t
+    }
+
     unsafe extern "C" fn postconfiguration(cf: *mut ngx_conf_t) -> nginx_sys::ngx_int_t {
         // SAFETY: nginx calls `postconfiguration` with a non-null, valid `ngx_conf_t`
         // during single-threaded config parsing, so this exclusive borrow is the only
@@ -277,6 +329,122 @@ impl HttpModule for HttpOtelModule {
 
         Status::NGX_OK.into()
     }
+}
+
+// ── Variable get-handlers ($otel_trace_id, $otel_parent_sampled) ────────────
+
+/// Tiny helper: encode `src` bytes as lowercase hex into `dst`.
+///
+/// Caller must ensure `dst.len() == src.len() * 2`.
+fn hex_encode_into(src: &[u8], dst: &mut [u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for (i, &b) in src.iter().enumerate() {
+        dst[i * 2] = HEX[(b >> 4) as usize];
+        dst[i * 2 + 1] = HEX[(b & 0x0f) as usize];
+    }
+}
+
+/// nginx variable get-handler for `$otel_trace_id`.
+///
+/// Returns the W3C trace ID (32 lowercase hex chars) from the request's
+/// `SpanCtx`.  Returns empty (not_found) when no `SpanCtx` is present
+/// (i.e. the location has tracing disabled or the REWRITE handler has not
+/// yet run).
+///
+/// # Safety
+/// nginx calls this with a valid non-null `ngx_http_request_t*` and a valid
+/// `ngx_variable_value_t*` during variable evaluation.
+unsafe extern "C" fn otel_var_get_trace_id(
+    r: *mut nginx_sys::ngx_http_request_t,
+    v: *mut nginx_sys::ngx_variable_value_t,
+    _data: usize,
+) -> nginx_sys::ngx_int_t {
+    use crate::traces::ctx::SpanCtx;
+
+    // SAFETY: `r` is the non-null `ngx_http_request_t*` nginx passes to variable
+    // get-handlers; `Request::from_ngx_http_request` reinterprets it as the
+    // ngx-rust request wrapper (same repr) and yields a valid `&mut Request`.
+    let request = unsafe { ngx::http::Request::from_ngx_http_request(r) };
+    // SAFETY: `ngx_http_otel_module` is a `static` module descriptor valid for
+    // the full process lifetime; `addr_of!` yields a valid pointer.
+    let module = unsafe { &*::core::ptr::addr_of!(ngx_http_otel_module) };
+    let ctx: Option<&SpanCtx> = request.get_module_ctx(module);
+
+    // SAFETY: `v` is the non-null `ngx_variable_value_t*` nginx supplies.
+    let vv = unsafe { &mut *v };
+    match ctx {
+        Some(span_ctx) => {
+            // SAFETY: `r` is valid; `(*r).pool` is the per-request pool.
+            let pool = unsafe { (*r).pool };
+            // SAFETY: `pool` is a valid nginx pool pointer; `ngx_pcalloc` returns
+            // a pointer to pool memory valid for the request lifetime (or null).
+            let buf = unsafe { nginx_sys::ngx_pcalloc(pool, 32) } as *mut u8;
+            if buf.is_null() {
+                vv.set_not_found(1);
+                return nginx_sys::NGX_OK as nginx_sys::ngx_int_t;
+            }
+            // SAFETY: `buf` is a valid 32-byte pool allocation.
+            let s = unsafe { core::slice::from_raw_parts_mut(buf, 32) };
+            hex_encode_into(&span_ctx.trace_id, s);
+            vv.set_valid(1);
+            vv.set_no_cacheable(1);
+            vv.set_not_found(0);
+            vv.set_len(32);
+            vv.data = buf;
+        }
+        None => {
+            vv.set_not_found(1);
+        }
+    }
+    nginx_sys::NGX_OK as nginx_sys::ngx_int_t
+}
+
+/// nginx variable get-handler for `$otel_parent_sampled`.
+///
+/// Returns `"1"` if the W3C sampled bit (bit 0 of `flags`) is set in the
+/// request's `SpanCtx`; `"0"` if unsampled.  Empty (not_found) when no
+/// `SpanCtx` is present.
+///
+/// # Safety
+/// nginx calls this with a valid non-null `ngx_http_request_t*` and
+/// `ngx_variable_value_t*`.
+unsafe extern "C" fn otel_var_get_parent_sampled(
+    r: *mut nginx_sys::ngx_http_request_t,
+    v: *mut nginx_sys::ngx_variable_value_t,
+    _data: usize,
+) -> nginx_sys::ngx_int_t {
+    use crate::traces::ctx::SpanCtx;
+
+    // SAFETY: `r` is the non-null `ngx_http_request_t*` nginx passes to variable
+    // get-handlers; same contract as `otel_var_get_trace_id`.
+    let request = unsafe { ngx::http::Request::from_ngx_http_request(r) };
+    // SAFETY: `ngx_http_otel_module` is a `static` module descriptor valid for
+    // the full process lifetime; `addr_of!` yields a valid pointer.
+    let module = unsafe { &*::core::ptr::addr_of!(ngx_http_otel_module) };
+    let ctx: Option<&SpanCtx> = request.get_module_ctx(module);
+
+    // SAFETY: `v` is the non-null `ngx_variable_value_t*` nginx supplies.
+    let vv = unsafe { &mut *v };
+    // Static byte strings: "1" and "0".  Using `b'1'` / `b'0'` stored in
+    // `static` so the pointer outlives the handler call (no pool alloc needed).
+    static ONE: u8 = b'1';
+    static ZERO: u8 = b'0';
+    match ctx {
+        Some(span_ctx) => {
+            let is_sampled = (span_ctx.flags & 0x01) != 0;
+            let byte_ptr =
+                if is_sampled { &raw const ONE as *mut u8 } else { &raw const ZERO as *mut u8 };
+            vv.set_valid(1);
+            vv.set_no_cacheable(1);
+            vv.set_not_found(0);
+            vv.set_len(1);
+            vv.data = byte_ptr;
+        }
+        None => {
+            vv.set_not_found(1);
+        }
+    }
+    nginx_sys::NGX_OK as nginx_sys::ngx_int_t
 }
 
 // ── init_process callback ─────────────────────────────────────────────────────
@@ -1148,5 +1316,43 @@ mod nginx_test_stubs {
         _p: *mut c_void,
     ) -> nginx_sys::ngx_int_t {
         nginx_sys::NGX_OK as nginx_sys::ngx_int_t
+    }
+
+    // ── Phase 3.5 S3 stubs — trace directives + variable registration ─────────
+    //
+    // These functions are called during config parsing (otel_trace / otel_span_name
+    // complex value compilation) and by the preconfiguration variable registration
+    // hook.  On macOS flat-namespace linking they must exist at startup; on Linux
+    // they must exist at link time.  Unit tests never drive config parsing, so
+    // these stubs are never actually called.
+
+    #[no_mangle]
+    pub unsafe extern "C" fn ngx_http_add_variable(
+        _cf: *mut nginx_sys::ngx_conf_t,
+        _name: *mut nginx_sys::ngx_str_t,
+        _flags: nginx_sys::ngx_uint_t,
+    ) -> *mut nginx_sys::ngx_http_variable_t {
+        core::ptr::null_mut()
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn ngx_http_compile_complex_value(
+        _ccv: *mut nginx_sys::ngx_http_compile_complex_value_t,
+    ) -> nginx_sys::ngx_int_t {
+        nginx_sys::NGX_OK as nginx_sys::ngx_int_t
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn ngx_http_complex_value(
+        _r: *mut nginx_sys::ngx_http_request_t,
+        _val: *mut nginx_sys::ngx_http_complex_value_t,
+        _value: *mut nginx_sys::ngx_str_t,
+    ) -> nginx_sys::ngx_int_t {
+        nginx_sys::NGX_OK as nginx_sys::ngx_int_t
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn ngx_list_push(_l: *mut nginx_sys::ngx_list_t) -> *mut c_void {
+        core::ptr::null_mut()
     }
 }

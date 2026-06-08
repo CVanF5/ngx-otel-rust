@@ -24,6 +24,12 @@
 //! [2]  url_path_len        (big-endian u16, ≤ MAX_SPAN_URL_PATH)
 //! [url_path_len] url_path  (url.path)
 //! [8]  duration_us         (big-endian u64, request duration in µs)
+//! [2]  n_attrs             (big-endian u16, number of extra attributes; 0 = none)
+//! For each attr (0..n_attrs):
+//!   [1]  key_len           (u8, ≤ MAX_SPAN_ATTR_KEY)
+//!   [key_len] key          (UTF-8 attribute name)
+//!   [2]  val_len           (big-endian u16, ≤ MAX_SPAN_ATTR_VAL)
+//!   [val_len] val          (UTF-8 attribute value string)
 //! ```
 //!
 //! **Hot-path rule**: no allocation, no heap, no locks, no logging.
@@ -48,6 +54,12 @@ pub const MAX_SPAN_NAME: usize = 64;
 pub const MAX_SPAN_METHOD: usize = 16;
 /// Maximum `url.path` bytes stored in the record.
 pub const MAX_SPAN_URL_PATH: usize = 64;
+/// Maximum number of extra span attributes from `otel_span_attr` directives.
+pub const MAX_SPAN_EXTRA_ATTRS: usize = 4;
+/// Maximum attribute key length (bytes) per extra attribute.
+pub const MAX_SPAN_ATTR_KEY: usize = 32;
+/// Maximum attribute value length (bytes) per extra attribute.
+pub const MAX_SPAN_ATTR_VAL: usize = 64;
 
 // ── Wire-format field sizes ───────────────────────────────────────────────────
 
@@ -61,12 +73,15 @@ pub const SPAN_RECORD_FIXED_HDR: usize = 16 + 8 + 8 + 4 + 8 + 8 + 1 + 1;
 ///
 /// Fixed header + name(2+MAX_SPAN_NAME) + method(2+MAX_SPAN_METHOD)
 /// + http_status(2) + url_path(2+MAX_SPAN_URL_PATH) + duration_us(8)
+/// + n_attrs(2) + MAX_SPAN_EXTRA_ATTRS × (1+MAX_SPAN_ATTR_KEY + 2+MAX_SPAN_ATTR_VAL)
 pub const SPAN_RECORD_WORST_CASE: usize = SPAN_RECORD_FIXED_HDR
     + (2 + MAX_SPAN_NAME)
     + (2 + MAX_SPAN_METHOD)
     + 2
     + (2 + MAX_SPAN_URL_PATH)
-    + 8;
+    + 8
+    + 2
+    + MAX_SPAN_EXTRA_ATTRS * (1 + MAX_SPAN_ATTR_KEY + 2 + MAX_SPAN_ATTR_VAL);
 
 /// Maximum bytes for a serialised span record (stack-buffer size).
 ///
@@ -113,6 +128,12 @@ pub struct SpanRecord<'a> {
     pub url_path: &'a [u8],
     /// Request duration in microseconds.
     pub duration_us: u64,
+    /// Extra span attributes from `otel_span_attr` directives (Phase 3.5 S3).
+    ///
+    /// Slice of `(key_bytes, value_bytes)` pairs built in `LogPhaseHandler` from
+    /// `LocationConf::span_attrs` — conf pool memory, valid for process lifetime.
+    /// Empty slice when no `otel_span_attr` directives are set.
+    pub extra_attrs: &'a [(&'a [u8], &'a [u8])],
 }
 
 // ── Wire encoder ─────────────────────────────────────────────────────────────
@@ -196,6 +217,18 @@ pub fn emit_span_record(producer: &dyn LogProducer, rec: &SpanRecord<'_>) -> boo
     write_u16_be!(rec.http_status);
     write_capped!(rec.url_path, MAX_SPAN_URL_PATH, u16);
     write_u64_be!(rec.duration_us);
+
+    // Extra attributes from otel_span_attr directives (Phase 3.5 S3).
+    let n = rec.extra_attrs.len().min(MAX_SPAN_EXTRA_ATTRS);
+    write_u16_be!(n as u16);
+    for (key, val) in &rec.extra_attrs[..n] {
+        let k = if key.len() > MAX_SPAN_ATTR_KEY { &key[..MAX_SPAN_ATTR_KEY] } else { key };
+        let v = if val.len() > MAX_SPAN_ATTR_VAL { &val[..MAX_SPAN_ATTR_VAL] } else { val };
+        write_u8!(k.len() as u8);
+        write_bytes!(k);
+        write_u16_be!(v.len() as u16);
+        write_bytes!(v);
+    }
 
     producer.push(&buf[..pos])
 }
@@ -294,9 +327,44 @@ pub fn parse_span_record(buf: &[u8], observed_ns: u64) -> Option<crate::data_mod
         return None;
     }
     let duration_us = u64::from_be_bytes(buf[pos..pos + 8].try_into().ok()?);
+    pos += 8;
+
+    // Extra attributes (Phase 3.5 S3) — gracefully absent in older records.
+    let n_extra = if pos + 2 <= buf.len() {
+        let n = u16::from_be_bytes(buf[pos..pos + 2].try_into().ok()?) as usize;
+        pos += 2;
+        n.min(MAX_SPAN_EXTRA_ATTRS * 4) // sanity cap
+    } else {
+        0
+    };
 
     // Build OTel attributes from decoded HTTP fields.
     let mut attributes = std::vec::Vec::new();
+
+    // Decode extra attrs.
+    for _ in 0..n_extra {
+        if pos + 1 > buf.len() {
+            break;
+        }
+        let k_len = buf[pos] as usize;
+        pos += 1;
+        if pos + k_len > buf.len() {
+            break;
+        }
+        let key = std::string::String::from_utf8_lossy(&buf[pos..pos + k_len]).into_owned();
+        pos += k_len;
+        if pos + 2 > buf.len() {
+            break;
+        }
+        let v_len = u16::from_be_bytes(buf[pos..pos + 2].try_into().ok()?) as usize;
+        pos += 2;
+        if pos + v_len > buf.len() {
+            break;
+        }
+        let val = std::string::String::from_utf8_lossy(&buf[pos..pos + v_len]).into_owned();
+        pos += v_len;
+        attributes.push(KeyValue { key, value: AnyValue::String(val) });
+    }
     if !method.is_empty() {
         attributes
             .push(KeyValue { key: "http.request.method".into(), value: AnyValue::String(method) });
@@ -352,11 +420,11 @@ mod tests {
     fn span_record_size_constants() {
         // SPAN_RECORD_FIXED_HDR = 16+8+8+4+8+8+1+1 = 54
         assert_eq!(SPAN_RECORD_FIXED_HDR, 54);
-        // WORST_CASE = 54 + (2+64) + (2+16) + 2 + (2+64) + 8
-        //            = 54 + 66 + 18 + 2 + 66 + 8 = 214
-        assert_eq!(SPAN_RECORD_WORST_CASE, 214);
-        // MAX_SPAN_RECORD = round_up(214, 16) = 224
-        assert_eq!(MAX_SPAN_RECORD, 224);
+        // WORST_CASE = 54 + (2+64) + (2+16) + 2 + (2+64) + 8 + 2 + 4*(1+32+2+64)
+        //            = 54 + 66 + 18 + 2 + 66 + 8 + 2 + 396 = 612
+        assert_eq!(SPAN_RECORD_WORST_CASE, 612);
+        // MAX_SPAN_RECORD = round_up(612, 16) = 624
+        assert_eq!(MAX_SPAN_RECORD, 624);
         // The compile-time `const _: ()` guard covers the overflow relationship;
         // the eq assertions above are sufficient to pin any accidental change.
     }
@@ -394,6 +462,7 @@ mod tests {
             http_status: 200,
             url_path: b"/health",
             duration_us: 1000,
+            extra_attrs: &[],
         };
 
         assert!(emit_span_record(&producer, &rec), "push must succeed");

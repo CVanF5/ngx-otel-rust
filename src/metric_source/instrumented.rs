@@ -18,6 +18,7 @@
 
 use core::sync::atomic::Ordering;
 
+use nginx_sys;
 use ngx::core::Status;
 use ngx::http::{
     HttpModuleLocationConf, HttpModuleMainConf, HttpPhase, HttpRequestHandler, NgxHttpCoreModule,
@@ -33,7 +34,7 @@ use crate::shm::{
     BYTES_BOUNDS, DEFAULT_SPAN_RING_CAP, DURATION_BOUNDS_MS, N_BYTES_BUCKETS, N_DURATION_BUCKETS,
     UPSTREAM_IDX_OTHER,
 };
-use crate::traces::{emit_span_record, SpanRecord, MAX_SPAN_NAME};
+use crate::traces::{emit_span_record, SpanRecord, MAX_SPAN_EXTRA_ATTRS, MAX_SPAN_NAME};
 use crate::HttpOtelModule;
 
 /// Unit struct for the log-phase handler; all state lives in the shm zone.
@@ -334,14 +335,83 @@ impl HttpRequestHandler for LogPhaseHandler {
         // for all sampled requests, not only "interesting" tail ones.
         if let Some(ctx) = span_ctx.filter(|ctx| ctx.sampled) {
             if let Some(spans_base) = amcf.spans_shm_base() {
-                // Build span name "METHOD route_name" into a fixed stack buffer.
-                // No heap allocation; capped at MAX_SPAN_NAME (64 bytes).
+                // Collect per-location config (span_name_cv + span_attrs).
+                // `HttpOtelModule::location_conf` returns the merged LocationConf for
+                // the matched location; null/absent → default (built-in name, no attrs).
+                let loc_conf = HttpOtelModule::location_conf(r);
+
+                // Build span name: evaluate `otel_span_name` complex value if set,
+                // else fall back to built-in "METHOD route_name" format.
+                // No heap allocation; evaluated into a stack buffer capped at MAX_SPAN_NAME.
                 let mut span_name_buf = [0u8; MAX_SPAN_NAME];
-                let span_name_len = build_span_name(
-                    &mut span_name_buf,
-                    r.method_name.as_bytes(),
-                    amcf.route_name(route_idx).as_bytes(),
-                );
+                let span_name_len = {
+                    let mut evaluated_name: &[u8] = &[];
+                    let mut cv_buf = nginx_sys::ngx_str_t::default();
+                    let use_cv = loc_conf
+                        .and_then(|lc| {
+                            if lc.span_name_cv.is_null() {
+                                None
+                            } else {
+                                Some(lc.span_name_cv)
+                            }
+                        })
+                        .is_some_and(|cv_ptr| {
+                            // SAFETY: `r` is the valid non-null request pointer (same
+                            // request the handler was called on); `cv_ptr` is a valid
+                            // `ngx_http_complex_value_t*` in conf-pool memory compiled
+                            // at config time; `cv_buf` is a local ngx_str_t for output.
+                            let rc = unsafe {
+                                nginx_sys::ngx_http_complex_value(
+                                    r as *const nginx_sys::ngx_http_request_t
+                                        as *mut nginx_sys::ngx_http_request_t,
+                                    cv_ptr,
+                                    &raw mut cv_buf,
+                                )
+                            };
+                            rc == nginx_sys::NGX_OK as nginx_sys::ngx_int_t && !cv_buf.is_empty()
+                        });
+                    if use_cv {
+                        // SAFETY: `cv_buf` was just populated by `ngx_http_complex_value`;
+                        // `data` points into the request pool (valid for the LOG-phase call).
+                        evaluated_name = unsafe {
+                            if cv_buf.len > 0 && !cv_buf.data.is_null() {
+                                core::slice::from_raw_parts(cv_buf.data, cv_buf.len)
+                            } else {
+                                b""
+                            }
+                        };
+                    }
+                    if evaluated_name.is_empty() {
+                        // Built-in "METHOD route_name" fallback.
+                        build_span_name(
+                            &mut span_name_buf,
+                            r.method_name.as_bytes(),
+                            amcf.route_name(route_idx).as_bytes(),
+                        )
+                    } else {
+                        let len = evaluated_name.len().min(MAX_SPAN_NAME);
+                        span_name_buf[..len].copy_from_slice(&evaluated_name[..len]);
+                        len
+                    }
+                };
+
+                // Build extra_attrs from otel_span_attr directives (up to
+                // MAX_SPAN_EXTRA_ATTRS pairs).  No heap alloc — stack buffer only.
+                let mut attrs_buf: [(&[u8], &[u8]); MAX_SPAN_EXTRA_ATTRS] =
+                    [(&[], &[]); MAX_SPAN_EXTRA_ATTRS];
+                let attrs_len = if let Some(lc) = loc_conf {
+                    let n = lc.span_attrs.len().min(MAX_SPAN_EXTRA_ATTRS);
+                    for (slot, (k, v)) in attrs_buf[..n].iter_mut().zip(lc.span_attrs[..n].iter()) {
+                        // SAFETY: `k` and `v` are `ngx_str_t` values from the nginx
+                        // conf pool (populated at config-parse time by
+                        // `cmd_add_otel_span_attr`); `as_bytes()` safely reinterprets
+                        // the pointer + length as a byte slice valid for process lifetime.
+                        *slot = (k.as_bytes(), v.as_bytes());
+                    }
+                    n
+                } else {
+                    0
+                };
 
                 // OTel HTTP server span StatusCode: Error(2) for 5xx, Unset(0) otherwise.
                 let otel_status_code: u8 = if status >= 500 { 2 } else { 0 };
@@ -360,6 +430,7 @@ impl HttpRequestHandler for LogPhaseHandler {
                     http_status: status,
                     url_path: r.unparsed_uri.as_bytes(),
                     duration_us,
+                    extra_attrs: &attrs_buf[..attrs_len],
                 };
 
                 // SAFETY: `spans_base` is the valid mapped shm start returned by
