@@ -56,7 +56,7 @@ use crate::logs::severity::nginx_to_otel;
 use crate::metric_source::instrumented::InstrumentedSource;
 use crate::metric_source::stub_status::StubStatusSource;
 use crate::metric_source::MetricSource;
-use crate::processor::SpanProcessor;
+use crate::processor::Processor;
 use crate::shm::{
     logs_access_ring, logs_coalesce_table, logs_error_ring, logs_n_workers_from_zone,
     spans_n_workers_from_zone, spans_ring, DEFAULT_SPAN_RING_CAP,
@@ -436,7 +436,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
     // passthrough); wired to operator directives in a follow-on phase.
     // The `from_config` API is designed for future bidi-driven remote
     // reconfiguration (control-shm §1.3.3 + bidi §1.2) — a staged follow-on.
-    let span_processor = SpanProcessor::from_config(&serde_json::Value::Object(Default::default()));
+    let processor = Processor::from_config(&serde_json::Value::Object(Default::default()));
 
     let protocol_str = match amcf.export_protocol() {
         ExportProtocol::OtlpHttp => "otlp_http",
@@ -489,7 +489,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                 },
                 amcf,
                 worker_start_ns,
-                &span_processor,
+                &processor,
             )
             .await;
             EXPORT_LOOP_DONE.store(true, Ordering::Release);
@@ -597,7 +597,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                         n_workers,
                         worker_start_ns,
                     ));
-                    span_processor.process(&mut logs_pd);
+                    processor.process(&mut logs_pd);
                     let n_logs = count_pdata_records(&logs_pd);
                     if n_logs > 0 {
                         let logs_bytes = encode_pdata(&logs_pd);
@@ -684,7 +684,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                 };
                 // Pdata pipeline: wrap → process → encode → send (Step U2).
                 let mut spans_pd = Pdata::Spans(collect_span_records(amcf, spans_base, n_workers));
-                span_processor.process(&mut spans_pd);
+                processor.process(&mut spans_pd);
                 let n_spans = count_pdata_records(&spans_pd);
                 if n_spans > 0 {
                     let spans_bytes = encode_pdata(&spans_pd);
@@ -745,7 +745,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                 },
                 amcf,
                 worker_start_ns,
-                &span_processor,
+                &processor,
             )
             .await;
             EXPORT_LOOP_DONE.store(true, Ordering::Release);
@@ -814,7 +814,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
         // ── Collect fresh metrics from all sources ────────────────────────
         // Pdata pipeline: wrap → process → encode → send (Step U2).
         let mut metrics_pd = Pdata::Metrics(collect_all_sources(amcf, worker_start_ns));
-        span_processor.process(&mut metrics_pd);
+        processor.process(&mut metrics_pd);
         let n_pts = count_pdata_records(&metrics_pd);
         if n_pts > 0 {
             let bytes = encode_pdata(&metrics_pd);
@@ -919,7 +919,7 @@ async fn graceful_drain(
     queues: &mut DrainQueues<'_>,
     amcf: &'static MainConfig,
     worker_start_ns: u64,
-    span_processor: &SpanProcessor,
+    processor: &Processor,
 ) {
     let log = ngx::log::ngx_cycle_log();
     let queued = queues.metrics.len();
@@ -971,7 +971,7 @@ async fn graceful_drain(
 
     // Final freshly-collected metrics batch (Pdata pipeline, Step U2).
     let mut final_pd = Pdata::Metrics(collect_all_sources(amcf, worker_start_ns));
-    span_processor.process(&mut final_pd);
+    processor.process(&mut final_pd);
     let n_pts = count_pdata_records(&final_pd);
     if n_pts > 0 {
         let bytes = encode_pdata(&final_pd);
@@ -1051,7 +1051,7 @@ async fn graceful_drain(
             // Pdata pipeline: wrap → process → encode → send (Step U2).
             let mut logs_pd =
                 Pdata::Logs(collect_log_records(amcf, logs_base, n_workers, worker_start_ns));
-            span_processor.process(&mut logs_pd);
+            processor.process(&mut logs_pd);
             let n_logs = count_pdata_records(&logs_pd);
             if n_logs > 0 {
                 let logs_bytes = encode_pdata(&logs_pd);
@@ -1129,7 +1129,7 @@ async fn graceful_drain(
             spans_n_workers_from_zone(avail, DEFAULT_SPAN_RING_CAP)
         };
         let mut spans_pd = Pdata::Spans(collect_span_records(amcf, spans_base, n_workers));
-        span_processor.process(&mut spans_pd);
+        processor.process(&mut spans_pd);
         let n_spans = count_pdata_records(&spans_pd);
         if n_spans > 0 {
             let spans_bytes = encode_pdata(&spans_pd);
