@@ -127,8 +127,9 @@ reserved for Phase 5 dynamic reconfiguration).  The `MetricSource` and
 dispatches OTLP/HTTP vs OTLP/gRPC — keep an eventual OTAP / columnar
 migration a swap, not a rewrite.
 
-**Design principle: workers do a bounded amount of format-independent
-work; the exporter does everything format-specific.**  On the request
+**Design principle: the worker copies raw facts and never encodes; all
+wire-format work is cold-path.**  Workers do a bounded amount of
+format-*independent* work; the exporter does everything format-specific.  On the request
 path a worker only *aggregates and defers* — a fixed set of `Relaxed`
 atomic increments into its own shm histogram slots, plus, for the
 sampled exception tail only, a single bounded, allocation-free copy into
@@ -140,6 +141,16 @@ only in the dedicated exporter on the cold path.  Because the data sits
 in shm in a **protocol-neutral shape**, moving OTLP → OTAP is an encoder
 swap inside one cold-path process and never reaches a worker or the
 request path.
+
+Two invariants follow.  **(1) The request path does zero wire-format
+work** — it copies raw facts (atomic bumps + bounded memcpys into shm)
+and never serialises; anything that shapes bytes for a wire format is
+pushed to the cold path.  **(2) "Zero wire-byte change" is the bar for
+refactoring telemetry code** — a change that leaves the emitted OTLP
+bytes byte-for-byte identical is a pure refactor (gated by the existing
+tests); a change that alters them is a behaviour change, treated as
+such.  The first governs *what a worker does*; the second governs *how
+we change the code that produces bytes*.
 
 This one dedicated exporter is deliberately the **single cold path for all
 three signals** — metrics today, logs and traces in Phases 2–3 — so per-signal
