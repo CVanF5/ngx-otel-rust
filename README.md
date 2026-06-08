@@ -73,11 +73,16 @@ flowchart LR
 
     subgraph NGINX["NGINX — one instance"]
         direction TB
-        Workers["<b>Worker processes</b> — hot path<br/><i>copy raw facts, never encode</i><br/>per-worker · no cross-worker writes"]:::data
+        subgraph Workers["Workers · copy raw facts"]
+            direction TB
+            W1["Worker 1"]:::data
+            W2["Worker 2"]:::data
+            W3["Worker N"]:::data
+        end
         SHM[("<b>Per-worker shm</b><br/>histograms · log/span rings · counters")]:::tel
         subgraph Exporter["<b>nginx: otel exporter</b> — single cold path · all signals"]
             direction LR
-            Drain["drain"]:::tel --> Proc["processor"]:::tel --> Encode["encode<br/>OTLP · OTAP → Phase 5"]:::tel --> Tx["transport<br/>HTTP/1 · gRPC/h2"]:::tel
+            Drain["drain"]:::tel --> Proc["processor"]:::tel --> Encode["encode<br/>OTLP / OTAP"]:::tel --> Tx["transport<br/>HTTP/1 · gRPC/h2"]:::tel
         end
         Ctl[("control shm<br/>flags · heartbeat")]:::ctl
     end
@@ -85,11 +90,11 @@ flowchart LR
     Coll["<b>OTel Collector</b>"]:::ext
 
     Client -->|"HTTP requests"| Workers
-    Workers -->|"bump &amp; defer<br/>1 atomic + bounded memcpy"| SHM
-    SHM -->|"drain · read-only"| Drain
-    Tx -->|"OTLP → /v1/metrics · /v1/logs · /v1/traces"| Coll
-    Ctl -.->|"flags · 1 relaxed load/req"| Workers
-    Coll -.->|"bidi control · Phase 5"| Ctl
+    Workers -->|"bump &amp; defer"| SHM
+    SHM -->|"drain"| Drain
+    Tx --> Coll
+    Ctl -.->|"control"| Workers
+    Coll -.-> Ctl
 
     classDef data fill:#e8e8e8,stroke:#000000,stroke-width:2px,color:#000000;
     classDef tel fill:#d0e2ff,stroke:#648FFF,stroke-width:2px,color:#000000;
