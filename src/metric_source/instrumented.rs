@@ -24,7 +24,10 @@ use ngx::http::{
     Request,
 };
 
-use crate::logs::{access::emit_access_record, WorkerRingProducer};
+use crate::logs::{
+    access::{emit_access_record, SampledRequest},
+    WorkerRingProducer,
+};
 use crate::shm::{
     combo_index, logs_access_ring, worker_slots, HttpMethod, ProtoVersion, StatusClass,
     BYTES_BOUNDS, DURATION_BOUNDS_MS, N_BYTES_BUCKETS, N_DURATION_BUCKETS, UPSTREAM_IDX_OTHER,
@@ -291,37 +294,29 @@ impl HttpRequestHandler for LogPhaseHandler {
                 // High-cardinality — stays on the tail record ONLY, never a metric dim.
                 let url_path: &[u8] = r.unparsed_uri.as_bytes();
 
-                emit_access_record(
-                    &producer,
+                // Build the canonical sampled-request record once; project into both sinks.
+                // No allocation — all fields borrow nginx request memory (stack frame).
+                let sampled = SampledRequest {
+                    ts_unix_nano,
+                    trace: trace_context,
+                    url_path,
+                    user_agent: user_agent_raw,
+                    duration_us,
+                    combo_idx: base_idx as u32,
                     method,
                     status,
-                    req_len,
-                    resp_bytes_acc,
+                    request_length: req_len,
+                    response_bytes: resp_bytes_acc,
                     client_addr,
-                    ts_unix_nano,
-                    trace_context,
-                    url_path,
-                    user_agent_raw,
-                );
+                };
 
-                // Write to the exemplar reservoir (Phase 2.2 Steps 2.2.4 + 2.2.5).
+                // Sink 1: per-worker SPSC log ring (exception-tail LogRecord).
+                emit_access_record(&producer, &sampled);
+
+                // Sink 2: exemplar reservoir (Phase 2.2 Steps 2.2.4 + 2.2.5).
                 // One fetch_add + ≤ 9 Relaxed stores + 2 memcpy = within budget.
                 let effective_size = amcf.access_sample_size().max(1);
-                let (trace_id_opt, span_id_opt) = if let Some((t, s)) = trace_context {
-                    (Some(t), Some(s))
-                } else {
-                    (None, None)
-                };
-                slot.exemplar_reservoir.write(
-                    effective_size,
-                    duration_us,
-                    base_idx as u32,
-                    trace_id_opt,
-                    span_id_opt,
-                    ts_unix_nano,
-                    url_path,       // url.path — on exemplar filtered_attrs only
-                    user_agent_raw, // user_agent.original — on exemplar filtered_attrs only
-                );
+                slot.exemplar_reservoir.write(effective_size, &sampled);
             }
         }
 
@@ -832,7 +827,38 @@ fn now_unix_nano() -> u64 {
 #[cfg(test)]
 mod tests {
     use crate::logs::ring::tests::make_ring_with_cap;
-    use crate::logs::{access::emit_access_record, WorkerRingProducer};
+    use crate::logs::{
+        access::{emit_access_record, SampledRequest},
+        WorkerRingProducer,
+    };
+
+    /// Minimal `SampledRequest` for unit tests.  Override fields as needed.
+    #[allow(clippy::too_many_arguments)]
+    fn make_req<'a>(
+        method: &'a [u8],
+        status: u16,
+        req_len: u64,
+        resp_bytes: u64,
+        client: &'a [u8],
+        ts: u64,
+        trace: Option<([u8; 16], [u8; 8])>,
+        url: &'a [u8],
+        ua: &'a [u8],
+    ) -> SampledRequest<'a> {
+        SampledRequest {
+            ts_unix_nano: ts,
+            trace,
+            url_path: url,
+            user_agent: ua,
+            duration_us: 0,
+            combo_idx: 0,
+            method,
+            status,
+            request_length: req_len,
+            response_bytes: resp_bytes,
+            client_addr: client,
+        }
+    }
 
     /// With `is_access_sample_enabled() = false` (the default), the exception-tail
     /// gate is closed: no ring operations occur even for interesting requests.
@@ -844,7 +870,10 @@ mod tests {
         let access_sample_enabled = false;
         if access_sample_enabled && super::is_interesting(503, 0) {
             let producer = WorkerRingProducer { ring };
-            emit_access_record(&producer, b"GET", 503, 0, 512, b"127.0.0.1", 0, None, b"", b"");
+            emit_access_record(
+                &producer,
+                &make_req(b"GET", 503, 0, 512, b"127.0.0.1", 0, None, b"", b""),
+            );
         }
 
         // Ring must be empty — no record pushed.
@@ -863,7 +892,10 @@ mod tests {
         // 200, 0ms — not interesting, no push.
         if access_sample_enabled && super::is_interesting(200, 0) {
             let producer = WorkerRingProducer { ring };
-            emit_access_record(&producer, b"GET", 200, 0, 512, b"127.0.0.1", 0, None, b"", b"");
+            emit_access_record(
+                &producer,
+                &make_req(b"GET", 200, 0, 512, b"127.0.0.1", 0, None, b"", b""),
+            );
         }
         let mut out = std::vec::Vec::new();
         assert!(!ring.pop_into(&mut out), "200/fast must NOT reach the tail ring");
@@ -871,14 +903,20 @@ mod tests {
         // 503, 0ms — interesting (error), push expected.
         if access_sample_enabled && super::is_interesting(503, 0) {
             let producer = WorkerRingProducer { ring };
-            emit_access_record(&producer, b"GET", 503, 0, 0, b"127.0.0.1", 0, None, b"", b"");
+            emit_access_record(
+                &producer,
+                &make_req(b"GET", 503, 0, 0, b"127.0.0.1", 0, None, b"", b""),
+            );
         }
         assert!(ring.pop_into(&mut out), "503 must reach the tail ring");
 
         // 200, 2000ms — interesting (latency outlier), push expected.
         if access_sample_enabled && super::is_interesting(200, 2000) {
             let producer = WorkerRingProducer { ring };
-            emit_access_record(&producer, b"GET", 200, 0, 0, b"127.0.0.1", 0, None, b"", b"");
+            emit_access_record(
+                &producer,
+                &make_req(b"GET", 200, 0, 0, b"127.0.0.1", 0, None, b"", b""),
+            );
         }
         out.clear();
         assert!(ring.pop_into(&mut out), "slow 200 must reach the tail ring");
@@ -897,15 +935,17 @@ mod tests {
             let producer = WorkerRingProducer { ring };
             emit_access_record(
                 &producer,
-                b"POST",
-                503,
-                128,
-                256,
-                b"10.0.0.1",
-                1_700_000_000_000_000_000,
-                None,
-                b"/api/test",
-                b"TestAgent/1.0",
+                &make_req(
+                    b"POST",
+                    503,
+                    128,
+                    256,
+                    b"10.0.0.1",
+                    1_700_000_000_000_000_000,
+                    None,
+                    b"/api/test",
+                    b"TestAgent/1.0",
+                ),
             );
         }
 

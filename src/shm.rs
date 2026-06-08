@@ -26,6 +26,8 @@ use core::{mem, ptr};
 use nginx_sys::{ngx_conf_t, ngx_int_t, ngx_shared_memory_add, ngx_shm_zone_t, ngx_slab_pool_t};
 use ngx::core::Status;
 
+use crate::logs::access::{SampledRequest, MAX_URL_PATH, MAX_USER_AGENT};
+
 /// Duration histogram bucket boundaries in **milliseconds**.
 ///
 /// These match the default OTel HTTP server latency boundaries (seconds × 1000).
@@ -531,14 +533,6 @@ pub struct WorkerSlots {
 /// worker — a negligible addition to `WorkerSlots`.
 pub const MAX_EXEMPLAR_RESERVOIR: usize = 64;
 
-/// Maximum `url.path` bytes stored in an exemplar entry.
-/// Matches `crate::logs::access::MAX_URL_PATH`.
-pub const EXEMPLAR_URL_PATH_MAX: usize = 64;
-
-/// Maximum `user_agent.original` bytes stored in an exemplar entry.
-/// Matches `crate::logs::access::MAX_USER_AGENT`.
-pub const EXEMPLAR_USER_AGENT_MAX: usize = 128;
-
 /// A single exemplar entry in the per-worker reservoir.
 ///
 /// Written on the hot path with `Ordering::Relaxed` on the atomic fields;
@@ -550,7 +544,7 @@ pub const EXEMPLAR_USER_AGENT_MAX: usize = 128;
 /// (see [`ExemplarReservoir::snapshot`]).
 ///
 /// Size: 5 × AtomicU64 + AtomicU32 + AtomicU8 + AtomicU8 + 2 pad
-///       + EXEMPLAR_URL_PATH_MAX + EXEMPLAR_USER_AGENT_MAX
+///       + MAX_URL_PATH + MAX_USER_AGENT
 ///     = 40 + 4 + 1 + 1 + 2 + 64 + 128 = 240 bytes.
 #[repr(C)]
 pub struct ExemplarEntry {
@@ -578,10 +572,10 @@ pub struct ExemplarEntry {
     /// `UnsafeCell` so the hot-path byte writes through `&self` are sound
     /// interior mutation rather than aliasing UB. `repr(transparent)`, so the
     /// shm layout is unchanged.
-    pub url_path_buf: core::cell::UnsafeCell<[u8; EXEMPLAR_URL_PATH_MAX]>,
+    pub url_path_buf: core::cell::UnsafeCell<[u8; MAX_URL_PATH]>,
     /// `user_agent.original` bytes — high-cardinality, exemplar filtered_attribute ONLY.
     /// NEVER a metric dimension. `UnsafeCell` for the same reason as `url_path_buf`.
-    pub user_agent_buf: core::cell::UnsafeCell<[u8; EXEMPLAR_USER_AGENT_MAX]>,
+    pub user_agent_buf: core::cell::UnsafeCell<[u8; MAX_USER_AGENT]>,
 }
 
 /// Per-worker exemplar reservoir — a fixed-capacity circular buffer of
@@ -602,7 +596,7 @@ pub struct ExemplarReservoir {
 }
 
 impl ExemplarReservoir {
-    /// Write one exemplar entry on the hot path.
+    /// Write one exemplar entry on the hot path from a `SampledRequest`.
     ///
     /// `effective_size` must be in `1..=MAX_EXEMPLAR_RESERVOIR`; values outside
     /// this range are clamped.
@@ -614,27 +608,16 @@ impl ExemplarReservoir {
     /// # High-cardinality fields
     /// `url_path` and `user_agent` are stored in the entry as filtered_attributes;
     /// they are **never** used as metric dimensions.
-    #[allow(clippy::too_many_arguments)]
     #[inline]
-    pub fn write(
-        &self,
-        effective_size: usize,
-        value_us: u64,
-        combo_idx: u32,
-        trace_id: Option<[u8; 16]>,
-        span_id: Option<[u8; 8]>,
-        ts_unix_nano: u64,
-        url_path: &[u8],
-        user_agent: &[u8],
-    ) {
+    pub fn write(&self, effective_size: usize, req: &SampledRequest<'_>) {
         let k = effective_size.clamp(1, MAX_EXEMPLAR_RESERVOIR);
         let n = self.count.fetch_add(1, Ordering::Relaxed) as usize;
         let slot = n % k;
         let e = &self.entries[slot];
-        e.value_us.store(value_us, Ordering::Relaxed);
-        e.ts_unix_nano.store(ts_unix_nano, Ordering::Relaxed);
-        e.combo_idx.store(combo_idx, Ordering::Relaxed);
-        if let (Some(tid), Some(sid)) = (trace_id, span_id) {
+        e.value_us.store(req.duration_us, Ordering::Relaxed);
+        e.ts_unix_nano.store(req.ts_unix_nano, Ordering::Relaxed);
+        e.combo_idx.store(req.combo_idx, Ordering::Relaxed);
+        if let Some((tid, sid)) = req.trace {
             let lo = u64::from_be_bytes(tid[0..8].try_into().unwrap_or([0u8; 8]));
             let hi = u64::from_be_bytes(tid[8..16].try_into().unwrap_or([0u8; 8]));
             e.trace_id_lo.store(lo, Ordering::Relaxed);
@@ -654,8 +637,8 @@ impl ExemplarReservoir {
         // wrong data point.  This is an intentional hot-path trade-off:
         // exemplars are sampling hints for drill-down, not an authoritative
         // record (see TELEMETRY_MODEL.md "Exemplars are best-effort hints").
-        let url_len = url_path.len().min(EXEMPLAR_URL_PATH_MAX) as u8;
-        let ua_len = user_agent.len().min(EXEMPLAR_USER_AGENT_MAX) as u8;
+        let url_len = req.url_path.len().min(MAX_URL_PATH) as u8;
+        let ua_len = req.user_agent.len().min(MAX_USER_AGENT) as u8;
         // SAFETY: the buffers are `UnsafeCell<[u8; N]>`, so mutating through
         // `&self` is sound interior mutability (not aliasing UB). `.get()` yields
         // `*mut [u8; N]`; the cast to `*mut u8` addresses the first byte. `url_len`
@@ -664,9 +647,9 @@ impl ExemplarReservoir {
         // vs the exporter's read is the accepted best-effort-hint semantics.
         unsafe {
             let dst = e.url_path_buf.get().cast::<u8>();
-            core::ptr::copy_nonoverlapping(url_path.as_ptr(), dst, url_len as usize);
+            core::ptr::copy_nonoverlapping(req.url_path.as_ptr(), dst, url_len as usize);
             let dst = e.user_agent_buf.get().cast::<u8>();
-            core::ptr::copy_nonoverlapping(user_agent.as_ptr(), dst, ua_len as usize);
+            core::ptr::copy_nonoverlapping(req.user_agent.as_ptr(), dst, ua_len as usize);
         }
         e.url_path_len.store(url_len, Ordering::Relaxed);
         e.user_agent_len.store(ua_len, Ordering::Relaxed);
@@ -728,9 +711,9 @@ pub struct ExemplarSnapshot {
     pub trace_id: [u8; 16],
     pub span_id: [u8; 8],
     pub ts_unix_nano: u64,
-    pub url_path: [u8; EXEMPLAR_URL_PATH_MAX],
+    pub url_path: [u8; MAX_URL_PATH],
     pub url_path_len: u8,
-    pub user_agent: [u8; EXEMPLAR_USER_AGENT_MAX],
+    pub user_agent: [u8; MAX_USER_AGENT],
     pub user_agent_len: u8,
 }
 
@@ -1324,15 +1307,61 @@ mod tests {
 
         // Write 3 exemplars into a reservoir of size 2 → slot 0 and 1 filled,
         // slot 0 is overwritten by the 3rd write.
-        let trace_id = Some([
+        use crate::logs::access::SampledRequest;
+        let tid = [
             0x4bu8, 0xf9, 0x2f, 0x35, 0x77, 0xb3, 0x4d, 0xa6, 0xa3, 0xce, 0x92, 0x9d, 0x0e, 0x0e,
             0x47, 0x36,
-        ]);
-        let span_id = Some([0x00u8, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7]);
+        ];
+        let sid = [0x00u8, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7];
 
-        reservoir.write(2, 100, 5, trace_id, span_id, 1_000_000_000, b"/api", b"curl/7"); // slot 0
-        reservoir.write(2, 200, 6, None, None, 2_000_000_000, b"", b""); // slot 1
-        reservoir.write(2, 300, 7, trace_id, span_id, 3_000_000_000, b"/v2", b"Go-http"); // slot 0 overwritten
+        reservoir.write(
+            2,
+            &SampledRequest {
+                ts_unix_nano: 1_000_000_000,
+                trace: Some((tid, sid)),
+                url_path: b"/api",
+                user_agent: b"curl/7",
+                duration_us: 100,
+                combo_idx: 5,
+                method: b"GET",
+                status: 200,
+                request_length: 0,
+                response_bytes: 0,
+                client_addr: b"127.0.0.1",
+            },
+        ); // slot 0
+        reservoir.write(
+            2,
+            &SampledRequest {
+                ts_unix_nano: 2_000_000_000,
+                trace: None,
+                url_path: b"",
+                user_agent: b"",
+                duration_us: 200,
+                combo_idx: 6,
+                method: b"GET",
+                status: 200,
+                request_length: 0,
+                response_bytes: 0,
+                client_addr: b"127.0.0.1",
+            },
+        ); // slot 1
+        reservoir.write(
+            2,
+            &SampledRequest {
+                ts_unix_nano: 3_000_000_000,
+                trace: Some((tid, sid)),
+                url_path: b"/v2",
+                user_agent: b"Go-http",
+                duration_us: 300,
+                combo_idx: 7,
+                method: b"GET",
+                status: 200,
+                request_length: 0,
+                response_bytes: 0,
+                client_addr: b"127.0.0.1",
+            },
+        ); // slot 0 overwritten
 
         // count must be 3 (candidates seen)
         assert_eq!(reservoir.count.load(core::sync::atomic::Ordering::Acquire), 3);
@@ -1417,8 +1446,9 @@ mod tests {
         );
 
         // 2. url/ua in ExemplarEntry, NOT in histograms.
-        let _url_max: usize = EXEMPLAR_URL_PATH_MAX; // present in ExemplarEntry only
-        let _ua_max: usize = EXEMPLAR_USER_AGENT_MAX; // present in ExemplarEntry only
+        // Caps are single-homed in `logs::access` and imported here.
+        let _url_max: usize = MAX_URL_PATH; // present in ExemplarEntry only (via access::MAX_URL_PATH)
+        let _ua_max: usize = MAX_USER_AGENT; // present in ExemplarEntry only (via access::MAX_USER_AGENT)
 
         // 3. combo_index is 3-arg (no url/ua/route/upstream) — route and upstream
         //    use separate WorkerSlots fields (route_duration_combos / upstream_duration_combos).

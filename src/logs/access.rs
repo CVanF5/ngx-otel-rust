@@ -64,9 +64,49 @@ use super::LogProducer;
 pub const MAX_ACCESS_RECORD: usize = 320;
 
 /// Maximum `url.path` bytes stored in the record.
+/// Single-homed here; `shm.rs` imports this constant for the exemplar reservoir.
 pub const MAX_URL_PATH: usize = 64;
 /// Maximum `user_agent.original` bytes stored in the record.
+/// Single-homed here; `shm.rs` imports this constant for the exemplar reservoir.
 pub const MAX_USER_AGENT: usize = 128;
+/// Maximum `client.address` bytes stored in the record.
+pub const MAX_CLIENT_ADDR: usize = 46;
+
+/// Canonical producer-side sampled-request record.
+///
+/// Built **once** on the stack from nginx request fields at the exception-tail /
+/// exemplar gate in `metric_source/instrumented.rs`; projected into both sinks
+/// (`emit_access_record` → log ring; `ExemplarReservoir::write` → exemplar
+/// reservoir) without a second gather pass.
+///
+/// All byte-slice fields borrow nginx request memory — no allocation.
+pub struct SampledRequest<'a> {
+    // ── shared by both sinks ──────────────────────────────────────────────
+    /// Unix epoch nanoseconds at request start.
+    pub ts_unix_nano: u64,
+    /// Optional W3C trace context: `(trace_id[16], span_id[8])`.
+    pub trace: Option<([u8; 16], [u8; 8])>,
+    /// `url.path` — high-cardinality, tail/exemplar only.
+    pub url_path: &'a [u8],
+    /// `user_agent.original` — high-cardinality, tail/exemplar only.
+    pub user_agent: &'a [u8],
+    /// Request duration in microseconds — exemplar value + log attribute (decision #3).
+    pub duration_us: u64,
+    /// Base `{method × status_class × protocol}` combo index — histogram join key.
+    pub combo_idx: u32,
+    // ── log ring only ─────────────────────────────────────────────────────
+    /// HTTP request method bytes (e.g. `b"GET"`).
+    pub method: &'a [u8],
+    /// HTTP response status code.
+    pub status: u16,
+    /// Request body size in bytes.
+    pub request_length: u64,
+    /// Response bytes sent.
+    pub response_bytes: u64,
+    /// Client address string (e.g. `b"127.0.0.1"`).
+    pub client_addr: &'a [u8],
+    // route_idx/upstream_idx: deferred to Phase 3 — see PHASE_3_NOTES.md
+}
 
 /// HTTP access record kind byte.
 const KIND_ACCESS: u8 = 0x00;
@@ -76,18 +116,7 @@ const NGX_LEVEL_INFO: u8 = 7;
 
 /// Emit one HTTP access log record into the producer's ring.
 ///
-/// # Arguments
-/// - `producer`       — the calling worker's ring producer.
-/// - `method`         — HTTP method string (e.g. `b"GET"`).
-/// - `status`         — HTTP response status code.
-/// - `request_length` — request body size in bytes.
-/// - `response_bytes` — response bytes sent.
-/// - `client_addr`    — client address string (e.g. `b"127.0.0.1"`).
-/// - `ts_unix_nano`   — timestamp of the request (Unix epoch, nanoseconds).
-/// - `trace_context`  — optional W3C trace context: `Some((trace_id[16], span_id[8]))`.
-///   `None` ⇒ `has_trace = 0` (one byte overhead).
-/// - `url_path`       — `url.path` (truncated to `MAX_URL_PATH` bytes).
-/// - `user_agent`     — `user_agent.original` (truncated to `MAX_USER_AGENT` bytes).
+/// Serialises the fields of `req` into a fixed-size stack buffer and pushes it.
 ///
 /// Returns `true` if the record was pushed; `false` if the ring was full.
 ///
@@ -98,20 +127,8 @@ const NGX_LEVEL_INFO: u8 = 7;
 /// # High-cardinality fields stay OFF the metric
 /// `url_path`, `user_agent`, and `client_addr` appear ONLY in this tail record
 /// and in exemplar `filtered_attributes`; they are NEVER used as metric dimensions.
-#[allow(clippy::too_many_arguments)]
 #[inline]
-pub fn emit_access_record(
-    producer: &dyn LogProducer,
-    method: &[u8],
-    status: u16,
-    request_length: u64,
-    response_bytes: u64,
-    client_addr: &[u8],
-    ts_unix_nano: u64,
-    trace_context: Option<([u8; 16], [u8; 8])>,
-    url_path: &[u8],
-    user_agent: &[u8],
-) -> bool {
+pub fn emit_access_record(producer: &dyn LogProducer, req: &SampledRequest<'_>) -> bool {
     let mut buf = [0u8; MAX_ACCESS_RECORD];
     let mut pos = 0usize;
 
@@ -148,22 +165,22 @@ pub fn emit_access_record(
     // kind
     write_u8!(KIND_ACCESS);
     // timestamp
-    write_u64_be!(ts_unix_nano);
+    write_u64_be!(req.ts_unix_nano);
     // ngx_level (info)
     write_u8!(NGX_LEVEL_INFO);
     // http.request.method
-    write_bytes_with_u16_len!(method, 16); // max method = 16 bytes
-                                           // http.response.status_code
-    write_u16_be!(status);
+    write_bytes_with_u16_len!(req.method, 16); // max method = 16 bytes
+                                               // http.response.status_code
+    write_u16_be!(req.status);
     // http.server.request.body.size
-    write_u64_be!(request_length);
+    write_u64_be!(req.request_length);
     // http.server.response.body.size
-    write_u64_be!(response_bytes);
+    write_u64_be!(req.response_bytes);
     // client.address
-    write_bytes_with_u16_len!(client_addr, 46); // max IPv6 = 46 chars
+    write_bytes_with_u16_len!(req.client_addr, MAX_CLIENT_ADDR);
 
     // W3C trace correlation (Phase 2.2.3).
-    match trace_context {
+    match req.trace {
         Some((trace_id, span_id)) => {
             write_u8!(1u8); // has_trace = 1
             buf[pos..pos + 16].copy_from_slice(&trace_id);
@@ -178,8 +195,8 @@ pub fn emit_access_record(
 
     // High-cardinality detail (Phase 2.2.5) — on tail/exemplar records ONLY.
     // NEVER promoted to metric dimensions (plan §DP-E; keeps combo index WithinU8).
-    write_bytes_with_u16_len!(url_path, MAX_URL_PATH);
-    write_bytes_with_u16_len!(user_agent, MAX_USER_AGENT);
+    write_bytes_with_u16_len!(req.url_path, MAX_URL_PATH);
+    write_bytes_with_u16_len!(req.user_agent, MAX_USER_AGENT);
 
     producer.push(&buf[..pos])
 }
@@ -280,18 +297,20 @@ mod tests {
         // LogsWorkerRing is Copy, so we can use it for both the producer and drain.
         let producer = WorkerRingProducer { ring };
 
-        let pushed = emit_access_record(
-            &producer,
-            b"GET",
-            200,
-            0,
-            512,
-            b"127.0.0.1",
-            1_700_000_000_000_000_000,
-            None,
-            b"/health",
-            b"curl/7.0",
-        );
+        let req = SampledRequest {
+            ts_unix_nano: 1_700_000_000_000_000_000,
+            trace: None,
+            url_path: b"/health",
+            user_agent: b"curl/7.0",
+            duration_us: 0,
+            combo_idx: 0,
+            method: b"GET",
+            status: 200,
+            request_length: 0,
+            response_bytes: 512,
+            client_addr: b"127.0.0.1",
+        };
+        let pushed = emit_access_record(&producer, &req);
         assert!(pushed, "push must succeed on an empty ring");
 
         let mut record = std::vec::Vec::new();
@@ -333,15 +352,19 @@ mod tests {
         let producer = WorkerRingProducer { ring };
         emit_access_record(
             &producer,
-            b"GET",
-            200,
-            0,
-            0,
-            b"127.0.0.1",
-            0,
-            Some((trace_id, span_id)),
-            b"/api/v1",
-            b"Mozilla/5.0",
+            &SampledRequest {
+                ts_unix_nano: 0,
+                trace: Some((trace_id, span_id)),
+                url_path: b"/api/v1",
+                user_agent: b"Mozilla/5.0",
+                duration_us: 0,
+                combo_idx: 0,
+                method: b"GET",
+                status: 200,
+                request_length: 0,
+                response_bytes: 0,
+                client_addr: b"127.0.0.1",
+            },
         );
         let mut rec = std::vec::Vec::new();
         assert!(ring.pop_into(&mut rec));
@@ -367,7 +390,22 @@ mod tests {
         // Emit record without trace context → has_trace = 0.
         let (_buf2, ring2) = make_ring_with_cap(4096);
         let producer2 = WorkerRingProducer { ring: ring2 };
-        emit_access_record(&producer2, b"GET", 200, 0, 0, b"127.0.0.1", 0, None, b"", b"");
+        emit_access_record(
+            &producer2,
+            &SampledRequest {
+                ts_unix_nano: 0,
+                trace: None,
+                url_path: b"",
+                user_agent: b"",
+                duration_us: 0,
+                combo_idx: 0,
+                method: b"GET",
+                status: 200,
+                request_length: 0,
+                response_bytes: 0,
+                client_addr: b"127.0.0.1",
+            },
+        );
         let mut rec2 = std::vec::Vec::new();
         assert!(ring2.pop_into(&mut rec2));
         let m2 = u16::from_be_bytes([rec2[10], rec2[11]]) as usize;
@@ -398,7 +436,22 @@ mod tests {
         let producer = WorkerRingProducer { ring };
         // Method longer than 16 bytes should be truncated.
         let long_method = b"VERYLONGMETHODNAME_EXCEEDS_LIMIT";
-        emit_access_record(&producer, long_method, 200, 0, 0, b"127.0.0.1", 0, None, b"", b"");
+        emit_access_record(
+            &producer,
+            &SampledRequest {
+                ts_unix_nano: 0,
+                trace: None,
+                url_path: b"",
+                user_agent: b"",
+                duration_us: 0,
+                combo_idx: 0,
+                method: long_method,
+                status: 200,
+                request_length: 0,
+                response_bytes: 0,
+                client_addr: b"127.0.0.1",
+            },
+        );
         let mut record = std::vec::Vec::new();
         assert!(ring.pop_into(&mut record));
         let method_len = u16::from_be_bytes([record[10], record[11]]) as usize;
