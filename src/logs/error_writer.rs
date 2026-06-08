@@ -45,6 +45,13 @@ use crate::logs::ring::LogsWorkerRing;
 /// Kind byte for error-log ring records (0x01; access records use 0x00).
 pub const KIND_ERROR: u8 = 0x01;
 
+/// Fixed header size for an error-log ring record, in bytes.
+///
+/// Layout: 1(kind) + 8(ts_unix_nano) + 1(ngx_level) + 8(template_hash) + 2(body_len) = 20.
+/// Single-homed here; the exporter's `parse_error_record` min-length guard and
+/// the two test helpers both import this constant.
+pub const ERROR_RECORD_HDR: usize = 20; // 1 + 8 + 1 + 8 + 2
+
 /// Maximum bytes of error-message body stored per ring record.
 ///
 /// Nginx error messages are bounded in practice: the longest include client
@@ -290,8 +297,7 @@ pub unsafe fn push_error_record(
     let body_len = body.len().min(MAX_ERROR_BODY_LEN);
 
     // Build the full wire record on the stack (no heap allocation).
-    const HDR: usize = 20; // 1 + 8 + 1 + 8 + 2
-    let mut record = [0u8; HDR + MAX_ERROR_BODY_LEN];
+    let mut record = [0u8; ERROR_RECORD_HDR + MAX_ERROR_BODY_LEN];
     record[0] = KIND_ERROR;
     record[1..9].copy_from_slice(&ts_ns.to_be_bytes());
     record[9] = ngx_level;
@@ -300,7 +306,7 @@ pub unsafe fn push_error_record(
     record[20..20 + body_len].copy_from_slice(&body[..body_len]);
 
     // push() returns false on ring-full (accounted in the ring's drop counter).
-    ring.push(&record[..HDR + body_len]);
+    ring.push(&record[..ERROR_RECORD_HDR + body_len]);
 }
 
 // ── Cleanup-flag wiring ───────────────────────────────────────────────────────

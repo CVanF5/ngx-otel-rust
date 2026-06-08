@@ -1423,8 +1423,8 @@ fn parse_error_record(
 ) -> Option<LogRecord> {
     use crate::data_model::{AnyValue, KeyValue};
 
-    // Minimum: kind(1) + ts(8) + level(1) + hash(8) + body_len(2) = 20 bytes
-    if buf.len() < 20 {
+    // Minimum length: ERROR_RECORD_HDR bytes
+    if buf.len() < crate::logs::error_writer::ERROR_RECORD_HDR {
         return None;
     }
     // kind must be 0x01 (error record)
@@ -1963,16 +1963,19 @@ mod tests {
         unsafe {
             let error_ring = logs_error_ring(slot_ptr, 0, cap);
             // Build and push the wire record manually.
-            const HDR: usize = 20;
+            use crate::logs::error_writer::ERROR_RECORD_HDR;
             let body_len = body.len();
-            let mut record = [0u8; HDR + 512];
+            let mut record = [0u8; ERROR_RECORD_HDR + 512];
             record[0] = KIND_ERROR;
             record[1..9].copy_from_slice(&ts_ns.to_be_bytes());
             record[9] = 4u8; // NGX_LOG_ERR
             record[10..18].copy_from_slice(&template_hash.to_be_bytes());
             record[18..20].copy_from_slice(&(body_len as u16).to_be_bytes());
             record[20..20 + body_len].copy_from_slice(body);
-            assert!(error_ring.push(&record[..HDR + body_len]), "error ring push must succeed");
+            assert!(
+                error_ring.push(&record[..ERROR_RECORD_HDR + body_len]),
+                "error ring push must succeed"
+            );
         }
 
         // Note: access ring is empty — we're testing that the error record still lands.
@@ -2041,18 +2044,18 @@ mod tests {
         // `logs_error_ring` yields a valid in-slot ring view and `push` touches
         // only that view's atomic header + in-bounds payload.
         unsafe {
+            use crate::logs::error_writer::ERROR_RECORD_HDR;
             let error_ring = logs_error_ring(slot_ptr, 0, cap);
-            const HDR: usize = 20;
             let body = b"no live upstreams while connecting to upstream";
             let body_len = body.len();
-            let mut record = [0u8; HDR + 512];
+            let mut record = [0u8; ERROR_RECORD_HDR + 512];
             record[0] = KIND_ERROR;
             record[1..9].copy_from_slice(&1_700_000_000_000_000_000u64.to_be_bytes());
             record[9] = 4u8; // ERR
             record[10..18].copy_from_slice(&template_hash.to_be_bytes());
             record[18..20].copy_from_slice(&(body_len as u16).to_be_bytes());
             record[20..20 + body_len].copy_from_slice(body);
-            assert!(error_ring.push(&record[..HDR + body_len]));
+            assert!(error_ring.push(&record[..ERROR_RECORD_HDR + body_len]));
         }
 
         // 2. Populate the coalescer table slot for this template_hash with count=N.
