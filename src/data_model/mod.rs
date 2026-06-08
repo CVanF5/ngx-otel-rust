@@ -303,6 +303,107 @@ pub struct LogsBatch {
 }
 
 // ────────────────────────────────────────────────────────────────
+// Trace types (Phase 3.1)
+// ────────────────────────────────────────────────────────────────
+
+/// OTel span kind — mirrors `SpanKind` in `trace.proto`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(i32)]
+pub enum SpanKind {
+    #[default]
+    Unspecified = 0,
+    Internal = 1,
+    Server = 2,
+    Client = 3,
+    Producer = 4,
+    Consumer = 5,
+}
+
+/// OTel span status code — mirrors `StatusCode` in `trace.proto`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(i32)]
+pub enum StatusCode {
+    /// Unset — default, do not interpret as OK.
+    #[default]
+    Unset = 0,
+    /// The operation completed successfully.
+    Ok = 1,
+    /// The operation contained an error.
+    Error = 2,
+}
+
+/// Span status (code + optional message).
+#[derive(Debug, Clone, Default)]
+pub struct SpanStatus {
+    pub code: StatusCode,
+    pub message: std::string::String,
+}
+
+/// A timed annotation on a span.
+#[derive(Debug, Clone)]
+pub struct SpanEvent {
+    pub time_unix_nano: u64,
+    pub name: std::string::String,
+    pub attributes: std::vec::Vec<KeyValue>,
+}
+
+/// A link to another span (same or different trace).
+#[derive(Debug, Clone)]
+pub struct SpanLink {
+    /// 16-byte trace ID of the linked span.
+    pub trace_id: std::vec::Vec<u8>,
+    /// 8-byte span ID of the linked span.
+    pub span_id: std::vec::Vec<u8>,
+    /// W3C flags from the linked span's traceparent.
+    pub flags: u32,
+    pub attributes: std::vec::Vec<KeyValue>,
+}
+
+/// A single OTel server span.
+///
+/// Rule: do NOT `use opentelemetry_proto::*` in this module.
+/// Raw field bytes are carried here; protobuf is built in the exporter.
+///
+/// Phase 3.1 cold-path: constructed synthetically; real spans arrive in Loop 2.
+#[derive(Debug, Clone)]
+pub struct Span {
+    /// 16-byte W3C trace ID.
+    pub trace_id: std::vec::Vec<u8>,
+    /// 8-byte W3C span ID.
+    pub span_id: std::vec::Vec<u8>,
+    /// 8-byte W3C parent span ID (empty for root spans).
+    pub parent_span_id: std::vec::Vec<u8>,
+    /// W3C trace flags (low 8 bits).
+    pub flags: u32,
+    /// Operation name.
+    pub name: std::string::String,
+    /// Span kind (server/client/internal/…).
+    pub kind: SpanKind,
+    /// Span start time (Unix epoch, nanoseconds).
+    pub start_time_unix_nano: u64,
+    /// Span end time (Unix epoch, nanoseconds).
+    pub end_time_unix_nano: u64,
+    /// HTTP semconv + custom attributes.
+    pub attributes: std::vec::Vec<KeyValue>,
+    /// Timed annotations.
+    pub events: std::vec::Vec<SpanEvent>,
+    /// Links to other spans.
+    pub links: std::vec::Vec<SpanLink>,
+    /// Terminal status.
+    pub status: SpanStatus,
+}
+
+/// A batch of spans ready for export.
+///
+/// Parallels [`Batch`] for metrics and [`LogsBatch`] for logs.
+#[derive(Debug, Clone)]
+pub struct SpansBatch {
+    pub resource: Resource,
+    pub scope: Scope,
+    pub spans: std::vec::Vec<Span>,
+}
+
+// ────────────────────────────────────────────────────────────────
 // Unit tests
 // ────────────────────────────────────────────────────────────────
 
@@ -422,5 +523,56 @@ pub(crate) mod tests {
         assert_eq!(batch.logs[1].event_name, "nginx.error");
         assert_eq!(batch.logs[1].severity_number, SeverityNumber::Error);
         assert_eq!(batch.logs[1].severity_number as i32, 17);
+    }
+
+    /// Construct a [`SpansBatch`] with one server span; inspect the shape manually.
+    #[test]
+    fn spans_batch_construction() {
+        let resource = Resource {
+            attributes: std::vec![KeyValue {
+                key: "service.name".into(),
+                value: AnyValue::String("test-nginx".into()),
+            }],
+        };
+        let scope = Scope { name: "ngx-otel-rust".into(), version: "0.1.0".into() };
+
+        let span = Span {
+            trace_id: std::vec![0x01u8; 16],
+            span_id: std::vec![0x02u8; 8],
+            parent_span_id: std::vec![0x03u8; 8],
+            flags: 0x01,
+            name: "GET /health".into(),
+            kind: SpanKind::Server,
+            start_time_unix_nano: 1_700_000_000_000_000_000,
+            end_time_unix_nano: 1_700_000_000_001_000_000,
+            attributes: std::vec![
+                KeyValue {
+                    key: "http.request.method".into(),
+                    value: AnyValue::String("GET".into()),
+                },
+                KeyValue { key: "http.response.status_code".into(), value: AnyValue::Int(200) },
+                KeyValue { key: "url.path".into(), value: AnyValue::String("/health".into()) },
+            ],
+            events: std::vec![],
+            links: std::vec![],
+            status: SpanStatus { code: StatusCode::Ok, message: std::string::String::new() },
+        };
+
+        let batch = SpansBatch { resource, scope, spans: std::vec![span] };
+
+        // Structural assertions.
+        assert_eq!(batch.resource.attributes[0].key, "service.name");
+        assert_eq!(batch.spans.len(), 1);
+        let s = &batch.spans[0];
+        assert_eq!(s.trace_id.len(), 16);
+        assert_eq!(s.span_id.len(), 8);
+        assert_eq!(s.parent_span_id.len(), 8);
+        assert_eq!(s.name, "GET /health");
+        assert_eq!(s.kind, SpanKind::Server);
+        assert_eq!(s.kind as i32, 2);
+        assert_eq!(s.status.code, StatusCode::Ok);
+        assert_eq!(s.status.code as i32, 1);
+        assert_eq!(s.attributes.len(), 3);
+        assert_eq!(s.end_time_unix_nano - s.start_time_unix_nano, 1_000_000);
     }
 }

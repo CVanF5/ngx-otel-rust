@@ -40,6 +40,9 @@ use crate::encoder::opentelemetry::proto::collector::logs::v1::{
 use crate::encoder::opentelemetry::proto::collector::metrics::v1::{
     metrics_service_client::MetricsServiceClient, ExportMetricsServiceRequest,
 };
+use crate::encoder::opentelemetry::proto::collector::trace::v1::{
+    trace_service_client::TraceServiceClient, ExportTraceServiceRequest,
+};
 use crate::transport::grpc::executor::NgxExecutor;
 use crate::transport::grpc::shim::SendRequestService;
 use crate::transport::hyper_http::{Connector, NgxConnector, ParsedEndpoint};
@@ -72,6 +75,8 @@ pub struct GrpcTransport<C: Connector> {
     /// Cached gRPC logs client (Phase 2.1).  Uses a separate h2 connection;
     /// a future optimisation could share the sender via `SendRequest::clone()`.
     logs_client: Option<LogsServiceClient<SendRequestService<tonic::body::Body>>>,
+    /// Cached gRPC traces client (Phase 3.1).  Uses a separate h2 connection.
+    traces_client: Option<TraceServiceClient<SendRequestService<tonic::body::Body>>>,
 }
 
 // SAFETY: `GrpcTransport` is only used from NGINX's single-threaded exporter
@@ -141,7 +146,14 @@ impl<C: Connector> GrpcTransport<C> {
             }
         })?;
 
-        Ok(Self { endpoint, origin, connector, client: None, logs_client: None })
+        Ok(Self {
+            endpoint,
+            origin,
+            connector,
+            client: None,
+            logs_client: None,
+            traces_client: None,
+        })
     }
 }
 
@@ -279,6 +291,62 @@ impl<C: Connector + Send> GrpcTransport<C> {
             }
             Err(status) => Err(TransportError::Connection {
                 cause: std::format!("gRPC LogsService/Export RPC failed: {status}"),
+            }),
+        }
+    }
+
+    /// Send an already-encoded `ExportTraceServiceRequest` over gRPC.
+    ///
+    /// Decodes the bytes (the same encoding [`OtlpTracesEncoder`] produces)
+    /// and issues a unary `TraceService/Export` RPC.  The traces client uses
+    /// its own h2 connection (same lazy-connect pattern as `logs_client`).
+    ///
+    /// On success the client is re-cached for the next call.  On any RPC
+    /// error the client is dropped so the next call reconnects fresh.
+    pub async fn send_traces(
+        &mut self,
+        bytes: std::vec::Vec<u8>,
+    ) -> Result<(), crate::transport::TransportError> {
+        use crate::transport::TransportError;
+
+        let req = ExportTraceServiceRequest::decode(bytes.as_slice()).map_err(|e| {
+            TransportError::Connection {
+                cause: std::format!(
+                    "gRPC traces transport: failed to decode ExportTraceServiceRequest: {e}"
+                ),
+            }
+        })?;
+
+        if self.traces_client.is_none() {
+            let io = self.connector.connect(&self.endpoint).await?;
+            let (sender, conn) = hyper::client::conn::http2::handshake::<_, _, tonic::body::Body>(
+                crate::transport::grpc::executor::NgxExecutor,
+                io,
+            )
+            .await
+            .map_err(|e| TransportError::Connection {
+                cause: std::format!("gRPC traces h2 handshake failed: {e}"),
+            })?;
+            ngx::async_::spawn(async move {
+                let _ = conn.await;
+            })
+            .detach();
+            self.traces_client = Some(TraceServiceClient::with_origin(
+                crate::transport::grpc::shim::SendRequestService::new(sender),
+                self.origin.clone(),
+            ));
+        }
+
+        let mut client = self.traces_client.take().expect("just connected above");
+        let result = client.export(tonic::Request::new(req)).await;
+
+        match result {
+            Ok(_resp) => {
+                self.traces_client = Some(client);
+                Ok(())
+            }
+            Err(status) => Err(TransportError::Connection {
+                cause: std::format!("gRPC TraceService/Export RPC failed: {status}"),
             }),
         }
     }

@@ -11,7 +11,8 @@
 use prost::Message;
 
 use crate::data_model::{
-    AggregationTemporality, AnyValue, Batch, LogRecord, LogsBatch, MetricData, NumberValue,
+    AggregationTemporality, AnyValue, Batch, LogRecord, LogsBatch, MetricData, NumberValue, Span,
+    SpanEvent, SpanLink, SpanStatus, SpansBatch,
 };
 
 // ── Generated protobuf types ─────────────────────────────────────────────────
@@ -51,6 +52,11 @@ pub(crate) mod opentelemetry {
                 include!(concat!(env!("OUT_DIR"), "/opentelemetry.proto.logs.v1.rs"));
             }
         }
+        pub mod trace {
+            pub mod v1 {
+                include!(concat!(env!("OUT_DIR"), "/opentelemetry.proto.trace.v1.rs"));
+            }
+        }
         pub mod collector {
             pub mod metrics {
                 pub mod v1 {
@@ -65,6 +71,14 @@ pub(crate) mod opentelemetry {
                     include!(concat!(env!("OUT_DIR"), "/opentelemetry.proto.collector.logs.v1.rs"));
                 }
             }
+            pub mod trace {
+                pub mod v1 {
+                    include!(concat!(
+                        env!("OUT_DIR"),
+                        "/opentelemetry.proto.collector.trace.v1.rs"
+                    ));
+                }
+            }
         }
     }
 }
@@ -72,10 +86,12 @@ pub(crate) mod opentelemetry {
 // Convenience re-exports so the rest of this file can use short paths.
 use opentelemetry::proto::collector::logs::v1 as logs_collector;
 use opentelemetry::proto::collector::metrics::v1 as collector;
+use opentelemetry::proto::collector::trace::v1 as traces_collector;
 use opentelemetry::proto::common::v1 as common;
 use opentelemetry::proto::logs::v1 as logs_proto;
 use opentelemetry::proto::metrics::v1 as metrics_proto;
 use opentelemetry::proto::resource::v1 as resource_proto;
+use opentelemetry::proto::trace::v1 as trace_proto;
 
 // ── Public trait ─────────────────────────────────────────────────────────────
 
@@ -167,6 +183,98 @@ impl OtlpLogsEncoder {
         request.encode(&mut buf).expect("encode to Vec never fails");
         buf
     }
+}
+
+// ── OTLP traces encoder ────────────────────────────────────────────────────
+
+/// Encodes a [`SpansBatch`] as an OTLP `ExportTraceServiceRequest`.
+///
+/// Mirrors [`OtlpLogsEncoder`] but operates on spans.  Reuses the existing
+/// `convert_kv` / `convert_any_value` helpers.
+pub struct OtlpTracesEncoder;
+
+impl OtlpTracesEncoder {
+    /// Encode a [`SpansBatch`] to wire bytes (protobuf).
+    pub fn encode(&self, batch: &SpansBatch) -> std::vec::Vec<u8> {
+        let resource_attrs: std::vec::Vec<common::KeyValue> =
+            batch.resource.attributes.iter().map(convert_kv).collect();
+
+        let proto_spans: std::vec::Vec<trace_proto::Span> =
+            batch.spans.iter().map(convert_span).collect();
+
+        let request = traces_collector::ExportTraceServiceRequest {
+            resource_spans: std::vec![trace_proto::ResourceSpans {
+                resource: Some(resource_proto::Resource {
+                    attributes: resource_attrs,
+                    dropped_attributes_count: 0,
+                }),
+                scope_spans: std::vec![trace_proto::ScopeSpans {
+                    scope: Some(common::InstrumentationScope {
+                        name: batch.scope.name.clone(),
+                        version: batch.scope.version.clone(),
+                        attributes: std::vec![],
+                        dropped_attributes_count: 0,
+                    }),
+                    spans: proto_spans,
+                    schema_url: std::string::String::new(),
+                }],
+                schema_url: std::string::String::new(),
+            }],
+        };
+
+        let mut buf = std::vec::Vec::with_capacity(request.encoded_len());
+        request.encode(&mut buf).expect("encode to Vec never fails");
+        buf
+    }
+}
+
+/// Convert a [`Span`] into its protobuf equivalent.
+fn convert_span(span: &Span) -> trace_proto::Span {
+    trace_proto::Span {
+        trace_id: span.trace_id.clone(),
+        span_id: span.span_id.clone(),
+        trace_state: std::string::String::new(),
+        parent_span_id: span.parent_span_id.clone(),
+        flags: span.flags,
+        name: span.name.clone(),
+        kind: span.kind as i32,
+        start_time_unix_nano: span.start_time_unix_nano,
+        end_time_unix_nano: span.end_time_unix_nano,
+        attributes: span.attributes.iter().map(convert_kv).collect(),
+        dropped_attributes_count: 0,
+        events: span.events.iter().map(convert_span_event).collect(),
+        dropped_events_count: 0,
+        links: span.links.iter().map(convert_span_link).collect(),
+        dropped_links_count: 0,
+        status: Some(convert_span_status(&span.status)),
+    }
+}
+
+/// Convert a [`SpanEvent`] into its protobuf equivalent.
+fn convert_span_event(ev: &SpanEvent) -> trace_proto::span::Event {
+    trace_proto::span::Event {
+        time_unix_nano: ev.time_unix_nano,
+        name: ev.name.clone(),
+        attributes: ev.attributes.iter().map(convert_kv).collect(),
+        dropped_attributes_count: 0,
+    }
+}
+
+/// Convert a [`SpanLink`] into its protobuf equivalent.
+fn convert_span_link(link: &SpanLink) -> trace_proto::span::Link {
+    trace_proto::span::Link {
+        trace_id: link.trace_id.clone(),
+        span_id: link.span_id.clone(),
+        trace_state: std::string::String::new(),
+        attributes: link.attributes.iter().map(convert_kv).collect(),
+        dropped_attributes_count: 0,
+        flags: link.flags,
+    }
+}
+
+/// Convert a [`SpanStatus`] into its protobuf equivalent.
+fn convert_span_status(status: &SpanStatus) -> trace_proto::Status {
+    trace_proto::Status { code: status.code as i32, message: status.message.clone() }
 }
 
 /// Convert a [`LogRecord`] into its protobuf equivalent.
@@ -328,6 +436,7 @@ mod tests {
     use super::collector::ExportMetricsServiceRequest;
     use super::logs_collector::ExportLogsServiceRequest;
     use super::metrics_proto;
+    use super::traces_collector::ExportTraceServiceRequest;
     use super::*;
     use crate::data_model::{
         AggregationTemporality, AnyValue, Batch, HistogramData, HistogramDataPoint, KeyValue,
@@ -601,5 +710,87 @@ mod tests {
             }
             other => panic!("expected ExponentialHistogram data, got {other:?}"),
         }
+    }
+
+    /// Encode a [`SpansBatch`] with one server span, decode it, and assert
+    /// structural equivalence.  This is the S1 round-trip verification gate.
+    #[test]
+    fn traces_round_trip() {
+        use crate::data_model::{Span, SpanKind, SpanStatus, SpansBatch, StatusCode};
+
+        let batch = SpansBatch {
+            resource: Resource {
+                attributes: std::vec![KeyValue {
+                    key: "service.name".into(),
+                    value: AnyValue::String("test-nginx".into()),
+                }],
+            },
+            scope: Scope { name: "ngx-otel-rust".into(), version: "0.1.0".into() },
+            spans: std::vec![Span {
+                trace_id: std::vec![0x01u8; 16],
+                span_id: std::vec![0x02u8; 8],
+                parent_span_id: std::vec![0x03u8; 8],
+                flags: 0x01,
+                name: "GET /health".into(),
+                kind: SpanKind::Server,
+                start_time_unix_nano: 1_700_000_000_000_000_000,
+                end_time_unix_nano: 1_700_000_000_001_000_000,
+                attributes: std::vec![
+                    KeyValue {
+                        key: "http.request.method".into(),
+                        value: AnyValue::String("GET".into()),
+                    },
+                    KeyValue { key: "http.response.status_code".into(), value: AnyValue::Int(200) },
+                    KeyValue { key: "url.path".into(), value: AnyValue::String("/health".into()) },
+                ],
+                events: std::vec![],
+                links: std::vec![],
+                status: SpanStatus { code: StatusCode::Ok, message: std::string::String::new() },
+            }],
+        };
+
+        let enc = OtlpTracesEncoder;
+        let bytes = enc.encode(&batch);
+
+        // Must be non-empty.
+        assert!(!bytes.is_empty(), "encoded bytes must be non-empty");
+
+        // Must decode back without error.
+        let decoded =
+            ExportTraceServiceRequest::decode(bytes.as_slice()).expect("must decode without error");
+
+        assert_eq!(decoded.resource_spans.len(), 1);
+        let rs = &decoded.resource_spans[0];
+
+        // Resource attributes.
+        let resource = rs.resource.as_ref().expect("resource present");
+        assert_eq!(resource.attributes.len(), 1);
+        assert_eq!(resource.attributes[0].key, "service.name");
+
+        // Scope.
+        assert_eq!(rs.scope_spans.len(), 1);
+        let ss = &rs.scope_spans[0];
+        let scope = ss.scope.as_ref().expect("scope present");
+        assert_eq!(scope.name, "ngx-otel-rust");
+
+        // Span.
+        assert_eq!(ss.spans.len(), 1);
+        let s = &ss.spans[0];
+        assert_eq!(s.trace_id, std::vec![0x01u8; 16]);
+        assert_eq!(s.span_id, std::vec![0x02u8; 8]);
+        assert_eq!(s.parent_span_id, std::vec![0x03u8; 8]);
+        assert_eq!(s.flags, 0x01);
+        assert_eq!(s.name, "GET /health");
+        assert_eq!(s.kind, SpanKind::Server as i32);
+        assert_eq!(s.start_time_unix_nano, 1_700_000_000_000_000_000);
+        assert_eq!(s.end_time_unix_nano, 1_700_000_000_001_000_000);
+        assert_eq!(s.attributes.len(), 3);
+        assert_eq!(s.attributes[0].key, "http.request.method");
+        assert_eq!(s.attributes[1].key, "http.response.status_code");
+        assert_eq!(s.attributes[2].key, "url.path");
+
+        // Status.
+        let status = s.status.as_ref().expect("status present");
+        assert_eq!(status.code, StatusCode::Ok as i32);
     }
 }

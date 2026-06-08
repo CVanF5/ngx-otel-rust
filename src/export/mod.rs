@@ -49,7 +49,10 @@ use crate::data_model::{
     AggregationTemporality, AnyValue, Batch, GaugeData, KeyValue, LogRecord, LogsBatch, Metric,
     MetricData, NumberDataPoint, NumberValue, Resource, Scope, SumData,
 };
-use crate::encoder::{Encoder, OtlpHttpEncoder, OtlpLogsEncoder};
+// OtlpTracesEncoder is imported here for S2 (spans drain). The import will be
+// used when collect_span_records is added; the explicit allow keeps the S1 commit clean.
+#[allow(unused_imports)]
+use crate::encoder::{Encoder, OtlpHttpEncoder, OtlpLogsEncoder, OtlpTracesEncoder};
 use crate::logs::coalesce;
 use crate::logs::severity::nginx_to_otel;
 use crate::metric_source::instrumented::InstrumentedSource;
@@ -172,6 +175,25 @@ impl ExportTransport {
         match self {
             Self::Http(t) => t.send_to_path("/v1/logs", bytes).await,
             Self::Grpc(t) => t.send_logs(bytes).await,
+        }
+    }
+
+    /// Send trace bytes to the OTel traces endpoint.
+    ///
+    /// For HTTP: POSTs to `/v1/traces` on the same host as metrics.
+    /// For gRPC: calls `TraceService/Export`.
+    ///
+    /// Traces ship over the same transport selected by `otel_export_protocol`.
+    /// Called by the spans drain (S2). Added here in S1 alongside the encoder
+    /// so the transport interface is complete before the ring plumbing lands.
+    #[allow(dead_code)]
+    async fn send_traces(
+        &mut self,
+        bytes: std::vec::Vec<u8>,
+    ) -> Result<(), crate::transport::TransportError> {
+        match self {
+            Self::Http(t) => t.send_to_path("/v1/traces", bytes).await,
+            Self::Grpc(t) => t.send_traces(bytes).await,
         }
     }
 }
