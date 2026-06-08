@@ -1422,9 +1422,10 @@ fn parse_error_record(
     counts_map: &std::collections::HashMap<u64, u32>,
 ) -> Option<LogRecord> {
     use crate::data_model::{AnyValue, KeyValue};
+    use crate::logs::error_writer::ERROR_RECORD_HDR as HDR;
 
-    // Minimum length: ERROR_RECORD_HDR bytes
-    if buf.len() < crate::logs::error_writer::ERROR_RECORD_HDR {
+    // Minimum length: ERROR_RECORD_HDR (HDR) bytes
+    if buf.len() < HDR {
         return None;
     }
     // kind must be 0x01 (error record)
@@ -1437,10 +1438,10 @@ fn parse_error_record(
     let template_hash = u64::from_be_bytes(buf[10..18].try_into().ok()?);
     let body_len = u16::from_be_bytes([buf[18], buf[19]]) as usize;
 
-    if 20 + body_len > buf.len() {
+    if HDR + body_len > buf.len() {
         return None;
     }
-    let body_bytes = &buf[20..20 + body_len];
+    let body_bytes = &buf[HDR..HDR + body_len];
     let body_str = std::string::String::from_utf8_lossy(body_bytes).into_owned();
 
     let (severity_number, severity_text) = nginx_to_otel(ngx_level);
@@ -1966,7 +1967,7 @@ mod tests {
             record[9] = 4u8; // NGX_LOG_ERR
             record[10..18].copy_from_slice(&template_hash.to_be_bytes());
             record[18..20].copy_from_slice(&(body_len as u16).to_be_bytes());
-            record[20..20 + body_len].copy_from_slice(body);
+            record[ERROR_RECORD_HDR..ERROR_RECORD_HDR + body_len].copy_from_slice(body);
             assert!(
                 error_ring.push(&record[..ERROR_RECORD_HDR + body_len]),
                 "error ring push must succeed"
@@ -2049,7 +2050,7 @@ mod tests {
             record[9] = 4u8; // ERR
             record[10..18].copy_from_slice(&template_hash.to_be_bytes());
             record[18..20].copy_from_slice(&(body_len as u16).to_be_bytes());
-            record[20..20 + body_len].copy_from_slice(body);
+            record[ERROR_RECORD_HDR..ERROR_RECORD_HDR + body_len].copy_from_slice(body);
             assert!(error_ring.push(&record[..ERROR_RECORD_HDR + body_len]));
         }
 
