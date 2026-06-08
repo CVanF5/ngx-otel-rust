@@ -27,7 +27,7 @@ impl MetricSource for StubStatusSource {
         let (accepted, handled, requests, active, reading, writing, waiting) =
             unsafe { read_stats() };
 
-        let now = now_unix_nano();
+        let now = crate::util::now_unix_nano();
 
         std::vec![
             counter_metric(
@@ -131,16 +131,6 @@ unsafe fn read_stats() -> (u64, u64, u64, u64, u64, u64, u64) {
 #[cfg(not(ngx_feature = "stat_stub"))]
 unsafe fn read_stats() -> (u64, u64, u64, u64, u64, u64, u64) {
     (0, 0, 0, 0, 0, 0, 0)
-}
-
-// ─── helpers ────────────────────────────────────────────────────────────────
-
-/// Returns the current time as Unix epoch nanoseconds.
-fn now_unix_nano() -> u64 {
-    // In nginx context we'd use ngx_timeofday(), but for Phase 1.1 std::time is fine
-    // because this runs only on the export worker (not the request path).
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64
 }
 
 /// Build a cumulative-sum "counter" metric from a scalar value.

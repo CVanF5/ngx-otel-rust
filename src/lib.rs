@@ -63,6 +63,7 @@ pub(crate) mod logs;
 mod metric_source;
 mod shm;
 pub mod transport;
+pub(crate) mod util;
 
 use config::NGX_HTTP_OTEL_COMMANDS;
 

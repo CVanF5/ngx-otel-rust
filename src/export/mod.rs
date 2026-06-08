@@ -200,7 +200,7 @@ pub struct SelfMetricsSource {
 
 impl MetricSource for SelfMetricsSource {
     fn collect(&self) -> std::vec::Vec<Metric> {
-        let now = now_unix_nano();
+        let now = crate::util::now_unix_nano();
         let dropped = DROPPED_RECORDS.load(Ordering::Acquire) as i64;
         let failures = SEND_FAILURES.load(Ordering::Acquire) as i64;
         let interval_ms = self.interval_ms as i64;
@@ -361,7 +361,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
     // Capture worker start time once — used as the start_time_unix_nano
     // for cumulative monotonic Sum self-metrics so that downstream rate
     // panels and delta-conversion processors can anchor windows correctly.
-    let worker_start_ns = now_unix_nano();
+    let worker_start_ns = crate::util::now_unix_nano();
 
     // Capture the master (parent) PID once at export loop startup.
     // nginx_sys::ngx_parent is set by ngx_spawn_process to the master's PID
@@ -1140,7 +1140,7 @@ fn collect_log_records(
     n_workers: usize,
     _now_ns: u64,
 ) -> LogsBatch {
-    let now = now_unix_nano();
+    let now = crate::util::now_unix_nano();
 
     let mut logs: std::vec::Vec<LogRecord> = std::vec::Vec::new();
     let mut total_dropped: u64 = 0;
@@ -1496,11 +1496,6 @@ fn read_u16_prefixed(buf: &[u8], pos: &mut usize) -> std::vec::Vec<u8> {
     v
 }
 
-fn now_unix_nano() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64
-}
-
 /// Build a monotonic cumulative Sum metric carrying a single i64 data point.
 ///
 /// `start_time_unix_nano` must be the time the worker (and therefore the
@@ -1564,7 +1559,7 @@ fn collect_error_rate_metric(base: *mut u8, n_workers: usize, start_time_ns: u64
     use crate::shm::{worker_slots, N_SEVERITY_CLASSES, SEVERITY_CLASS_NAMES};
     use core::sync::atomic::Ordering;
 
-    let now = now_unix_nano();
+    let now = crate::util::now_unix_nano();
 
     // Sum each severity class across all workers.
     let mut totals = [0i64; N_SEVERITY_CLASSES];

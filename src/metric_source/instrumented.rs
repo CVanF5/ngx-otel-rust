@@ -386,7 +386,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
         };
 
         let start = self.start_time_unix_nano;
-        let now = now_unix_nano();
+        let now = crate::util::now_unix_nano();
 
         // Aggregate per-combination exp-histogram slots over all workers.
         // combo_agg[idx] = ([bucket_counts; N_EXP_BUCKETS], zero_count, sum, count)
@@ -815,11 +815,6 @@ fn hist_metric<const N: usize>(
             }],
         }),
     }
-}
-
-fn now_unix_nano() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64
 }
 
 // ── Unit tests ───────────────────────────────────────────────────────────────
