@@ -36,6 +36,8 @@
 //! any future cap increase that would overflow the buffer is a **build failure**
 //! rather than a latent runtime panic.
 
+pub mod ctx;
+
 use crate::logs::LogProducer;
 
 // ── Named field caps ──────────────────────────────────────────────────────────

@@ -10,6 +10,7 @@
 //!  - `InstrumentedSource`: reads per-worker shm slots (Step 6)
 
 pub mod instrumented;
+pub mod span_start;
 pub mod stub_status;
 
 use crate::data_model::Metric;

@@ -258,6 +258,16 @@ impl HttpModule for HttpOtelModule {
             return e.into();
         }
 
+        // Phase 3.3: register REWRITE-phase span-start handler when configured.
+        // The handler checks `amcf.is_configured()` itself on every request (zero
+        // cost when unconfigured), but registration is also gated here so the
+        // handler is not even in the phase chain when the module is unconfigured.
+        if amcf.is_configured()
+            && add_phase_handler::<metric_source::span_start::SpanStartHandler>(cf_ref).is_err()
+        {
+            return Status::NGX_ERROR.into();
+        }
+
         // Step 6: register log-phase handler only when exporter is configured.
         if amcf.is_configured()
             && add_phase_handler::<metric_source::instrumented::LogPhaseHandler>(cf_ref).is_err()

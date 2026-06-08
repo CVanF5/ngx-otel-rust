@@ -261,7 +261,25 @@ pub fn emit_access_record(producer: &dyn LogProducer, req: &SampledRequest<'_>) 
 ///
 /// # No allocation
 /// Operates entirely on the `&[u8]` slice; no heap operations.
+///
+/// Used by tests and as the simplified accessor when flags are not needed.
+/// Production hot path uses [`parse_traceparent_full`] which also returns flags.
+/// `#[allow(dead_code)]` guards the S1→S3 gap; removed when `inject` / S3 uses it.
+#[allow(dead_code)]
 pub fn parse_traceparent(header: &[u8]) -> Option<([u8; 16], [u8; 8])> {
+    parse_traceparent_full(header).map(|(tid, sid, _)| (tid, sid))
+}
+
+/// Parse a W3C `traceparent` header value and return `(trace_id[16], parent_span_id[8], flags)`.
+///
+/// Extends `parse_traceparent` with the trace-flags byte (offset 52 of the header).
+/// Bit 0 of flags is the W3C `sampled` flag.
+///
+/// Returns `None` for absent, malformed, or non-`00`-version headers.
+///
+/// # No allocation
+/// Operates entirely on the `&[u8]` slice; no heap operations.
+pub fn parse_traceparent_full(header: &[u8]) -> Option<([u8; 16], [u8; 8], u32)> {
     // Minimum: "00-" + 32 hex + "-" + 16 hex + "-" + 2 hex = 55 bytes
     if header.len() < 55 {
         return None;
@@ -270,25 +288,31 @@ pub fn parse_traceparent(header: &[u8]) -> Option<([u8; 16], [u8; 8])> {
     if header[0] != b'0' || header[1] != b'0' || header[2] != b'-' {
         return None;
     }
-    // trace_id: 32 hex chars starting at offset 3
+    // trace_id: 32 hex chars at offset 3..35
     let mut trace_id = [0u8; 16];
     if !decode_hex16(&header[3..3 + 32], &mut trace_id) {
         return None;
     }
-    // dash after trace_id
     if header[35] != b'-' {
         return None;
     }
-    // span_id (parent_id): 16 hex chars starting at offset 36
-    let mut span_id = [0u8; 8];
-    if !decode_hex8(&header[36..36 + 16], &mut span_id) {
+    // parent span_id: 16 hex chars at offset 36..52
+    let mut parent_span_id = [0u8; 8];
+    if !decode_hex8(&header[36..36 + 16], &mut parent_span_id) {
         return None;
     }
+    if header[52] != b'-' {
+        return None;
+    }
+    // flags: 2 hex chars at offset 53..55
+    let hi = hex_nibble(header[53])?;
+    let lo = hex_nibble(header[54])?;
+    let flags = ((hi << 4) | lo) as u32;
     // All-zero trace_id is invalid per spec
     if trace_id == [0u8; 16] {
         return None;
     }
-    Some((trace_id, span_id))
+    Some((trace_id, parent_span_id, flags))
 }
 
 /// Decode 32 hex characters into 16 bytes.  Returns false on invalid input.
