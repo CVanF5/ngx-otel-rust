@@ -1,0 +1,1614 @@
+/bin/sh: 1: cargo: not found
+[harness] collector reachable at http://127.0.0.1:4318
+DOCKER_ARCH="$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"; \
+docker build \
+    --platform "linux/${DOCKER_ARCH}" \
+    -f build/Dockerfile.tsan \
+    -t ngx-otel-tsan:latest \
+    .; \
+docker run --rm \
+    --network=host \
+    --cap-add=SYS_PTRACE \
+    --security-opt seccomp=unconfined \
+    --platform "linux/${DOCKER_ARCH}" \
+    -e TSAN_OPTIONS="halt_on_error=1:second_deadlock_stack=1:detect_deadlocks=1" \
+    -e OTEL_COLLECTOR_AUTOSTART=0 \
+    -v "/home/cvandesande/project-nginx-otel/ngx-otel-rust":/work/ngx-otel-rust \
+    -v "/home/cvandesande/project-nginx-otel/ngx-otel-rust/../nginx":/work/nginx \
+    -v "/home/cvandesande/project-nginx-otel/ngx-otel-rust/../ngx-rust":/work/ngx-rust \
+    ngx-otel-tsan:latest \
+    bash /work/ngx-otel-rust/build/tsan-run.sh
+#0 building with "default" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile.tsan
+#1 transferring dockerfile: 1.95kB done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/library/debian:13-slim
+#2 DONE 0.9s
+
+#3 [internal] load .dockerignore
+#3 transferring context: 2B done
+#3 DONE 0.0s
+
+#4 [1/4] FROM docker.io/library/debian:13-slim@sha256:b6e2a152f22a40ff69d92cb397223c906017e1391a73c952b588e51af8883bf8
+#4 DONE 0.0s
+
+#5 [2/4] RUN apt-get update && apt-get install -y     clang make curl pkg-config libssl-dev libpcre2-dev zlib1g-dev     protobuf-compiler     ca-certificates perl git netcat-openbsd lsof     python3-minimal     && rm -rf /var/lib/apt/lists/*
+#5 CACHED
+
+#6 [3/4] RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs     | sh -s -- -y --default-toolchain 1.95.0 --profile minimal         --component rust-src
+#6 CACHED
+
+#7 [4/4] WORKDIR /work
+#7 CACHED
+
+#8 exporting to image
+#8 exporting layers done
+#8 writing image sha256:92f9ae66b43b133d16c398458f1a8831cfdd751e7bc6a860fea94465608448a1 done
+#8 naming to docker.io/library/ngx-otel-tsan:latest done
+#8 DONE 0.0s
+[tsan-run] Step 1: Compile sanity check (make build BUILD=tsan)...
+cd /work/nginx \
+	&& RUSTFLAGS="-Cforce-frame-pointers=yes -Zsanitizer=thread -Zexternal-clangrt" RUSTC_BOOTSTRAP=1 NGX_RUSTC_OPT="-Zbuild-std" NGX_RUST_TARGET="aarch64-unknown-linux-gnu" NGINX_SOURCE_DIR="/work/nginx" NGINX_BUILD_DIR="/work/ngx-otel-rust/objs-tsan" make -f /work/ngx-otel-rust/objs-tsan/Makefile binary
+make[1]: Entering directory '/work/nginx'
+cargo rustc \
+	--config /work/ngx-otel-rust/objs-tsan/.cargo/config.toml \
+	--crate-type staticlib \
+	--manifest-path "/work/ngx-otel-rust/Cargo.toml" \
+	--no-default-features \
+	--profile ngx-debug \
+	--target aarch64-unknown-linux-gnu \
+	--target-dir /work/ngx-otel-rust/objs-tsan/ngx_otel_rust \
+	--features "" \
+	 -Zbuild-std
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded tower-layer v0.3.3
+  Downloaded tonic-prost v0.14.6
+  Downloaded errno v0.3.14
+  Downloaded tracing-core v0.1.36
+  Downloaded tonic-prost-build v0.14.6
+  Downloaded want v0.3.1
+  Downloaded tower-service v0.3.3
+  Downloaded equivalent v1.0.2
+  Downloaded try-lock v0.2.5
+  Downloaded tracing-attributes v0.1.31
+  Downloaded zmij v1.0.21
+  Downloaded atomic-waker v1.1.2
+  Downloaded unicode-ident v1.0.24
+  Downloaded vcpkg v0.2.15
+  Downloaded unicode-width v0.2.2
+  Downloaded tower v0.5.3
+  Downloaded dunce v1.0.5
+  Downloaded tracing v0.1.44
+  Downloaded cfg-if v1.0.4
+  Downloaded multimap v0.10.1
+  Downloaded httpdate v1.0.3
+  Downloaded futures-task v0.3.32
+  Downloaded http-body v1.0.1
+  Downloaded tokio-macros v2.7.0
+  Downloaded heck v0.5.0
+  Downloaded scopeguard v1.2.0
+  Downloaded percent-encoding v2.3.2
+  Downloaded itoa v1.0.18
+  Downloaded tonic-build v0.14.6
+  Downloaded fnv v1.0.7
+  Downloaded futures-sink v0.3.32
+  Downloaded sync_wrapper v1.0.2
+  Downloaded mime v0.3.17
+  Downloaded futures-core v0.3.32
+  Downloaded rustc-hash v2.1.2
+  Downloaded axum-core v0.5.6
+  Downloaded annotate-snippets v0.11.5
+  Downloaded bitflags v2.11.1
+  Downloaded either v1.16.0
+  Downloaded async-trait v0.1.89
+  Downloaded cexpr v0.6.0
+  Downloaded pin-project-internal v1.1.13
+  Downloaded slab v0.4.12
+  Downloaded quote v1.0.45
+  Downloaded thiserror v2.0.18
+  Downloaded foldhash v0.1.5
+  Downloaded fixedbitset v0.5.7
+  Downloaded fastrand v2.4.1
+  Downloaded prost-derive v0.14.3
+  Downloaded thiserror-impl v2.0.18
+  Downloaded hyper-timeout v0.5.2
+  Downloaded glob v0.3.3
+  Downloaded pkg-config v0.3.33
+  Downloaded pin-project-lite v0.2.17
+  Downloaded find-msvc-tools v0.1.9
+  Downloaded lock_api v0.4.14
+  Downloaded shlex v1.3.0
+  Downloaded libloading v0.8.9
+  Downloaded clang-sys v1.8.1
+  Downloaded anyhow v1.0.102
+  Downloaded tempfile v3.27.0
+  Downloaded matchit v0.8.4
+  Downloaded anstyle v1.0.14
+  Downloaded async-task v4.7.1
+  Downloaded once_cell v1.21.4
+  Downloaded futures-channel v0.3.32
+  Downloaded httparse v1.10.1
+  Downloaded http-body-util v0.1.3
+  Downloaded prost v0.14.3
+  Downloaded smallvec v1.15.1
+  Downloaded socket2 v0.6.3
+  Downloaded allocator-api2 v0.4.0
+  Downloaded tokio-stream v0.1.18
+  Downloaded prost-types v0.14.3
+  Downloaded log v0.4.29
+  Downloaded prost-build v0.14.3
+  Downloaded getrandom v0.4.2
+  Downloaded base64 v0.22.1
+  Downloaded serde_core v1.0.228
+  Downloaded proc-macro2 v1.0.106
+  Downloaded prettyplease v0.2.37
+  Downloaded pin-project v1.1.13
+  Downloaded bytes v1.11.1
+  Downloaded cc v1.2.62
+  Downloaded minimal-lexical v0.2.1
+  Downloaded openssl-sys v0.9.116
+  Downloaded memchr v2.8.0
+  Downloaded tonic v0.14.6
+  Downloaded http v1.4.0
+  Downloaded indexmap v2.14.0
+  Downloaded mio v1.2.0
+  Downloaded hashbrown v0.15.5
+  Downloaded nom v7.1.3
+  Downloaded hyper-util v0.1.20
+  Downloaded tokio-util v0.7.18
+  Downloaded itertools v0.13.0
+  Downloaded serde_json v1.0.149
+  Downloaded hyper v1.9.0
+  Downloaded axum v0.8.9
+  Downloaded hashbrown v0.17.1
+  Downloaded futures-util v0.3.32
+  Downloaded itertools v0.14.0
+  Downloaded aho-corasick v1.1.4
+  Downloaded regex v1.12.3
+  Downloaded h2 v0.4.14
+  Downloaded bindgen v0.72.1
+  Downloaded syn v2.0.117
+  Downloaded regex-syntax v0.8.10
+  Downloaded rustix v1.1.4
+  Downloaded regex-automata v0.4.14
+  Downloaded petgraph v0.8.3
+  Downloaded libc v0.2.186
+  Downloaded tokio v1.52.3
+  Downloaded linux-raw-sys v0.12.1
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded adler2 v2.0.1
+  Downloaded rustc-literal-escaper v0.0.7
+  Downloaded foldhash v0.2.0
+  Downloaded rustc-demangle v0.1.27
+  Downloaded getopts v0.2.24
+  Downloaded addr2line v0.25.1
+  Downloaded miniz_oxide v0.8.9
+  Downloaded memchr v2.7.6
+  Downloaded hashbrown v0.16.1
+  Downloaded gimli v0.32.3
+  Downloaded object v0.37.3
+  Downloaded libc v0.2.178
+    Finished `ngx-debug` profile [unoptimized + debuginfo] target(s) in 9.28s
+clang -o /work/ngx-otel-rust/objs-tsan/nginx \
+/work/ngx-otel-rust/objs-tsan/src/core/nginx.o \
+/work/ngx-otel-rust/objs-tsan/src/core/ngx_log.o \
+/work/ngx-otel-rust/objs-tsan/src/core/ngx_palloc.o \
+/work/ngx-otel-rust/objs-tsan/src/core/ngx_array.o \
+/work/ngx-otel-rust/objs-tsan/src/core/ngx_list.o \
+/work/ngx-otel-rust/objs-tsan/src/core/ngx_hash.o \
+/work/ngx-otel-rust/objs-tsan/src/core/ngx_buf.o \
+/work/ngx-otel-rust/objs-tsan/src/core/ngx_queue.o \
+/work/ngx-otel-rust/objs-tsan/src/core/ngx_output_chain.o \
+/work/ngx-otel-rust/objs-tsan/src/core/ngx_string.o \
+/work/ngx-otel-rust/objs-tsan/src/core/ngx_parse.o \
+/work/ngx-otel-rust/objs-tsan/src/core/ngx_parse_time.o \
+/work/ngx-otel-rust/objs-tsan/src/core/ngx_inet.o \
+/work/ngx-otel-rust/objs-tsan/src/core/ngx_file.o \
+/work/ngx-otel-rust/objs-tsan/src/core/ngx_crc32.o \
+/work/ngx-otel-rust/objs-tsan/src/core/ngx_murmurhash.o \
+/work/ngx-otel-rust/objs-tsan/src/core/ngx_md5.o \
+/work/ngx-otel-rust/objs-tsan/src/core/ngx_sha1.o \
+/work/ngx-otel-rust/objs-tsan/src/core/ngx_rbtree.o \
+/work/ngx-otel-rust/objs-tsan/src/core/ngx_radix_tree.o \
+/work/ngx-otel-rust/objs-tsan/src/core/ngx_slab.o \
+/work/ngx-otel-rust/objs-tsan/src/core/ngx_times.o \
+/work/ngx-otel-rust/objs-tsan/src/core/ngx_shmtx.o \
+/work/ngx-otel-rust/objs-tsan/src/core/ngx_connection.o \
+/work/ngx-otel-rust/objs-tsan/src/core/ngx_cycle.o \
+/work/ngx-otel-rust/objs-tsan/src/core/ngx_spinlock.o \
+/work/ngx-otel-rust/objs-tsan/src/core/ngx_rwlock.o \
+/work/ngx-otel-rust/objs-tsan/src/core/ngx_cpuinfo.o \
+/work/ngx-otel-rust/objs-tsan/src/core/ngx_conf_file.o \
+/work/ngx-otel-rust/objs-tsan/src/core/ngx_module.o \
+/work/ngx-otel-rust/objs-tsan/src/core/ngx_resolver.o \
+/work/ngx-otel-rust/objs-tsan/src/core/ngx_open_file_cache.o \
+/work/ngx-otel-rust/objs-tsan/src/core/ngx_crypt.o \
+/work/ngx-otel-rust/objs-tsan/src/core/ngx_proxy_protocol.o \
+/work/ngx-otel-rust/objs-tsan/src/core/ngx_syslog.o \
+/work/ngx-otel-rust/objs-tsan/src/event/ngx_event.o \
+/work/ngx-otel-rust/objs-tsan/src/event/ngx_event_timer.o \
+/work/ngx-otel-rust/objs-tsan/src/event/ngx_event_posted.o \
+/work/ngx-otel-rust/objs-tsan/src/event/ngx_event_accept.o \
+/work/ngx-otel-rust/objs-tsan/src/event/ngx_event_udp.o \
+/work/ngx-otel-rust/objs-tsan/src/event/ngx_event_connect.o \
+/work/ngx-otel-rust/objs-tsan/src/event/ngx_event_pipe.o \
+/work/ngx-otel-rust/objs-tsan/src/os/unix/ngx_time.o \
+/work/ngx-otel-rust/objs-tsan/src/os/unix/ngx_errno.o \
+/work/ngx-otel-rust/objs-tsan/src/os/unix/ngx_alloc.o \
+/work/ngx-otel-rust/objs-tsan/src/os/unix/ngx_files.o \
+/work/ngx-otel-rust/objs-tsan/src/os/unix/ngx_socket.o \
+/work/ngx-otel-rust/objs-tsan/src/os/unix/ngx_recv.o \
+/work/ngx-otel-rust/objs-tsan/src/os/unix/ngx_readv_chain.o \
+/work/ngx-otel-rust/objs-tsan/src/os/unix/ngx_udp_recv.o \
+/work/ngx-otel-rust/objs-tsan/src/os/unix/ngx_send.o \
+/work/ngx-otel-rust/objs-tsan/src/os/unix/ngx_writev_chain.o \
+/work/ngx-otel-rust/objs-tsan/src/os/unix/ngx_udp_send.o \
+/work/ngx-otel-rust/objs-tsan/src/os/unix/ngx_udp_sendmsg_chain.o \
+/work/ngx-otel-rust/objs-tsan/src/os/unix/ngx_channel.o \
+/work/ngx-otel-rust/objs-tsan/src/os/unix/ngx_shmem.o \
+/work/ngx-otel-rust/objs-tsan/src/os/unix/ngx_process.o \
+/work/ngx-otel-rust/objs-tsan/src/os/unix/ngx_daemon.o \
+/work/ngx-otel-rust/objs-tsan/src/os/unix/ngx_setaffinity.o \
+/work/ngx-otel-rust/objs-tsan/src/os/unix/ngx_setproctitle.o \
+/work/ngx-otel-rust/objs-tsan/src/os/unix/ngx_posix_init.o \
+/work/ngx-otel-rust/objs-tsan/src/os/unix/ngx_user.o \
+/work/ngx-otel-rust/objs-tsan/src/os/unix/ngx_dlopen.o \
+/work/ngx-otel-rust/objs-tsan/src/os/unix/ngx_process_cycle.o \
+/work/ngx-otel-rust/objs-tsan/src/os/unix/ngx_linux_init.o \
+/work/ngx-otel-rust/objs-tsan/src/event/modules/ngx_epoll_module.o \
+/work/ngx-otel-rust/objs-tsan/src/os/unix/ngx_linux_sendfile_chain.o \
+/work/ngx-otel-rust/objs-tsan/src/core/ngx_bpf.o \
+/work/ngx-otel-rust/objs-tsan/src/core/ngx_regex.o \
+/work/ngx-otel-rust/objs-tsan/src/http/ngx_http.o \
+/work/ngx-otel-rust/objs-tsan/src/http/ngx_http_core_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/ngx_http_special_response.o \
+/work/ngx-otel-rust/objs-tsan/src/http/ngx_http_request.o \
+/work/ngx-otel-rust/objs-tsan/src/http/ngx_http_parse.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_log_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/ngx_http_request_body.o \
+/work/ngx-otel-rust/objs-tsan/src/http/ngx_http_variables.o \
+/work/ngx-otel-rust/objs-tsan/src/http/ngx_http_script.o \
+/work/ngx-otel-rust/objs-tsan/src/http/ngx_http_upstream.o \
+/work/ngx-otel-rust/objs-tsan/src/http/ngx_http_upstream_round_robin.o \
+/work/ngx-otel-rust/objs-tsan/src/http/ngx_http_file_cache.o \
+/work/ngx-otel-rust/objs-tsan/src/http/ngx_http_write_filter_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/ngx_http_header_filter_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_chunked_filter_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_range_filter_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_gzip_filter_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/ngx_http_postpone_filter_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_ssi_filter_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_charset_filter_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_userid_filter_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_headers_filter_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/ngx_http_copy_filter_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_not_modified_filter_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_static_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_autoindex_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_index_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_mirror_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_try_files_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_auth_basic_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_access_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_limit_conn_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_limit_req_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_geo_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_map_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_split_clients_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_referer_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_rewrite_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_proxy_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_fastcgi_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_uwsgi_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_scgi_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_tunnel_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_memcached_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_empty_gif_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_browser_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_upstream_hash_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_upstream_ip_hash_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_upstream_least_conn_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_upstream_least_time_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_upstream_random_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_upstream_keepalive_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_upstream_zone_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_upstream_sticky_module.o \
+/work/ngx-otel-rust/objs-tsan/src/http/modules/ngx_http_stub_status_module.o \
+/work/ngx-otel-rust/objs-tsan/ngx_modules.o \
+-fsanitize=thread -lcrypt /work/ngx-otel-rust/objs-tsan/ngx_otel_rust/aarch64-unknown-linux-gnu/ngx-debug/libngx_http_otel_module.a -lm -lpcre2-8 -lz \
+-Wl,-E
+make[1]: Leaving directory '/work/nginx'
+[tsan-run] Step 1: OK — TSAN flags accepted by clang + rustc.
+[tsan-run] Step 2: Building plain TSAN nginx (no --add-module)...
+checking for OS
+ + Linux 6.12.90+deb13.1-arm64 aarch64
+checking for C compiler ... found
+ + using Clang C compiler
+ + clang version: 19.1.7 (3+b1)
+checking for --with-ld-opt="-fsanitize=thread" ... found
+checking for -Wl,-E switch ... found
+checking for gcc builtin atomic operations ... found
+checking for C99 variadic macros ... found
+checking for gcc variadic macros ... found
+checking for gcc builtin 64 bit byteswap ... found
+checking for unistd.h ... found
+checking for inttypes.h ... found
+checking for limits.h ... found
+checking for sys/filio.h ... not found
+checking for sys/param.h ... found
+checking for sys/mount.h ... found
+checking for sys/statvfs.h ... found
+checking for crypt.h ... found
+checking for Linux specific features
+checking for epoll ... found
+checking for EPOLLRDHUP ... found
+checking for EPOLLEXCLUSIVE ... found
+checking for eventfd() ... found
+checking for O_PATH ... found
+checking for sendfile() ... found
+checking for sendfile64() ... found
+checking for sys/prctl.h ... found
+checking for prctl(PR_SET_DUMPABLE) ... found
+checking for prctl(PR_SET_KEEPCAPS) ... found
+checking for capabilities ... found
+checking for crypt_r() ... found
+checking for sys/vfs.h ... found
+checking for BPF sockhash ... found
+checking for SO_COOKIE ... found
+checking for UDP_SEGMENT ... found
+checking for nobody group ... not found
+checking for nogroup group ... found
+checking for poll() ... found
+checking for /dev/poll ... not found
+checking for kqueue ... not found
+checking for crypt() ... not found
+checking for crypt() in libcrypt ... found
+checking for F_READAHEAD ... not found
+checking for posix_fadvise() ... found
+checking for O_DIRECT ... found
+checking for F_NOCACHE ... not found
+checking for directio() ... not found
+checking for statfs() ... found
+checking for statvfs() ... found
+checking for dlopen() ... found
+checking for sched_yield() ... found
+checking for sched_setaffinity() ... found
+checking for SO_SETFIB ... not found
+checking for SO_REUSEPORT ... found
+checking for SO_ACCEPTFILTER ... not found
+checking for SO_BINDANY ... not found
+checking for IP_TRANSPARENT ... found
+checking for IP_BINDANY ... not found
+checking for IP_BIND_ADDRESS_NO_PORT ... found
+checking for IP_RECVDSTADDR ... not found
+checking for IP_SENDSRCADDR ... not found
+checking for IP_PKTINFO ... found
+checking for IPV6_RECVPKTINFO ... found
+checking for IP_MTU_DISCOVER ... found
+checking for IPV6_MTU_DISCOVER ... found
+checking for IP_DONTFRAG ... not found
+checking for IPV6_DONTFRAG ... found
+checking for TCP_DEFER_ACCEPT ... found
+checking for TCP_KEEPIDLE ... found
+checking for TCP_FASTOPEN ... found
+checking for TCP_INFO ... found
+checking for accept4() ... found
+checking for int size ... 4 bytes
+checking for long size ... 8 bytes
+checking for long long size ... 8 bytes
+checking for void * size ... 8 bytes
+checking for uint32_t ... found
+checking for uint64_t ... found
+checking for sig_atomic_t ... found
+checking for sig_atomic_t size ... 4 bytes
+checking for socklen_t ... found
+checking for in_addr_t ... found
+checking for in_port_t ... found
+checking for rlim_t ... found
+checking for uintptr_t ... uintptr_t found
+checking for system byte ordering ... little endian
+checking for size_t size ... 8 bytes
+checking for off_t size ... 8 bytes
+checking for time_t size ... 8 bytes
+checking for AF_INET6 ... found
+checking for setproctitle() ... not found
+checking for pread() ... found
+checking for pwrite() ... found
+checking for pwritev() ... found
+checking for strerrordesc_np() ... found
+checking for localtime_r() ... found
+checking for clock_gettime(CLOCK_MONOTONIC) ... found
+checking for posix_memalign() ... found
+checking for memalign() ... found
+checking for mmap(MAP_ANON|MAP_SHARED) ... found
+checking for mmap("/dev/zero", MAP_SHARED) ... found
+checking for System V shared memory ... found
+checking for POSIX semaphores ... found
+checking for struct msghdr.msg_control ... found
+checking for ioctl(FIONBIO) ... found
+checking for ioctl(FIONREAD) ... found
+checking for struct tm.tm_gmtoff ... found
+checking for struct dirent.d_namlen ... not found
+checking for struct dirent.d_type ... found
+checking for sysconf(_SC_NPROCESSORS_ONLN) ... found
+checking for sysconf(_SC_LEVEL1_DCACHE_LINESIZE) ... found
+checking for openat(), fstatat() ... found
+checking for getaddrinfo() ... found
+checking for PCRE2 library ... found
+checking for zlib library ... found
+creating /work/ngx-otel-rust/objs-tsan-plain/Makefile
+
+Configuration summary
+  + using system PCRE2 library
+  + OpenSSL library is not used
+  + using system zlib library
+
+  nginx path prefix: "/usr/local/nginx"
+  nginx binary file: "/usr/local/nginx/sbin/nginx"
+  nginx modules path: "/usr/local/nginx/modules"
+  nginx configuration prefix: "/usr/local/nginx/conf"
+  nginx configuration file: "/usr/local/nginx/conf/nginx.conf"
+  nginx pid file: "/usr/local/nginx/logs/nginx.pid"
+  nginx error log file: "/usr/local/nginx/logs/error.log"
+  nginx http access log file: "/usr/local/nginx/logs/access.log"
+  nginx http client request body temporary files: "client_body_temp"
+  nginx http proxy temporary files: "proxy_temp"
+  nginx http fastcgi temporary files: "fastcgi_temp"
+  nginx http uwsgi temporary files: "uwsgi_temp"
+  nginx http scgi temporary files: "scgi_temp"
+
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/nginx.o \
+	src/core/nginx.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_log.o \
+	src/core/ngx_log.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_palloc.o \
+	src/core/ngx_palloc.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_array.o \
+	src/core/ngx_array.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_list.o \
+	src/core/ngx_list.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_hash.o \
+	src/core/ngx_hash.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_buf.o \
+	src/core/ngx_buf.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_queue.o \
+	src/core/ngx_queue.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_output_chain.o \
+	src/core/ngx_output_chain.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_string.o \
+	src/core/ngx_string.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_parse.o \
+	src/core/ngx_parse.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_parse_time.o \
+	src/core/ngx_parse_time.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_inet.o \
+	src/core/ngx_inet.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_file.o \
+	src/core/ngx_file.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_crc32.o \
+	src/core/ngx_crc32.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_murmurhash.o \
+	src/core/ngx_murmurhash.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_md5.o \
+	src/core/ngx_md5.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_sha1.o \
+	src/core/ngx_sha1.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_rbtree.o \
+	src/core/ngx_rbtree.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_radix_tree.o \
+	src/core/ngx_radix_tree.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_slab.o \
+	src/core/ngx_slab.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_times.o \
+	src/core/ngx_times.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_shmtx.o \
+	src/core/ngx_shmtx.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_connection.o \
+	src/core/ngx_connection.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_cycle.o \
+	src/core/ngx_cycle.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_spinlock.o \
+	src/core/ngx_spinlock.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_rwlock.o \
+	src/core/ngx_rwlock.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_cpuinfo.o \
+	src/core/ngx_cpuinfo.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_conf_file.o \
+	src/core/ngx_conf_file.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_module.o \
+	src/core/ngx_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_resolver.o \
+	src/core/ngx_resolver.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_open_file_cache.o \
+	src/core/ngx_open_file_cache.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_crypt.o \
+	src/core/ngx_crypt.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_proxy_protocol.o \
+	src/core/ngx_proxy_protocol.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_syslog.o \
+	src/core/ngx_syslog.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/event/ngx_event.o \
+	src/event/ngx_event.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/event/ngx_event_timer.o \
+	src/event/ngx_event_timer.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/event/ngx_event_posted.o \
+	src/event/ngx_event_posted.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/event/ngx_event_accept.o \
+	src/event/ngx_event_accept.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/event/ngx_event_udp.o \
+	src/event/ngx_event_udp.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/event/ngx_event_connect.o \
+	src/event/ngx_event_connect.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/event/ngx_event_pipe.o \
+	src/event/ngx_event_pipe.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_time.o \
+	src/os/unix/ngx_time.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_errno.o \
+	src/os/unix/ngx_errno.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_alloc.o \
+	src/os/unix/ngx_alloc.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_files.o \
+	src/os/unix/ngx_files.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_socket.o \
+	src/os/unix/ngx_socket.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_recv.o \
+	src/os/unix/ngx_recv.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_readv_chain.o \
+	src/os/unix/ngx_readv_chain.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_udp_recv.o \
+	src/os/unix/ngx_udp_recv.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_send.o \
+	src/os/unix/ngx_send.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_writev_chain.o \
+	src/os/unix/ngx_writev_chain.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_udp_send.o \
+	src/os/unix/ngx_udp_send.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_udp_sendmsg_chain.o \
+	src/os/unix/ngx_udp_sendmsg_chain.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_channel.o \
+	src/os/unix/ngx_channel.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_shmem.o \
+	src/os/unix/ngx_shmem.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_process.o \
+	src/os/unix/ngx_process.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_daemon.o \
+	src/os/unix/ngx_daemon.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_setaffinity.o \
+	src/os/unix/ngx_setaffinity.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_setproctitle.o \
+	src/os/unix/ngx_setproctitle.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_posix_init.o \
+	src/os/unix/ngx_posix_init.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_user.o \
+	src/os/unix/ngx_user.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_dlopen.o \
+	src/os/unix/ngx_dlopen.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_process_cycle.o \
+	src/os/unix/ngx_process_cycle.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_linux_init.o \
+	src/os/unix/ngx_linux_init.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/event/modules/ngx_epoll_module.o \
+	src/event/modules/ngx_epoll_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_linux_sendfile_chain.o \
+	src/os/unix/ngx_linux_sendfile_chain.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_bpf.o \
+	src/core/ngx_bpf.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_regex.o \
+	src/core/ngx_regex.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/ngx_http.o \
+	src/http/ngx_http.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/ngx_http_core_module.o \
+	src/http/ngx_http_core_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/ngx_http_special_response.o \
+	src/http/ngx_http_special_response.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/ngx_http_request.o \
+	src/http/ngx_http_request.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/ngx_http_parse.o \
+	src/http/ngx_http_parse.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_log_module.o \
+	src/http/modules/ngx_http_log_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/ngx_http_request_body.o \
+	src/http/ngx_http_request_body.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/ngx_http_variables.o \
+	src/http/ngx_http_variables.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/ngx_http_script.o \
+	src/http/ngx_http_script.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/ngx_http_upstream.o \
+	src/http/ngx_http_upstream.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/ngx_http_upstream_round_robin.o \
+	src/http/ngx_http_upstream_round_robin.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/ngx_http_file_cache.o \
+	src/http/ngx_http_file_cache.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/ngx_http_write_filter_module.o \
+	src/http/ngx_http_write_filter_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/ngx_http_header_filter_module.o \
+	src/http/ngx_http_header_filter_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_chunked_filter_module.o \
+	src/http/modules/ngx_http_chunked_filter_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_range_filter_module.o \
+	src/http/modules/ngx_http_range_filter_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_gzip_filter_module.o \
+	src/http/modules/ngx_http_gzip_filter_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/ngx_http_postpone_filter_module.o \
+	src/http/ngx_http_postpone_filter_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_ssi_filter_module.o \
+	src/http/modules/ngx_http_ssi_filter_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_charset_filter_module.o \
+	src/http/modules/ngx_http_charset_filter_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_userid_filter_module.o \
+	src/http/modules/ngx_http_userid_filter_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_headers_filter_module.o \
+	src/http/modules/ngx_http_headers_filter_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/ngx_http_copy_filter_module.o \
+	src/http/ngx_http_copy_filter_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_not_modified_filter_module.o \
+	src/http/modules/ngx_http_not_modified_filter_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_static_module.o \
+	src/http/modules/ngx_http_static_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_autoindex_module.o \
+	src/http/modules/ngx_http_autoindex_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_index_module.o \
+	src/http/modules/ngx_http_index_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_mirror_module.o \
+	src/http/modules/ngx_http_mirror_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_try_files_module.o \
+	src/http/modules/ngx_http_try_files_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_auth_basic_module.o \
+	src/http/modules/ngx_http_auth_basic_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_access_module.o \
+	src/http/modules/ngx_http_access_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_limit_conn_module.o \
+	src/http/modules/ngx_http_limit_conn_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_limit_req_module.o \
+	src/http/modules/ngx_http_limit_req_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_geo_module.o \
+	src/http/modules/ngx_http_geo_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_map_module.o \
+	src/http/modules/ngx_http_map_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_split_clients_module.o \
+	src/http/modules/ngx_http_split_clients_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_referer_module.o \
+	src/http/modules/ngx_http_referer_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_rewrite_module.o \
+	src/http/modules/ngx_http_rewrite_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_proxy_module.o \
+	src/http/modules/ngx_http_proxy_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_fastcgi_module.o \
+	src/http/modules/ngx_http_fastcgi_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_uwsgi_module.o \
+	src/http/modules/ngx_http_uwsgi_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_scgi_module.o \
+	src/http/modules/ngx_http_scgi_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_tunnel_module.o \
+	src/http/modules/ngx_http_tunnel_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_memcached_module.o \
+	src/http/modules/ngx_http_memcached_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_empty_gif_module.o \
+	src/http/modules/ngx_http_empty_gif_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_browser_module.o \
+	src/http/modules/ngx_http_browser_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_upstream_hash_module.o \
+	src/http/modules/ngx_http_upstream_hash_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_upstream_ip_hash_module.o \
+	src/http/modules/ngx_http_upstream_ip_hash_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_upstream_least_conn_module.o \
+	src/http/modules/ngx_http_upstream_least_conn_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_upstream_least_time_module.o \
+	src/http/modules/ngx_http_upstream_least_time_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_upstream_random_module.o \
+	src/http/modules/ngx_http_upstream_random_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_upstream_keepalive_module.o \
+	src/http/modules/ngx_http_upstream_keepalive_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_upstream_zone_module.o \
+	src/http/modules/ngx_http_upstream_zone_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_upstream_sticky_module.o \
+	src/http/modules/ngx_http_upstream_sticky_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain -I src/http -I src/http/modules \
+	-o /work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_stub_status_module.o \
+	src/http/modules/ngx_http_stub_status_module.c
+clang -c -pipe  -O -Wall -Wextra -Wpointer-arith -Wconditional-uninitialized -Wno-unused-parameter -Werror -g -O1 -fsanitize=thread -fno-omit-frame-pointer -I src/core -I src/event -I src/event/modules -I src/event/quic -I src/os/unix -I /work/ngx-otel-rust/objs-tsan-plain \
+	-o /work/ngx-otel-rust/objs-tsan-plain/ngx_modules.o \
+	/work/ngx-otel-rust/objs-tsan-plain/ngx_modules.c
+clang -o /work/ngx-otel-rust/objs-tsan-plain/nginx \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/nginx.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_log.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_palloc.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_array.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_list.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_hash.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_buf.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_queue.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_output_chain.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_string.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_parse.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_parse_time.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_inet.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_file.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_crc32.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_murmurhash.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_md5.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_sha1.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_rbtree.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_radix_tree.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_slab.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_times.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_shmtx.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_connection.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_cycle.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_spinlock.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_rwlock.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_cpuinfo.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_conf_file.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_resolver.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_open_file_cache.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_crypt.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_proxy_protocol.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_syslog.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/event/ngx_event.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/event/ngx_event_timer.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/event/ngx_event_posted.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/event/ngx_event_accept.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/event/ngx_event_udp.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/event/ngx_event_connect.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/event/ngx_event_pipe.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_time.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_errno.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_alloc.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_files.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_socket.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_recv.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_readv_chain.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_udp_recv.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_send.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_writev_chain.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_udp_send.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_udp_sendmsg_chain.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_channel.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_shmem.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_process.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_daemon.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_setaffinity.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_setproctitle.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_posix_init.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_user.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_dlopen.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_process_cycle.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_linux_init.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/event/modules/ngx_epoll_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/os/unix/ngx_linux_sendfile_chain.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_bpf.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/core/ngx_regex.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/ngx_http.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/ngx_http_core_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/ngx_http_special_response.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/ngx_http_request.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/ngx_http_parse.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_log_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/ngx_http_request_body.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/ngx_http_variables.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/ngx_http_script.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/ngx_http_upstream.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/ngx_http_upstream_round_robin.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/ngx_http_file_cache.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/ngx_http_write_filter_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/ngx_http_header_filter_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_chunked_filter_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_range_filter_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_gzip_filter_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/ngx_http_postpone_filter_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_ssi_filter_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_charset_filter_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_userid_filter_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_headers_filter_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/ngx_http_copy_filter_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_not_modified_filter_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_static_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_autoindex_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_index_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_mirror_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_try_files_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_auth_basic_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_access_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_limit_conn_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_limit_req_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_geo_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_map_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_split_clients_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_referer_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_rewrite_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_proxy_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_fastcgi_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_uwsgi_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_scgi_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_tunnel_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_memcached_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_empty_gif_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_browser_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_upstream_hash_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_upstream_ip_hash_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_upstream_least_conn_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_upstream_least_time_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_upstream_random_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_upstream_keepalive_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_upstream_zone_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_upstream_sticky_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/src/http/modules/ngx_http_stub_status_module.o \
+/work/ngx-otel-rust/objs-tsan-plain/ngx_modules.o \
+-fsanitize=thread -lcrypt -lpcre2-8 -lz \
+-Wl,-E
+[tsan-run] Step 2: OK — plain TSAN nginx at /work/ngx-otel-rust/objs-tsan-plain/nginx
+[tsan-run] Step 2.5: Pre-building bidi_echo_server example (no TSAN)...
+   Compiling nginx-sys v0.5.0 (/work/ngx-rust/nginx-sys)
+   Compiling ngx v0.5.0 (/work/ngx-rust)
+   Compiling ngx-otel-rust v0.1.0 (/work/ngx-otel-rust)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.03s
+[tsan-run] Step 2.5: OK — example at /work/ngx-otel-rust/target/debug/examples/bidi_echo_server
+[tsan-run] Step 3: Exporting TSAN env for integration scripts...
+[tsan-run] TSAN nginx:  /work/ngx-otel-rust/objs-tsan-plain/nginx
+[tsan-run] RUSTFLAGS:   -Cforce-frame-pointers=yes -Zsanitizer=thread -Zexternal-clangrt
+
+[tsan-run] === Running run_grpc_smoke.sh under TSAN ===
+[1;33m[INFO][0m Pre-flight checks...
+[harness] collector reachable at http://127.0.0.1:4318
+[1;33m[INFO][0m Building release module with --features test-support...
+   Compiling nginx-sys v0.5.0 (/work/ngx-rust/nginx-sys)
+   Compiling ngx v0.5.0 (/work/ngx-rust)
+   Compiling ngx-otel-rust v0.1.0 (/work/ngx-otel-rust)
+    Finished `release` profile [optimized] target(s) in 9.55s
+[1;33m[INFO][0m Module built: /work/ngx-otel-rust/target/aarch64-unknown-linux-gnu/release/libngx_http_otel_module.so
+[1;33m[INFO][0m Sandbox: /tmp/ngx-otel-grpc-smoke.qCqjFo
+[1;33m[INFO][0m metrics.json pre-size: 6923554 bytes
+[1;33m[INFO][0m Starting nginx (worker_processes 4, with otel_grpc_smoke_endpoint)...
+[1;33m[INFO][0m nginx running (PID 3277)
+[1;33m[INFO][0m Waiting up to 5s for 'grpc smoke: export complete' or 'failed' line...
+[1;33m[INFO][0m Sending nginx -s quit...
+[1;33m[INFO][0m Running assertions...
+[0;32m[PASS][0m error.log: exactly 1 'grpc smoke: firing one unary' line (Worker 0 only)
+[0;32m[PASS][0m error.log: exactly 1 'grpc smoke: export complete' line (Ok(()) reached)
+[0;32m[PASS][0m error.log: zero 'grpc smoke: export failed' lines
+[0;32m[PASS][0m error.log: no panic / SIGSEGV / SIGABRT / unexpected worker exit signals
+[0;32m[PASS][0m metrics.json delta contains service.name = ngx-otel-grpc-smoke (collector received the gRPC payload)
+
+[0;32m[PASS][0m All assertions passed.  Phase 1.2 Item 1 in-worker gRPC smoke COMPLETE.
+
+=== error.log: grpc / otel lines ===
+2026/06/08 17:15:28 [notice] 3277#0: start otel exporter 3279
+2026/06/08 17:15:28 [debug] 3279#0: setproctitle: "nginx: otel exporter"
+2026/06/08 17:15:28 [notice] 3279#0: otel exporter: cycle entered, pid=3279, parent=3277, endpoint=http://127.0.0.1:4318/v1/metrics
+2026/06/08 17:15:28 [notice] 3280#0: grpc smoke: firing one unary OTLP/gRPC export (endpoint=http://127.0.0.1:4317)
+2026/06/08 17:15:28 [notice] 3279#0: otel export: export loop started, endpoint=http://127.0.0.1:4318/v1/metrics, protocol=otlp_http, interval=60000ms, retry_depth=4
+2026/06/08 17:15:28 [notice] 3280#0: *1 grpc smoke: export complete
+2026/06/08 17:15:31 [notice] 3277#0: signal 3 (SIGQUIT) received from 3284, shutting down
+2026/06/08 17:15:31 [notice] 3277#0: signal 17 (SIGCHLD) received from 3280
+2026/06/08 17:15:31 [notice] 3277#0: worker process 3280 exited with code 0
+2026/06/08 17:15:31 [notice] 3277#0: signal 29 (SIGIO) received
+2026/06/08 17:15:31 [notice] 3279#0: otel export: ngx_quit set during sleep, starting graceful drain
+2026/06/08 17:15:31 [notice] 3279#0: otel export: graceful drain starting (0 queued batch(es))
+2026/06/08 17:15:31 [notice] 3279#0: *2 otel export: drain: final batch sent (21 data points)
+2026/06/08 17:15:31 [notice] 3279#0: *2 otel export: graceful drain complete
+2026/06/08 17:15:31 [notice] 3279#0: *2 otel exporter: ngx_quit, drain_done=true, exit
+2026/06/08 17:15:31 [notice] 3277#0: signal 17 (SIGCHLD) received from 3279
+2026/06/08 17:15:31 [notice] 3277#0: otel exporter 3279 exited with code 0
+[1;33m[INFO][0m Tearing down /tmp/ngx-otel-grpc-smoke.qCqjFo (skipped if KEEP_SANDBOX=1)
+
+[tsan-run] === Running run_grpc_bidi_smoke.sh under TSAN ===
+[1;33m[INFO][0m Pre-flight checks...
+[1;33m[INFO][0m Building release module with --features test-support...
+[harness] collector reachable at http://127.0.0.1:4318
+    Finished `release` profile [optimized] target(s) in 0.10s
+[1;33m[INFO][0m Module built: /work/ngx-otel-rust/target/aarch64-unknown-linux-gnu/release/libngx_http_otel_module.so
+[1;33m[INFO][0m Using ECHO_BINARY override: /work/ngx-otel-rust/target/debug/examples/bidi_echo_server
+[1;33m[INFO][0m Echo server built: /work/ngx-otel-rust/target/debug/examples/bidi_echo_server
+[1;33m[INFO][0m Launching bidi echo server on 127.0.0.1:4319...
+[1;33m[INFO][0m Echo server listening (PID 3332)
+[1;33m[INFO][0m Sandbox: /tmp/ngx-otel-grpc-bidi-smoke.RwJVQK
+[1;33m[INFO][0m metrics.json pre-size: 6923866 bytes
+[1;33m[INFO][0m Starting nginx (1 worker, both smoke directives set)...
+[1;33m[INFO][0m nginx running (PID 3344)
+[1;33m[INFO][0m Waiting up to 10s for both smoke calls to complete...
+[1;33m[INFO][0m Sending nginx -s quit...
+[1;33m[INFO][0m Running assertions...
+[0;32m[PASS][0m error.log: exactly 1 'grpc smoke: firing one unary' line
+[0;32m[PASS][0m error.log: exactly 1 'grpc smoke: export complete' line
+[0;32m[PASS][0m error.log: zero 'grpc smoke: export failed' lines
+[0;32m[PASS][0m error.log: no panic / SIGSEGV / SIGABRT / unexpected worker exit signals
+[0;32m[PASS][0m metrics.json delta contains service.name = ngx-otel-grpc-smoke
+[0;32m[PASS][0m error.log: exactly 1 'bidi smoke: firing one bidi stream' line
+[0;32m[PASS][0m error.log: exactly 1 'bidi smoke: bidi complete (sent=10, received=10)' line
+[0;32m[PASS][0m error.log: zero 'bidi smoke: bidi failed' lines
+
+[0;32m[PASS][0m All 8 assertions passed.  Phase 1.2 Item 2 bidi gRPC smoke COMPLETE.
+
+=== error.log: grpc/bidi/otel lines ===
+2026/06/08 17:15:32 [notice] 3344#0: start otel exporter 3346
+2026/06/08 17:15:32 [debug] 3346#0: setproctitle: "nginx: otel exporter"
+2026/06/08 17:15:32 [notice] 3346#0: otel exporter: cycle entered, pid=3346, parent=3344, endpoint=http://127.0.0.1:4318/v1/metrics
+2026/06/08 17:15:32 [notice] 3347#0: grpc smoke: firing one unary OTLP/gRPC export (endpoint=http://127.0.0.1:4317)
+2026/06/08 17:15:32 [notice] 3346#0: otel export: export loop started, endpoint=http://127.0.0.1:4318/v1/metrics, protocol=otlp_http, interval=60000ms, retry_depth=4
+2026/06/08 17:15:32 [notice] 3347#0: bidi smoke: firing one bidi stream (endpoint=http://127.0.0.1:4319)
+2026/06/08 17:15:32 [debug] 3347#0: *2 bidi smoke: awaiting h2 handshake
+2026/06/08 17:15:32 [debug] 3347#0: *2 bidi smoke: h2 handshake completed
+2026/06/08 17:15:32 [debug] 3347#0: *2 bidi smoke: Phase A sent (sent=3)
+2026/06/08 17:15:32 [debug] 3347#0: *2 bidi smoke: Phase A drained (received=3)
+2026/06/08 17:15:32 [debug] 3347#0: *2 bidi smoke: Phase B sent (sent=10)
+2026/06/08 17:15:32 [debug] 3347#0: *2 bidi smoke: Phase B drained (received=10)
+2026/06/08 17:15:32 [debug] 3347#0: *2 bidi smoke: Phase C stream end confirmed
+2026/06/08 17:15:32 [notice] 3347#0: *2 bidi smoke: bidi complete (sent=10, received=10)
+2026/06/08 17:15:32 [notice] 3347#0: *2 grpc smoke: export complete
+2026/06/08 17:15:33 [notice] 3344#0: signal 3 (SIGQUIT) received from 3354, shutting down
+2026/06/08 17:15:33 [notice] 3346#0: otel export: ngx_quit set during sleep, starting graceful drain
+2026/06/08 17:15:33 [notice] 3346#0: otel export: graceful drain starting (0 queued batch(es))
+2026/06/08 17:15:33 [notice] 3344#0: signal 17 (SIGCHLD) received from 3347
+2026/06/08 17:15:33 [notice] 3344#0: worker process 3347 exited with code 0
+2026/06/08 17:15:33 [notice] 3344#0: signal 29 (SIGIO) received
+2026/06/08 17:15:33 [notice] 3346#0: *3 otel export: drain: final batch sent (21 data points)
+2026/06/08 17:15:33 [notice] 3346#0: *3 otel export: graceful drain complete
+2026/06/08 17:15:33 [notice] 3346#0: *3 otel exporter: ngx_quit, drain_done=true, exit
+2026/06/08 17:15:33 [notice] 3344#0: signal 17 (SIGCHLD) received from 3346
+2026/06/08 17:15:33 [notice] 3344#0: otel exporter 3346 exited with code 0
+[1;33m[INFO][0m Echo server log:
+bidi echo server: listening on 127.0.0.1:4319 (delay=0ms)
+[1;33m[INFO][0m Tearing down /tmp/ngx-otel-grpc-bidi-smoke.RwJVQK (skipped if KEEP_SANDBOX=1)
+
+[tsan-run] === Running run_grpc_export.sh under TSAN (production gRPC export path) ===
+[1;33m[INFO][0m Pre-flight checks...
+[harness] collector reachable at http://127.0.0.1:4318
+[1;33m[INFO][0m Building release module (production build, no test-support)...
+   Compiling ngx-otel-rust v0.1.0 (/work/ngx-otel-rust)
+    Finished `release` profile [optimized] target(s) in 6.91s
+[1;33m[INFO][0m Module built: /work/ngx-otel-rust/target/aarch64-unknown-linux-gnu/release/libngx_http_otel_module.so
+[1;33m[INFO][0m Sandbox: /tmp/ngx-otel-grpc-export.5UB5dW
+[1;33m[INFO][0m metrics.json pre-size: 6937765 bytes
+[1;33m[INFO][0m Starting nginx with otel_export_protocol otlp_grpc...
+[1;33m[INFO][0m nginx running (PID 3427)
+[1;33m[INFO][0m Worker PIDs: <none found>
+[1;33m[INFO][0m Sending 20 requests to http://127.0.0.1:9105/...
+[1;33m[INFO][0m Traffic sent.
+[1;33m[INFO][0m Waiting 5s for gRPC metrics flush (interval=2s)...
+[1;33m[INFO][0m No worker PIDs found — skipping lsof socket check (workers may have exited already)
+[1;33m[INFO][0m Sending nginx -s quit (graceful drain)...
+[1;33m[INFO][0m Running assertions...
+[0;32m[PASS][0m error.log: export loop started with protocol=otlp_grpc
+[0;32m[PASS][0m metrics.json delta contains service.name = ngx-otel-grpc-export-integration (gRPC path confirmed)
+[0;32m[PASS][0m metrics.json delta contains http.server.request.duration
+[0;32m[PASS][0m error.log: exactly 1 'export loop started' line
+[0;32m[PASS][0m graceful drain integrity: 1 start(s), 1 complete(s)
+[0;32m[PASS][0m error.log: no panics / crashes
+
+[0;32m[PASS][0m All assertions passed.  Production gRPC export E2E test COMPLETE.
+
+  New metrics.json tail:
+{"resourceMetrics":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"ngx-otel-grpc-export-integration"}},{"key":"service.instance.id","value":{"stringValue":"3427"}}]},"scopeMetrics":[{"scope":{"name":"ngx-otel-rust","version":"0.1.0"},"metrics":[{"name":"nginx.connections.accepted","description":"Total accepted connections","unit":"connections","histogram":{"dataPoints":[{"timeUnixNano":"1780938945205712278","count":"1","sum":20,"bucketCounts":["1"]}],"aggregationTemporality":2}},{"name":"nginx.connections.handled","description":"Total handled connections","unit":"connections","histogram":{"dataPoints":[{"timeUnixNano":"1780938945205712278","count":"1","sum":20,"bucketCounts":["1"]}],"aggregationTemporality":2}},{"name":"nginx.requests.total","description":"Total HTTP requests processed","unit":"requests","histogram":{"dataPoints":[{"timeUnixNano":"1780938945205712278","count":"1","sum":20,"bucketCounts":["1"]}],"aggregationTemporality":2}},{"name":"nginx.connections.active","description":"Active connections (reading + writing + waiting)","unit":"connections","gauge":{"dataPoints":[{"timeUnixNano":"1780938945205712278","asInt":"0"}]}},{"name":"nginx.connections.reading","description":"Connections reading request headers","unit":"connections","gauge":{"dataPoints":[{"timeUnixNano":"1780938945205712278","asInt":"0"}]}},{"name":"nginx.connections.writing","description":"Connections writing responses","unit":"connections","gauge":{"dataPoints":[{"timeUnixNano":"1780938945205712278","asInt":"0"}]}},{"name":"nginx.connections.waiting","description":"Idle keep-alive connections","unit":"connections","gauge":{"dataPoints":[{"timeUnixNano":"1780938945205712278","asInt":"0"}]}},{"name":"http.server.request.duration","description":"HTTP server request duration","unit":"us","exponentialHistogram":{"dataPoints":[{"attributes":[{"key":"http.request.method","value":{"stringValue":"GET"}},{"key":"http.response.status_code","value":{"intValue":"200"}},{"key":"network.protocol.version","value":{"stringValue":"1.1"}}],"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938945205771647","count":"20","sum":14579,"scale":3,"positive":{"bucketCounts":["0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","1","0","0","0","0","1","0","2","0","1","1","1","3","1","0","0","0","5","1","1","1","1"]},"negative":{}}],"aggregationTemporality":2}},{"name":"http.server.request.duration.by_route","description":"HTTP server request duration by matched location (http.route)","unit":"us","exponentialHistogram":{"dataPoints":[{"attributes":[{"key":"http.route","value":{"stringValue":"/"}}],"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938945205771647","count":"20","sum":14579,"scale":3,"positive":{"bucketCounts":["0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","1","0","0","0","0","1","0","2","0","1","1","1","3","1","0","0","0","5","1","1","1","1"]},"negative":{}}],"aggregationTemporality":2}},{"name":"http.server.request.duration.by_upstream","description":"HTTP server request duration by upstream zone (nginx.upstream.zone)","unit":"us","exponentialHistogram":{"aggregationTemporality":2}},{"name":"http.server.request.body.size","description":"HTTP server request body size","unit":"By","histogram":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938945205771647","count":"20","sum":1560,"bucketCounts":["20","0","0","0","0","0","0"],"explicitBounds":[128,512,4096,65536,524288,4194304]}],"aggregationTemporality":2}},{"name":"http.server.response.body.size","description":"HTTP server response body size","unit":"By","histogram":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938945205771647","count":"20","sum":3360,"bucketCounts":["0","20","0","0","0","0","0"],"explicitBounds":[128,512,4096,65536,524288,4194304]}],"aggregationTemporality":2}},{"name":"http.server.upstream.response.duration","description":"Upstream response time","unit":"ms","histogram":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938945205771647","sum":0,"bucketCounts":["0","0","0","0","0","0","0","0","0","0","0","0","0","0","0"],"explicitBounds":[5,10,25,50,75,100,250,500,750,1000,2500,5000,7500,10000]}],"aggregationTemporality":2}},{"name":"http.server.upstream.header.duration","description":"Upstream time to first response byte","unit":"ms","histogram":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938945205771647","sum":0,"bucketCounts":["0","0","0","0","0","0","0","0","0","0","0","0","0","0","0"],"explicitBounds":[5,10,25,50,75,100,250,500,750,1000,2500,5000,7500,10000]}],"aggregationTemporality":2}},{"name":"http.server.upstream.connect.duration","description":"Upstream connection establishment time","unit":"ms","histogram":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938945205771647","sum":0,"bucketCounts":["0","0","0","0","0","0","0","0","0","0","0","0","0","0","0"],"explicitBounds":[5,10,25,50,75,100,250,500,750,1000,2500,5000,7500,10000]}],"aggregationTemporality":2}},{"name":"http.server.upstream.bytes.received","description":"Bytes received from upstream","unit":"By","histogram":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938945205771647","sum":0,"bucketCounts":["0","0","0","0","0","0","0"],"explicitBounds":[128,512,4096,65536,524288,4194304]}],"aggregationTemporality":2}},{"name":"http.server.upstream.bytes.sent","description":"Bytes sent to upstream","unit":"By","histogram":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938945205771647","sum":0,"bucketCounts":["0","0","0","0","0","0","0"],"explicitBounds":[128,512,4096,65536,524288,4194304]}],"aggregationTemporality":2}},{"name":"ngx_otel.dropped_records","description":"Metric data points dropped due to a full retry buffer","unit":"points","sum":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938945213212070","asInt":"0"}],"aggregationTemporality":2,"isMonotonic":true}},{"name":"ngx_otel.send_failures","description":"Cumulative export send failures since worker startup","unit":"failures","sum":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938945213212070","asInt":"0"}],"aggregationTemporality":2,"isMonotonic":true}},{"name":"ngx_otel.bidi_backpressure_drops","description":"Bidi outbound messages dropped due to channel backpressure","unit":"messages","sum":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938945213212070","asInt":"0"}],"aggregationTemporality":2,"isMonotonic":true}},{"name":"ngx_otel.logs.access.dropped_records","description":"Access log records dropped because the per-worker ring was full","unit":"records","sum":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938945213212070","asInt":"0"}],"aggregationTemporality":2,"isMonotonic":true}},{"name":"ngx_otel.logs.error.dropped_records","description":"Error log records dropped because the per-worker ring was full","unit":"records","sum":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938945213212070","asInt":"0"}],"aggregationTemporality":2,"isMonotonic":true}},{"name":"ngx_otel.logs.send_failures","description":"Cumulative logs transport send failures since exporter startup","unit":"failures","sum":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938945213212070","asInt":"0"}],"aggregationTemporality":2,"isMonotonic":true}},{"name":"ngx_otel.export_interval","description":"Configured metric export interval","unit":"ms","gauge":{"dataPoints":[{"timeUnixNano":"1780938945213212070","asInt":"2000"}]}}]}]}]}
+{"resourceMetrics":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"ngx-otel-grpc-export-integration"}},{"key":"service.instance.id","value":{"stringValue":"3427"}}]},"scopeMetrics":[{"scope":{"name":"ngx-otel-rust","version":"0.1.0"},"metrics":[{"name":"nginx.connections.accepted","description":"Total accepted connections","unit":"connections","histogram":{"dataPoints":[{"timeUnixNano":"1780938947233448652","count":"1","sum":20,"bucketCounts":["1"]}],"aggregationTemporality":2}},{"name":"nginx.connections.handled","description":"Total handled connections","unit":"connections","histogram":{"dataPoints":[{"timeUnixNano":"1780938947233448652","count":"1","sum":20,"bucketCounts":["1"]}],"aggregationTemporality":2}},{"name":"nginx.requests.total","description":"Total HTTP requests processed","unit":"requests","histogram":{"dataPoints":[{"timeUnixNano":"1780938947233448652","count":"1","sum":20,"bucketCounts":["1"]}],"aggregationTemporality":2}},{"name":"nginx.connections.active","description":"Active connections (reading + writing + waiting)","unit":"connections","gauge":{"dataPoints":[{"timeUnixNano":"1780938947233448652","asInt":"0"}]}},{"name":"nginx.connections.reading","description":"Connections reading request headers","unit":"connections","gauge":{"dataPoints":[{"timeUnixNano":"1780938947233448652","asInt":"0"}]}},{"name":"nginx.connections.writing","description":"Connections writing responses","unit":"connections","gauge":{"dataPoints":[{"timeUnixNano":"1780938947233448652","asInt":"0"}]}},{"name":"nginx.connections.waiting","description":"Idle keep-alive connections","unit":"connections","gauge":{"dataPoints":[{"timeUnixNano":"1780938947233448652","asInt":"0"}]}},{"name":"http.server.request.duration","description":"HTTP server request duration","unit":"us","exponentialHistogram":{"dataPoints":[{"attributes":[{"key":"http.request.method","value":{"stringValue":"GET"}},{"key":"http.response.status_code","value":{"intValue":"200"}},{"key":"network.protocol.version","value":{"stringValue":"1.1"}}],"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938947233507063","count":"20","sum":14579,"scale":3,"positive":{"bucketCounts":["0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","1","0","0","0","0","1","0","2","0","1","1","1","3","1","0","0","0","5","1","1","1","1"]},"negative":{}}],"aggregationTemporality":2}},{"name":"http.server.request.duration.by_route","description":"HTTP server request duration by matched location (http.route)","unit":"us","exponentialHistogram":{"dataPoints":[{"attributes":[{"key":"http.route","value":{"stringValue":"/"}}],"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938947233507063","count":"20","sum":14579,"scale":3,"positive":{"bucketCounts":["0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","1","0","0","0","0","1","0","2","0","1","1","1","3","1","0","0","0","5","1","1","1","1"]},"negative":{}}],"aggregationTemporality":2}},{"name":"http.server.request.duration.by_upstream","description":"HTTP server request duration by upstream zone (nginx.upstream.zone)","unit":"us","exponentialHistogram":{"aggregationTemporality":2}},{"name":"http.server.request.body.size","description":"HTTP server request body size","unit":"By","histogram":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938947233507063","count":"20","sum":1560,"bucketCounts":["20","0","0","0","0","0","0"],"explicitBounds":[128,512,4096,65536,524288,4194304]}],"aggregationTemporality":2}},{"name":"http.server.response.body.size","description":"HTTP server response body size","unit":"By","histogram":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938947233507063","count":"20","sum":3360,"bucketCounts":["0","20","0","0","0","0","0"],"explicitBounds":[128,512,4096,65536,524288,4194304]}],"aggregationTemporality":2}},{"name":"http.server.upstream.response.duration","description":"Upstream response time","unit":"ms","histogram":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938947233507063","sum":0,"bucketCounts":["0","0","0","0","0","0","0","0","0","0","0","0","0","0","0"],"explicitBounds":[5,10,25,50,75,100,250,500,750,1000,2500,5000,7500,10000]}],"aggregationTemporality":2}},{"name":"http.server.upstream.header.duration","description":"Upstream time to first response byte","unit":"ms","histogram":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938947233507063","sum":0,"bucketCounts":["0","0","0","0","0","0","0","0","0","0","0","0","0","0","0"],"explicitBounds":[5,10,25,50,75,100,250,500,750,1000,2500,5000,7500,10000]}],"aggregationTemporality":2}},{"name":"http.server.upstream.connect.duration","description":"Upstream connection establishment time","unit":"ms","histogram":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938947233507063","sum":0,"bucketCounts":["0","0","0","0","0","0","0","0","0","0","0","0","0","0","0"],"explicitBounds":[5,10,25,50,75,100,250,500,750,1000,2500,5000,7500,10000]}],"aggregationTemporality":2}},{"name":"http.server.upstream.bytes.received","description":"Bytes received from upstream","unit":"By","histogram":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938947233507063","sum":0,"bucketCounts":["0","0","0","0","0","0","0"],"explicitBounds":[128,512,4096,65536,524288,4194304]}],"aggregationTemporality":2}},{"name":"http.server.upstream.bytes.sent","description":"Bytes sent to upstream","unit":"By","histogram":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938947233507063","sum":0,"bucketCounts":["0","0","0","0","0","0","0"],"explicitBounds":[128,512,4096,65536,524288,4194304]}],"aggregationTemporality":2}},{"name":"ngx_otel.dropped_records","description":"Metric data points dropped due to a full retry buffer","unit":"points","sum":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938947247312474","asInt":"0"}],"aggregationTemporality":2,"isMonotonic":true}},{"name":"ngx_otel.send_failures","description":"Cumulative export send failures since worker startup","unit":"failures","sum":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938947247312474","asInt":"0"}],"aggregationTemporality":2,"isMonotonic":true}},{"name":"ngx_otel.bidi_backpressure_drops","description":"Bidi outbound messages dropped due to channel backpressure","unit":"messages","sum":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938947247312474","asInt":"0"}],"aggregationTemporality":2,"isMonotonic":true}},{"name":"ngx_otel.logs.access.dropped_records","description":"Access log records dropped because the per-worker ring was full","unit":"records","sum":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938947247312474","asInt":"0"}],"aggregationTemporality":2,"isMonotonic":true}},{"name":"ngx_otel.logs.error.dropped_records","description":"Error log records dropped because the per-worker ring was full","unit":"records","sum":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938947247312474","asInt":"0"}],"aggregationTemporality":2,"isMonotonic":true}},{"name":"ngx_otel.logs.send_failures","description":"Cumulative logs transport send failures since exporter startup","unit":"failures","sum":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938947247312474","asInt":"0"}],"aggregationTemporality":2,"isMonotonic":true}},{"name":"ngx_otel.export_interval","description":"Configured metric export interval","unit":"ms","gauge":{"dataPoints":[{"timeUnixNano":"1780938947247312474","asInt":"2000"}]}}]}]}]}
+{"resourceMetrics":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"ngx-otel-grpc-export-integration"}},{"key":"service.instance.id","value":{"stringValue":"3427"}}]},"scopeMetrics":[{"scope":{"name":"ngx-otel-rust","version":"0.1.0"},"metrics":[{"name":"nginx.connections.accepted","description":"Total accepted connections","unit":"connections","histogram":{"dataPoints":[{"timeUnixNano":"1780938947753846649","count":"1","sum":20,"bucketCounts":["1"]}],"aggregationTemporality":2}},{"name":"nginx.connections.handled","description":"Total handled connections","unit":"connections","histogram":{"dataPoints":[{"timeUnixNano":"1780938947753846649","count":"1","sum":20,"bucketCounts":["1"]}],"aggregationTemporality":2}},{"name":"nginx.requests.total","description":"Total HTTP requests processed","unit":"requests","histogram":{"dataPoints":[{"timeUnixNano":"1780938947753846649","count":"1","sum":20,"bucketCounts":["1"]}],"aggregationTemporality":2}},{"name":"nginx.connections.active","description":"Active connections (reading + writing + waiting)","unit":"connections","gauge":{"dataPoints":[{"timeUnixNano":"1780938947753846649","asInt":"0"}]}},{"name":"nginx.connections.reading","description":"Connections reading request headers","unit":"connections","gauge":{"dataPoints":[{"timeUnixNano":"1780938947753846649","asInt":"0"}]}},{"name":"nginx.connections.writing","description":"Connections writing responses","unit":"connections","gauge":{"dataPoints":[{"timeUnixNano":"1780938947753846649","asInt":"0"}]}},{"name":"nginx.connections.waiting","description":"Idle keep-alive connections","unit":"connections","gauge":{"dataPoints":[{"timeUnixNano":"1780938947753846649","asInt":"0"}]}},{"name":"http.server.request.duration","description":"HTTP server request duration","unit":"us","exponentialHistogram":{"dataPoints":[{"attributes":[{"key":"http.request.method","value":{"stringValue":"GET"}},{"key":"http.response.status_code","value":{"intValue":"200"}},{"key":"network.protocol.version","value":{"stringValue":"1.1"}}],"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938947753940390","count":"20","sum":14579,"scale":3,"positive":{"bucketCounts":["0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","1","0","0","0","0","1","0","2","0","1","1","1","3","1","0","0","0","5","1","1","1","1"]},"negative":{}}],"aggregationTemporality":2}},{"name":"http.server.request.duration.by_route","description":"HTTP server request duration by matched location (http.route)","unit":"us","exponentialHistogram":{"dataPoints":[{"attributes":[{"key":"http.route","value":{"stringValue":"/"}}],"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938947753940390","count":"20","sum":14579,"scale":3,"positive":{"bucketCounts":["0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","1","0","0","0","0","1","0","2","0","1","1","1","3","1","0","0","0","5","1","1","1","1"]},"negative":{}}],"aggregationTemporality":2}},{"name":"http.server.request.duration.by_upstream","description":"HTTP server request duration by upstream zone (nginx.upstream.zone)","unit":"us","exponentialHistogram":{"aggregationTemporality":2}},{"name":"http.server.request.body.size","description":"HTTP server request body size","unit":"By","histogram":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938947753940390","count":"20","sum":1560,"bucketCounts":["20","0","0","0","0","0","0"],"explicitBounds":[128,512,4096,65536,524288,4194304]}],"aggregationTemporality":2}},{"name":"http.server.response.body.size","description":"HTTP server response body size","unit":"By","histogram":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938947753940390","count":"20","sum":3360,"bucketCounts":["0","20","0","0","0","0","0"],"explicitBounds":[128,512,4096,65536,524288,4194304]}],"aggregationTemporality":2}},{"name":"http.server.upstream.response.duration","description":"Upstream response time","unit":"ms","histogram":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938947753940390","sum":0,"bucketCounts":["0","0","0","0","0","0","0","0","0","0","0","0","0","0","0"],"explicitBounds":[5,10,25,50,75,100,250,500,750,1000,2500,5000,7500,10000]}],"aggregationTemporality":2}},{"name":"http.server.upstream.header.duration","description":"Upstream time to first response byte","unit":"ms","histogram":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938947753940390","sum":0,"bucketCounts":["0","0","0","0","0","0","0","0","0","0","0","0","0","0","0"],"explicitBounds":[5,10,25,50,75,100,250,500,750,1000,2500,5000,7500,10000]}],"aggregationTemporality":2}},{"name":"http.server.upstream.connect.duration","description":"Upstream connection establishment time","unit":"ms","histogram":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938947753940390","sum":0,"bucketCounts":["0","0","0","0","0","0","0","0","0","0","0","0","0","0","0"],"explicitBounds":[5,10,25,50,75,100,250,500,750,1000,2500,5000,7500,10000]}],"aggregationTemporality":2}},{"name":"http.server.upstream.bytes.received","description":"Bytes received from upstream","unit":"By","histogram":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938947753940390","sum":0,"bucketCounts":["0","0","0","0","0","0","0"],"explicitBounds":[128,512,4096,65536,524288,4194304]}],"aggregationTemporality":2}},{"name":"http.server.upstream.bytes.sent","description":"Bytes sent to upstream","unit":"By","histogram":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938947753940390","sum":0,"bucketCounts":["0","0","0","0","0","0","0"],"explicitBounds":[128,512,4096,65536,524288,4194304]}],"aggregationTemporality":2}},{"name":"ngx_otel.dropped_records","description":"Metric data points dropped due to a full retry buffer","unit":"points","sum":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938947761088466","asInt":"0"}],"aggregationTemporality":2,"isMonotonic":true}},{"name":"ngx_otel.send_failures","description":"Cumulative export send failures since worker startup","unit":"failures","sum":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938947761088466","asInt":"0"}],"aggregationTemporality":2,"isMonotonic":true}},{"name":"ngx_otel.bidi_backpressure_drops","description":"Bidi outbound messages dropped due to channel backpressure","unit":"messages","sum":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938947761088466","asInt":"0"}],"aggregationTemporality":2,"isMonotonic":true}},{"name":"ngx_otel.logs.access.dropped_records","description":"Access log records dropped because the per-worker ring was full","unit":"records","sum":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938947761088466","asInt":"0"}],"aggregationTemporality":2,"isMonotonic":true}},{"name":"ngx_otel.logs.error.dropped_records","description":"Error log records dropped because the per-worker ring was full","unit":"records","sum":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938947761088466","asInt":"0"}],"aggregationTemporality":2,"isMonotonic":true}},{"name":"ngx_otel.logs.send_failures","description":"Cumulative logs transport send failures since exporter startup","unit":"failures","sum":{"dataPoints":[{"startTimeUnixNano":"1780938941106725424","timeUnixNano":"1780938947761088466","asInt":"0"}],"aggregationTemporality":2,"isMonotonic":true}},{"name":"ngx_otel.export_interval","description":"Configured metric export interval","unit":"ms","gauge":{"dataPoints":[{"timeUnixNano":"1780938947761088466","asInt":"2000"}]}}]}]}]}
+
+=== error.log (first 40 lines) ===
+2026/06/08 17:15:41 [debug] 3427#0: bind() 127.0.0.1:9105 #6 
+2026/06/08 17:15:41 [notice] 3427#0: using the "epoll" event method
+2026/06/08 17:15:41 [debug] 3427#0: counter: 0000FFFF89ECE080, 1
+2026/06/08 17:15:41 [debug] 3427#0: channel 7:8
+2026/06/08 17:15:41 [notice] 3427#0: start otel exporter 3429
+2026/06/08 17:15:41 [notice] 3427#0: otel: spawned exporter process, pid=3429, reload=false
+2026/06/08 17:15:41 [notice] 3427#0: nginx/1.31.1
+2026/06/08 17:15:41 [notice] 3427#0: built by clang 19.1.7 (3+b1)
+2026/06/08 17:15:41 [notice] 3427#0: OS: Linux 6.12.90+deb13.1-arm64
+2026/06/08 17:15:41 [notice] 3427#0: getrlimit(RLIMIT_NOFILE): 1073741816:1073741816
+2026/06/08 17:15:41 [debug] 3427#0: write: 9, 0000FFFFF6C29312, 5, 0
+2026/06/08 17:15:41 [debug] 3427#0: setproctitle: "nginx: master process /work/ngx-otel-rust/objs-tsan-plain/nginx -p /tmp/ngx-otel-grpc-export.5UB5dW -c /tmp/ngx-otel-grpc-export.5UB5dW/nginx.conf"
+2026/06/08 17:15:41 [notice] 3427#0: start worker processes
+2026/06/08 17:15:41 [debug] 3427#0: channel 3:9
+2026/06/08 17:15:41 [notice] 3427#0: start worker process 3430
+2026/06/08 17:15:41 [debug] 3427#0: pass channel s:1 pid:3430 fd:3 to s:0 pid:3429 fd:7
+2026/06/08 17:15:41 [debug] 3427#0: channel 10:11
+2026/06/08 17:15:41 [notice] 3427#0: start worker process 3432
+2026/06/08 17:15:41 [debug] 3427#0: pass channel s:2 pid:3432 fd:10 to s:0 pid:3429 fd:7
+2026/06/08 17:15:41 [debug] 3427#0: pass channel s:2 pid:3432 fd:10 to s:1 pid:3430 fd:3
+2026/06/08 17:15:41 [debug] 3427#0: sigsuspend
+2026/06/08 17:15:41 [debug] 3430#0: add cleanup: 0000FFFF854160A0
+2026/06/08 17:15:41 [debug] 3430#0: malloc: 0000FFFF86400380:8
+2026/06/08 17:15:41 [debug] 3430#0: notify eventfd: 11
+2026/06/08 17:15:41 [debug] 3430#0: testing the EPOLLRDHUP flag: success
+2026/06/08 17:15:41 [debug] 3430#0: malloc: 0000FFFF82802000:8192
+2026/06/08 17:15:41 [debug] 3432#0: add cleanup: 0000FFFF854160A0
+2026/06/08 17:15:41 [debug] 3430#0: malloc: 0000FFFF85404000:15872
+2026/06/08 17:15:41 [debug] 3430#0: malloc: 0000FFFF83E00000:6144
+2026/06/08 17:15:41 [debug] 3432#0: malloc: 0000FFFF86400370:8
+2026/06/08 17:15:41 [debug] 3430#0: malloc: 0000FFFF83E04800:6144
+2026/06/08 17:15:41 [debug] 3430#0: epoll add event: fd:6 op:1 ev:10000001
+2026/06/08 17:15:41 [debug] 3430#0: epoll add event: fd:9 op:1 ev:00002001
+2026/06/08 17:15:41 [debug] 3430#0: setproctitle: "nginx: worker process"
+2026/06/08 17:15:41 [debug] 3430#0: worker cycle
+2026/06/08 17:15:41 [debug] 3430#0: epoll timer: -1
+2026/06/08 17:15:41 [debug] 3430#0: epoll: fd:9 ev:0001 d:0000FFFF854040F8
+2026/06/08 17:15:41 [debug] 3430#0: channel handler
+2026/06/08 17:15:41 [debug] 3430#0: channel: 32
+2026/06/08 17:15:41 [debug] 3430#0: channel command: 1
+...
+=== error.log (last 30 lines) ===
+2026/06/08 17:15:47 [notice] 3427#0: signal 17 (SIGCHLD) received from 3429
+2026/06/08 17:15:47 [notice] 3427#0: otel exporter 3429 exited with code 0
+2026/06/08 17:15:47 [debug] 3427#0: shmtx forced unlock
+2026/06/08 17:15:47 [debug] 3427#0: shmtx forced unlock
+2026/06/08 17:15:47 [debug] 3427#0: shmtx forced unlock
+2026/06/08 17:15:47 [debug] 3427#0: shmtx forced unlock
+2026/06/08 17:15:47 [debug] 3427#0: wake up, sigio 0
+2026/06/08 17:15:47 [debug] 3427#0: reap children
+2026/06/08 17:15:47 [debug] 3427#0: child: 0 3429 e:1 t:1 d:0 r:1 j:0
+2026/06/08 17:15:47 [debug] 3427#0: child: 1 -1 e:1 t:1 d:0 r:1 j:0
+2026/06/08 17:15:47 [notice] 3427#0: exit
+2026/06/08 17:15:47 [debug] 3427#0: run cleanup: 0000FFFF85411990
+2026/06/08 17:15:47 [debug] 3427#0: cleanup resolver
+2026/06/08 17:15:47 [debug] 3427#0: run cleanup: 0000FFFF85411470
+2026/06/08 17:15:47 [debug] 3427#0: run cleanup: 0000FFFF8540F9C0
+2026/06/08 17:15:47 [debug] 3427#0: run cleanup: 0000FFFF85409130
+2026/06/08 17:15:47 [debug] 3427#0: run cleanup: 0000FFFF854090E0
+2026/06/08 17:15:47 [debug] 3427#0: run cleanup: 0000FFFF85402770
+2026/06/08 17:15:47 [debug] 3427#0: run cleanup: 0000FFFF85402130
+2026/06/08 17:15:47 [debug] 3427#0: free: 0000FFFF83E01800
+2026/06/08 17:15:47 [debug] 3427#0: free: 0000FFFF86202000
+2026/06/08 17:15:47 [debug] 3427#0: free: 0000FFFF84403C00
+2026/06/08 17:15:47 [debug] 3427#0: free: 0000FFFF84405000
+2026/06/08 17:15:47 [debug] 3427#0: free: 0000FFFF84406400
+2026/06/08 17:15:47 [debug] 3427#0: free: 0000FFFF84201C00
+2026/06/08 17:15:47 [debug] 3427#0: free: 0000FFFF85400000, unused: 0
+2026/06/08 17:15:47 [debug] 3427#0: free: 0000FFFF85408000, unused: 1
+2026/06/08 17:15:47 [debug] 3427#0: free: 0000FFFF8540C000, unused: 1
+2026/06/08 17:15:47 [debug] 3427#0: free: 0000FFFF85410000, unused: 1
+2026/06/08 17:15:47 [debug] 3427#0: free: 0000FFFF85414000, unused: 8036
+[1;33m[INFO][0m Tearing down /tmp/ngx-otel-grpc-export.5UB5dW
+
+[tsan-run] === Running run_access_log.sh under TSAN (Phase 2.2 §6.6.1 rebalanced path) ===
+[1;33m[INFO][0m Pre-flight checks...
+[harness] collector reachable at http://127.0.0.1:4318
+[1;33m[INFO][0m Building release module...
+    Finished `release` profile [optimized] target(s) in 0.06s
+[1;33m[INFO][0m Module built: /work/ngx-otel-rust/target/aarch64-unknown-linux-gnu/release/libngx_http_otel_module.so
+[1;33m[INFO][0m Sandbox: /tmp/ngx-otel-access-log.3nAGsv
+[1;33m[INFO][0m metrics.json pre-size: 6970273 bytes
+[1;33m[INFO][0m logs.json pre-size: 9040134 bytes
+[1;33m[INFO][0m Starting nginx...
+[1;33m[INFO][0m nginx running (PID 3521)
+[1;33m[INFO][0m Sending 30 GET requests (200) to http://127.0.0.1:9101/...
+[1;33m[INFO][0m Sending 5 GET requests (500/error) to http://127.0.0.1:9101/error...
+[1;33m[INFO][0m Sending 1 GET with traceparent header to /error...
+[1;33m[INFO][0m Sending 3 GET requests to /api (upstream → 502 = interesting)...
+[1;33m[INFO][0m Sending 2 GET requests to /regex-unmapped (regex → '(other)' route bucket)...
+[1;33m[INFO][0m Traffic sent.
+[1;33m[INFO][0m Waiting 5s for export flush (interval=2s)...
+[1;33m[INFO][0m Sending nginx -s quit (graceful drain)...
+[1;33m[INFO][0m Running assertions...
+[0;32m[PASS][0m metrics.json: service.name = ngx-otel-access-log-test present (metrics not regressed)
+[0;32m[PASS][0m metrics.json: http.server.request.duration present
+[0;32m[PASS][0m metrics.json: http.server.request.duration is exponentialHistogram (DP-F)
+[0;32m[PASS][0m metrics.json: http.route dimension present (DP-E)
+[0;32m[PASS][0m metrics.json: nginx.upstream.zone dimension present (DP-E, FU4)
+[1;33m[INFO][0m metrics.json: http.route occurrences = 16
+[0;32m[PASS][0m metrics.json: ≥ 2 distinct http.route data points (different locations)
+[0;32m[PASS][0m metrics.json: '(other)' route bucket present (regex/unregistered → overflow, DP-E)
+[1;33m[INFO][0m logs.json: got 7236 bytes of new content
+[1;33m[INFO][0m event_name=http.access count in new logs.json content: 9
+[0;32m[PASS][0m logs.json: 200 flood blocked, interesting requests produced tail records (count=9)
+[0;32m[PASS][0m logs.json: at least 1 tail LogRecord present from error requests (got 9)
+[0;32m[PASS][0m logs.json: http.request.method attribute present
+[0;32m[PASS][0m logs.json: http.response.status_code attribute present
+[0;32m[PASS][0m logs.json: client.address attribute present
+[0;32m[PASS][0m logs.json: severity_number = 9 (INFO) present
+[0;32m[PASS][0m logs.json: event_name = http.access present
+[0;32m[PASS][0m metrics.json: trace_id 4bf92f3577b34da6a3ce929d0e0e4736 carried in exemplar (FU4a traceparent)
+[0;32m[PASS][0m logs.json: trace_id 4bf92f3577b34da6a3ce929d0e0e4736 carried on tail LogRecord (traceparent → LogRecord)
+[0;32m[PASS][0m logs.json: url.path attribute present on tail records (FU4b)
+[0;32m[PASS][0m logs.json: http.server.request.duration key present (S2)
+
+[0;32m[PASS][0m All assertions passed.
+
+=== error.log (last 30 lines) ===
+2026/06/08 17:15:55 [debug] 3521#0: reap children
+2026/06/08 17:15:55 [debug] 3521#0: child: 0 3523 e:1 t:1 d:0 r:1 j:0
+2026/06/08 17:15:55 [debug] 3521#0: child: 1 -1 e:1 t:1 d:0 r:1 j:0
+2026/06/08 17:15:55 [notice] 3521#0: exit
+2026/06/08 17:15:55 [debug] 3521#0: run cleanup: 0000FFFFA80196A0
+2026/06/08 17:15:55 [debug] 3521#0: cleanup resolver
+2026/06/08 17:15:55 [debug] 3521#0: run cleanup: 0000FFFFA8019090
+2026/06/08 17:15:55 [debug] 3521#0: run cleanup: 0000FFFFA80175E0
+2026/06/08 17:15:55 [debug] 3521#0: run cleanup: 0000FFFFA8015A60
+2026/06/08 17:15:55 [debug] 3521#0: run cleanup: 0000FFFFA8013EC0
+2026/06/08 17:15:55 [debug] 3521#0: run cleanup: 0000FFFFA80123E0
+2026/06/08 17:15:55 [debug] 3521#0: run cleanup: 0000FFFFA8010380
+2026/06/08 17:15:55 [debug] 3521#0: run cleanup: 0000FFFFA8009A20
+2026/06/08 17:15:55 [debug] 3521#0: run cleanup: 0000FFFFA80099D0
+2026/06/08 17:15:55 [debug] 3521#0: run cleanup: 0000FFFFA8003060
+2026/06/08 17:15:55 [debug] 3521#0: run cleanup: 0000FFFFA8002130
+2026/06/08 17:15:55 [debug] 3521#0: free: 0000FFFFA6A01800
+2026/06/08 17:15:55 [debug] 3521#0: free: 0000FFFFA700A000
+2026/06/08 17:15:55 [debug] 3521#0: free: 0000FFFFA8E02000
+2026/06/08 17:15:55 [debug] 3521#0: free: 0000FFFFA7003C00
+2026/06/08 17:15:55 [debug] 3521#0: free: 0000FFFFA7005000
+2026/06/08 17:15:55 [debug] 3521#0: free: 0000FFFFA7006400
+2026/06/08 17:15:55 [debug] 3521#0: free: 0000FFFFA6E01C00
+2026/06/08 17:15:55 [debug] 3521#0: free: 0000FFFFA8000000, unused: 0
+2026/06/08 17:15:55 [debug] 3521#0: free: 0000FFFFA8008000, unused: 0
+2026/06/08 17:15:55 [debug] 3521#0: free: 0000FFFFA800C000, unused: 1
+2026/06/08 17:15:55 [debug] 3521#0: free: 0000FFFFA8010000, unused: 1
+2026/06/08 17:15:55 [debug] 3521#0: free: 0000FFFFA8014000, unused: 1
+2026/06/08 17:15:55 [debug] 3521#0: free: 0000FFFFA8018000, unused: 0
+2026/06/08 17:15:55 [debug] 3521#0: free: 0000FFFFA801C000, unused: 7817
+[1;33m[INFO][0m Tearing down /tmp/ngx-otel-access-log.3nAGsv
+
+[tsan-run] === Running run_error_log.sh under TSAN (Phase 2.3 §6.6.2 error-log path) ===
+[1;33m[INFO][0m Pre-flight checks...
+[harness] collector reachable at http://127.0.0.1:4318
+[1;33m[INFO][0m Building release module...
+    Finished `release` profile [optimized] target(s) in 0.05s
+[1;33m[INFO][0m Module built: /work/ngx-otel-rust/target/aarch64-unknown-linux-gnu/release/libngx_http_otel_module.so
+[1;33m[INFO][0m === Stage A: port=9104 level=debug otel_error_log='warn' coalesce=on flood=100 ===
+[1;33m[INFO][0m   Starting nginx...
+[1;33m[INFO][0m   nginx running (PID 3667)
+[1;33m[INFO][0m   Sending 100 requests to /flood (broken upstream)...
+[1;33m[INFO][0m   Traffic sent.
+[1;33m[INFO][0m   Waiting 5s for export flush...
+[1;33m[INFO][0m   Sending nginx -s quit...
+[1;33m[INFO][0m   Stage A: 2844 bytes new logs.json, 37263 bytes new metrics.json
+
+=== Stage A error.log (last 20 lines) ===
+2026/06/08 17:16:03 [debug] 3667#0: cleanup resolver
+2026/06/08 17:16:03 [debug] 3667#0: run cleanup: 0000FFFF8BA134E0
+2026/06/08 17:16:03 [debug] 3667#0: run cleanup: 0000FFFF8BA11960
+2026/06/08 17:16:03 [debug] 3667#0: run cleanup: 0000FFFF8BA0FEB0
+2026/06/08 17:16:03 [debug] 3667#0: run cleanup: 0000FFFF8BA09540
+2026/06/08 17:16:03 [debug] 3667#0: run cleanup: 0000FFFF8BA094F0
+2026/06/08 17:16:03 [debug] 3667#0: run cleanup: 0000FFFF8BA02B80
+2026/06/08 17:16:03 [debug] 3667#0: run cleanup: 0000FFFF8BA02130
+2026/06/08 17:16:03 [debug] 3667#0: free: 0000FFFF8A401800
+2026/06/08 17:16:03 [debug] 3667#0: free: 0000FFFF8C802000
+2026/06/08 17:16:03 [debug] 3667#0: free: 0000FFFF8AA03C00
+2026/06/08 17:16:03 [debug] 3667#0: free: 0000FFFF8AA05000
+2026/06/08 17:16:03 [debug] 3667#0: free: 0000FFFF8AA06400
+2026/06/08 17:16:03 [debug] 3667#0: free: 0000FFFF8A801C00
+2026/06/08 17:16:03 [debug] 3667#0: free: 0000FFFF8BA00000, unused: 0
+2026/06/08 17:16:03 [debug] 3667#0: free: 0000FFFF8BA08000, unused: 0
+2026/06/08 17:16:03 [debug] 3667#0: free: 0000FFFF8BA0C000, unused: 1
+2026/06/08 17:16:03 [debug] 3667#0: free: 0000FFFF8BA10000, unused: 4
+2026/06/08 17:16:03 [debug] 3667#0: free: 0000FFFF8BA14000, unused: 1534
+2026/06/08 17:16:03 [debug] 3667#0: free: 0000FFFF8BA18000, unused: 13688
+[1;33m[INFO][0m Tearing down /tmp/ngx-otel-error-log.vXbUgH
+[1;33m[INFO][0m === Stage A assertions ===
+[0;32m[PASS][0m Stage A: new logs.json content arrived
+[0;32m[PASS][0m Stage A: event_name=nginx.error present
+[0;32m[PASS][0m Stage A: body contains 'connect() failed'
+[0;32m[PASS][0m Stage A: body contains 'upstream:' context (nginx appended it)
+[1;33m[INFO][0m Stage A: nginx.error record count = 4
+[0;32m[PASS][0m Stage A: flood coalesced — 4 nginx.error records for 100 events (< 50)
+[0;32m[PASS][0m Stage A: nginx.error.coalesced_count attribute present (coalescing in effect)
+[0;32m[PASS][0m Stage A: no non-zero traceId on error records (decision #6 OK)
+[0;32m[PASS][0m Stage A: no http.route attribute on error records (decision #6 OK)
+[0;32m[PASS][0m Stage A: no nginx.upstream.zone attribute on error records (decision #6 OK)
+[0;32m[PASS][0m Stage A: ngx_otel.error_log.events metric present
+[0;32m[PASS][0m Stage A: severity_class attribute present on error_log.events metric
+[0;32m[PASS][0m Stage A: no DEBUG-severity nginx.error records (floor=warn in effect)
+[0;32m[PASS][0m Stage A: service.name=ngx-otel-error-log-test present (no metrics regression)
+[1;33m[INFO][0m === Stage B: port=9105 level=debug otel_error_log='warn' coalesce=off flood=20 ===
+[1;33m[INFO][0m   Starting nginx...
+[1;33m[INFO][0m   nginx running (PID 3824)
+[1;33m[INFO][0m   Sending 20 requests to /flood (broken upstream)...
+[1;33m[INFO][0m   Traffic sent.
+[1;33m[INFO][0m   Waiting 5s for export flush...
+[1;33m[INFO][0m   Sending nginx -s quit...
+[1;33m[INFO][0m   Stage B: 8945 bytes new logs.json, 37177 bytes new metrics.json
+
+=== Stage B error.log (last 20 lines) ===
+2026/06/08 17:16:11 [debug] 3824#0: cleanup resolver
+2026/06/08 17:16:11 [debug] 3824#0: run cleanup: 0000FFFFB9E134E0
+2026/06/08 17:16:11 [debug] 3824#0: run cleanup: 0000FFFFB9E11960
+2026/06/08 17:16:11 [debug] 3824#0: run cleanup: 0000FFFFB9E0FEB0
+2026/06/08 17:16:11 [debug] 3824#0: run cleanup: 0000FFFFB9E09540
+2026/06/08 17:16:11 [debug] 3824#0: run cleanup: 0000FFFFB9E094F0
+2026/06/08 17:16:11 [debug] 3824#0: run cleanup: 0000FFFFB9E02B80
+2026/06/08 17:16:11 [debug] 3824#0: run cleanup: 0000FFFFB9E02130
+2026/06/08 17:16:11 [debug] 3824#0: free: 0000FFFFB8801800
+2026/06/08 17:16:11 [debug] 3824#0: free: 0000FFFFBAC02000
+2026/06/08 17:16:11 [debug] 3824#0: free: 0000FFFFB8E03C00
+2026/06/08 17:16:11 [debug] 3824#0: free: 0000FFFFB8E05000
+2026/06/08 17:16:11 [debug] 3824#0: free: 0000FFFFB8E06400
+2026/06/08 17:16:11 [debug] 3824#0: free: 0000FFFFB8C01C00
+2026/06/08 17:16:11 [debug] 3824#0: free: 0000FFFFB9E00000, unused: 0
+2026/06/08 17:16:11 [debug] 3824#0: free: 0000FFFFB9E08000, unused: 0
+2026/06/08 17:16:11 [debug] 3824#0: free: 0000FFFFB9E0C000, unused: 1
+2026/06/08 17:16:11 [debug] 3824#0: free: 0000FFFFB9E10000, unused: 4
+2026/06/08 17:16:11 [debug] 3824#0: free: 0000FFFFB9E14000, unused: 1534
+2026/06/08 17:16:11 [debug] 3824#0: free: 0000FFFFB9E18000, unused: 13688
+[1;33m[INFO][0m Tearing down /tmp/ngx-otel-error-log.JP2wrP
+[1;33m[INFO][0m === Stage B assertions ===
+[0;32m[PASS][0m Stage B: new logs.json content arrived (coalesce-off)
+[1;33m[INFO][0m Stage B: nginx.error record count = 20 for 20 events
+[0;32m[PASS][0m Stage B: coalesce-off produced 20 records (> 1, not collapsed)
+[0;32m[PASS][0m Stage B: no coalesced_count in coalesce-off mode (expected)
+[0;32m[PASS][0m Stage B: ngx_otel.error_log.events metric present (coalesce-off)
+[0;32m[PASS][0m Stage B: body contains 'connect() failed' (coalesce-off verbatim)
+[1;33m[INFO][0m === Stage C: port=9106 level=debug otel_error_log='crit' coalesce=on flood=10 ===
+[1;33m[INFO][0m   Starting nginx...
+[1;33m[INFO][0m   nginx running (PID 3885)
+[1;33m[INFO][0m   Sending 10 requests to /flood (broken upstream)...
+[1;33m[INFO][0m   Traffic sent.
+[1;33m[INFO][0m   Waiting 5s for export flush...
+[1;33m[INFO][0m   Sending nginx -s quit...
+[1;33m[INFO][0m   Stage C: 0 bytes new logs.json, 36977 bytes new metrics.json
+
+=== Stage C error.log (last 20 lines) ===
+2026/06/08 17:16:19 [debug] 3885#0: cleanup resolver
+2026/06/08 17:16:19 [debug] 3885#0: run cleanup: 0000FFFF81E134E0
+2026/06/08 17:16:19 [debug] 3885#0: run cleanup: 0000FFFF81E11960
+2026/06/08 17:16:19 [debug] 3885#0: run cleanup: 0000FFFF81E0FEB0
+2026/06/08 17:16:19 [debug] 3885#0: run cleanup: 0000FFFF81E09540
+2026/06/08 17:16:19 [debug] 3885#0: run cleanup: 0000FFFF81E094F0
+2026/06/08 17:16:19 [debug] 3885#0: run cleanup: 0000FFFF81E02B80
+2026/06/08 17:16:19 [debug] 3885#0: run cleanup: 0000FFFF81E02130
+2026/06/08 17:16:19 [debug] 3885#0: free: 0000FFFF80801800
+2026/06/08 17:16:19 [debug] 3885#0: free: 0000FFFF82C02000
+2026/06/08 17:16:19 [debug] 3885#0: free: 0000FFFF80E03C00
+2026/06/08 17:16:19 [debug] 3885#0: free: 0000FFFF80E05000
+2026/06/08 17:16:19 [debug] 3885#0: free: 0000FFFF80E06400
+2026/06/08 17:16:19 [debug] 3885#0: free: 0000FFFF80C01C00
+2026/06/08 17:16:19 [debug] 3885#0: free: 0000FFFF81E00000, unused: 0
+2026/06/08 17:16:19 [debug] 3885#0: free: 0000FFFF81E08000, unused: 0
+2026/06/08 17:16:19 [debug] 3885#0: free: 0000FFFF81E0C000, unused: 1
+2026/06/08 17:16:19 [debug] 3885#0: free: 0000FFFF81E10000, unused: 4
+2026/06/08 17:16:19 [debug] 3885#0: free: 0000FFFF81E14000, unused: 1534
+2026/06/08 17:16:19 [debug] 3885#0: free: 0000FFFF81E18000, unused: 13688
+[1;33m[INFO][0m Tearing down /tmp/ngx-otel-error-log.EP16fo
+[1;33m[INFO][0m === Stage C assertions (floor=crit) ===
+[1;33m[INFO][0m Stage C: nginx.error record count = 0
+0 (floor=crit, should block error-level connect failures)
+[0;32m[PASS][0m Stage C: 'connect() failed' blocked by crit floor (floor filtering OK)
+[1;33m[INFO][0m === Stage D: DP-C — config-load error goes to core log, not LOGS_LOG ===
+[0;32m[PASS][0m Stage D: config-load error present in core error.log
+[0;32m[PASS][0m Stage D: no new LOGS_LOG content during config-load test (DP-C guard working)
+[1;33m[INFO][0m === Stage E: fixed-default floor proof — bare otel_error_log; with core=notice ===
+[1;33m[INFO][0m   Starting nc fake upstream on port 9591 (triggers WARN on single request)...
+[1;33m[INFO][0m   Starting nginx (core=notice, otel floor=NGX_LOG_ERR fixed)...
+[1;33m[INFO][0m   Sending 1 /warn request (Content-Length mismatch → 'upstream sent more data' WARN)...
+GET /warn HTTP/1.1
+Host: 127.0.0.1:9591
+User-Agent: curl/8.14.1
+Accept: */*
+
+[1;33m[INFO][0m   Sending 10 /flood requests (expect 'connect() failed' ERR)...
+[1;33m[INFO][0m   Waiting 5s for export flush...
+[1;33m[INFO][0m   Sending nginx -s quit...
+[1;33m[INFO][0m Stage E: 1355 bytes new logs.json, 41975 bytes new metrics.json
+[1;33m[INFO][0m === Stage E assertions (fixed-default floor) ===
+[0;32m[PASS][0m Stage E: 'upstream sent more data' WARN present in core error.log (WARN was generated)
+[0;32m[PASS][0m Stage E: 'upstream sent more data' (WARN) NOT in LOGS_LOG — fixed ERR floor blocks WARN
+[0;32m[PASS][0m Stage E: 'connect() failed' (ERR) present in LOGS_LOG — ERR passes fixed floor
+
+=== Stage E error.log (last 20 lines) ===
+2026/06/08 17:16:30 [notice] 3968#0: signal process started
+2026/06/08 17:16:30 [notice] 3946#0: signal 3 (SIGQUIT) received from 3968, shutting down
+2026/06/08 17:16:30 [notice] 3951#0: gracefully shutting down
+2026/06/08 17:16:30 [notice] 3949#0: gracefully shutting down
+2026/06/08 17:16:30 [notice] 3951#0: exiting
+2026/06/08 17:16:30 [notice] 3949#0: exiting
+2026/06/08 17:16:30 [notice] 3949#0: exit
+2026/06/08 17:16:30 [notice] 3951#0: exit
+2026/06/08 17:16:30 [notice] 3946#0: signal 17 (SIGCHLD) received from 3951
+2026/06/08 17:16:30 [notice] 3946#0: worker process 3949 exited with code 0
+2026/06/08 17:16:30 [notice] 3946#0: worker process 3951 exited with code 0
+2026/06/08 17:16:30 [notice] 3946#0: signal 29 (SIGIO) received
+2026/06/08 17:16:30 [notice] 3948#0: *26 otel export: ngx_quit set during sleep, starting graceful drain
+2026/06/08 17:16:30 [notice] 3948#0: *26 otel export: graceful drain starting (0 queued batch(es))
+2026/06/08 17:16:30 [notice] 3948#0: *27 otel export: drain: final batch sent (30 data points)
+2026/06/08 17:16:30 [notice] 3948#0: *27 otel export: graceful drain complete
+2026/06/08 17:16:30 [notice] 3948#0: *27 otel exporter: ngx_quit, drain_done=true, exit
+2026/06/08 17:16:30 [notice] 3946#0: signal 17 (SIGCHLD) received from 3948
+2026/06/08 17:16:30 [notice] 3946#0: otel exporter 3948 exited with code 0
+2026/06/08 17:16:30 [notice] 3946#0: exit
+[1;33m[INFO][0m Tearing down /tmp/ngx-otel-error-log-stage-e.FOdZSf
+
+[0;32m[PASS][0m All Phase 2.3 + FU2 error-log assertions passed.
+
+[tsan-run] === Running run_signal_storm.sh under TSAN (Phase 2.3 re-entrancy gate) ===
+[1;33m[INFO][0m Pre-flight checks...
+[1;33m[INFO][0m Building release module...
+[harness] collector reachable at http://127.0.0.1:4318
+    Finished `release` profile [optimized] target(s) in 0.06s
+[1;33m[INFO][0m Module built: /work/ngx-otel-rust/target/aarch64-unknown-linux-gnu/release/libngx_http_otel_module.so
+[1;33m[INFO][0m Starting nginx...
+[1;33m[INFO][0m nginx master running (PID 4016)
+[1;33m[INFO][0m Storm running (30s flood + SIGUSR1 storm)...
+nginx: [emerg] open() "/tmp/ngx-otel-signal-storm.1xSPNC/logs/error.log" failed (13: Permission denied)
+nginx: [emerg] open() "/tmp/ngx-otel-signal-storm.1xSPNC/logs/access.log" failed (13: Permission denied)
+[1;33m[INFO][0m Flood loop finished.
+[1;33m[INFO][0m Signal storm finished.
+[1;33m[INFO][0m Storm complete.
+[1;33m[INFO][0m Waiting 5s for final export flush...
+[1;33m[INFO][0m Sending nginx -s quit...
+[0;32m[PASS][0m nginx exited gracefully after signal storm
+[1;33m[INFO][0m Running assertions...
+[0;32m[PASS][0m No Rust panics in error.log
+[0;32m[PASS][0m No SIGABRT (signal 6) in error.log
+[0;32m[PASS][0m No SIGSEGV (signal 11) in error.log
+[0;32m[PASS][0m No ThreadSanitizer warnings in error.log
+[0;32m[PASS][0m Drain progressed — LOGS_LOG grew by 205385 bytes during storm
+[0;32m[PASS][0m All LOGS_LOG records are valid JSON (no torn records)
+[1;33m[INFO][0m nginx.error records in LOGS_LOG during storm: 358
+[0;32m[PASS][0m nginx.error records arrived during storm (coalescer active under signals)
+
+[0;32m[PASS][0m All signal-storm re-entrancy assertions passed.
+
+=== error.log (last 30 lines) ===
+2026/06/08 17:17:08 [debug] 4016#0: shmtx forced unlock
+2026/06/08 17:17:08 [debug] 4016#0: shmtx forced unlock
+2026/06/08 17:17:08 [debug] 4016#0: shmtx forced unlock
+2026/06/08 17:17:08 [debug] 4016#0: shmtx forced unlock
+2026/06/08 17:17:08 [debug] 4016#0: wake up, sigio 0
+2026/06/08 17:17:08 [debug] 4016#0: reap children
+2026/06/08 17:17:08 [debug] 4016#0: child: 0 4018 e:1 t:1 d:0 r:1 j:0
+2026/06/08 17:17:08 [debug] 4016#0: child: 1 -1 e:1 t:1 d:0 r:1 j:0
+2026/06/08 17:17:08 [notice] 4016#0: exit
+2026/06/08 17:17:08 [debug] 4016#0: run cleanup: 0000FFFFB8613A90
+2026/06/08 17:17:08 [debug] 4016#0: cleanup resolver
+2026/06/08 17:17:08 [debug] 4016#0: run cleanup: 0000FFFFB86134F0
+2026/06/08 17:17:08 [debug] 4016#0: run cleanup: 0000FFFFB8611970
+2026/06/08 17:17:08 [debug] 4016#0: run cleanup: 0000FFFFB860FEC0
+2026/06/08 17:17:08 [debug] 4016#0: run cleanup: 0000FFFFB8609550
+2026/06/08 17:17:08 [debug] 4016#0: run cleanup: 0000FFFFB8609500
+2026/06/08 17:17:08 [debug] 4016#0: run cleanup: 0000FFFFB8602B90
+2026/06/08 17:17:08 [debug] 4016#0: run cleanup: 0000FFFFB8602130
+2026/06/08 17:17:08 [debug] 4016#0: free: 0000FFFFB7001800
+2026/06/08 17:17:08 [debug] 4016#0: free: 0000FFFFB9602000
+2026/06/08 17:17:08 [debug] 4016#0: free: 0000FFFFB7603C00
+2026/06/08 17:17:08 [debug] 4016#0: free: 0000FFFFB7605000
+2026/06/08 17:17:08 [debug] 4016#0: free: 0000FFFFB7606400
+2026/06/08 17:17:08 [debug] 4016#0: free: 0000FFFFB7401C00
+2026/06/08 17:17:08 [debug] 4016#0: free: 0000FFFFB8600000, unused: 0
+2026/06/08 17:17:08 [debug] 4016#0: free: 0000FFFFB8608000, unused: 0
+2026/06/08 17:17:08 [debug] 4016#0: free: 0000FFFFB860C000, unused: 0
+2026/06/08 17:17:08 [debug] 4016#0: free: 0000FFFFB8610000, unused: 4
+2026/06/08 17:17:08 [debug] 4016#0: free: 0000FFFFB8614000, unused: 1471
+2026/06/08 17:17:08 [debug] 4016#0: free: 0000FFFFB8618000, unused: 13688
+[1;33m[INFO][0m Tearing down /tmp/ngx-otel-signal-storm.1xSPNC
+
+[tsan-run] === Running run_traces.sh under TSAN (Phase 3 span emit→ring→drain→encode→collector) ===
+[1;33m[INFO][0m Pre-flight checks...
+[1;33m[INFO][0m Building release module...
+[harness] collector reachable at http://127.0.0.1:4318
+    Finished `release` profile [optimized] target(s) in 0.05s
+[1;33m[INFO][0m Module built: /work/ngx-otel-rust/target/aarch64-unknown-linux-gnu/release/libngx_http_otel_module.so
+[1;33m[INFO][0m Sandbox: /tmp/ngx-otel-traces.ApQUD9
+[1;33m[INFO][0m traces.json pre-size: 19456 bytes
+[1;33m[INFO][0m logs.json pre-size: 9265902 bytes
+[1;33m[INFO][0m metrics.json pre-size: 7347469 bytes
+[1;33m[INFO][0m Starting nginx...
+[1;33m[INFO][0m nginx running (PID 23578)
+[1;33m[INFO][0m Sending 10 GET / requests (200) to build histogram...
+[1;33m[INFO][0m Sending 1 GET /error with traceparent (known trace_id=a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6)...
+[1;33m[INFO][0m Waiting 6s for the exporter to flush...
+[1;33m[INFO][0m Stopping nginx (SIGQUIT → graceful drain)...
+[1;33m[INFO][0m New traces.json bytes: 5337 chars
+[1;33m[INFO][0m New logs.json bytes: 1038 chars
+[1;33m[INFO][0m New metrics.json bytes: 38107 chars
+
+=== Assertions ===
+[0;32m[PASS][0m traces.json: ResourceSpans payload received — span reached the collector
+[0;32m[PASS][0m traces.json: span traceId=a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6 matches inbound traceparent
+[0;32m[PASS][0m traces.json: parentSpanId=f1e2d3c4b5a69788 matches inbound traceparent span_id
+[0;32m[PASS][0m traces.json: http.request.method attribute present
+[0;32m[PASS][0m traces.json: http.response.status_code attribute present
+[0;32m[PASS][0m traces.json: url.path attribute present
+[0;32m[PASS][0m logs.json: trace_id a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6 carried on tail LogRecord (cross-signal logs→trace)
+[0;32m[PASS][0m metrics.json: trace_id a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6 in metric exemplar (cross-signal metrics→trace)
+[0;32m[PASS][0m metrics.json: no resourceSpans in new data (FU1 split holds)
+
+[0;32m[PASS][0m All assertions passed.
+
+=== error.log (last 30 lines) ===
+2026/06/08 17:17:17 [debug] 23578#0: shmtx forced unlock
+2026/06/08 17:17:17 [debug] 23578#0: shmtx forced unlock
+2026/06/08 17:17:17 [debug] 23578#0: shmtx forced unlock
+2026/06/08 17:17:17 [debug] 23578#0: shmtx forced unlock
+2026/06/08 17:17:17 [debug] 23578#0: wake up, sigio 0
+2026/06/08 17:17:17 [debug] 23578#0: reap children
+2026/06/08 17:17:17 [debug] 23578#0: child: 0 23580 e:1 t:1 d:0 r:1 j:0
+2026/06/08 17:17:17 [debug] 23578#0: child: 1 -1 e:1 t:1 d:0 r:1 j:0
+2026/06/08 17:17:17 [notice] 23578#0: exit
+2026/06/08 17:17:17 [debug] 23578#0: run cleanup: 0000FFFFA1413CA0
+2026/06/08 17:17:17 [debug] 23578#0: cleanup resolver
+2026/06/08 17:17:17 [debug] 23578#0: run cleanup: 0000FFFFA1413780
+2026/06/08 17:17:17 [debug] 23578#0: run cleanup: 0000FFFFA1411C00
+2026/06/08 17:17:17 [debug] 23578#0: run cleanup: 0000FFFFA1410130
+2026/06/08 17:17:17 [debug] 23578#0: run cleanup: 0000FFFFA1409870
+2026/06/08 17:17:17 [debug] 23578#0: run cleanup: 0000FFFFA1409820
+2026/06/08 17:17:17 [debug] 23578#0: run cleanup: 0000FFFFA1402EB0
+2026/06/08 17:17:17 [debug] 23578#0: run cleanup: 0000FFFFA1402120
+2026/06/08 17:17:17 [debug] 23578#0: free: 0000FFFF9FE01800
+2026/06/08 17:17:17 [debug] 23578#0: free: 0000FFFFA2202000
+2026/06/08 17:17:17 [debug] 23578#0: free: 0000FFFFA0403C00
+2026/06/08 17:17:17 [debug] 23578#0: free: 0000FFFFA0405000
+2026/06/08 17:17:17 [debug] 23578#0: free: 0000FFFFA0406400
+2026/06/08 17:17:17 [debug] 23578#0: free: 0000FFFFA0201C00
+2026/06/08 17:17:17 [debug] 23578#0: free: 0000FFFFA1400000, unused: 0
+2026/06/08 17:17:17 [debug] 23578#0: free: 0000FFFFA1408000, unused: 0
+2026/06/08 17:17:17 [debug] 23578#0: free: 0000FFFFA140C000, unused: 0
+2026/06/08 17:17:17 [debug] 23578#0: free: 0000FFFFA1410000, unused: 4
+2026/06/08 17:17:17 [debug] 23578#0: free: 0000FFFFA1414000, unused: 1629
+2026/06/08 17:17:17 [debug] 23578#0: free: 0000FFFFA1418000, unused: 13688
+[1;33m[INFO][0m Tearing down /tmp/ngx-otel-traces.ApQUD9
+
+[tsan-run] === Running run_dns_dualstack.sh under TSAN (transport_dns async resolver path) ===
+[1;33m[INFO][0m Pre-flight checks...
+[1;33m[INFO][0m nginx binary: /work/ngx-otel-rust/objs-tsan-plain/nginx
+[1;33m[INFO][0m Module:       /work/ngx-otel-rust/objs-release/ngx_http_otel_module.so
+[1;33m[INFO][0m === TEST A: DNS name → v4 connect ===
+[harness] collector reachable at http://127.0.0.1:4318
+[1;33m[INFO][0m DNS stub PID 23638 on 127.0.0.1:15353 → ngx-otel-dns-test→127.0.0.1
+[1;33m[INFO][0m nginx TEST A PID 23646
+[1;33m[INFO][0m Sending 5 requests to nginx (TEST A)...
+[1;33m[INFO][0m Waiting 5s for metric flush (TEST A)...
+[0;32m[PASS][0m TEST A: error.log contains 'export loop started'
+[0;32m[PASS][0m TEST A: no resolver-missing error in error.log
+[0;32m[PASS][0m TEST A: no connection / DNS errors in error.log
+[0;32m[PASS][0m TEST A: collector received +3 new metric record(s) (DNS → v4 path confirmed)
+[1;33m[INFO][0m === TEST B: IPv6 literal endpoint ===
+[1;33m[INFO][0m IPv6 HTTP stub PID 23667 on [::1]:14318
+[1;33m[INFO][0m nginx TEST B PID 23672
+[1;33m[INFO][0m Sending 5 requests to nginx (TEST B)...
+[1;33m[INFO][0m Waiting 5s for metric flush (TEST B)...
+[0;32m[PASS][0m TEST B: error.log contains 'export loop started'
+[0;32m[PASS][0m TEST B: no IPv6 connection errors in error.log
+[0;32m[PASS][0m TEST B: v6 stub received 13347 bytes — IPv6 literal connect confirmed
+[1;33m[INFO][0m === TEST C: DNS name → v6 via AAAA (FU2 — headline dual-stack proof) ===
+[1;33m[INFO][0m v6 AAAA HTTP stub PID 23693 on [::1]:14319
+[1;33m[INFO][0m DNS AAAA stub PID 23695 on 127.0.0.1:15354 → ngx-otel-dns-aaaa→::1
+[1;33m[INFO][0m nginx TEST C PID 23700
+[1;33m[INFO][0m Sending 5 requests to nginx (TEST C)...
+[1;33m[INFO][0m Waiting 5s for metric flush (TEST C)...
+[0;32m[PASS][0m TEST C: error.log contains 'export loop started'
+[0;32m[PASS][0m TEST C: no resolver-missing error in error.log
+[0;32m[PASS][0m TEST C: no connection / DNS errors in error.log
+[0;32m[PASS][0m TEST C: v6 AAAA stub received 13347 bytes — DNS→v6 AAAA path confirmed (FU2)
+[1;33m[INFO][0m === TEST D: Unresolvable name — clean error, no panic, no hang (FU2) ===
+[1;33m[INFO][0m DNS NXDOMAIN stub PID 23720 on 127.0.0.1:15355
+[1;33m[INFO][0m nginx TEST D PID 23728
+[1;33m[INFO][0m Sending 5 requests to nginx (TEST D)...
+[1;33m[INFO][0m Waiting 5s (TEST D)...
+nginx: [error] otel export: send failed (connection failed: DNS resolve 'ngx-otel-nxdomain-test': Host not found: resolving `ngx-otel-nxdomain-test`); queuing for retry
+nginx: [error] otel export: retry send failed (connection failed: DNS resolve 'ngx-otel-nxdomain-test': Host not found: resolving `ngx-otel-nxdomain-test`); re-queuing
+nginx: [error] otel export: send failed (connection failed: DNS resolve 'ngx-otel-nxdomain-test': Host not found: resolving `ngx-otel-nxdomain-test`); queuing for retry
+nginx: [error] otel export: drain: queued batch (23 pts) send failed: connection failed: DNS resolve 'ngx-otel-nxdomain-test': Host not found: resolving `ngx-otel-nxdomain-test`
+nginx: [error] otel export: drain: final batch failed: connection failed: DNS resolve 'ngx-otel-nxdomain-test': Host not found: resolving `ngx-otel-nxdomain-test`
+[0;32m[PASS][0m TEST D: nginx exited cleanly within 0s of -QUIT (no hang)
+[0;32m[PASS][0m TEST D: no panic or fatal signal in error.log
+[0;32m[PASS][0m TEST D: error.log contains expected connection-failure entry (NXDOMAIN error path)
+[0;32m[PASS][0m TEST D: collector metric count unchanged (731) — no records exported on NXDOMAIN (correct)
+
+[0;32m[PASS][0m All DNS + dual-stack integration assertions passed.
+
+[tsan-run] Checking for ThreadSanitizer warnings in error logs...
+[tsan-run] Zero ThreadSanitizer warnings.  TSAN gate: PASS.
