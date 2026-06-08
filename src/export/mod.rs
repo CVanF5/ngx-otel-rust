@@ -50,7 +50,7 @@ use crate::data_model::{
     MetricData, NumberDataPoint, NumberValue, SumData,
 };
 use crate::data_model::{Pdata, Resource, Scope, Span, SpansBatch};
-use crate::encoder::{Encoder, OtlpHttpEncoder, OtlpLogsEncoder, OtlpTracesEncoder};
+use crate::encoder::{OtlpHttpEncoder, OtlpLogsEncoder, OtlpTracesEncoder};
 use crate::logs::coalesce;
 use crate::logs::severity::nginx_to_otel;
 use crate::metric_source::instrumented::InstrumentedSource;
@@ -202,6 +202,23 @@ impl ExportTransport {
         match self {
             Self::Http(t) => t.send_to_path("/v1/traces", bytes).await,
             Self::Grpc(t) => t.send_traces(bytes).await,
+        }
+    }
+
+    /// Unified send dispatch for the `Pdata` pipeline (Step U2).
+    ///
+    /// Routes `bytes` to the per-signal endpoint derived from the `Pdata` variant.
+    /// The bytes must already be encoded (via [`encode_pdata`]) for the matching
+    /// signal — the variant is used only for routing, not for re-encoding.
+    async fn send_pdata(
+        &mut self,
+        signal: &Pdata,
+        bytes: std::vec::Vec<u8>,
+    ) -> Result<(), crate::transport::TransportError> {
+        match signal {
+            Pdata::Metrics(_) => self.send(bytes).await,
+            Pdata::Logs(_) => self.send_logs(bytes).await,
+            Pdata::Spans(_) => self.send_traces(bytes).await,
         }
     }
 }
@@ -386,8 +403,6 @@ pub async fn export_loop(amcf: &'static MainConfig) {
         }
     };
 
-    let encoder = OtlpHttpEncoder;
-
     // Capture worker start time once — used as the start_time_unix_nano
     // for cumulative monotonic Sum self-metrics so that downstream rate
     // panels and delta-conversion processors can anchor windows correctly.
@@ -416,8 +431,6 @@ pub async fn export_loop(amcf: &'static MainConfig) {
     // Separate retry queue for span batches (Phase 3.2).
     let mut spans_retry_queue: VecDeque<(std::vec::Vec<u8>, u64)> = VecDeque::new();
 
-    let logs_encoder = OtlpLogsEncoder;
-    let traces_encoder = OtlpTracesEncoder;
     // Processor stage: drain → [process] → encode → send.  Constructed once at
     // exporter startup from a JSON config blob.  Currently always empty (→ Noop
     // passthrough); wired to operator directives in a follow-on phase.
@@ -474,7 +487,6 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                     logs: &mut logs_retry_queue,
                     spans: &mut spans_retry_queue,
                 },
-                &encoder,
                 amcf,
                 worker_start_ns,
                 &span_processor,
@@ -578,12 +590,18 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                         let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
                         logs_n_workers_from_zone(avail, amcf.log_ring_cap())
                     };
-                    let logs_batch =
-                        collect_log_records(amcf, logs_base, n_workers, worker_start_ns);
-                    if !logs_batch.logs.is_empty() {
-                        let n_logs = logs_batch.logs.len() as u64;
-                        let logs_bytes = logs_encoder.encode(&logs_batch);
-                        match transport.send_logs(logs_bytes.clone()).await {
+                    // Pdata pipeline: wrap → process → encode → send (Step U2).
+                    let mut logs_pd = Pdata::Logs(collect_log_records(
+                        amcf,
+                        logs_base,
+                        n_workers,
+                        worker_start_ns,
+                    ));
+                    span_processor.process(&mut logs_pd);
+                    let n_logs = count_pdata_records(&logs_pd);
+                    if n_logs > 0 {
+                        let logs_bytes = encode_pdata(&logs_pd);
+                        match transport.send_pdata(&logs_pd, logs_bytes.clone()).await {
                             Ok(()) => {
                                 ngx::ngx_log_error!(
                                     NGX_LOG_INFO,
@@ -664,16 +682,13 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                     let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
                     spans_n_workers_from_zone(avail, DEFAULT_SPAN_RING_CAP)
                 };
+                // Pdata pipeline: wrap → process → encode → send (Step U2).
                 let mut spans_pd = Pdata::Spans(collect_span_records(amcf, spans_base, n_workers));
                 span_processor.process(&mut spans_pd);
-                let spans_batch = match spans_pd {
-                    Pdata::Spans(b) => b,
-                    _ => unreachable!("span drain always produces Pdata::Spans"),
-                };
-                if !spans_batch.spans.is_empty() {
-                    let n_spans = spans_batch.spans.len() as u64;
-                    let spans_bytes = traces_encoder.encode(&spans_batch);
-                    match transport.send_traces(spans_bytes.clone()).await {
+                let n_spans = count_pdata_records(&spans_pd);
+                if n_spans > 0 {
+                    let spans_bytes = encode_pdata(&spans_pd);
+                    match transport.send_pdata(&spans_pd, spans_bytes.clone()).await {
                         Ok(()) => {
                             ngx::ngx_log_error!(
                                 NGX_LOG_INFO,
@@ -728,7 +743,6 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                     logs: &mut logs_retry_queue,
                     spans: &mut spans_retry_queue,
                 },
-                &encoder,
                 amcf,
                 worker_start_ns,
                 &span_processor,
@@ -798,13 +812,15 @@ pub async fn export_loop(amcf: &'static MainConfig) {
         }
 
         // ── Collect fresh metrics from all sources ────────────────────────
-        let batch = collect_all_sources(amcf, worker_start_ns);
-        let n_pts = count_data_points(&batch);
+        // Pdata pipeline: wrap → process → encode → send (Step U2).
+        let mut metrics_pd = Pdata::Metrics(collect_all_sources(amcf, worker_start_ns));
+        span_processor.process(&mut metrics_pd);
+        let n_pts = count_pdata_records(&metrics_pd);
         if n_pts > 0 {
-            let bytes = encoder.encode(&batch);
+            let bytes = encode_pdata(&metrics_pd);
 
             // ── Send the fresh batch ──────────────────────────────────────
-            match transport.send(bytes.clone()).await {
+            match transport.send_pdata(&metrics_pd, bytes.clone()).await {
                 Ok(()) => {
                     ngx::ngx_log_error!(
                         NGX_LOG_INFO,
@@ -901,7 +917,6 @@ struct DrainQueues<'a> {
 async fn graceful_drain(
     transport: &mut ExportTransport,
     queues: &mut DrainQueues<'_>,
-    encoder: &OtlpHttpEncoder,
     amcf: &'static MainConfig,
     worker_start_ns: u64,
     span_processor: &SpanProcessor,
@@ -954,12 +969,18 @@ async fn graceful_drain(
         }
     }
 
-    // Final freshly-collected metrics batch.
-    let final_batch = collect_all_sources(amcf, worker_start_ns);
-    let n_pts = count_data_points(&final_batch);
+    // Final freshly-collected metrics batch (Pdata pipeline, Step U2).
+    let mut final_pd = Pdata::Metrics(collect_all_sources(amcf, worker_start_ns));
+    span_processor.process(&mut final_pd);
+    let n_pts = count_pdata_records(&final_pd);
     if n_pts > 0 {
-        let bytes = encoder.encode(&final_batch);
-        match with_deadline(transport.send(bytes), GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET).await {
+        let bytes = encode_pdata(&final_pd);
+        match with_deadline(
+            transport.send_pdata(&final_pd, bytes),
+            GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET,
+        )
+        .await
+        {
             Ok(Ok(())) => {
                 ngx::ngx_log_error!(
                     NGX_LOG_NOTICE,
@@ -1027,12 +1048,15 @@ async fn graceful_drain(
                 let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
                 logs_n_workers_from_zone(avail, amcf.log_ring_cap())
             };
-            let logs_batch = collect_log_records(amcf, logs_base, n_workers, worker_start_ns);
-            if !logs_batch.logs.is_empty() {
-                let n_logs = logs_batch.logs.len() as u64;
-                let logs_bytes = OtlpLogsEncoder.encode(&logs_batch);
+            // Pdata pipeline: wrap → process → encode → send (Step U2).
+            let mut logs_pd =
+                Pdata::Logs(collect_log_records(amcf, logs_base, n_workers, worker_start_ns));
+            span_processor.process(&mut logs_pd);
+            let n_logs = count_pdata_records(&logs_pd);
+            if n_logs > 0 {
+                let logs_bytes = encode_pdata(&logs_pd);
                 match with_deadline(
-                    transport.send_logs(logs_bytes),
+                    transport.send_pdata(&logs_pd, logs_bytes),
                     GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET,
                 )
                 .await
@@ -1093,7 +1117,7 @@ async fn graceful_drain(
         }
     }
 
-    // Final freshly-collected spans batch.
+    // Final freshly-collected spans batch (Pdata pipeline, Step U2).
     if let Some(spans_base) = amcf.spans_shm_base() {
         // SAFETY: `spans_shm_base()` returned `Some`, so the spans zone is
         // registered and mapped; `amcf.spans_shm_zone` points to a live
@@ -1106,15 +1130,11 @@ async fn graceful_drain(
         };
         let mut spans_pd = Pdata::Spans(collect_span_records(amcf, spans_base, n_workers));
         span_processor.process(&mut spans_pd);
-        let spans_batch = match spans_pd {
-            Pdata::Spans(b) => b,
-            _ => unreachable!("span drain always produces Pdata::Spans"),
-        };
-        if !spans_batch.spans.is_empty() {
-            let n_spans = spans_batch.spans.len() as u64;
-            let spans_bytes = OtlpTracesEncoder.encode(&spans_batch);
+        let n_spans = count_pdata_records(&spans_pd);
+        if n_spans > 0 {
+            let spans_bytes = encode_pdata(&spans_pd);
             match with_deadline(
-                transport.send_traces(spans_bytes),
+                transport.send_pdata(&spans_pd, spans_bytes),
                 GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET,
             )
             .await
@@ -1236,6 +1256,33 @@ fn count_data_points(batch: &Batch) -> u64 {
             MetricData::Gauge(g) => g.data_points.len() as u64,
         })
         .sum()
+}
+
+/// Unified encode entry point for the `Pdata` pipeline (Step U2).
+///
+/// Dispatches to the per-signal encoder based on the [`Pdata`] variant.
+/// Per-signal encode logic is preserved verbatim — only re-homed here.
+/// Guarantees byte-identical OTLP output vs the per-signal entry points.
+fn encode_pdata(data: &Pdata) -> std::vec::Vec<u8> {
+    use crate::encoder::Encoder as _;
+    match data {
+        Pdata::Metrics(b) => OtlpHttpEncoder.encode(b),
+        Pdata::Logs(b) => OtlpLogsEncoder.encode(b),
+        Pdata::Spans(b) => OtlpTracesEncoder.encode(b),
+    }
+}
+
+/// Count exportable records in a [`Pdata`] payload.
+///
+/// For metrics: total data points across all instruments.
+/// For logs: number of [`LogRecord`]s.
+/// For spans: number of [`Span`]s.
+fn count_pdata_records(data: &Pdata) -> u64 {
+    match data {
+        Pdata::Metrics(b) => count_data_points(b),
+        Pdata::Logs(b) => b.logs.len() as u64,
+        Pdata::Spans(b) => b.spans.len() as u64,
+    }
 }
 
 /// Build the OTLP `Resource` attribute list for this exporter process.
