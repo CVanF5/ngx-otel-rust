@@ -49,30 +49,32 @@ use super::LogProducer;
 
 /// Maximum size of a formatted access record in bytes.
 ///
-/// Breakdown:
+/// Breakdown (all fields at cap, `has_trace = 1`):
 /// - 1  (kind)
 /// - 8  (ts_unix_nano)
 /// - 1  (ngx_level)
-/// - 2  (method_len) + 8 (method, e.g. "OPTIONS")
+/// - 2  (method_len) + `MAX_METHOD` = 16 bytes
 /// - 2  (status_code)
 /// - 8  (request_length)
 /// - 8  (response_bytes)
-/// - 2  (client_addr_len) + 46 (max IPv6 with brackets + port)
-/// - 1  (has_trace)
-/// - 16 (trace_id, only when has_trace = 1)
-/// - 8  (span_id,  only when has_trace = 1)
+/// - 2  (client_addr_len) + `MAX_CLIENT_ADDR` = 46 bytes (max IPv6 with brackets + port)
+/// - 1  (has_trace) + 16 (trace_id) + 8 (span_id) = 25 bytes
 ///
 /// Phase 2.2 Step 2.2.5 — high-cardinality detail:
 ///
-/// - 2  (url_path_len) + 64 (url.path, truncated to 64 bytes)
-/// - 2  (user_agent_len) + 128 (user_agent.original, truncated to 128 bytes)
+/// - 2  (url_path_len) + `MAX_URL_PATH` = 64 bytes
+/// - 2  (user_agent_len) + `MAX_USER_AGENT` = 128 bytes
 ///
 /// Phase 2 S2 — request duration:
 ///
 /// - 8  (duration_us, big-endian u64 — µs precision, same unit as exp-histogram)
 ///
-/// Total worst case: 95 + 2+64 + 2+128 + 8 = 299 bytes → round to 320.
-pub const MAX_ACCESS_RECORD: usize = 320;
+/// Worst case: 1+8+1+(2+16)+2+8+8+(2+46)+(1+16+8)+(2+64)+(2+128)+8 = **323 bytes**
+/// → rounded up to 336 (16-byte aligned, ≥ 323).
+/// The compile-time guard `ACCESS_RECORD_WORST_CASE ≤ MAX_ACCESS_RECORD` makes any
+/// future field or cap increase that would overflow the buffer a **build failure**,
+/// not a latent panic.
+pub const MAX_ACCESS_RECORD: usize = 336;
 
 /// Maximum `url.path` bytes stored in the record.
 /// Single-homed here; `shm.rs` imports this constant for the exemplar reservoir.
@@ -82,6 +84,36 @@ pub const MAX_URL_PATH: usize = 64;
 pub const MAX_USER_AGENT: usize = 128;
 /// Maximum `client.address` bytes stored in the record.
 pub const MAX_CLIENT_ADDR: usize = 46;
+/// Maximum `http.request.method` bytes stored in the record.
+/// Single-homed here; `emit_access_record` references this constant rather than the
+/// literal `16` so that the doc arithmetic and the wire layout stay in sync.
+pub const MAX_METHOD: usize = 16;
+
+/// Worst-case access record length, derived from named caps.
+///
+/// Formula: kind(1) + ts(8) + level(1) + (len+MAX_METHOD)(method) + status(2)
+///   + req_len(8) + resp(8) + (len+MAX_CLIENT_ADDR)(client) + (has+trace+span)(1+16+8)
+///   + (len+MAX_URL_PATH)(url) + (len+MAX_USER_AGENT)(ua) + duration(8)
+pub const ACCESS_RECORD_WORST_CASE: usize = 1
+    + 8
+    + 1
+    + (2 + MAX_METHOD)
+    + 2
+    + 8
+    + 8
+    + (2 + MAX_CLIENT_ADDR)
+    + (1 + 16 + 8)
+    + (2 + MAX_URL_PATH)
+    + (2 + MAX_USER_AGENT)
+    + 8;
+
+/// Compile-time overflow guard: if a future field or cap bump would make
+/// `ACCESS_RECORD_WORST_CASE` exceed `MAX_ACCESS_RECORD`, this assertion
+/// turns the problem into a build failure rather than a latent runtime panic.
+const _: () = assert!(
+    ACCESS_RECORD_WORST_CASE <= MAX_ACCESS_RECORD,
+    "ACCESS_RECORD_WORST_CASE exceeds MAX_ACCESS_RECORD — bump MAX_ACCESS_RECORD"
+);
 
 /// Canonical producer-side sampled-request record.
 ///
@@ -180,8 +212,8 @@ pub fn emit_access_record(producer: &dyn LogProducer, req: &SampledRequest<'_>) 
     // ngx_level (info)
     write_u8!(NGX_LEVEL_INFO);
     // http.request.method
-    write_bytes_with_u16_len!(req.method, 16); // max method = 16 bytes
-                                               // http.response.status_code
+    write_bytes_with_u16_len!(req.method, MAX_METHOD);
+    // http.response.status_code
     write_u16_be!(req.status);
     // http.server.request.body.size
     write_u64_be!(req.request_length);
@@ -450,7 +482,7 @@ mod tests {
     fn access_record_long_method_truncated() {
         let (_buf, ring) = make_ring_with_cap(4096);
         let producer = WorkerRingProducer { ring };
-        // Method longer than 16 bytes should be truncated.
+        // Method longer than MAX_METHOD bytes should be truncated.
         let long_method = b"VERYLONGMETHODNAME_EXCEEDS_LIMIT";
         emit_access_record(
             &producer,
@@ -471,6 +503,52 @@ mod tests {
         let mut record = std::vec::Vec::new();
         assert!(ring.pop_into(&mut record));
         let method_len = u16::from_be_bytes([record[10], record[11]]) as usize;
-        assert!(method_len <= 16, "method must be truncated to 16 bytes");
+        assert!(method_len <= MAX_METHOD, "method must be truncated to MAX_METHOD bytes");
+    }
+
+    /// Build a worst-case `SampledRequest` (every field at its cap, has_trace=1)
+    /// and verify that `emit_access_record` neither panics nor exceeds
+    /// `MAX_ACCESS_RECORD`.  Also verifies the record is exactly
+    /// `ACCESS_RECORD_WORST_CASE` bytes (all caps hit simultaneously).
+    ///
+    /// This test guards against the C1 regression where `MAX_ACCESS_RECORD = 320`
+    /// but the 323-byte worst-case record triggered an index-out-of-bounds panic.
+    #[test]
+    fn access_record_worst_case_fits_in_buffer() {
+        let (_buf, ring) = make_ring_with_cap(4096);
+        let producer = WorkerRingProducer { ring };
+        let method = [b'X'; MAX_METHOD];
+        let client = [b'c'; MAX_CLIENT_ADDR];
+        let url = [b'/'; MAX_URL_PATH];
+        let ua = [b'A'; MAX_USER_AGENT];
+        let req = SampledRequest {
+            ts_unix_nano: u64::MAX,
+            trace: Some(([0xaa_u8; 16], [0xbb_u8; 8])),
+            url_path: &url,
+            user_agent: &ua,
+            duration_us: u64::MAX,
+            combo_idx: 0,
+            method: &method,
+            status: 500,
+            request_length: u64::MAX,
+            response_bytes: u64::MAX,
+            client_addr: &client,
+        };
+        let pushed = emit_access_record(&producer, &req);
+        assert!(pushed, "worst-case record must push without panic");
+
+        let mut record = std::vec::Vec::new();
+        assert!(ring.pop_into(&mut record));
+        assert!(
+            record.len() <= MAX_ACCESS_RECORD,
+            "record len {} must not exceed MAX_ACCESS_RECORD {}",
+            record.len(),
+            MAX_ACCESS_RECORD
+        );
+        assert_eq!(
+            record.len(),
+            ACCESS_RECORD_WORST_CASE,
+            "worst-case record must be exactly ACCESS_RECORD_WORST_CASE bytes"
+        );
     }
 }
