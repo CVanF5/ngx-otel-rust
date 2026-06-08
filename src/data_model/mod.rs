@@ -404,6 +404,30 @@ pub struct SpansBatch {
 }
 
 // ────────────────────────────────────────────────────────────────
+// Pdata — unified pipeline payload (Step U)
+// ────────────────────────────────────────────────────────────────
+
+/// Unified exporter payload — the native currency flowing through
+/// `drain → process → encode → send`.
+///
+/// Each variant wraps one of the three signal batch types. The `Processor`
+/// trait operates on `&mut Pdata` and dispatches on the variant internally,
+/// keeping signal-specific logic inside the processor while exposing a
+/// single entry point to the pipeline.
+///
+/// **Row-backed, no Arrow** — Arrow is a Phase 5 representation swap inside
+/// the same enum shape.
+#[derive(Debug, Clone)]
+pub enum Pdata {
+    /// A metrics batch (Prometheus-model counters, histograms, gauges).
+    Metrics(Batch),
+    /// An access-log / error-log batch.
+    Logs(LogsBatch),
+    /// A server-span batch.
+    Spans(SpansBatch),
+}
+
+// ────────────────────────────────────────────────────────────────
 // Unit tests
 // ────────────────────────────────────────────────────────────────
 

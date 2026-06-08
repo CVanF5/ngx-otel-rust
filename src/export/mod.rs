@@ -49,7 +49,7 @@ use crate::data_model::{
     AggregationTemporality, AnyValue, Batch, GaugeData, KeyValue, LogRecord, LogsBatch, Metric,
     MetricData, NumberDataPoint, NumberValue, SumData,
 };
-use crate::data_model::{Resource, Scope, Span, SpansBatch};
+use crate::data_model::{Pdata, Resource, Scope, Span, SpansBatch};
 use crate::encoder::{Encoder, OtlpHttpEncoder, OtlpLogsEncoder, OtlpTracesEncoder};
 use crate::logs::coalesce;
 use crate::logs::severity::nginx_to_otel;
@@ -664,8 +664,12 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                     let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
                     spans_n_workers_from_zone(avail, DEFAULT_SPAN_RING_CAP)
                 };
-                let spans_batch =
-                    span_processor.process(collect_span_records(amcf, spans_base, n_workers));
+                let mut spans_pd = Pdata::Spans(collect_span_records(amcf, spans_base, n_workers));
+                span_processor.process(&mut spans_pd);
+                let spans_batch = match spans_pd {
+                    Pdata::Spans(b) => b,
+                    _ => unreachable!("span drain always produces Pdata::Spans"),
+                };
                 if !spans_batch.spans.is_empty() {
                     let n_spans = spans_batch.spans.len() as u64;
                     let spans_bytes = traces_encoder.encode(&spans_batch);
@@ -1100,7 +1104,12 @@ async fn graceful_drain(
             let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
             spans_n_workers_from_zone(avail, DEFAULT_SPAN_RING_CAP)
         };
-        let spans_batch = span_processor.process(collect_span_records(amcf, spans_base, n_workers));
+        let mut spans_pd = Pdata::Spans(collect_span_records(amcf, spans_base, n_workers));
+        span_processor.process(&mut spans_pd);
+        let spans_batch = match spans_pd {
+            Pdata::Spans(b) => b,
+            _ => unreachable!("span drain always produces Pdata::Spans"),
+        };
         if !spans_batch.spans.is_empty() {
             let n_spans = spans_batch.spans.len() as u64;
             let spans_bytes = OtlpTracesEncoder.encode(&spans_batch);

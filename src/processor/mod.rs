@@ -3,14 +3,16 @@
 // This source code is licensed under the Apache License, Version 2.0 license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! Config-driven `Processor` trait for the exporter's span pipeline — Phase 3.6.
+//! Config-driven `Processor` trait for the exporter pipeline — Step U (signal-generic).
 //!
 //! # Pipeline position
 //!
 //! ```text
-//! collect_span_records → [SpanProcessor::process] → OtlpTracesEncoder → send
+//! drain → [SpanProcessor::process(&mut Pdata)] → encode → send
 //! ```
 //!
+//! The trait is **signal-generic**: it receives `&mut Pdata` and dispatches
+//! on the variant internally, so one processor handles all three signals.
 //! Processors are constructed once at exporter startup via [`SpanProcessor::from_config`].
 //! The default processor is [`NoopProcessor`] — a zero-overhead passthrough.
 //!
@@ -30,14 +32,15 @@
 //! `ExportTransport` — the exporter is already on the heap; one enum avoids a
 //! `Box<dyn Processor>` indirection.
 
-use crate::data_model::SpansBatch;
+use crate::data_model::Pdata;
 
 // ── `Processor` trait ────────────────────────────────────────────────────────
 
-/// Exporter-side processing stage in the span pipeline.
+/// Exporter-side processing stage — signal-generic (Step U).
 ///
-/// Receives a [`SpansBatch`] after drain and before encode.  May filter,
-/// transform, or enrich spans.
+/// Receives `&mut Pdata` after drain and before encode. May filter,
+/// transform, or enrich the payload in-place. Dispatches on the variant
+/// internally so signal-specific logic stays inside the processor.
 ///
 /// # Config-driven construction
 ///
@@ -58,16 +61,17 @@ pub trait Processor {
     where
         Self: Sized;
 
-    /// Process a batch of spans, returning the (possibly modified) batch.
-    fn process(&self, batch: SpansBatch) -> SpansBatch;
+    /// Process the payload in-place. Dispatches on the [`Pdata`] variant
+    /// internally; unknown variants are left unchanged (passthrough).
+    fn process(&self, data: &mut Pdata);
 }
 
 // ── NoopProcessor ─────────────────────────────────────────────────────────────
 
-/// Passthrough processor — returns the batch unchanged.
+/// Passthrough processor — leaves the payload unchanged.
 ///
 /// This is the default [`SpanProcessor`] variant.  It adds no overhead beyond
-/// a function call and a move.
+/// a function call; no clone or move of the data.
 pub struct NoopProcessor;
 
 impl Processor for NoopProcessor {
@@ -76,8 +80,8 @@ impl Processor for NoopProcessor {
     }
 
     #[inline]
-    fn process(&self, batch: SpansBatch) -> SpansBatch {
-        batch
+    fn process(&self, _data: &mut Pdata) {
+        // Passthrough: nothing to do.
     }
 }
 
@@ -105,12 +109,14 @@ impl Processor for StatusFilterProcessor {
         StatusFilterProcessor { drop_errors }
     }
 
-    fn process(&self, mut batch: SpansBatch) -> SpansBatch {
+    fn process(&self, data: &mut Pdata) {
         if self.drop_errors {
-            use crate::data_model::StatusCode;
-            batch.spans.retain(|span| span.status.code != StatusCode::Error);
+            if let Pdata::Spans(batch) = data {
+                use crate::data_model::StatusCode;
+                batch.spans.retain(|span| span.status.code != StatusCode::Error);
+            }
+            // Metrics and Logs variants are passed through unchanged.
         }
-        batch
     }
 }
 
@@ -145,12 +151,12 @@ impl SpanProcessor {
         }
     }
 
-    /// Apply the processor to a batch of spans.
+    /// Apply the processor to the payload in-place.
     #[inline]
-    pub fn process(&self, batch: SpansBatch) -> SpansBatch {
+    pub fn process(&self, data: &mut Pdata) {
         match self {
-            SpanProcessor::Noop(p) => p.process(batch),
-            SpanProcessor::StatusFilter(p) => p.process(batch),
+            SpanProcessor::Noop(p) => p.process(data),
+            SpanProcessor::StatusFilter(p) => p.process(data),
         }
     }
 }
@@ -167,7 +173,9 @@ impl Default for SpanProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data_model::{Resource, Scope, Span, SpanKind, SpanStatus, StatusCode};
+    use crate::data_model::{
+        Batch, LogsBatch, Resource, Scope, Span, SpanKind, SpanStatus, SpansBatch, StatusCode,
+    };
 
     fn make_span(status_code: StatusCode) -> Span {
         Span {
@@ -186,7 +194,7 @@ mod tests {
         }
     }
 
-    fn make_batch(spans: std::vec::Vec<Span>) -> SpansBatch {
+    fn make_spans_batch(spans: std::vec::Vec<Span>) -> SpansBatch {
         SpansBatch {
             resource: Resource { attributes: std::vec![] },
             scope: Scope { name: "test".into(), version: "0.1".into() },
@@ -194,26 +202,65 @@ mod tests {
         }
     }
 
-    /// Passthrough — batch is returned unchanged.
+    fn make_pdata_spans(spans: std::vec::Vec<Span>) -> Pdata {
+        Pdata::Spans(make_spans_batch(spans))
+    }
+
+    fn unwrap_spans(pd: Pdata) -> SpansBatch {
+        match pd {
+            Pdata::Spans(b) => b,
+            _ => panic!("expected Pdata::Spans"),
+        }
+    }
+
+    fn make_pdata_metrics() -> Pdata {
+        Pdata::Metrics(Batch {
+            resource: Resource { attributes: std::vec![] },
+            scope: Scope { name: "test".into(), version: "0.1".into() },
+            metrics: std::vec![],
+        })
+    }
+
+    fn make_pdata_logs() -> Pdata {
+        Pdata::Logs(LogsBatch {
+            resource: Resource { attributes: std::vec![] },
+            scope: Scope { name: "test".into(), version: "0.1".into() },
+            logs: std::vec![],
+        })
+    }
+
+    /// Passthrough — Pdata::Spans is left unchanged.
     #[test]
     fn noop_processor_leaves_batch_unchanged() {
         let p = NoopProcessor;
-        let batch = make_batch(std::vec![
+        let mut pd = make_pdata_spans(std::vec![
             make_span(StatusCode::Ok),
             make_span(StatusCode::Error),
             make_span(StatusCode::Unset),
         ]);
-        let result = p.process(batch);
-        assert_eq!(result.spans.len(), 3);
+        p.process(&mut pd);
+        assert_eq!(unwrap_spans(pd).spans.len(), 3);
     }
 
     /// `from_config` with null — still constructs a valid Noop.
     #[test]
     fn noop_from_config_null_input() {
         let p = NoopProcessor::from_config(&serde_json::Value::Null);
-        let batch = make_batch(std::vec![make_span(StatusCode::Ok)]);
-        let result = p.process(batch);
-        assert_eq!(result.spans.len(), 1);
+        let mut pd = make_pdata_spans(std::vec![make_span(StatusCode::Ok)]);
+        p.process(&mut pd);
+        assert_eq!(unwrap_spans(pd).spans.len(), 1);
+    }
+
+    /// Noop is a true passthrough for Metrics and Logs variants too.
+    #[test]
+    fn noop_processor_passes_through_all_variants() {
+        let p = NoopProcessor;
+        let mut m = make_pdata_metrics();
+        p.process(&mut m);
+        assert!(matches!(m, Pdata::Metrics(_)));
+        let mut l = make_pdata_logs();
+        p.process(&mut l);
+        assert!(matches!(l, Pdata::Logs(_)));
     }
 
     /// StatusFilter with `drop_errors: true` removes error spans.
@@ -221,12 +268,13 @@ mod tests {
     fn status_filter_drops_errors_when_configured() {
         let cfg = serde_json::json!({"drop_errors": true});
         let p = StatusFilterProcessor::from_config(&cfg);
-        let batch = make_batch(std::vec![
+        let mut pd = make_pdata_spans(std::vec![
             make_span(StatusCode::Ok),
             make_span(StatusCode::Error),
             make_span(StatusCode::Unset),
         ]);
-        let result = p.process(batch);
+        p.process(&mut pd);
+        let result = unwrap_spans(pd);
         assert_eq!(result.spans.len(), 2, "Error span must be dropped");
         for span in &result.spans {
             assert_ne!(span.status.code, StatusCode::Error, "No Error spans should remain");
@@ -238,28 +286,42 @@ mod tests {
     fn status_filter_passthrough_when_drop_errors_false() {
         let cfg = serde_json::json!({"drop_errors": false});
         let p = StatusFilterProcessor::from_config(&cfg);
-        let batch =
-            make_batch(std::vec![make_span(StatusCode::Error), make_span(StatusCode::Error),]);
-        let result = p.process(batch);
-        assert_eq!(result.spans.len(), 2);
+        let mut pd =
+            make_pdata_spans(std::vec![make_span(StatusCode::Error), make_span(StatusCode::Error)]);
+        p.process(&mut pd);
+        assert_eq!(unwrap_spans(pd).spans.len(), 2);
+    }
+
+    /// StatusFilter passes through Metrics and Logs variants unchanged.
+    #[test]
+    fn status_filter_passes_through_non_span_variants() {
+        let cfg = serde_json::json!({"drop_errors": true});
+        let p = StatusFilterProcessor::from_config(&cfg);
+        let mut m = make_pdata_metrics();
+        p.process(&mut m);
+        assert!(matches!(m, Pdata::Metrics(_)));
+        let mut l = make_pdata_logs();
+        p.process(&mut l);
+        assert!(matches!(l, Pdata::Logs(_)));
     }
 
     /// `SpanProcessor::default()` is a passthrough (Noop).
     #[test]
     fn span_processor_default_is_noop() {
         let p = SpanProcessor::default();
-        let batch = make_batch(std::vec![make_span(StatusCode::Ok), make_span(StatusCode::Error),]);
-        let result = p.process(batch);
-        assert_eq!(result.spans.len(), 2);
+        let mut pd =
+            make_pdata_spans(std::vec![make_span(StatusCode::Ok), make_span(StatusCode::Error)]);
+        p.process(&mut pd);
+        assert_eq!(unwrap_spans(pd).spans.len(), 2);
     }
 
     /// `from_config` with `type: noop` returns Noop.
     #[test]
     fn span_processor_from_config_noop() {
         let p = SpanProcessor::from_config(&serde_json::json!({"type": "noop"}));
-        let batch = make_batch(std::vec![make_span(StatusCode::Error)]);
-        let result = p.process(batch);
-        assert_eq!(result.spans.len(), 1);
+        let mut pd = make_pdata_spans(std::vec![make_span(StatusCode::Error)]);
+        p.process(&mut pd);
+        assert_eq!(unwrap_spans(pd).spans.len(), 1);
     }
 
     /// `from_config` with `type: status_filter, drop_errors: true` filters errors.
@@ -269,8 +331,10 @@ mod tests {
             "type": "status_filter",
             "drop_errors": true
         }));
-        let batch = make_batch(std::vec![make_span(StatusCode::Ok), make_span(StatusCode::Error),]);
-        let result = p.process(batch);
+        let mut pd =
+            make_pdata_spans(std::vec![make_span(StatusCode::Ok), make_span(StatusCode::Error)]);
+        p.process(&mut pd);
+        let result = unwrap_spans(pd);
         assert_eq!(result.spans.len(), 1);
         assert_eq!(result.spans[0].status.code, StatusCode::Ok);
     }
@@ -280,8 +344,8 @@ mod tests {
     fn span_processor_unknown_type_falls_back_to_noop() {
         let p =
             SpanProcessor::from_config(&serde_json::json!({"type": "future_unknown_processor"}));
-        let batch = make_batch(std::vec![make_span(StatusCode::Error)]);
-        let result = p.process(batch);
-        assert_eq!(result.spans.len(), 1);
+        let mut pd = make_pdata_spans(std::vec![make_span(StatusCode::Error)]);
+        p.process(&mut pd);
+        assert_eq!(unwrap_spans(pd).spans.len(), 1);
     }
 }
