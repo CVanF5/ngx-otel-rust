@@ -1,0 +1,105 @@
+[2026-06-06T22:15:49Z] SOAK START — OTLP/gRPC, all features (access tail+exemplars, error log+coalesce, metrics).
+[2026-06-06T22:15:49Z] params: duration=86400s chunk=900s threads=4 conns=100
+[2026-06-06T22:15:49Z] baseline: metrics.json=5628357B logs.json=6034835B
+[2026-06-06T22:15:53Z] exporter: 'export loop started ... protocol=otlp_grpc' CONFIRMED
+[2026-06-06T22:30:54Z] chunk 1: worker_rss=33952KB exporter_rss=15316KB metrics=5628357B logs=2132709B (acc~3 err~3) reqs=11820560 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-06T22:45:55Z] chunk 2: worker_rss=34164KB exporter_rss=15308KB metrics=9239666B logs=4982216B (acc~7 err~7) reqs=11821360 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-06T23:00:56Z] chunk 3: worker_rss=34164KB exporter_rss=15308KB metrics=8495483B logs=7932256B (acc~11 err~11) reqs=11821228 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-06T23:15:58Z] chunk 4: worker_rss=34168KB exporter_rss=15292KB metrics=7754573B logs=9986328B (acc~14 err~14) reqs=11822863 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-06T23:30:59Z] chunk 5: worker_rss=34168KB exporter_rss=15280KB metrics=7104431B logs=3556254B (acc~5 err~5) reqs=11823094 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-06T23:46:00Z] chunk 6: worker_rss=34168KB exporter_rss=15272KB metrics=6392786B logs=4943075B (acc~7 err~7) reqs=11820160 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T00:01:01Z] chunk 7: worker_rss=34172KB exporter_rss=15280KB metrics=5682641B logs=7267814B (acc~10 err~10) reqs=11820171 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T00:16:02Z] chunk 8: worker_rss=34172KB exporter_rss=15240KB metrics=4974869B logs=5702813B (acc~8 err~8) reqs=11821811 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T00:31:02Z] chunk 9: worker_rss=34172KB exporter_rss=15264KB metrics=4315769B logs=5531761B (acc~8 err~8) reqs=11820806 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T00:46:03Z] chunk 10: worker_rss=34180KB exporter_rss=15260KB metrics=3652991B logs=7062975B (acc~10 err~10) reqs=11821929 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T01:01:03Z] chunk 11: worker_rss=34180KB exporter_rss=15280KB metrics=2929166B logs=6981413B (acc~10 err~10) reqs=11821895 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T01:16:04Z] chunk 12: worker_rss=34180KB exporter_rss=15192KB metrics=2280587B logs=7691712B (acc~11 err~11) reqs=11820471 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T01:31:04Z] chunk 13: worker_rss=34180KB exporter_rss=15268KB metrics=1671204B logs=8494439B (acc~12 err~12) reqs=11822060 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T01:46:05Z] chunk 14: worker_rss=34180KB exporter_rss=15364KB metrics=997665B logs=9919226B (acc~14 err~14) reqs=11821690 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T02:01:05Z] chunk 15: worker_rss=34180KB exporter_rss=15244KB metrics=389870B logs=738953B (acc~1 err~1) reqs=11821212 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T02:16:06Z] chunk 16: worker_rss=34180KB exporter_rss=15332KB metrics=10235235B logs=9944118B (acc~14 err~14) reqs=11819263 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T02:31:08Z] chunk 17: worker_rss=34180KB exporter_rss=15276KB metrics=9635697B logs=8751118B (acc~12 err~12) reqs=11822177 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T02:46:09Z] chunk 18: worker_rss=34180KB exporter_rss=15284KB metrics=9030485B logs=7761550B (acc~11 err~11) reqs=11819261 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T03:01:11Z] chunk 19: worker_rss=34180KB exporter_rss=15336KB metrics=8417819B logs=5700089B (acc~8 err~8) reqs=11820439 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T03:16:12Z] chunk 20: worker_rss=34180KB exporter_rss=15296KB metrics=7740103B logs=5617704B (acc~8 err~8) reqs=11823564 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T03:31:13Z] chunk 21: worker_rss=34180KB exporter_rss=15212KB metrics=7129628B logs=6490542B (acc~9 err~9) reqs=11820909 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T03:46:14Z] chunk 22: worker_rss=34180KB exporter_rss=15312KB metrics=6520957B logs=5688073B (acc~8 err~8) reqs=11821122 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T04:01:15Z] chunk 23: worker_rss=34180KB exporter_rss=15212KB metrics=5912633B logs=6452439B (acc~9 err~9) reqs=11823184 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T04:16:16Z] chunk 24: worker_rss=34188KB exporter_rss=15308KB metrics=5349963B logs=5804231B (acc~8 err~8) reqs=11823610 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T04:31:17Z] chunk 25: worker_rss=34188KB exporter_rss=15336KB metrics=4680875B logs=5632890B (acc~8 err~8) reqs=11821370 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T04:46:17Z] chunk 26: worker_rss=34188KB exporter_rss=15368KB metrics=4069658B logs=5752758B (acc~8 err~8) reqs=11820443 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T05:01:18Z] chunk 27: worker_rss=34188KB exporter_rss=15388KB metrics=3454103B logs=6460633B (acc~9 err~9) reqs=11822243 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T05:16:18Z] chunk 28: worker_rss=34192KB exporter_rss=15212KB metrics=2894823B logs=7870455B (acc~11 err~11) reqs=11821865 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T05:31:19Z] chunk 29: worker_rss=34192KB exporter_rss=15268KB metrics=2344259B logs=8436635B (acc~12 err~12) reqs=11822164 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T05:46:19Z] chunk 30: worker_rss=34192KB exporter_rss=15348KB metrics=1723766B logs=9344279B (acc~13 err~13) reqs=11822106 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T06:01:20Z] chunk 31: worker_rss=34192KB exporter_rss=15380KB metrics=1177327B logs=9320572B (acc~13 err~13) reqs=11823235 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T06:16:20Z] chunk 32: worker_rss=34192KB exporter_rss=15360KB metrics=612481B logs=650356B (acc~14 err~14) reqs=11821703 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T06:31:21Z] chunk 33: worker_rss=34192KB exporter_rss=15368KB metrics=10449781B logs=1407523B (acc~2 err~2) reqs=11821147 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T06:46:23Z] chunk 34: worker_rss=34192KB exporter_rss=15304KB metrics=9888294B logs=10150362B (acc~14 err~14) reqs=11823299 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T07:01:24Z] chunk 35: worker_rss=34192KB exporter_rss=15336KB metrics=9321839B logs=9304689B (acc~13 err~13) reqs=11822379 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T07:16:26Z] chunk 36: worker_rss=34192KB exporter_rss=15008KB metrics=8778483B logs=7878756B (acc~11 err~11) reqs=11823290 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T07:31:27Z] chunk 37: worker_rss=34200KB exporter_rss=15244KB metrics=8172708B logs=8680050B (acc~12 err~12) reqs=11823667 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T07:46:28Z] chunk 38: worker_rss=34200KB exporter_rss=15216KB metrics=7624255B logs=8358787B (acc~12 err~12) reqs=11820931 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T08:01:29Z] chunk 39: worker_rss=34200KB exporter_rss=15284KB metrics=7046519B logs=8527578B (acc~12 err~12) reqs=11822089 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T08:16:30Z] chunk 40: worker_rss=34200KB exporter_rss=15348KB metrics=6489556B logs=8736308B (acc~12 err~12) reqs=11823099 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T08:31:31Z] chunk 41: worker_rss=34200KB exporter_rss=15284KB metrics=5872627B logs=9870000B (acc~14 err~14) reqs=11822392 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T08:46:32Z] chunk 42: worker_rss=34200KB exporter_rss=15208KB metrics=5315828B logs=10054480B (acc~14 err~14) reqs=11823401 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T09:01:33Z] chunk 43: worker_rss=34200KB exporter_rss=15220KB metrics=4760934B logs=1423837B (acc~2 err~2) reqs=11825649 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T09:16:33Z] chunk 44: worker_rss=34200KB exporter_rss=15240KB metrics=4196967B logs=654299B (acc~1 err~1) reqs=11822189 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T09:31:34Z] chunk 45: worker_rss=34200KB exporter_rss=15320KB metrics=3637677B logs=705325B (acc~1 err~1) reqs=11822433 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T09:46:35Z] chunk 46: worker_rss=34200KB exporter_rss=15316KB metrics=3073248B logs=1388744B (acc~2 err~2) reqs=11820167 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T10:01:35Z] chunk 47: worker_rss=34200KB exporter_rss=15356KB metrics=2458259B logs=1342637B (acc~2 err~2) reqs=11821564 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T10:16:36Z] chunk 48: worker_rss=34208KB exporter_rss=15284KB metrics=1909110B logs=687214B (acc~1 err~1) reqs=11824046 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T10:31:36Z] chunk 49: worker_rss=34208KB exporter_rss=15368KB metrics=1346106B logs=2147335B (acc~3 err~3) reqs=11822459 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T10:46:36Z] chunk 50: worker_rss=34208KB exporter_rss=15360KB metrics=838743B logs=2818524B (acc~4 err~4) reqs=11823775 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T11:01:36Z] chunk 51: worker_rss=34208KB exporter_rss=15264KB metrics=280541B logs=2988181B (acc~4 err~4) reqs=11825484 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T11:16:38Z] chunk 52: worker_rss=34208KB exporter_rss=15324KB metrics=10214947B logs=4273914B (acc~6 err~6) reqs=11821856 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T11:31:40Z] chunk 53: worker_rss=34208KB exporter_rss=15352KB metrics=9700163B logs=4335267B (acc~6 err~6) reqs=11823635 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T11:46:41Z] chunk 54: worker_rss=34208KB exporter_rss=15316KB metrics=9156607B logs=4250859B (acc~6 err~6) reqs=11822857 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T12:01:42Z] chunk 55: worker_rss=34212KB exporter_rss=15224KB metrics=8652188B logs=4310685B (acc~6 err~6) reqs=11821547 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T12:16:43Z] chunk 56: worker_rss=34212KB exporter_rss=15248KB metrics=8133888B logs=3560055B (acc~5 err~5) reqs=11820967 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T12:31:45Z] chunk 57: worker_rss=34212KB exporter_rss=15220KB metrics=7629189B logs=4878541B (acc~7 err~7) reqs=11821199 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T12:46:46Z] chunk 58: worker_rss=34212KB exporter_rss=15232KB metrics=7131399B logs=5659275B (acc~8 err~8) reqs=11822035 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T13:01:47Z] chunk 59: worker_rss=34212KB exporter_rss=15312KB metrics=6563512B logs=6420795B (acc~9 err~9) reqs=11820650 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T13:16:48Z] chunk 60: worker_rss=34212KB exporter_rss=15348KB metrics=6067198B logs=7837238B (acc~11 err~11) reqs=11823772 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T13:31:49Z] chunk 61: worker_rss=34212KB exporter_rss=15268KB metrics=5548094B logs=9132014B (acc~13 err~13) reqs=11820298 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T13:46:49Z] chunk 62: worker_rss=34212KB exporter_rss=15288KB metrics=4993718B logs=10452961B (acc~15 err~15) reqs=11825549 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T14:01:50Z] chunk 63: worker_rss=34212KB exporter_rss=15368KB metrics=4488523B logs=9972482B (acc~14 err~14) reqs=11822455 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T14:16:51Z] chunk 64: worker_rss=34212KB exporter_rss=15280KB metrics=3927546B logs=10011431B (acc~14 err~14) reqs=11822045 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T14:31:52Z] chunk 65: worker_rss=34212KB exporter_rss=15308KB metrics=3428648B logs=9815361B (acc~14 err~14) reqs=11821231 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T14:46:52Z] chunk 66: worker_rss=34212KB exporter_rss=15256KB metrics=2921518B logs=1401472B (acc~2 err~2) reqs=11822668 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T15:01:53Z] chunk 67: worker_rss=34212KB exporter_rss=15352KB metrics=2411302B logs=2168072B (acc~3 err~3) reqs=11823501 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T15:16:53Z] chunk 68: worker_rss=34228KB exporter_rss=15344KB metrics=1906911B logs=2836408B (acc~4 err~4) reqs=11824506 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T15:31:53Z] chunk 69: worker_rss=34228KB exporter_rss=15380KB metrics=1352017B logs=2755489B (acc~4 err~4) reqs=11822537 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T15:46:54Z] chunk 70: worker_rss=34228KB exporter_rss=15276KB metrics=843235B logs=1473095B (acc~2 err~2) reqs=11824316 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T16:01:54Z] chunk 71: worker_rss=34228KB exporter_rss=15276KB metrics=280798B logs=2083508B (acc~3 err~3) reqs=11824366 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T16:16:55Z] chunk 72: worker_rss=34228KB exporter_rss=15292KB metrics=10220868B logs=2135542B (acc~3 err~3) reqs=11824630 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T16:31:57Z] chunk 73: worker_rss=34228KB exporter_rss=15292KB metrics=9727039B logs=2861925B (acc~4 err~4) reqs=11826559 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T16:46:58Z] chunk 74: worker_rss=34228KB exporter_rss=15320KB metrics=9235039B logs=2932987B (acc~4 err~4) reqs=11824544 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T17:02:00Z] chunk 75: worker_rss=34228KB exporter_rss=15308KB metrics=8655673B logs=3516017B (acc~5 err~5) reqs=11823134 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T17:17:01Z] chunk 76: worker_rss=34228KB exporter_rss=15288KB metrics=8150898B logs=2882684B (acc~4 err~4) reqs=11822965 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T17:32:02Z] chunk 77: worker_rss=34228KB exporter_rss=15284KB metrics=7644702B logs=2809919B (acc~4 err~4) reqs=11821953 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T17:47:03Z] chunk 78: worker_rss=34228KB exporter_rss=15284KB metrics=7148375B logs=2881251B (acc~4 err~4) reqs=11823280 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T18:02:04Z] chunk 79: worker_rss=34228KB exporter_rss=15304KB metrics=6632621B logs=2869354B (acc~4 err~4) reqs=11820965 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T18:17:05Z] chunk 80: worker_rss=34228KB exporter_rss=15324KB metrics=6115763B logs=2772937B (acc~3 err~3) reqs=11821223 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T18:32:06Z] chunk 81: worker_rss=34228KB exporter_rss=15316KB metrics=5627025B logs=4296162B (acc~6 err~6) reqs=11822045 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T18:47:07Z] chunk 82: worker_rss=34228KB exporter_rss=15348KB metrics=5061603B logs=3658605B (acc~5 err~5) reqs=11818141 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T19:02:08Z] chunk 83: worker_rss=34228KB exporter_rss=15244KB metrics=4547815B logs=5024917B (acc~7 err~7) reqs=11823421 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T19:17:08Z] chunk 84: worker_rss=34228KB exporter_rss=15296KB metrics=4047360B logs=4238643B (acc~6 err~6) reqs=11820497 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T19:32:09Z] chunk 85: worker_rss=34228KB exporter_rss=15356KB metrics=3486813B logs=4898475B (acc~7 err~7) reqs=11822936 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T19:47:09Z] chunk 86: worker_rss=34228KB exporter_rss=15356KB metrics=2986321B logs=5670332B (acc~8 err~8) reqs=11823120 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T20:02:10Z] chunk 87: worker_rss=34228KB exporter_rss=15172KB metrics=2481198B logs=4207058B (acc~6 err~6) reqs=11825274 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T20:17:10Z] chunk 88: worker_rss=34228KB exporter_rss=15268KB metrics=1910189B logs=4223239B (acc~6 err~6) reqs=11819665 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T20:32:11Z] chunk 89: worker_rss=34228KB exporter_rss=15280KB metrics=1402342B logs=2850593B (acc~4 err~4) reqs=11823859 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T20:47:11Z] chunk 90: worker_rss=34228KB exporter_rss=15308KB metrics=902227B logs=2153837B (acc~3 err~3) reqs=11822114 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T21:02:11Z] chunk 91: worker_rss=34228KB exporter_rss=15380KB metrics=395532B logs=2917530B (acc~4 err~4) reqs=11821431 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T21:17:13Z] chunk 92: worker_rss=34228KB exporter_rss=15240KB metrics=10295479B logs=4317009B (acc~6 err~6) reqs=11819416 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T21:32:14Z] chunk 93: worker_rss=34240KB exporter_rss=15260KB metrics=9791445B logs=4218538B (acc~6 err~6) reqs=11820321 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T21:47:15Z] chunk 94: worker_rss=34240KB exporter_rss=15328KB metrics=9284459B logs=3575734B (acc~5 err~5) reqs=11819369 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T22:02:17Z] chunk 95: worker_rss=34240KB exporter_rss=15284KB metrics=8775445B logs=4188167B (acc~6 err~6) reqs=11821340 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T22:15:54Z] chunk 96: worker_rss=34240KB exporter_rss=15348KB metrics=7308654B logs=5574410B (acc~8 err~8) reqs=10718563 nginx_up=yes drops=0 logdrops_acc=0 logdrops_err=0 sendfail=0
+[2026-06-07T22:15:54Z] LOAD COMPLETE — graceful drain (SIGQUIT).
+[2026-06-07T22:16:00Z] post-drain: nginx_up=no
+[2026-06-07T22:17:52Z] panics/crashes in error.log: 0
+[2026-06-07T22:17:53Z] final self-metrics: dropped=0 acc_logdrops=0 err_logdrops=0 sendfail=0
+[2026-06-07T22:17:53Z] SOAK END.
