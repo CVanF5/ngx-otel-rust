@@ -7,6 +7,8 @@
 #   - COLLECTOR_CONTAINER     — docker container name (ngx-otel-test-collector)
 #   - COLLECTOR_HTTP_ENDPOINT — http://127.0.0.1:4318
 #   - METRICS_LOG             — test-harness/logs/metrics.json
+#   - LOGS_LOG                — test-harness/logs/logs.json
+#   - TRACES_LOG              — test-harness/logs/traces.json
 #
 #   - ensure_collector_running   — start the collector if not already up;
 #                                  wait until OTLP/HTTP receiver answers.
@@ -37,6 +39,7 @@ COLLECTOR_CONTAINER="${COLLECTOR_CONTAINER:-ngx-otel-test-collector}"
 COLLECTOR_HTTP_ENDPOINT="${COLLECTOR_HTTP_ENDPOINT:-http://127.0.0.1:4318}"
 METRICS_LOG="${METRICS_LOG:-${HARNESS_DIR}/logs/metrics.json}"
 LOGS_LOG="${LOGS_LOG:-${HARNESS_DIR}/logs/logs.json}"
+TRACES_LOG="${TRACES_LOG:-${HARNESS_DIR}/logs/traces.json}"
 
 # Tunables (override via env in callers if needed):
 COLLECTOR_STARTUP_TIMEOUT_S="${COLLECTOR_STARTUP_TIMEOUT_S:-15}"

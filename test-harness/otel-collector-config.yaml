@@ -36,6 +36,16 @@ exporters:
       max_days: 1
       max_backups: 3
 
+  # Dedicated traces file — traces pipeline writes here so integration scripts
+  # can grep for ResourceSpans payloads without disambiguating against metrics.
+  # Named instance of the 'file' exporter: "file/traces".
+  file/traces:
+    path: /var/log/otel/traces.json
+    rotation:
+      max_megabytes: 10
+      max_days: 1
+      max_backups: 3
+
 service:
   telemetry:
     logs:
@@ -52,4 +62,4 @@ service:
     traces:
       receivers: [otlp]
       processors: [batch]
-      exporters: [debug, file]
+      exporters: [debug, file/traces]
