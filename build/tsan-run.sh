@@ -197,6 +197,14 @@ echo "[tsan-run] === Running run_signal_storm.sh under TSAN (Phase 2.3 re-entran
 STORM_DURATION_S=30 bash tests/integration/run_signal_storm.sh
 
 echo ""
+echo "[tsan-run] === Running run_traces.sh under TSAN (Phase 3 span emit→ring→drain→encode→collector) ==="
+# FU3: closes the Loop-2 gap by exercising the full spans-ring writer → drain
+# → OtlpTracesEncoder → /v1/traces path under TSAN.  Asserts that a span
+# with the expected traceId and parentSpanId (from an inbound traceparent)
+# arrives at the collector — proving the E2E path is race-free.
+bash tests/integration/run_traces.sh
+
+echo ""
 echo "[tsan-run] === Running run_dns_dualstack.sh under TSAN (transport_dns async resolver path) ==="
 # Exercises Items 2 + 3 of the transport_dns work under TSAN:
 #   - NgxConnector::connect_dns: Resolver::resolve_name (UDP event-loop path)
@@ -220,7 +228,8 @@ for log in /tmp/ngx-otel-grpc-smoke.*/logs/error.log \
            /tmp/ngx-otel-dns-a.*/logs/error.log \
            /tmp/ngx-otel-dns-b.*/logs/error.log \
            /tmp/ngx-otel-dns-c.*/logs/error.log \
-           /tmp/ngx-otel-dns-d.*/logs/error.log; do
+           /tmp/ngx-otel-dns-d.*/logs/error.log \
+           /tmp/ngx-otel-traces.*/logs/error.log; do
     if [[ -f "${log}" ]]; then
         count=$(grep -c "WARNING: ThreadSanitizer" "${log}" 2>/dev/null || true)
         if [[ "${count}" -gt 0 ]]; then
