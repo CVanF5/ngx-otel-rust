@@ -57,12 +57,15 @@ impl HttpRequestHandler for SpanStartHandler {
     /// ring work.  The pool alloc is a bump pointer — effectively free.
     fn handler(request: &mut Request) -> Status {
         // ── Gate 1: module not configured → zero cost ────────────────────────
+        // NGX_DECLINED passes to the next handler in the REWRITE phase (correct
+        // passthrough).  NGX_OK in the REWRITE phase re-enters the phase checker
+        // from the top (re-location-matching), which would hang the request.
         let amcf = match HttpOtelModule::main_conf(request) {
             Some(c) => c,
-            None => return Status::NGX_OK,
+            None => return Status::NGX_DECLINED,
         };
         if !amcf.is_configured() {
-            return Status::NGX_OK;
+            return Status::NGX_DECLINED;
         }
 
         // ── Gate 2: spans zone not available → skip ──────────────────────────
@@ -70,7 +73,7 @@ impl HttpRequestHandler for SpanStartHandler {
         // the handler per location.  For now we gate on span zone availability
         // as a proxy for "tracing is globally enabled".
         if amcf.spans_shm_base().is_none() {
-            return Status::NGX_OK;
+            return Status::NGX_DECLINED;
         }
 
         // ── Record span start time (wall clock, µs precision → nanos) ────────
@@ -137,8 +140,8 @@ impl HttpRequestHandler for SpanStartHandler {
         let pool = unsafe { pool_from_request(r) };
         let ctx_ptr = alloc_span_ctx(&pool);
         if ctx_ptr.is_null() {
-            // OOM in the request pool — extremely rare.  Fall through without ctx.
-            return Status::NGX_OK;
+            // OOM in the request pool — extremely rare.  Pass through without ctx.
+            return Status::NGX_DECLINED;
         }
 
         // Initialise the SpanCtx fields.
@@ -158,7 +161,9 @@ impl HttpRequestHandler for SpanStartHandler {
             &*core::ptr::addr_of!(crate::ngx_http_otel_module)
         });
 
-        Status::NGX_OK
+        // NGX_DECLINED: SpanCtx set; pass to the next REWRITE handler (normal
+        // request processing continues — we don't modify the URI or block the request).
+        Status::NGX_DECLINED
     }
 }
 

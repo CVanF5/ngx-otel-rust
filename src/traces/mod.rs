@@ -85,12 +85,7 @@ const _: () = assert!(
 /// Descriptor for a completed server span, built at span-end in the Log phase.
 ///
 /// All byte-slice fields borrow nginx request memory — no allocation.
-/// Phase 3 cold-path: synthetic records are constructed for S2 testing;
-/// real records arrive in Loop 2.
-///
-/// Loop 2 (hot-path) will construct this struct from request context.
-/// `#[allow(dead_code)]` guards the S2→Loop-2 gap.
-#[allow(dead_code)]
+/// Built from `SpanCtx` + request fields in `LogPhaseHandler` (Phase 3.4, S2).
 pub struct SpanRecord<'a> {
     /// 16-byte W3C trace ID.
     pub trace_id: [u8; 16],
@@ -131,9 +126,7 @@ pub struct SpanRecord<'a> {
 /// All formatting is done into a `[u8; MAX_SPAN_RECORD]` stack buffer.
 /// No `Vec`, no `Box`, no heap use.
 ///
-/// Loop 2 (hot-path) will call this from the log phase.
-/// `#[allow(dead_code)]` guards the S2→Loop-2 gap.
-#[allow(dead_code)]
+/// Called from `LogPhaseHandler` (Phase 3.4, S2) for every sampled request.
 #[inline]
 pub fn emit_span_record(producer: &dyn LogProducer, rec: &SpanRecord<'_>) -> bool {
     let mut buf = [0u8; MAX_SPAN_RECORD];

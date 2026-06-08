@@ -29,9 +29,11 @@ use crate::logs::{
     WorkerRingProducer,
 };
 use crate::shm::{
-    combo_index, logs_access_ring, worker_slots, HttpMethod, ProtoVersion, StatusClass,
-    BYTES_BOUNDS, DURATION_BOUNDS_MS, N_BYTES_BUCKETS, N_DURATION_BUCKETS, UPSTREAM_IDX_OTHER,
+    combo_index, logs_access_ring, spans_ring, worker_slots, HttpMethod, ProtoVersion, StatusClass,
+    BYTES_BOUNDS, DEFAULT_SPAN_RING_CAP, DURATION_BOUNDS_MS, N_BYTES_BUCKETS, N_DURATION_BUCKETS,
+    UPSTREAM_IDX_OTHER,
 };
+use crate::traces::{emit_span_record, SpanRecord, MAX_SPAN_NAME};
 use crate::HttpOtelModule;
 
 /// Unit struct for the log-phase handler; all state lives in the shm zone.
@@ -101,14 +103,15 @@ impl HttpRequestHandler for LogPhaseHandler {
         // saturates to 0 (saturating_sub below), a rare forward step inflates a
         // single data point. Acceptable for a sampling-grade latency histogram;
         // revisit if a monotonic per-request start ever becomes available.
-        let duration_us: u64 = {
+        let (duration_us, end_time_unix_nano): (u64, u64) = {
             use std::time::{SystemTime, UNIX_EPOCH};
-            let end_us = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_micros() as u64)
-                .unwrap_or(0);
+            // One `now()` call; derive both nanoseconds (for span end timestamp)
+            // and microseconds (for the duration histogram).
+            let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+            let end_ns = d.as_nanos() as u64; // safe until year ~2554
+            let end_us = end_ns / 1_000;
             let start_us = (r.start_sec as u64) * 1_000_000 + (r.start_msec as u64) * 1_000;
-            end_us.saturating_sub(start_us)
+            (end_us.saturating_sub(start_us), end_ns)
         };
         // Keep a ms version for the is_interesting tail-latency gate (still ms-threshold).
         let duration_ms: u64 = duration_us / 1_000;
@@ -213,6 +216,23 @@ impl HttpRequestHandler for LogPhaseHandler {
             }
         }
 
+        // ── Read SpanCtx once (§6.6.3 parse-once) ────────────────────────────
+        // Set by SpanStartHandler in the REWRITE phase.  Re-used for:
+        //   (1) trace correlation on the access tail log / exemplar (Phase 2.2 block below).
+        //   (2) span record emission when the request is sampled (S2 block below).
+        // Returns None when tracing is not configured or SpanStartHandler was not
+        // registered — no cost beyond a single pointer read from the ctx array.
+        let span_ctx: Option<&crate::traces::ctx::SpanCtx> = {
+            use crate::traces::ctx::SpanCtx;
+            // SAFETY: `ngx_http_otel_module` is a valid static module descriptor;
+            // `get_module_ctx` reads the request ctx array at our module's index and
+            // returns a valid reference only when non-null (set by `SpanStartHandler`
+            // from a pool-allocated `SpanCtx` that lives for the full request lifetime).
+            request.get_module_ctx::<SpanCtx>(unsafe {
+                &*core::ptr::addr_of!(crate::ngx_http_otel_module)
+            })
+        };
+
         // ── Phase 2.2: exception-tail / exemplar sampling ─────────────────
         // Gate 1 (cheap config check): absent directive → is_access_sample_enabled()
         //   = false, this entire block is skipped.
@@ -258,25 +278,12 @@ impl HttpRequestHandler for LogPhaseHandler {
                     .saturating_mul(1_000_000_000)
                     .saturating_add(r.start_msec as u64 * 1_000_000);
 
-                // W3C trace correlation (Phase 3.3 §6.6.3 parse-once):
-                // Read from the SpanCtx set by SpanStartHandler in the REWRITE
-                // phase — no second header scan.  Before Phase 3.3 we scanned
-                // headers here; that scan is now in SpanStartHandler.
-                // `get_module_ctx` returns None when tracing is not configured or
-                // the REWRITE handler was skipped (zero-cost path).
-                let trace_context: Option<([u8; 16], [u8; 8])> = {
-                    use crate::traces::ctx::SpanCtx;
-                    // SAFETY: `ngx_http_otel_module` is a valid static module
-                    // descriptor; `get_module_ctx` dereferences the ctx pointer only
-                    // when it is non-null, which is guaranteed by `SpanStartHandler`
-                    // having called `set_module_ctx` with a pool-allocated pointer.
-                    request
-                        .get_module_ctx::<SpanCtx>(unsafe {
-                            &*core::ptr::addr_of!(crate::ngx_http_otel_module)
-                        })
-                        .filter(|ctx| ctx.sampled)
-                        .map(|ctx| (ctx.trace_id, ctx.span_id))
-                };
+                // W3C trace correlation (§6.6.3 parse-once):
+                // SpanCtx was read once above; extract trace_id/span_id when sampled.
+                // Unsampled requests (ctx.sampled=false) still have a SpanCtx for
+                // W3C propagation but do not stamp the access tail.
+                let trace_context: Option<([u8; 16], [u8; 8])> =
+                    span_ctx.filter(|ctx| ctx.sampled).map(|ctx| (ctx.trace_id, ctx.span_id));
 
                 // User-Agent header: still requires one targeted header scan since it
                 // is NOT cached in SpanCtx (not needed for trace correlation).
@@ -319,6 +326,52 @@ impl HttpRequestHandler for LogPhaseHandler {
             }
         }
 
+        // ── S2: Span record emission (Phase 3.4) ──────────────────────────────
+        // Gate 1: request must be sampled (ctx.sampled=true).
+        // Gate 2: spans shm zone must be available (otel_spans_zone configured).
+        // Both gates false → zero work, no ring push.
+        // This block is INDEPENDENT of the access-log gate above — spans are emitted
+        // for all sampled requests, not only "interesting" tail ones.
+        if let Some(ctx) = span_ctx.filter(|ctx| ctx.sampled) {
+            if let Some(spans_base) = amcf.spans_shm_base() {
+                // Build span name "METHOD route_name" into a fixed stack buffer.
+                // No heap allocation; capped at MAX_SPAN_NAME (64 bytes).
+                let mut span_name_buf = [0u8; MAX_SPAN_NAME];
+                let span_name_len = build_span_name(
+                    &mut span_name_buf,
+                    r.method_name.as_bytes(),
+                    amcf.route_name(route_idx).as_bytes(),
+                );
+
+                // OTel HTTP server span StatusCode: Error(2) for 5xx, Unset(0) otherwise.
+                let otel_status_code: u8 = if status >= 500 { 2 } else { 0 };
+
+                let rec = SpanRecord {
+                    trace_id: ctx.trace_id,
+                    span_id: ctx.span_id,
+                    parent_span_id: ctx.parent_span_id,
+                    flags: ctx.flags,
+                    start_time_unix_nano: ctx.start_time_unix_nano,
+                    end_time_unix_nano,
+                    status_code: otel_status_code,
+                    kind: 2, // SpanKind::Server
+                    name: &span_name_buf[..span_name_len],
+                    method: r.method_name.as_bytes(),
+                    http_status: status,
+                    url_path: r.unparsed_uri.as_bytes(),
+                    duration_us,
+                };
+
+                // SAFETY: `spans_base` is the valid mapped shm start returned by
+                // `spans_shm_base()`, sized for ≥ worker_id spans-ring slots at zone
+                // registration in postconfiguration.  The ring lives for the worker's
+                // lifetime and outlives this handler invocation.
+                let spans = unsafe { spans_ring(spans_base, worker_id, DEFAULT_SPAN_RING_CAP) };
+                let producer = WorkerRingProducer { ring: spans };
+                emit_span_record(&producer, &rec);
+            }
+        }
+
         Status::NGX_OK
     }
 }
@@ -344,6 +397,31 @@ pub const TAIL_LATENCY_MS: u64 = 1000;
 #[inline]
 pub fn is_interesting(status: u16, duration_ms: u64) -> bool {
     status >= TAIL_STATUS_FLOOR || duration_ms >= TAIL_LATENCY_MS
+}
+
+/// Build an OTel HTTP server span name `"METHOD route_name"` into a fixed
+/// stack buffer, capped at `MAX_SPAN_NAME` bytes.  Returns the number of
+/// bytes written.
+///
+/// Both components are ASCII-safe (nginx method/location names); raw byte
+/// copies avoid heap allocation.  No `String`, no `format!`.
+///
+/// # Hot-path note
+/// All work is in-register or stack-copy — no allocation, no locking.
+#[inline]
+fn build_span_name(buf: &mut [u8; MAX_SPAN_NAME], method: &[u8], route: &[u8]) -> usize {
+    let mut off = 0usize;
+    let m_len = method.len().min(MAX_SPAN_NAME);
+    buf[..m_len].copy_from_slice(&method[..m_len]);
+    off += m_len;
+    if off < MAX_SPAN_NAME && !route.is_empty() {
+        buf[off] = b' ';
+        off += 1;
+        let rem = (MAX_SPAN_NAME - off).min(route.len());
+        buf[off..off + rem].copy_from_slice(&route[..rem]);
+        off += rem;
+    }
+    off
 }
 
 /// A `MetricSource` that reads all per-worker shm slots and produces

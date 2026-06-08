@@ -43,8 +43,7 @@ use ngx::core::Pool;
 /// plain arrays/scalars — no pointers into request memory.
 ///
 /// Fields `parent_span_id`, `flags`, and `start_time_unix_nano` are written
-/// in S1 (REWRITE) and consumed in S2 (LOG span record) — the gap between
-/// steps means they are technically unused until S2 lands.
+/// in S1 (REWRITE) and consumed in S2 (LOG span record).
 #[derive(Copy, Clone, Debug)]
 pub struct SpanCtx {
     /// W3C trace ID (16 bytes).
@@ -52,19 +51,13 @@ pub struct SpanCtx {
     /// This request's span ID (8 bytes, newly generated in REWRITE).
     pub span_id: [u8; 8],
     /// Inbound parent span ID from `traceparent` (zeros = root span).
-    /// Used in S2 (span end) to fill the span record's parent_span_id field.
-    // `#[allow(dead_code)]` guards the S1→S2 gap; removed when S2 reads this.
-    #[allow(dead_code)]
+    /// Written in S1 (REWRITE); read in S2 (LOG span record).
     pub parent_span_id: [u8; 8],
     /// W3C trace flags low byte (bit 0 = sampled, as recorded in traceparent).
-    /// Used in S2 (span end) to fill the span record's flags field.
-    // `#[allow(dead_code)]` guards the S1→S2 gap; removed when S2 reads this.
-    #[allow(dead_code)]
+    /// Written in S1 (REWRITE); read in S2 (LOG span record).
     pub flags: u32,
     /// Span start time — Unix epoch, nanoseconds (set at REWRITE phase entry).
-    /// Used in S2 (span end) as the span's start timestamp.
-    // `#[allow(dead_code)]` guards the S1→S2 gap; removed when S2 reads this.
-    #[allow(dead_code)]
+    /// Written in S1 (REWRITE); read in S2 (LOG span record).
     pub start_time_unix_nano: u64,
     /// Whether this request is sampled.
     ///
