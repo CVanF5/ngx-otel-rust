@@ -136,13 +136,14 @@ check: $(NGINX_BUILD_DIR)/Makefile ## Check style and lint
 weaver-check: ## Lint the custom semconv registry (weaver registry check)
 	weaver registry check --registry semconv/registry
 
-weaver-live-check: ## Report-only live-check via gRPC:4317 (fail-on: none — non-blocking)
-	@echo "Running Weaver live-check against gRPC :4317 (report-only, fail-on: none)..."
-	@echo "Ensure run_grpc_export.sh (otlp_grpc → :4317) is running first."
-	weaver live-check \
+weaver-live-check: ## Report-only live-check via gRPC:4317 (non-blocking: exit always 0)
+	@echo "Weaver live-check: listens on 0.0.0.0:4317 (OTLP/gRPC) for up to 30 s."
+	@echo "Point nginx otel_export_protocol=otlp_grpc at 127.0.0.1:4317 to feed it."
+	@echo "(report-only — non-blocking gate; see semconv/weaver.yaml and plan 3.7)"
+	weaver registry live-check \
 	    --registry semconv/registry \
-	    --fail-on none \
-	    --grpc-endpoint 127.0.0.1:4317 || true
+	    --otlp-grpc-port 4317 \
+	    --inactivity-timeout 30 || true
 
 install-hooks: ## Install the local pre-commit gate (sets git core.hooksPath)
 	git config core.hooksPath .githooks
