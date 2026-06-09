@@ -33,8 +33,8 @@ gRPC, `otel_export_protocol`) from the dedicated `nginx: otel exporter` process.
 > **exponential histogram in microseconds**, the `fix3b` dimensions are **live**,
 > per-route / per-upstream series were added, the temporality mislabel is
 > **fixed (Cumulative)**, and the Phase 2.3 companion error-rate metric
-> (`ngx_otel.error_log.events`) is now **implemented** (Step 2.3.4 — pointer
-> wired to init_process in Step 2.3.5).
+> (`ngx_otel.error_log.events`) is **wired** (`lib.rs` `init_process` sets
+> `error_rate_ptr`; `export/mod.rs` collects it).
 
 ## Provenance — read this first
 
@@ -216,7 +216,7 @@ closed-cardinality enums live in `src/shm.rs` (`HttpMethod`, `StatusClass`,
 ## Phase 2.3 error-rate metric (`ngx_otel.error_log.events`) — **implemented**
 
 The companion error-rate metric emitted alongside the coalesced error `LogRecord`s.
-Implemented in Step 2.3.4; wire to init_process in Step 2.3.5 (pointer set null until then).
+Wired in `lib.rs` `init_process` (`error_rate_ptr`); collected by `export/mod.rs`.
 
 | Metric | Instrument | Unit | Temporality | Attributes |
 |---|---|---|---|---|
@@ -342,7 +342,7 @@ location wins on merge.
 | Variable | Type | Value |
 |---|---|---|
 | `$otel_trace_id` | string (32-char hex) | trace ID from the current request's `SpanCtx`, or empty string when tracing is disabled. |
-| `$otel_parent_sampled` | string `"1"` / `"0"` | `"1"` when the inbound `traceparent` has the sampled flag set; `"0"` otherwise (empty when no traceparent). |
+| `$otel_parent_sampled` | string `"1"` / empty | `"1"` when this request is sampled — including root spans with no inbound `traceparent`; empty only when tracing is disabled. (The name reads as a parent-only flag but reflects the sampling state of *this* request — see `span_start.rs:162–180`.) |
 
 ### Span shape
 
@@ -351,14 +351,15 @@ One OTel **server span** per sampled request.
 | Field | Value | Source |
 |---|---|---|
 | `name` | `"METHOD route_name"` or `otel_span_name` override | `src/traces/mod.rs` |
-| `start_time_unix_nano` | wall-clock at REWRITE phase entry (vDSO `SystemTime::now()`) | `src/metric_source/span_start.rs` |
-| `end_time_unix_nano` | wall-clock at LOG phase entry | `src/metric_source/instrumented.rs` |
+| `start_time_unix_nano` | wall-clock anchor at REWRITE phase entry (`SystemTime::now()`) | `src/metric_source/span_start.rs` |
+| `end_time_unix_nano` | `start_time_unix_nano + monotonic_duration_ns` (always ≥ start; NTP-immune; derived from `Instant::elapsed()` at LOG) | `src/metric_source/instrumented.rs` |
 | `trace_id` | extracted from inbound `traceparent` (propagate/extract), or freshly generated | `src/traces/ctx.rs` |
 | `span_id` | freshly generated per request | `src/traces/ctx.rs` |
 | `parent_span_id` | from inbound `traceparent` (when `extract` or `propagate`), else zero | `src/metric_source/span_start.rs` |
 | `flags` | W3C trace flags byte (propagated from inbound header, or `0x01` for root spans) | `src/metric_source/span_start.rs` |
 | `kind` | `SERVER` | `src/traces/mod.rs` |
-| `status` | `OK` (2xx) or `ERROR` (≥ 4xx) | `src/metric_source/instrumented.rs` |
+| `status` | `ERROR` (5xx), else `Unset` — semconv-correct (4xx is not a server-span error) | `src/metric_source/instrumented.rs` |
+| ↳ parser note | `parse_span_record`'s `1 => Ok` branch (`traces/mod.rs`) is forward-compat only; dead for module-produced records (which are always 0 or 2). | — |
 
 ### Span attributes
 

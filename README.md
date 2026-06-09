@@ -15,52 +15,41 @@ with OTel-semconv names/units. See [Signals](#signals-what-this-module-emits).
 
 ## Status
 
-**Phases 1.1–1.3 complete (OTLP/HTTP + OTLP/gRPC metrics from a dedicated
-exporter process); pre-upstream-PR.**  Phase 2 (logs) is in design.
+**Phases 1–3 shipped: metrics, logs, and traces from a dedicated exporter
+process; pre-upstream-PR.**
 
-What works today:
+What this module emits:
 
-- Per-worker shm counter slots written from a Log-phase handler — no
-  allocations, no locks, no syscalls on the request path.  The handler's
-  only branch is a single `Relaxed` atomic load on the control-shm flags
-  word (a Phase 5 dynamic-reconfig placeholder; the value is discarded
-  today).
-- A dedicated `nginx: otel exporter` child process owns the entire cold
-  path — the async export loop driving hyper-on-`ngx-rust` (no Tokio
-  runtime).  Workers hold zero collector sockets; they bump shm counters
-  and defer.
-- Two production export transports, selected by `otel_export_protocol`:
-  **OTLP/HTTP** over HTTP/1.1 (`otlp_http`, the default) and **OTLP/gRPC**
-  unary over HTTP/2 (`otlp_grpc`).
-- Stub-status equivalents (`nginx.connections.*`, `nginx.requests.total`)
-  plus a histogram set inspired by F5 AVR
-  (`http.server.request.duration`, request/response body size, upstream
-  timings, upstream byte counts).  Full model in
-  [`TELEMETRY_MODEL.md`](TELEMETRY_MODEL.md).
-- OTLP protobuf encoding with vendored proto files; collector receives
-  the expected Sum / Gauge / Histogram shapes with correct Cumulative
-  temporality.
-- Graceful drain on `nginx -s quit`, a crash-respawn supervisor for the
-  exporter process, and SIGHUP reload safety (`old_config()` accessor,
-  clean worker-generation transition; endpoint and protocol changes
-  supported).  A control-shm heartbeat tracks exporter liveness.
-- `http://` and `unix:` endpoints.  `https://` / TLS is not yet
-  implemented (see [Limitations](#limitations)) and is deferred to a
-  later phase.
-- Zero-cost-when-disabled invariant verified statistically: ≤ 0.01%
-  throughput delta (module-loaded-but-disabled vs no-module baseline)
-  on isolated AWS EPYC and macOS arm64 hosts.  See
-  `tests/bench/RESULTS.md`.
+- **Metrics** (Phase 1, on by default): per-worker shm counter slots written
+  from a Log-phase handler — no allocations, no locks, no syscalls on the
+  request path.  A dedicated `nginx: otel exporter` child process owns the
+  entire cold path (async export loop, hyper-on-`ngx-rust`, no Tokio runtime).
+  Workers hold zero collector sockets.
+- **Access logs + exemplars** (Phase 2, `otel_access_log_sample <n>`):
+  reservoir-sampled exemplars and a thin exception tail (status ≥ 4xx / latency
+  outliers), written into a per-worker SPSC ring on the request path.  No
+  per-request log; metrics-primary.
+- **Error logs** (Phase 2, `otel_error_log`): coalesced error `LogRecord`s with
+  a companion error-rate counter.
+- **Traces** (Phase 3, `otel_trace <expr>`): OTel server spans with W3C
+  `traceparent` propagation, parent/ratio sampling, per-location span name and
+  attributes, and `$otel_trace_id` / `$otel_parent_sampled` nginx variables.
 
-Validated by a **24-hour soak** on a dedicated AWS EPYC 9R14 instance
-(2026-05-29 → 30): 45.2 billion requests at ~523k req/s sustained
-(p99 200µs), bounded memory growth, and a live collector-downtime
-injection in which nginx kept serving (HTTP 200 throughout), the
-`ngx_otel.send_failures` / `ngx_otel.dropped_records` self-metrics
-accounted every drop, and export recovered cleanly on collector restart.
+Two production export transports (`otel_export_protocol`): **OTLP/HTTP** over
+HTTP/1.1 (`otlp_http`, default) and **OTLP/gRPC** unary over HTTP/2 (`otlp_grpc`).
+`http://` and `unix:` endpoints; `https://` / TLS is not yet implemented
+(see [Limitations](#limitations)).
 
-Phase 2 onward (logs, traces, NGINX Plus, OTAP) is out of scope for this
-README.  See the Confluence proposal (link below) for the full phase plan.
+**Performance (metrics-only build, 2026-05-22):** zero-cost-when-disabled
+invariant verified at ≤ 0.01% throughput delta (module-loaded-but-disabled vs
+no-module baseline) on isolated AWS EPYC and macOS arm64.  See
+`tests/bench/RESULTS.md`. Validated by a **24-hour soak** (2026-05-29 → 30):
+45.2 billion requests at ~523k req/s, bounded memory, and clean
+collector-downtime recovery.
+
+The README covers all shipped signals (metrics, logs, traces — Phases 1–3).
+**NGINX Plus (Phase 4)** and **OTAP (Phase 5)** remain roadmap.  See the
+Confluence proposal (link below) for the full phase plan.
 
 ## Architecture
 
@@ -161,9 +150,9 @@ worker does* per request; (3) governs *how we change the code that
 produces bytes*.
 
 This one dedicated exporter is deliberately the **single cold path for all
-three signals** — metrics today, logs and traces in Phases 2–3 — so per-signal
-differences stay confined to the shm shape on the left while one process owns
-all collector I/O.  The per-worker-export alternative (the model the production
+three signals** — metrics (Phase 1), logs (Phase 2), and traces (Phase 3) —
+so per-signal differences stay confined to the shm shape on the left while
+one process owns all collector I/O.  The per-worker-export alternative (the model the production
 C++ `nginx/nginx-otel` module uses: a background thread and its own connection
 in every worker) was weighed across all three signals and declined; the
 reasoning and the conditions that would reverse it are recorded in the proposal
