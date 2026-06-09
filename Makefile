@@ -126,26 +126,6 @@ check: $(NGINX_BUILD_DIR)/Makefile ## Check style and lint
 	$(BUILD_ENV) $(NGX_CARGO) fmt --all -- --check
 	$(BUILD_ENV) $(NGX_CARGO) clippy --all-targets --verbose -- -D warnings
 
-# ── Weaver semconv registry lint ─────────────────────────────────────────────
-# Validates the custom nginx.* / ngx_otel.* attribute registry in semconv/.
-# Requires the `weaver` binary (https://github.com/open-telemetry/weaver).
-# Install: cargo install weaver-forge  -or-  download from GitHub releases.
-# NOT a blocking gate in CI yet (Weaver pre-1.0; see semconv/weaver.yaml).
-
-.PHONY: weaver-check weaver-live-check
-
-weaver-check: ## Lint the custom semconv registry (weaver registry check)
-	weaver registry check --registry semconv/registry
-
-weaver-live-check: ## Report-only live-check via gRPC:4317 (non-blocking: exit always 0)
-	@echo "Weaver live-check: listens on 0.0.0.0:4317 (OTLP/gRPC) for up to 30 s."
-	@echo "Point nginx otel_export_protocol=otlp_grpc at 127.0.0.1:4317 to feed it."
-	@echo "(report-only — non-blocking gate; see semconv/weaver.yaml and plan 3.7)"
-	weaver registry live-check \
-	    --registry semconv/registry \
-	    --otlp-grpc-port 4317 \
-	    --inactivity-timeout 30 || true
-
 install-hooks: ## Install the local pre-commit gate (sets git core.hooksPath)
 	git config core.hooksPath .githooks
 	@echo "Installed: core.hooksPath=.githooks — pre-commit now runs 'make check'."
