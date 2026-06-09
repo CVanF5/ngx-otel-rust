@@ -73,7 +73,7 @@ flowchart TB
     subgraph NGINX["NGINX — one instance"]
         direction TB
         subgraph Hot["Hot path — every request"]
-            Workers["Workers ×N<br/>serve traffic · bump &amp; defer<br/>constant, lock-free, no syscalls"]:::data
+            Workers["Workers ×N — serve traffic<br/>REWRITE: span starts ·<br/>traceparent parsed once<br/>LOG: bump histograms ·<br/>exemplars · tail · span end<br/>lock-free · no syscalls"]:::data
         end
         SHM[("shared memory — the only coupling<br/>per-worker slots + rings ×N<br/>drop-newest when full · counted")]:::tel
         Ctl[("control shm<br/>flags · heartbeat")]:::ctl
