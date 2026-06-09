@@ -1,63 +1,29 @@
 # ngx-otel-rust — Telemetry Model
 
 This document is the **producer-side contract for everything the module emits** —
-metrics, logs, and (Phase 3) traces — in the style of the
+metrics, logs, and traces — in the style of the
 [OpenTelemetry Semantic Conventions][semconv]: signal names, instruments/record
 shapes, units, temporality, and the bounded attribute set the OTAP collector
-dictionary-encodes downstream (proposal §6.4, "Producer-side cardinality
-discipline"). **If you are building a dashboard, alert, or pipeline against this
-module and do not have the proposal, this file is the source of truth** — the repo
-is meant to be self-describing for *what it emits*; the proposal covers *why*.
+dictionary-encodes downstream. **If you are building a dashboard, alert, or pipeline
+against this module, this file is the source of truth for *what* it emits** — the
+proposal covers *why*.
 
 ## Signals at a glance
 
-| Signal | Status | Enabled by | Where |
-|---|---|---|---|
-| **Metrics** | shipped (1.1–2.2) | on by default (`otel_metrics`) | [Metrics](#metrics) |
-| **Logs — access (tail + exemplars)** | shipped (2.1–2.2) | `otel_access_log_sample <n>` | [Logs](#logs) |
-| **Logs — error (coalesced + rate metric)** | shipped (2.3) | `otel_error_log [level]` | [Logs](#logs) |
-| **Traces** | shipped (Phase 3) | `otel_trace <expr>` per location | [Traces](#traces-phase-3) |
+| Signal | Enabled by | Where |
+|---|---|---|
+| **Metrics** | on by default (`otel_metrics`) | [Metrics](#metrics) |
+| **Logs — access (tail + exemplars)** | `otel_access_log_sample <n>` | [Logs](#logs) |
+| **Logs — error (coalesced + rate metric)** | `otel_error_log [level]` | [Logs](#logs) |
+| **Traces** | `otel_trace <expr>` per location | [Traces](#traces) |
 
 **Conventions shared by all signals:** the [Resource and scope](#resource-and-scope)
 below applies to every signal; all attributes are drawn from OTel semconv and kept
-**WithinU8 cardinality** (§6.4) so the collector dictionary-encodes per-point columns
+**WithinU8 cardinality** so the collector dictionary-encodes per-point columns
 at u8 key width; high-cardinality detail (`url.path`, `client.address`,
-`user_agent.original`, upstream peer addr) never becomes a metric dimension — it rides
+`user_agent.original`, upstream peer addr) is never a metric dimension — it rides
 on exemplars, the access tail, or error-record bodies. Transport is OTLP (HTTP or
 gRPC, `otel_export_protocol`) from the dedicated `nginx: otel exporter` process.
-
-## Metrics
-
-> **Currency.** Reflects the shipped module through **Phase 2.3** (error-log
-> §6.6.2, June 2026): the request-duration histogram is an OTel
-> **exponential histogram in microseconds**, the `fix3b` dimensions are **live**,
-> per-route / per-upstream series were added, the temporality mislabel is
-> **fixed (Cumulative)**, and the Phase 2.3 companion error-rate metric
-> (`ngx_otel.error_log.events`) is **wired** (`lib.rs` `init_process` sets
-> `error_rate_ptr`; `export/mod.rs` collects it).
-
-## Provenance — read this first
-
-The metric **model** (which signals to collect from each request, and how
-to derive them) was ported from the F5 **AVR nginx module**
-(`avr-module/`, sibling repo). The metric **names and units** follow the
-OpenTelemetry HTTP semantic conventions. Keep both lineages intact:
-
-- **Signals / derivation → `avr-module/`.** When adding or changing a
-  metric, the avr source is the precedent — read it, don't guess. The
-  per-request data model is `avr-module/src/ngx_http_avr_data_sources.h:69-92`
-  (`ngx_avr_data_t`); the duration idiom is
-  `avr-module/src/ngx_http_avr_data_sources.c:10-13` (`get_request_time`);
-  the aggregation + dimension model is
-  `avr-module/src/ngx_http_avr_output.c:111-177` (time-slice buckets,
-  per-request `hitcount`, dictionary-encoded entity IDs).
-- **Names / units → OTel semconv.** So the OTAP collector-side classifier
-  recognises them and the cardinality stays bounded.
-
-> The duration defect fixed in the metrics-correctness loop was a *drift*
-> from the avr model: `LogPhaseHandler` reimplemented request duration as
-> `ngx_current_msec - r->start_msec` instead of avr's `get_request_time`.
-> This doc exists so that lineage is not lost again.
 
 ## Resource and scope
 
@@ -76,27 +42,18 @@ as cumulative running totals (workers bump; the exporter snapshots without
 resetting) and are emitted **Cumulative** with a fixed
 `start_time_unix_nano`, matching the `nginx.*` counters.
 
-> **Resolved (metrics-correctness loop).** An earlier build emitted `Delta`
-> temporality with a zero `StartTimestamp` while carrying cumulative values —
-> a mislabel. Fixed: every `http.*` data point now sets
-> `aggregation_temporality = Cumulative` (`src/encoder/mod.rs`,
-> `src/metric_source/instrumented.rs`).
-
 ---
 
 ## HTTP server request duration (exponential histogram, µs)
 
-Derived per request in `LogPhaseHandler`
-(`src/metric_source/instrumented.rs`). Phase 2.2 (DP-F) switched the request
-duration from an explicit-bucket `ms` histogram to an **OTel exponential
-histogram recorded in microseconds**, for native sub-millisecond quantiles
-in the ~90–200µs operating regime. Source values come from avr's
-`get_request_time` idiom (`data_sources.c:10-13`), now in µs.
+Derived per request in `LogPhaseHandler` (`src/metric_source/instrumented.rs`). The
+request duration is an OTel **exponential histogram recorded in microseconds**, for
+native sub-millisecond quantiles in the ~90–200µs operating regime.
 
-The duration is emitted as **three decomposed series** (not a cross-product —
-proposal §6.6.1): a base series carrying the bounded `{method × status-class ×
-protocol}` dimensions, plus independent per-route and per-upstream series.
-Each is its own `ExpHistogramSlot` table in `WorkerSlots` (`src/shm.rs`).
+The duration is emitted as **three decomposed series** (not a cross-product): a base
+series carrying the bounded `{method × status-class × protocol}` dimensions, plus
+independent per-route and per-upstream series. Each is its own `ExpHistogramSlot`
+table in `WorkerSlots` (`src/shm.rs`).
 
 | Metric | Instrument | Unit | Temporality | Attributes (data-point keys) |
 |---|---|---|---|---|
@@ -108,7 +65,7 @@ Each is its own `ExpHistogramSlot` table in `WorkerSlots` (`src/shm.rs`).
   N_STATUS_CLASSES(5) × N_PROTO_VERSIONS(4)`); empty combos are skipped.
   `http.response.status_code` carries the **status-class representative**
   (100/200/300/400/500), not the raw code — class bucketing keeps the column
-  WithinU8 (proposal §6.4).
+  WithinU8.
 - `by_route` / `by_upstream` are **always** emitted (independent of
   `otel_metric_status_code_class`). Route names are the matched `location`
   name (never the raw URI), bounded `ROUTE_CAP = 64` + an `"other"` slot;
@@ -129,44 +86,40 @@ Each is its own `ExpHistogramSlot` table in `WorkerSlots` (`src/shm.rs`).
   computed in O(1) using only integer shifts and 7 precomputed u64 thresholds —
   no float, no `log()` call, no syscall on the hot path. Verified exact for all
   values in [1, 2^14] and a random sample up to 2^24.
-- **Boundary convention (note):** our bucket index uses a lower-inclusive
+- **Boundary convention (note):** the bucket index uses a lower-inclusive
   boundary `[base^k, base^(k+1))` (i.e. `floor(log2(v)*8) = k` iff
   `2^(k/8) ≤ v < 2^((k+1)/8)`), whereas the OTel exp-histogram spec defines
   bucket `k` as the upper-inclusive `(base^k, base^(k+1)]`. The two differ for
   exactly one input: a value landing *precisely* on a boundary `base^k` (e.g.
   2µs, 4µs, 8µs — exact powers of 2) is counted in bucket `k` here vs `k-1`
   per spec — an off-by-one of a single bucket only at exact powers of 2. For
-  all other integer-µs latencies the bucketing is identical. Documented,
-  not "fixed."
+  all other integer-µs latencies the bucketing is identical. This is a
+  deliberate, documented choice.
 
 ---
 
 ## HTTP server size + upstream metrics (explicit-bucket histograms)
 
-These were **not** changed by Phase 2.2 — they remain explicit-bucket
-`Histogram<N>` (`src/shm.rs`), single unattributed data point each (no
-method/route/zone decomposition). Recorded in `LogPhaseHandler`; upstream
+Explicit-bucket `Histogram<N>` (`src/shm.rs`), single unattributed data point each
+(no method/route/zone decomposition). Recorded in `LogPhaseHandler`; upstream
 metrics only when an upstream was used (from `ngx_http_upstream_state_t`).
 
-| Metric | Instrument | Unit | Temporality | avr-module source |
-|---|---|---|---|---|
-| `http.server.request.body.size` | Histogram (explicit) | `By` | Cumulative | `bytes_in` (`data_sources.h:78`) |
-| `http.server.response.body.size` | Histogram (explicit) | `By` | Cumulative | `bytes_out` (`data_sources.h:79`) |
-| `http.server.upstream.response.duration` | Histogram (explicit) | `ms` | Cumulative | `uppstream_response_time` (`data_sources.h:88`) |
-| `http.server.upstream.header.duration` | Histogram (explicit) | `ms` | Cumulative | `uppstream_header_time` (`data_sources.h:86`) |
-| `http.server.upstream.connect.duration` | Histogram (explicit) | `ms` | Cumulative | `uppstream_connect_time` (`data_sources.h:87`) |
-| `http.server.upstream.bytes.received` | Histogram (explicit) | `By` | Cumulative | `uppstream_bytes_received` (`data_sources.h:83`) |
-| `http.server.upstream.bytes.sent` | Histogram (explicit) | `By` | Cumulative | `uppstream_bytes_sent` (`data_sources.h:84`) |
+| Metric | Instrument | Unit | Temporality |
+|---|---|---|---|
+| `http.server.request.body.size` | Histogram (explicit) | `By` | Cumulative |
+| `http.server.response.body.size` | Histogram (explicit) | `By` | Cumulative |
+| `http.server.upstream.response.duration` | Histogram (explicit) | `ms` | Cumulative |
+| `http.server.upstream.header.duration` | Histogram (explicit) | `ms` | Cumulative |
+| `http.server.upstream.connect.duration` | Histogram (explicit) | `ms` | Cumulative |
+| `http.server.upstream.bytes.received` | Histogram (explicit) | `By` | Cumulative |
+| `http.server.upstream.bytes.sent` | Histogram (explicit) | `By` | Cumulative |
 
 ## NGINX connection / request metrics
 
 Read from nginx's `stub_status` globals each export interval
-(`src/metric_source/stub_status.rs`). The connection **gauges**
-(active/reading/writing/waiting) are emitted as real OTLP **Gauge** metrics;
-the **counters** (accepted/handled/requests) are still single-bucket
-cumulative histograms today (semantically a monotonic Sum). Modelling a gauge
-as a `count=1` histogram is dropped by Prometheus remote-write, so the gauges
-were corrected to true Gauges (the counters round-trip fine as-is).
+(`src/metric_source/stub_status.rs`). Connection state
+(active/reading/writing/waiting) is emitted as OTLP **Gauge** metrics; the
+cumulative counters (accepted/handled/requests) as monotonic **Sum** metrics.
 
 | Name | Instrument | Unit (UCUM) | Temporality | Stability |
 |---|---|---|---|---|
@@ -178,33 +131,28 @@ were corrected to true Gauges (the counters round-trip fine as-is).
 | `nginx.connections.writing` | Gauge | `{connection}` | — | experimental |
 | `nginx.connections.waiting` | Gauge | `{connection}` | — | experimental |
 
-These are not part of the avr model; they come from nginx core
-`stub_status` and are already temporality-correct.
-
 ---
 
-## Attributes (implemented — `fix3b` shipped, Phase 2.1; route/zone, Phase 2.2)
+## Attributes
 
 The duration series attach the bounded, semconv-aligned dimensions below.
 All are **WithinU8 cardinality** so the OTAP collector-side classifier can
-dictionary-encode each per-point column at u8 key width (proposal §6.4). The
-closed-cardinality enums live in `src/shm.rs` (`HttpMethod`, `StatusClass`,
-`ProtoVersion`).
+dictionary-encode each per-point column at u8 key width. The closed-cardinality
+enums live in `src/shm.rs` (`HttpMethod`, `StatusClass`, `ProtoVersion`).
 
-| Attribute | On series | Cardinality | avr-module source |
-|---|---|---|---|
-| `http.request.method` | base duration | 8 (`HttpMethod`, 7 + `_OTHER`) | `method` → `avr_lookup_or_insert_method` (`output.c:144-148`) |
-| `http.response.status_code` | base duration | 5 status classes (representative value) | `rcode`/`status` (`output.c:129-131`) |
-| `network.protocol.version` | base duration | 4 (`ProtoVersion`) | `http_version` (`output.c:132-134`) |
-| `http.route` | `…by_route` | ≤ 64 + `other` (location name) | matched `location` name (cf. C++ module `clcf->name`) |
-| `nginx.upstream.zone` | `…by_upstream` | ≤ 32 + `other`/none | declared upstream `zone` (NGINX Plus model) |
+| Attribute | On series | Cardinality |
+|---|---|---|
+| `http.request.method` | base duration | 8 (`HttpMethod`, 7 + `_OTHER`) |
+| `http.response.status_code` | base duration | 5 status classes (representative value) |
+| `network.protocol.version` | base duration | 4 (`ProtoVersion`) |
+| `http.route` | `…by_route` | ≤ 64 + `other` (location name) |
+| `nginx.upstream.zone` | `…by_upstream` | ≤ 32 + `other`/none |
 
 > **High-cardinality detail is NOT a metric dimension.** `url.path`,
-> `user_agent.original`, and `client.address` were considered (avr keys on
-> them) but are deliberately kept **off** the metrics. As of Phase 2.2 they
-> ride on **access-log exemplars + the exception tail** (proposal §6.6.1),
-> reachable via the exemplar → trace drill-down, never as histogram
-> attributes (that would break the WithinU8 budget).
+> `user_agent.original`, and `client.address` are deliberately kept **off** the
+> metrics. They ride on **access-log exemplars + the exception tail**, reachable
+> via the exemplar → trace drill-down, never as histogram attributes (that would
+> break the WithinU8 budget).
 
 ## Histogram bucket boundaries (`src/shm.rs`)
 
@@ -217,10 +165,9 @@ closed-cardinality enums live in `src/shm.rs` (`HttpMethod`, `StatusClass`,
 
 ---
 
-## Phase 2.3 error-rate metric (`ngx_otel.error_log.events`) — **implemented**
+## Error-rate metric (`ngx_otel.error_log.events`)
 
 The companion error-rate metric emitted alongside the coalesced error `LogRecord`s.
-Wired in `lib.rs` `init_process` (`error_rate_ptr`); collected by `export/mod.rs`.
 
 | Metric | Instrument | Unit | Temporality | Attributes |
 |---|---|---|---|---|
@@ -236,13 +183,12 @@ Severity classes (5 values, WithinU8 cardinality):
 | `"info"` | 6–7 | notice, info |
 | `"debug"` | 8 | debug |
 
-> **Scope boundary (decided 2026-06-05 — DP-B).** The error metric is keyed on
-> `severity_class` **only** — no `http.route` / `nginx.upstream.zone` and no
-> `trace_id`. The `ngx_log_writer_pt` seam hands the writer its own log node,
-> not the connection's `c->log`, so the request context is structurally
-> unreachable on the error path (the access path is unaffected). "Which
-> upstream/route" remains readable in the error sample's **body text**.
-> Per-template counts ride on the `LogRecord`'s `nginx.error.coalesced_count`
+> **Scope boundary.** The error metric is keyed on `severity_class` **only** — no
+> `http.route` / `nginx.upstream.zone` and no `trace_id`. The `ngx_log_writer_pt`
+> seam hands the writer its own log node, not the connection's `c->log`, so the
+> request context is structurally unreachable on the error path (the access path is
+> unaffected). "Which upstream/route" remains readable in the error sample's **body
+> text**. Per-template counts ride on the `LogRecord`'s `nginx.error.coalesced_count`
 > attribute, never on the metric.
 
 ---
@@ -251,10 +197,9 @@ Severity classes (5 values, WithinU8 cardinality):
 
 OTel logs are **orthogonal to nginx's own `access_log`/`error_log`** (the module emits
 via its own directives; core file logging is untouched and remains the on-box
-transcript). The OTel stream carries "summary + samples", not a per-request firehose
-(proposal §6.6).
+transcript). The OTel stream carries "summary + samples", not a per-request firehose.
 
-### Access log — exemplars + thin exception tail (§6.6.1)
+### Access log — exemplars + thin exception tail
 
 The bulk of access information is the **metrics** above. Per-event access output is
 **gated by `otel_access_log_sample <reservoir-size>`** (absent ⇒ off) and is two
@@ -296,7 +241,7 @@ A common (2xx, fast) request produces **neither** — only the histogram `fetch_
 > aggregate histogram and the exception-tail `LogRecord`s are the authoritative
 > surfaces.
 
-### Error log — coalesced `LogRecord`s (§6.6.2)
+### Error log — coalesced `LogRecord`s
 
 Enabled by `otel_error_log [level]`. Logs-primary (the message body is the payload).
 Floods of identical lines are collapsed at the producer.
@@ -323,7 +268,7 @@ Floods of identical lines are collapsed at the producer.
   errors fall through to nginx's own `error_log` (structural; not exported over OTel).
 - Source: `src/logs/error_writer.rs`, `src/logs/coalesce.rs`, drain in `src/export/mod.rs`.
 
-## Traces (Phase 3)
+## Traces
 
 OTel **server spans** are emitted for requests where `otel_trace` is configured.
 Source: `src/metric_source/span_start.rs` (REWRITE phase), `src/metric_source/instrumented.rs`
@@ -346,7 +291,7 @@ location wins on merge.
 | Variable | Type | Value |
 |---|---|---|
 | `$otel_trace_id` | string (32-char hex) | trace ID from the current request's `SpanCtx`, or empty string when tracing is disabled. |
-| `$otel_parent_sampled` | string `"1"` / empty | `"1"` when this request is sampled — including root spans with no inbound `traceparent`; empty only when tracing is disabled. (The name reads as a parent-only flag but reflects the sampling state of *this* request — see `span_start.rs:162–180`.) |
+| `$otel_parent_sampled` | string `"1"` / empty | `"1"` when this request is sampled — including root spans with no inbound `traceparent`; empty only when tracing is disabled. (The name reads as a parent-only flag but reflects the sampling state of *this* request — see `span_start.rs`.) |
 
 ### Span shape
 
@@ -391,7 +336,7 @@ Standard OTel HTTP semconv attributes recorded on every span:
 - **Ratio / head-sampling:** when no inbound `traceparent` is present, the `otel_trace`
   complex value is re-read at decision time. A `split_clients`-managed variable (e.g.
   `$otel_trace_sample`) returning `"1"` → sampled; `"0"` / `"off"` → unsampled.
-  Currently defaults to `sampled=true` for any truthy value.
+  A truthy value → `sampled=true`.
 - **Probe / health-check drop:** a configurable `probe_drop` pipeline `Processor`
   (`src/processor/mod.rs`) drops spans whose `url.path` matches the configured set
   (defaults: `/healthz`, `/readyz`, `/livez`, `/ping`, `/metrics`). Configured via the
@@ -410,9 +355,9 @@ Standard OTel HTTP semconv attributes recorded on every span:
 
 ### Trace–metric–log correlation
 
-- **Exemplars** on `http.server.request.duration` now carry `trace_id`/`span_id` from the
+- **Exemplars** on `http.server.request.duration` carry `trace_id`/`span_id` from the
   module's own spans (when `otel_access_log_sample` + `otel_trace` are both configured).
-  This is the metric→exemplar→**Tempo trace** drill-down pivot (proposal §6.6.5).
+  This is the metric→exemplar→**Tempo trace** drill-down pivot.
 - **Access tail `LogRecord`s** carry the same `trace_id`/`span_id` as the span.
 - **Error `LogRecord`s** do NOT carry trace context (the `ngx_log_writer_pt` seam can't
   reach request context — see the error-log scope note in [Logs](#logs)).
@@ -423,10 +368,6 @@ OTLP via the same dedicated `nginx: otel exporter` process as metrics and logs.
 Spans are sent to the derived traces path (`base/v1/traces` for OTLP/HTTP, or
 overridden by `traces_endpoint` in `otel_exporter {}`; `otlp_grpc` uses the gRPC
 TraceService method). All span encoding and I/O happen on the cold path.
-
-> **Structural correctness verified (Phase 3 S5).** The TSAN gate
-> (`tests/RESULTS-tsan-2026-06-08-traces.txt`) exercises the spans-ring writer + REWRITE
-> `SpanCtx` shared state on Linux/arm64 with zero races.
 
 ---
 
@@ -443,73 +384,25 @@ The exporter process emits its own health metrics every export interval
 | `ngx_otel.logs.access.dropped_records` | Sum (monotonic) | `{record}` | Access log records dropped because the per-worker ring was full |
 | `ngx_otel.logs.error.dropped_records` | Sum (monotonic) | `{record}` | Error log records dropped because the per-worker ring was full |
 | `ngx_otel.logs.send_failures` | Sum (monotonic) | `{failure}` | Cumulative logs transport send failures since exporter startup |
-| `ngx_otel.traces.dropped_records` | Sum (monotonic) | `{record}` | Span records dropped because the per-worker spans ring was full (P3 pre-promote fix — was written to `TRACES_DROPPED_RECORDS` but never emitted) |
+| `ngx_otel.traces.dropped_records` | Sum (monotonic) | `{record}` | Span records dropped because the per-worker spans ring was full |
 | `ngx_otel.export_interval` | Gauge | `ms` | Configured metric export interval |
 
 ---
-
-## avr-module signals not yet ported
-
-Present in the avr model but not currently emitted by ngx-otel-rust —
-candidates for future metrics, listed so they aren't forgotten:
-
-| avr field | Note |
-|---|---|
-| `client_rtt` / `clientside_network_latency` | client-side RTT (TCP info) |
-| `client_ttfb` | composite client time-to-first-byte (`output.c:126`) |
-| `serverside_network_latency` | from `uppstream_connect_time` (`output.c:123`) |
-| `uppstream_status` | upstream response status code |
-| `uppstream_response_length` | upstream response content length |
-| `uppstream_addr` | upstream peer address (high-card; sample/exemplar only) |
-| `is_ssl` | TLS yes/no (dimension) |
 
 ## Dashboard
 
 A reference Grafana dashboard is committed at
 `test-harness/demo/grafana/dashboards/ngx-otel-rust-overview.json`. It covers the
-current surface: request rate / avg latency by method · status-class · route
+emitted surface: request rate / latency by method · status-class · route
 (`by_route`, topk) · upstream zone (`by_upstream`); body-size and upstream-timing
-quantiles (those are explicit-bucket, so `histogram_quantile(…, _bucket … by le)`);
-nginx `stub_status`; the exporter self-metrics (incl. the Phase-2 log drop / send-failure
-counters); and a Loki panel for 4xx/5xx access logs.
-
-**Open iteration items (the dashboard is a working base, not final):**
-- **Request-duration percentiles** are shown as **averages** (`rate(_sum)/rate(_count)`),
-  NOT p50/p90/p99. The duration metric is an OTel **exponential histogram (µs)**; true
-  quantiles need the collector→Prometheus **native-histogram** path
-  (`histogram_quantile(0.99, sum(rate(metric[range])))`, no `le`) or an exp→classic
-  bucket conversion. Wiring this is what validates DP-F's sub-ms quantile benefit
-  (tied to the §6.6.5 demo plan). Until then, averages can hide the tail.
-- **Exemplar → Tempo pivot** (Phase 3, wired): `exemplarTraceIdDestinations` is now
-  configured in the Tempo datasource in the demo dashboard; clicking an exemplar on the
-  `http.server.request.duration` panel opens the corresponding nginx server span in Tempo.
-  Requires the demo Tempo instance to receive spans from the module.
-- **Traces panel** added to the dashboard pointing at the Tempo datasource (service = `otel_service_name`).
-- **Error-rate panel** (`ngx_otel.error_log.events`): present in the dashboard since Phase 2.3.
-- **Provisioning reconciliation:** the committed file uses the new Grafana **dynamic
-  dashboard schema** (`elements`/`layout`); set a stable `uid` (`ngx-otel-rust-overview`),
-  a generic title, and reconcile datasource UIDs with the demo provisioning + confirm
-  the demo Grafana version supports the schema before relying on auto-load.
-
-**Connecting metrics ↔ logs in Grafana (design direction):** two mechanisms, both
-serve the §6.6.3 "drill-down without SSH" story:
-1. **Grafana Correlations / data links (label-based, available now):** click a metric
-   panel → open Explore in Loki filtered by the shared labels (`service_name`,
-   `http.route`, …) at the clicked time range. Works for *any* logs (access tail AND
-   error), needs no traces. The dashboard's existing "Explore service logs" link is a
-   basic form; a Correlation makes it click-through from a spike.
-2. **Exemplar → trace → log (richer, Phase 3):** exemplars on the duration histogram
-   carry `trace_id`; Grafana's `exemplarTraceIdDestinations` links them to Tempo, and
-   Tempo→Loki via `trace_id`. Works for the **access** path (its tail/exemplars carry
-   `trace_id`); **error** logs are NOT trace-linked (the writer can't reach request
-   context — see Logs above), so error correlation stays label-based (#1).
+quantiles (explicit-bucket); nginx `stub_status`; the exporter self-metrics; an
+error-rate panel (`ngx_otel.error_log.events`); a Loki panel for 4xx/5xx access logs;
+and the exemplar → Tempo trace pivot (`exemplarTraceIdDestinations` on the Tempo
+datasource) for the metric → exemplar → trace → log drill-down.
 
 ## References
 
 - [OpenTelemetry Semantic Conventions — HTTP metrics][semconv]
-- Reference model: `avr-module/src/ngx_http_avr_data_sources.{h,c}`,
-  `ngx_http_avr_output.c`
-- Producer-side cardinality discipline: proposal §6.4; logs-as-summary §6.6
 - Shared-memory layout + histograms: `src/shm.rs`
 - Metrics emission + attributes: `src/metric_source/instrumented.rs`, `src/encoder/mod.rs`
 - Logs: `src/logs/{access,ring,error_writer,coalesce,severity}.rs`; drain in `src/export/mod.rs`
