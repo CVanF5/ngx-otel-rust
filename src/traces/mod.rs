@@ -336,7 +336,7 @@ pub fn parse_span_record(buf: &[u8], observed_ns: u64) -> Option<crate::data_mod
     let n_extra = if pos + 2 <= buf.len() {
         let n = u16::from_be_bytes(buf[pos..pos + 2].try_into().ok()?) as usize;
         pos += 2;
-        n.min(MAX_SPAN_EXTRA_ATTRS * 4) // sanity cap
+        n.min(MAX_SPAN_EXTRA_ATTRS) // sanity cap: producer never writes more than MAX_SPAN_EXTRA_ATTRS
     } else {
         0
     };
@@ -659,5 +659,107 @@ mod tests {
             .map(|kv| kv.key.as_str())
             .collect();
         assert_eq!(extra_keys, vec!["env"], "only 'env' extra attr expected");
+    }
+
+    /// S4 — Parser sanity cap: a corrupted `n_extra` field must not cause the
+    /// parser to loop more than `MAX_SPAN_EXTRA_ATTRS` times.
+    ///
+    /// Produces a well-formed span record with one extra attr, then patches the
+    /// raw `n_extra` wire field to a value far above the producer maximum.
+    /// The parser must clamp at `MAX_SPAN_EXTRA_ATTRS` and still return a valid
+    /// span (one or zero extra attrs, depending on how many bytes are valid).
+    #[test]
+    fn span_parser_extra_attrs_sanity_cap() {
+        use crate::data_model::{SpanKind, StatusCode};
+
+        struct VecProducer(std::sync::Mutex<std::vec::Vec<u8>>);
+        impl LogProducer for VecProducer {
+            fn push(&self, data: &[u8]) -> bool {
+                let mut v = self.0.lock().unwrap();
+                let len = data.len() as u32;
+                v.extend_from_slice(&len.to_be_bytes());
+                v.extend_from_slice(data);
+                true
+            }
+        }
+
+        // Emit a span with one valid extra attr.
+        let extra: [(&[u8], &[u8]); 1] = [(&b"k"[..], &b"v"[..])];
+        let rec = SpanRecord {
+            trace_id: [0x01u8; 16],
+            span_id: [0x02u8; 8],
+            parent_span_id: [0x00u8; 8],
+            flags: 0x01,
+            start_time_unix_nano: 1_000_000_000,
+            end_time_unix_nano: 2_000_000_000,
+            status_code: StatusCode::Ok as u8,
+            kind: SpanKind::Server as u8,
+            name: b"GET /s4",
+            method: b"GET",
+            http_status: 200,
+            url_path: b"/s4",
+            duration_us: 500,
+            extra_attrs: &extra,
+        };
+
+        let producer = VecProducer(std::sync::Mutex::new(std::vec::Vec::new()));
+        assert!(emit_span_record(&producer, &rec));
+
+        let raw = producer.0.lock().unwrap();
+        let len = u32::from_be_bytes(raw[..4].try_into().unwrap()) as usize;
+
+        // Copy payload so we can mutate it.
+        let mut payload = raw[4..4 + len].to_vec();
+
+        // Locate the n_extra field.  It appears right after the fixed header,
+        // name (2+len), method (2+len), http_status (2), url_path (2+len),
+        // duration_us (8).  Walk to it rather than hard-coding an offset so
+        // this test is resilient to field order changes.
+        let mut pos = SPAN_RECORD_FIXED_HDR;
+        // name
+        let name_len = u16::from_be_bytes(payload[pos..pos + 2].try_into().unwrap()) as usize;
+        pos += 2 + name_len;
+        // method
+        let method_len = u16::from_be_bytes(payload[pos..pos + 2].try_into().unwrap()) as usize;
+        pos += 2 + method_len;
+        // http_status
+        pos += 2;
+        // url_path
+        let path_len = u16::from_be_bytes(payload[pos..pos + 2].try_into().unwrap()) as usize;
+        pos += 2 + path_len;
+        // duration_us
+        pos += 8;
+        // pos now points at n_extra (u16 big-endian)
+        let n_extra_offset = pos;
+        assert!(n_extra_offset + 2 <= payload.len(), "n_extra offset out of bounds");
+
+        // Corrupt n_extra to a large value (200 — well above MAX_SPAN_EXTRA_ATTRS * 4).
+        let corrupt_n: u16 = 200;
+        payload[n_extra_offset..n_extra_offset + 2].copy_from_slice(&corrupt_n.to_be_bytes());
+
+        // The parser must not panic or loop 200 times; it must clamp and return.
+        let span = parse_span_record(&payload, 0).expect("parser must tolerate corrupted n_extra");
+
+        // With a corrupted n_extra the parser tries MAX_SPAN_EXTRA_ATTRS iterations
+        // at most.  Only the bytes for 1 real attr were serialized; the rest break
+        // inside the loop (pos overruns buf), so we get ≤ MAX_SPAN_EXTRA_ATTRS attrs
+        // in the final span (typically 0 or 1 extra, plus the standard HTTP attrs).
+        let extra_count = span
+            .attributes
+            .iter()
+            .filter(|kv| {
+                ![
+                    "http.request.method",
+                    "http.response.status_code",
+                    "url.path",
+                    "http.server.request.duration",
+                ]
+                .contains(&kv.key.as_str())
+            })
+            .count();
+        assert!(
+            extra_count <= MAX_SPAN_EXTRA_ATTRS,
+            "parser must not exceed MAX_SPAN_EXTRA_ATTRS ({MAX_SPAN_EXTRA_ATTRS}) extra attrs, got {extra_count}"
+        );
     }
 }
