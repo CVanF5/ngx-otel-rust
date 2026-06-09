@@ -7,7 +7,7 @@
     "ngx-otel-rust"
   ],
   "schemaVersion": 41,
-  "version": 2,
+  "version": 4,
   "editable": true,
   "time": {
     "from": "now-15m",
@@ -1949,14 +1949,14 @@
     },
     {
       "id": 51,
-      "type": "row",
+      "type": "table",
       "title": "Traces (Phase 3 \u2014 nginx server spans via Tempo)",
       "collapsed": true,
       "gridPos": {
-        "h": 1,
+        "h": 10,
         "w": 24,
         "x": 0,
-        "y": 100
+        "y": 121
       },
       "panels": [
         {
@@ -2018,7 +2018,30 @@
             }
           }
         }
-      ]
+      ],
+      "datasource": {
+        "type": "tempo",
+        "uid": "tempo"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "tempo",
+            "uid": "tempo"
+          },
+          "refId": "A",
+          "queryType": "traceql",
+          "query": "{resource.service.name=\"nginx-otel\"}",
+          "limit": 20,
+          "tableType": "traces"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {},
+      "description": "nginx OTel server spans (root traces) via Tempo TraceQL. Click a trace to open it; from a span use 'Logs for this span' to reach the matching Loki access-tail log."
     },
     {
       "id": 52,

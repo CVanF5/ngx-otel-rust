@@ -52,13 +52,15 @@ http {
     otel_error_log warn;
 
     # ── Phase 3 traces (server spans → Tempo) ───────────────────────────────
-    # Emit an OTel server span per request. `propagate` reads the inbound W3C
-    # traceparent (the traffic generator sends one) AND injects it downstream,
-    # so an /api/ request yields a 2-span trace (front server → backend). With
-    # otel_access_log_sample above, the duration-histogram exemplars carry the
-    # span's trace_id — the metric → exemplar → Tempo trace → Loki log drill-down.
+    # Emit an OTel server span per request. `ignore` = start a fresh ROOT span
+    # per request; do NOT inherit the traffic generator's synthetic inbound
+    # traceparent (that parent never reaches Tempo, which would leave every
+    # trace rootless / "root span not yet received"). So each nginx span is a
+    # clean, searchable trace root. With otel_access_log_sample above, the
+    # duration-histogram exemplars carry the span's trace_id — the
+    # metric → exemplar → Tempo trace → Loki log drill-down.
     otel_trace on;
-    otel_trace_context propagate;
+    otel_trace_context ignore;
     otel_span_attr deployment.environment demo;
 
     # Backend the front server proxies to (populates upstream.* metrics).
