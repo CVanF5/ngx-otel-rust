@@ -159,7 +159,7 @@ impl<C: Connector> GrpcTransport<C> {
 
 // ── Transport impl ────────────────────────────────────────────────────────────
 
-#[allow(private_bounds)]
+#[allow(private_bounds)] // see note on the struct definition above
 impl<C: Connector + Send> GrpcTransport<C> {
     /// Send a batch of OTLP metrics (encoded protobuf) over OTLP/gRPC unary.
     pub async fn send(&mut self, bytes: std::vec::Vec<u8>) -> Result<(), TransportError> {
@@ -239,7 +239,7 @@ impl<C: Connector + Send> GrpcTransport<C> {
 
 // ── Logs send (Phase 2.1) ─────────────────────────────────────────────────────
 
-#[allow(private_bounds)]
+#[allow(private_bounds)] // see note on the struct definition above
 impl<C: Connector + Send> GrpcTransport<C> {
     /// Send an `ExportLogsServiceRequest` (already prost-encoded) to the
     /// `LogsService/Export` RPC.

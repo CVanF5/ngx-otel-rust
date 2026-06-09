@@ -530,7 +530,7 @@ unsafe impl Send for InstrumentedSource {}
 unsafe impl Sync for InstrumentedSource {}
 
 impl crate::metric_source::MetricSource for InstrumentedSource {
-    #[allow(clippy::needless_range_loop)]
+    #[allow(clippy::needless_range_loop)] // idx parallels two independent slices (buckets + bounds)
     fn collect(&self) -> std::vec::Vec<crate::data_model::Metric> {
         use crate::data_model::{AggregationTemporality, AnyValue, Exemplar, KeyValue};
         use crate::shm::{

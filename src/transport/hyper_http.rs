@@ -1321,7 +1321,7 @@ impl HyperHttpTransport<NgxConnector> {
     }
 }
 
-#[allow(private_bounds)]
+#[allow(private_bounds)] // Connector is pub(crate); see note on struct above.
 impl<C: Connector> HyperHttpTransport<C> {
     /// Send a batch of OTLP/HTTP protobuf metrics to the configured endpoint.
     ///

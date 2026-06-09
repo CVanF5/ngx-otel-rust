@@ -908,7 +908,6 @@ pub unsafe fn logs_access_ring(base_addr: *mut u8, worker_id: usize, cap: usize)
 /// Obtain a [`LogsWorkerRing`] view of the **error** ring for `worker_id`.
 ///
 /// Error ring follows immediately after the access ring within the same slot.
-#[allow(dead_code)]
 #[inline]
 pub unsafe fn logs_error_ring(base_addr: *mut u8, worker_id: usize, cap: usize) -> LogsWorkerRing {
     let slot_off = worker_id * logs_slot_size(cap);
@@ -1214,31 +1213,22 @@ mod tests {
         assert_eq!(total_sum, 1300);
 
         // Confirm no cross-write between slots.
-        // scale 3: bucket index = n*8 + frac (n = floor(log2(value))).
-        // 100µs: n=6, k=6*8+((100>>3)&7)=48+3=51.  500µs: n=8, k=8*8+((500>>5)&7)=64+15=79.
+        // scale 3: bucket index = (n << 3) | frac   where n = floor(log2(v)), s = 3.
+        //   100µs: n=6 (64≤100<128), frac=((100>>3)&7)=(12&7)=4 → 6*8+4 = 52
+        //   500µs: n=8 (256≤500<512), frac=((500>>5)&7)=(15&7)=7 → 8*8+7 = 71
         let (buckets0, _, _, _) = slot0.request_duration_combos[combo].snapshot();
         let (buckets1, _, _, _) = slot1.request_duration_combos[combo].snapshot();
 
-        // Compute expected bucket indices using the same formula as record().
-        fn bucket_idx(v: u64) -> usize {
-            let n = 63u32.saturating_sub(v.leading_zeros());
-            let s = EXP_HISTOGRAM_SCALE as u32;
-            let upper = (n as usize) << s;
-            let frac = if n >= s {
-                ((v >> (n - s)) as usize) & ((1usize << s) - 1)
-            } else {
-                ((v << (s - n)) as usize) & ((1usize << s) - 1)
-            };
-            (upper | frac).min(N_EXP_BUCKETS - 1)
-        }
-        let bucket_100 = bucket_idx(100);
-        let bucket_500 = bucket_idx(500);
+        // Expected bucket indices — literals derived above, NOT recomputed via the same
+        // formula under test (A1 anti-pattern: a self-referential helper never validates).
+        const BUCKET_100: usize = 52;
+        const BUCKET_500: usize = 71;
+        const _: () = assert!(BUCKET_100 != BUCKET_500, "100 and 500 must be in distinct buckets");
 
-        assert_ne!(bucket_100, bucket_500, "100 and 500 must be in distinct buckets");
-        assert_eq!(buckets0[bucket_100], 3, "worker 0 bucket for 100");
-        assert_eq!(buckets1[bucket_500], 2, "worker 1 bucket for 500");
-        assert_eq!(buckets0[bucket_500], 0, "slot 0 not written by worker 1");
-        assert_eq!(buckets1[bucket_100], 0, "slot 1 not written by worker 0");
+        assert_eq!(buckets0[BUCKET_100], 3, "worker 0 bucket for 100");
+        assert_eq!(buckets1[BUCKET_500], 2, "worker 1 bucket for 500");
+        assert_eq!(buckets0[BUCKET_500], 0, "slot 0 not written by worker 1");
+        assert_eq!(buckets1[BUCKET_100], 0, "slot 1 not written by worker 0");
     }
 
     /// Base combo index mapping: all N_COMBOS (160) combinations must be distinct.
@@ -1552,7 +1542,7 @@ mod tests {
         assert_eq!(buckets[60], 1, "200µs → bucket 60");
     }
 
-    #[allow(dead_code)]
+    #[test]
     fn high_cardinality_only_on_tail_not_metric() {
         // 1. N_COMBOS is the base 160 (method × sc × proto) ONLY.
         //    Route and upstream are separate tables (decomposed) — NOT multiplied in.
