@@ -93,26 +93,43 @@ impl HttpRequestHandler for LogPhaseHandler {
         // Use AsRef to get a typed reference to the underlying ngx_http_request_t.
         let r = request.as_ref();
 
+        // ── Read SpanCtx early (§6.6.3 parse-once + D-2 dual-clock) ─────────
+        // Read BEFORE the duration computation so the monotonic anchor in
+        // SpanCtx.start_mono can drive the µs histogram when tracing is on.
+        // Set by SpanStartHandler in REWRITE.  None when tracing is not configured.
+        // Re-used for:
+        //   (1) µs histogram / duration_ms gate (this block).
+        //   (2) trace correlation on the access tail log / exemplar (Phase 2.2 below).
+        //   (3) span record emission when sampled (S2 block below).
+        let span_ctx: Option<&crate::traces::ctx::SpanCtx> = {
+            use crate::traces::ctx::SpanCtx;
+            // SAFETY: `ngx_http_otel_module` is a valid static module descriptor;
+            // `get_module_ctx` reads the request ctx array at our module's index and
+            // returns a valid reference only when non-null (set by `SpanStartHandler`
+            // from a pool-allocated `SpanCtx` that lives for the full request lifetime).
+            request.get_module_ctx::<SpanCtx>(unsafe {
+                &*core::ptr::addr_of!(crate::ngx_http_otel_module)
+            })
+        };
+
         // ── request duration in MICROSECONDS ─────────────────────────────────
-        // CONSCIOUS EXCEPTION to nginx's cached-clock discipline. We read
-        // SystemTime::now() per request (a vDSO clock_gettime on Linux, not a
-        // kernel syscall) for a µs-precision end time, combined with nginx's
-        // cached ms-precision start time, so the ~90–200µs regime resolves into
-        // distinct scale-3 exp-histogram buckets — the point of the µs histogram.
-        // Tradeoffs accepted: (1) it deviates from nginx's per-tick cached time;
-        // (2) wall-clock subtraction is not monotonic — a backward NTP step
-        // saturates to 0 (saturating_sub below), a rare forward step inflates a
-        // single data point. Acceptable for a sampling-grade latency histogram;
-        // revisit if a monotonic per-request start ever becomes available.
-        let (duration_us, end_time_unix_nano): (u64, u64) = {
+        // D-2 fix — OTel-SDK-idiomatic dual-clock:
+        //   When tracing is enabled (SpanCtx present): `start_mono.elapsed()` is
+        //   one vDSO CLOCK_MONOTONIC read per request; always ≥ 0, NTP-immune.
+        //   Makes the µs histogram, span (end−start), and the
+        //   http.server.request.duration attribute all coherent (same duration,
+        //   same basis).
+        //   When tracing is disabled (no SpanCtx): fall back to the wall-clock
+        //   approach (SystemTime::now() minus nginx's cached start — existing
+        //   behaviour; saturating_sub handles backward NTP steps).
+        let duration_us: u64 = if let Some(ctx) = span_ctx {
+            ctx.start_mono.elapsed().as_micros() as u64
+        } else {
             use std::time::{SystemTime, UNIX_EPOCH};
-            // One `now()` call; derive both nanoseconds (for span end timestamp)
-            // and microseconds (for the duration histogram).
             let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-            let end_ns = d.as_nanos() as u64; // safe until year ~2554
-            let end_us = end_ns / 1_000;
+            let end_us = d.as_nanos() as u64 / 1_000;
             let start_us = (r.start_sec as u64) * 1_000_000 + (r.start_msec as u64) * 1_000;
-            (end_us.saturating_sub(start_us), end_ns)
+            end_us.saturating_sub(start_us)
         };
         // Keep a ms version for the is_interesting tail-latency gate (still ms-threshold).
         let duration_ms: u64 = duration_us / 1_000;
@@ -216,23 +233,6 @@ impl HttpRequestHandler for LogPhaseHandler {
                 slot.upstream_bytes_sent.record(bytes_tx, &BYTES_BOUNDS);
             }
         }
-
-        // ── Read SpanCtx once (§6.6.3 parse-once) ────────────────────────────
-        // Set by SpanStartHandler in the REWRITE phase.  Re-used for:
-        //   (1) trace correlation on the access tail log / exemplar (Phase 2.2 block below).
-        //   (2) span record emission when the request is sampled (S2 block below).
-        // Returns None when tracing is not configured or SpanStartHandler was not
-        // registered — no cost beyond a single pointer read from the ctx array.
-        let span_ctx: Option<&crate::traces::ctx::SpanCtx> = {
-            use crate::traces::ctx::SpanCtx;
-            // SAFETY: `ngx_http_otel_module` is a valid static module descriptor;
-            // `get_module_ctx` reads the request ctx array at our module's index and
-            // returns a valid reference only when non-null (set by `SpanStartHandler`
-            // from a pool-allocated `SpanCtx` that lives for the full request lifetime).
-            request.get_module_ctx::<SpanCtx>(unsafe {
-                &*core::ptr::addr_of!(crate::ngx_http_otel_module)
-            })
-        };
 
         // ── Phase 2.2: exception-tail / exemplar sampling ─────────────────
         // Gate 1 (cheap config check): absent directive → is_access_sample_enabled()
@@ -415,6 +415,12 @@ impl HttpRequestHandler for LogPhaseHandler {
 
                 // OTel HTTP server span StatusCode: Error(2) for 5xx, Unset(0) otherwise.
                 let otel_status_code: u8 = if status >= 500 { 2 } else { 0 };
+
+                // Span end time: derived from the monotonic duration for coherence.
+                // end = start + duration_us * 1_000 ns.
+                // Invariants: end >= start (monotonic); span (end−start) == duration_us.
+                let end_time_unix_nano =
+                    ctx.start_time_unix_nano.saturating_add(duration_us.saturating_mul(1_000));
 
                 let rec = SpanRecord {
                     trace_id: ctx.trace_id,

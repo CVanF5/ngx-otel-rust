@@ -25,25 +25,26 @@ use ngx::core::Pool;
 
 /// Per-request span context, allocated on the nginx request pool in REWRITE.
 ///
-/// Stores the trace/span IDs, parent linkage, and sampling decision for the
-/// current request.  Read in LOG to stamp the access tail/exemplar and
-/// (when sampled) push a span record to the ring.
+/// Stores the trace/span IDs, parent linkage, sampling decision, and span
+/// timing anchors for the current request.  Read in LOG to stamp the access
+/// tail/exemplar and (when sampled) push a span record to the ring.
 ///
 /// # Safety / layout
 /// `Copy` is required for `Pool::calloc_type::<SpanCtx>()`.  All fields are
 /// plain arrays/scalars — no pointers into request memory.
-/// Per-request span context, allocated on the nginx request pool in REWRITE.
+/// `std::time::Instant` is `Copy` on all supported platforms.
+/// The pool-alloc zeroes memory; since the entire struct is overwritten
+/// before use (see `span_start.rs`), the zeroed-bytes state is never observed.
 ///
-/// Stores the trace/span IDs, parent linkage, and sampling decision for the
-/// current request.  Read in LOG to stamp the access tail/exemplar and
-/// (when sampled) push a span record to the ring.
+/// Fields `parent_span_id`, `flags`, `start_time_unix_nano`, and `start_mono`
+/// are written in S1 (REWRITE) and consumed in S2 (LOG span record).
 ///
-/// # Safety / layout
-/// `Copy` is required for `Pool::calloc_type::<SpanCtx>()`.  All fields are
-/// plain arrays/scalars — no pointers into request memory.
-///
-/// Fields `parent_span_id`, `flags`, and `start_time_unix_nano` are written
-/// in S1 (REWRITE) and consumed in S2 (LOG span record).
+/// # Dual-clock span timing (D-2 fix)
+/// Two anchors are captured at REWRITE:
+/// - `start_time_unix_nano`: wall-clock absolute timestamp for the span start.
+/// - `start_mono`: monotonic anchor; `start_mono.elapsed()` at LOG gives the
+///   request duration.  Span end = `start_time_unix_nano + elapsed`; guaranteed
+///   `end ≥ start` and `span (end−start) == http.server.request.duration`.
 #[derive(Copy, Clone, Debug)]
 pub struct SpanCtx {
     /// W3C trace ID (16 bytes).
@@ -57,8 +58,16 @@ pub struct SpanCtx {
     /// Written in S1 (REWRITE); read in S2 (LOG span record).
     pub flags: u32,
     /// Span start time — Unix epoch, nanoseconds (set at REWRITE phase entry).
+    /// Wall-clock anchor for the absolute span start timestamp.
     /// Written in S1 (REWRITE); read in S2 (LOG span record).
     pub start_time_unix_nano: u64,
+    /// Monotonic anchor captured alongside `start_time_unix_nano` at REWRITE.
+    ///
+    /// `start_mono.elapsed()` at LOG gives the request duration, always ≥ 0.
+    /// Span end = `start_time_unix_nano + elapsed_nanos`.
+    /// Also used for the `http.server.request.duration` histogram (coherent).
+    /// Written in S1 (REWRITE); read in S2 (LOG span record).
+    pub start_mono: std::time::Instant,
     /// Whether this request is sampled.
     ///
     /// `true`  → LOG phase builds + pushes a `SpanRecord` to the spans ring.
@@ -223,10 +232,55 @@ mod tests {
     fn span_ctx_is_copy_sized() {
         fn assert_copy<T: Copy>() {}
         assert_copy::<SpanCtx>();
-        // 16 + 8 + 8 + 4 + 8 + 1 (bool) + alignment padding
-        // Actual size depends on alignment; just assert it's reasonable.
+        // Fields: trace_id(16) + span_id(8) + parent_span_id(8) + flags(4) +
+        //   padding(4) + start_time_unix_nano(8) + start_mono(Instant: 8-16 B) +
+        //   sampled(bool: 1) + alignment padding.
+        // Instant is 8 B on macOS (mach_absolute_time u64); 16 B on Linux
+        // (Timespec {sec: i64, nsec: i64}).  Widen range accordingly.
         let sz = core::mem::size_of::<SpanCtx>();
-        assert!((45..=64).contains(&sz), "SpanCtx size {sz} is outside expected range 45..64");
+        assert!((45..=96).contains(&sz), "SpanCtx size {sz} is outside expected range 45..96");
+    }
+
+    /// D-2 dual-clock coherence: span end = start + duration, end >= start.
+    ///
+    /// Verifies the D-2 fix: using monotonic duration guarantees
+    /// `end_time_unix_nano ≥ start_time_unix_nano` (NTP-immune) and
+    /// `span (end−start) == http.server.request.duration attribute` (coherent).
+    #[test]
+    fn span_timing_monotonic_coherence() {
+        // A realistic wall-clock anchor (2023-11-14 in nanos).
+        let start_nanos: u64 = 1_700_000_000_000_000_000u64;
+
+        // The production formula: end = start + duration_us * 1_000.
+        // Test with representative durations including zero and large values.
+        let test_durations_us: &[u64] = &[0, 1, 100, 999, 10_000, 999_999, 3_600_000_000];
+        for &duration_us in test_durations_us {
+            let end_nanos = start_nanos.saturating_add(duration_us.saturating_mul(1_000));
+
+            // Coherence: (end − start) / 1_000 == duration_us.
+            let derived_us = end_nanos.saturating_sub(start_nanos) / 1_000;
+            assert_eq!(
+                derived_us, duration_us,
+                "coherence: span (end-start) must equal duration_us (got {derived_us}, want {duration_us})"
+            );
+
+            // Monotonic safety: end >= start always.
+            assert!(
+                end_nanos >= start_nanos,
+                "NTP safety: end ({end_nanos}) < start ({start_nanos}) for duration_us={duration_us}"
+            );
+        }
+
+        // Backward-clock proof: production path uses Instant::elapsed()
+        // which returns std::time::Duration — always ≥ 0 by construction.
+        let t0 = std::time::Instant::now();
+        let elapsed: std::time::Duration = t0.elapsed();
+        let duration_us = elapsed.as_micros() as u64;
+        let end_nanos = start_nanos.saturating_add(duration_us.saturating_mul(1_000));
+        assert!(
+            end_nanos >= start_nanos,
+            "real Instant::elapsed produced end < start: duration_us={duration_us}"
+        );
     }
 
     /// S2 — Read-once traceparent guard (§6.6.3 parse-once design).
@@ -261,6 +315,7 @@ mod tests {
             parent_span_id,
             flags,
             start_time_unix_nano: 1_700_000_000_000_000_000,
+            start_mono: std::time::Instant::now(),
             sampled: (flags & 0x01) != 0,
         };
 

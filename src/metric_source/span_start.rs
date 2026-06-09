@@ -114,13 +114,20 @@ impl HttpRequestHandler for SpanStartHandler {
             return Status::NGX_DECLINED;
         }
 
-        // ── Record span start time (wall clock, µs precision → nanos) ────────
-        // Using SystemTime::now() — same rationale as the LogPhaseHandler
-        // duration calculation (vDSO, not a kernel syscall on Linux).
+        // ── Record span start time (OTel-SDK-idiomatic dual-clock, D-2) ─────
+        // Wall-clock anchor: SystemTime::now() → absolute start timestamp.
+        // Monotonic anchor: Instant::now() → elapsed at LOG gives duration,
+        //   always ≥ 0 (NTP-immune).
+        // At LOG: span_end = start_time_unix_nano + start_mono.elapsed();
+        //   http.server.request.duration = start_mono.elapsed() (same value).
+        // Result: µs precision kept, end ≥ start guaranteed, span (end−start)
+        //   == attribute (coherent), histogram NTP-exposure removed.
+        // Both reads are vDSO calls on Linux — not kernel syscalls.
         let start_time_unix_nano: u64 = {
             use std::time::{SystemTime, UNIX_EPOCH};
             SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
         };
+        let start_mono = std::time::Instant::now();
 
         // ── Parse inbound `traceparent` once ──────────────────────────────────
         // Scan headers a SINGLE time here and cache on SpanCtx.
@@ -194,9 +201,18 @@ impl HttpRequestHandler for SpanStartHandler {
         // Initialise the SpanCtx fields.
         // SAFETY: `ctx_ptr` is freshly allocated (calloc — zeroed) from the
         // request pool, so writing to it is sound and there are no live aliases.
+        // Note: `start_mono` (Instant) is Copy, and the pool-zeroed bytes are
+        // overwritten by this struct assignment before any read occurs.
         unsafe {
-            (*ctx_ptr) =
-                SpanCtx { trace_id, span_id, parent_span_id, flags, start_time_unix_nano, sampled };
+            (*ctx_ptr) = SpanCtx {
+                trace_id,
+                span_id,
+                parent_span_id,
+                flags,
+                start_time_unix_nano,
+                start_mono,
+                sampled,
+            };
         }
 
         // Store on the request via set_module_ctx.
