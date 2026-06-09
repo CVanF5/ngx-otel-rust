@@ -74,9 +74,15 @@ start_traffic() {
         req "http://127.0.0.1:9400/client-error"                 # 4xx
         # 5xx less often, so the breakdown shows a realistic error mix
         [ $((RANDOM % 4)) -eq 0 ] && req "http://127.0.0.1:9400/server-error"
-        # Periodic dead-upstream hit → real nginx "connect() failed" error_log
-        # lines → the OTel error-log signal (coalesced) for the Error Log panel.
-        [ $((RANDOM % 5)) -eq 0 ] && req "http://127.0.0.1:9400/backend-down"
+        # Periodic BURST of dead-upstream hits: many identical "connect() failed"
+        # error lines inside one ~250ms log-drain window → a single coalesced
+        # nginx.error LogRecord with coalesced_count >> 1 (showcases producer-side
+        # error coalescing; a sparse 1-per-window hit would always show x1).
+        if [ $((RANDOM % 8)) -eq 0 ]; then
+          # ONE curl process firing ~30 identical dead-upstream requests, packed
+          # into a single ~250ms log-drain window → coalesced_count well above 1.
+          curl -s -o /dev/null $(yes "http://127.0.0.1:9400/backend-down" | head -n 30) 2>/dev/null || true
+        fi
         sleep 0.05
       done ) >/dev/null 2>&1 &
     echo $! > "${PREFIX}/traffic.pid"

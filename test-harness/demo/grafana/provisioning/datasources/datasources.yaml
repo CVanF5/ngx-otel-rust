@@ -17,25 +17,15 @@ datasources:
       httpMethod: POST
       # Match the collector exporter scrape cadence for sane $__rate_interval.
       timeInterval: 5s
-      # Exemplar drill-down (Phase 3 — now live):
-      # The request-duration histogram carries exemplars tagged with trace_id
-      # from the module's own nginx server spans. Two destinations:
-      #
-      # 1. Native Tempo link (primary, Phase 3): clicking an exemplar diamond
-      #    opens the corresponding nginx server span directly in Tempo.
-      #    Requires the `traces` compose profile enabled.
-      #
-      # 2. Dashboard variable filter (fallback): also sets the `trace_id`
-      #    variable so the "Exemplar → Request Log" Loki panel filters to the
-      #    same request — useful even without Tempo.
+      # Exemplar drill-down: the request-duration histogram carries exemplars
+      # tagged with trace_id from the module's own nginx server spans. Clicking
+      # an exemplar diamond opens the corresponding server span in Tempo; from
+      # the span, Tempo→Loki (tracesToLogsV2) reaches the request's log.
       exemplarTraceIdDestinations:
         - name: traceID
           datasourceUid: tempo
         - name: trace_id
           datasourceUid: tempo
-        - name: trace_id
-          url: "/d/ngx-otel-rust-overview?var-trace_id=${__value.raw}"
-          urlDisplayLabel: "Show this request's log ↓"
 
   # ── Logs (Phase 2). Brought online by `--profile logs`. ────────────────
   - name: Loki
