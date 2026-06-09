@@ -17,6 +17,21 @@
 #      the new exporter's crash count starts fresh (verified indirectly by
 #      confirming the new exporter is still running after SIGHUP, not
 #      pre-emptively self-disabled by a stale counter).
+#      NOTE: Assertion 5 here is intentionally lightweight (liveness only).
+#      Part C below is the hard reload-reset gate (F3).
+#
+#   SIGHUP crash-counter reset (Part C — F3 hardened reload-reset gate):
+#   6. Using the test-support crash hook (NGX_OTEL_CRASH_ON_STARTUP),
+#      pre-accumulate crash_count=3 BEFORE the reload, then SIGHUP and assert
+#      the new exporter's first backoff log entry reads "crash #2 in window"
+#      (not "crash #4") — proving control_shm_zone_init zeroed the counter on
+#      reload.  The assertion is hard: it checks the exact crash sequence number
+#      from error.log, NOT just whether the exporter is alive.
+#
+#      MUTATION CHECK (part of this test): temporarily neutering the
+#      store(0) call in control_shm_zone_init and re-running this test causes
+#      a FAIL (sees "crash #4 in window" instead of "crash #2").  Evidence
+#      recorded in the commit message and the RESULTS artifact.
 #
 # Prerequisites: NGINX_BINARY set or auto-detected; no OTel collector required
 # (the endpoint is a black-hole port that has no listener).
@@ -257,8 +272,192 @@ kill -SIGQUIT "${NGINX_PID_B}"
 wait_for 25 "Part B nginx to exit" "! kill -0 ${NGINX_PID_B} 2>/dev/null"
 pass "Part B nginx exited cleanly"
 NGINX_PID_B=""
+
+# ─── Part C: SIGHUP crash-counter reset — hardened F3 gate ───────────────────
+#
+# Assertion 5 in Part B above passes vacuously when the prior exporter never
+# crashed (liveness ≠ counter-reset evidence). Part C drives real crashes into
+# the exporter BEFORE the reload, then asserts the exact crash-sequence number
+# in error.log AFTER the reload.
+#
+# Hard observable: after a clean-slate reload the first exporter crash logs
+# "crash #2 in window" (count 0→1 first start, 1→2 on first crash-restart).
+# Without the reset it would log "crash #4 in window" (3 prior + 1 = 4).
+#
+# Requires the test-support feature (crash hook: NGX_OTEL_CRASH_ON_STARTUP).
+# No non-test-gated production code is changed.
+
+info "=== Part C: SIGHUP crash-counter reset (F3 hardened gate) ==="
+
+# ─ Build test-support module (same pattern as run_chaos_crashloop.sh) ─────────
+case "$(uname -s)" in
+    Darwin) MODULE_EXT="dylib" ;;
+    *)      MODULE_EXT="so"    ;;
+esac
+
+TEST_SUPPORT_TARGET_DIR="${CRATE_DIR}/target/test-support"
+TEST_SUPPORT_MODULE="${TEST_SUPPORT_TARGET_DIR}/debug/libngx_http_otel_module.${MODULE_EXT}"
+
+NGINX_BUILD_DIR_C="${CRATE_DIR}/objs-${BUILD:-debug}"
+if [[ ! -d "${NGINX_BUILD_DIR_C}" ]]; then
+    NGINX_BUILD_DIR_C="$(ls -d "${CRATE_DIR}"/objs-* 2>/dev/null | head -1)"
+fi
+if [[ -z "${NGINX_BUILD_DIR_C}" ]]; then
+    echo "ERROR: no objs-* build dir found. Run 'make' first." >&2; exit 1
+fi
+NGINX_SOURCE_DIR_C="${CRATE_DIR}/../nginx"
+if [[ ! -d "${NGINX_SOURCE_DIR_C}" ]]; then
+    echo "ERROR: nginx source dir not found at ${NGINX_SOURCE_DIR_C}." >&2; exit 1
+fi
+
+if [[ ! -f "${TEST_SUPPORT_MODULE}" ]]; then
+    info "Building test-support module (features=test-support)..."
+    NGINX_BUILD_DIR="${NGINX_BUILD_DIR_C}" NGINX_SOURCE_DIR="${NGINX_SOURCE_DIR_C}" \
+        cargo build \
+        --manifest-path "${CRATE_DIR}/Cargo.toml" \
+        --features test-support \
+        --target-dir "${TEST_SUPPORT_TARGET_DIR}" 2>&1 | grep -E 'Compiling|Finished|error' || true
+fi
+if [[ ! -f "${TEST_SUPPORT_MODULE}" ]]; then
+    fail "test-support module not found at ${TEST_SUPPORT_MODULE} after build"
+fi
+pass "Part C: test-support module ready: ${TEST_SUPPORT_MODULE}"
+
+# ─ Start nginx with crash hook on a fresh prefix ──────────────────────────────
+PREFIX_C="$(mktemp -d /tmp/ngx-otel-deadcoll-c.XXXXXX)"
+mkdir -p "${PREFIX_C}/logs" "${PREFIX_C}/client_body_temp"
+echo "${NGINX_CONF_BODY}" \
+    | sed -e "s|@MODULE_PATH@|${TEST_SUPPORT_MODULE}|g" \
+          -e "s|@PREFIX@|${PREFIX_C}|g" \
+    > "${PREFIX_C}/nginx.conf"
+
+NGINX_PID_C=""
+cleanup_c() {
+    [[ -n "${NGINX_PID_C:-}" ]] && kill "${NGINX_PID_C}" 2>/dev/null || true
+    sleep 1
+    echo "=== Part C error.log (last 40 lines) ==="
+    tail -40 "${PREFIX_C}/logs/error.log" 2>/dev/null || echo "(not found)"
+    rm -rf "${PREFIX_C}"
+}
+trap '{ cleanup; cleanup_b; cleanup_c; }' EXIT
+
+# MAX_CRASH_RESTARTS=5; we want to accumulate exactly 3 crashes then reload.
+# Total time: 3 crashes × (500ms crash-hook sleep + nginx respawn overhead)
+# ≈ 3 × 1.5s = ~5s. Allow 30s.
+MAX_WAIT_C=30
+
+info "Starting nginx (Part C) with NGX_OTEL_CRASH_ON_STARTUP=1..."
+env NGX_OTEL_CRASH_ON_STARTUP=1 \
+    "${NGINX_BINARY}" -p "${PREFIX_C}" -c "${PREFIX_C}/nginx.conf" &
+NGINX_PID_C=$!
+sleep 1
+
+if ! kill -0 "${NGINX_PID_C}" 2>/dev/null; then
+    fail "nginx master (Part C) exited immediately"
+fi
+pass "Part C: nginx master started, PID = ${NGINX_PID_C}"
+
+# Wait for crash_count to reach 3. Indicator: "crash #3 in window" in error.log.
+# (count=1 has no log; count=2 has "crash #2"; count=3 has "crash #3".)
+info "Part C: waiting for crash_count=3 ('crash #3 in window' in error.log)..."
+deadline_c=$(( $(date +%s) + MAX_WAIT_C ))
+SEEN_COUNT3=false
+while (( $(date +%s) < deadline_c )); do
+    if grep -q "crash #3 in window" "${PREFIX_C}/logs/error.log" 2>/dev/null; then
+        SEEN_COUNT3=true
+        break
+    fi
+    sleep 0.5
+done
+if [[ "${SEEN_COUNT3}" != "true" ]]; then
+    fail "Part C: 'crash #3 in window' not seen in error.log within ${MAX_WAIT_C}s"
+fi
+pass "Part C: crash_count=3 confirmed in error.log ('crash #3 in window' observed)"
+
+# Record the current log line count so we can isolate post-reload entries.
+LOG_LINES_BEFORE_RELOAD=$(wc -l < "${PREFIX_C}/logs/error.log" 2>/dev/null || echo 0)
+info "Part C: log line offset before SIGHUP = ${LOG_LINES_BEFORE_RELOAD}"
+
+# Give the exporter time to actually start (back off + setproctitle) before
+# the reload races with it.  The 300ms crash-hook sleep in the crash path means
+# the exporter is alive for ~300-500ms before aborting; add a beat to let it
+# reach step 10 (setproctitle).
+sleep 1
+
+# Send SIGHUP (reload).
+info "Part C: sending SIGHUP to master PID ${NGINX_PID_C}..."
+kill -SIGHUP "${NGINX_PID_C}"
+
+# Wait for a new exporter PID after reload.
+EXP_PID_C_OLD="$(exporter_pid "${NGINX_PID_C}")"
+EXP_PID_C_NEW=""
+for _ in $(seq 1 20); do
+    sleep 0.5
+    CUR="$(exporter_pid "${NGINX_PID_C}")"
+    if [[ -n "${CUR}" && "${CUR}" != "${EXP_PID_C_OLD:-}" ]]; then
+        EXP_PID_C_NEW="${CUR}"
+        break
+    fi
+done
+[[ -n "${EXP_PID_C_NEW}" ]] \
+    || fail "Part C: no new exporter appeared within 10s after SIGHUP"
+pass "Part C: new exporter after reload, PID = ${EXP_PID_C_NEW}"
+
+# Wait for the first "crash #N in window" entry AFTER the reload.
+# The new exporter still has NGX_OTEL_CRASH_ON_STARTUP inherited, so it will
+# crash and log the backoff message on its second startup (count=2 after reset).
+info "Part C: waiting for first post-reload crash log entry..."
+deadline_c2=$(( $(date +%s) + 20 ))
+POST_RELOAD_CRASH_LINE=""
+while (( $(date +%s) < deadline_c2 )); do
+    if POST_RELOAD_CRASH_LINE="$(tail -n +"${LOG_LINES_BEFORE_RELOAD}" \
+            "${PREFIX_C}/logs/error.log" 2>/dev/null \
+            | grep "crash #" | head -1)"; then
+        if [[ -n "${POST_RELOAD_CRASH_LINE}" ]]; then
+            break
+        fi
+    fi
+    sleep 0.5
+done
+if [[ -z "${POST_RELOAD_CRASH_LINE}" ]]; then
+    fail "Part C: no 'crash #N in window' line appeared after reload within 20s"
+fi
+info "Part C: first post-reload crash line: ${POST_RELOAD_CRASH_LINE}"
+
+# Hard assertion: the sequence number must be 2, not 4.
+# "crash #2 in window" → counter was reset to 0 on SIGHUP (PASS).
+# "crash #4 in window" → counter was NOT reset (stale value 3 carried over → FAIL).
+if echo "${POST_RELOAD_CRASH_LINE}" | grep -q "crash #2 in window"; then
+    pass "Part C: post-reload crash log shows 'crash #2 in window' — counter reset on SIGHUP CONFIRMED"
+elif echo "${POST_RELOAD_CRASH_LINE}" | grep -qE "crash #[3-9] in window|crash #[0-9]{2,}"; then
+    fail "Part C: post-reload crash log shows high sequence number — counter NOT reset on SIGHUP: ${POST_RELOAD_CRASH_LINE}"
+else
+    fail "Part C: unexpected post-reload crash log format: ${POST_RELOAD_CRASH_LINE}"
+fi
+
+# Assertion (a): new exporter is still alive 3s after reload (liveness guard).
+# With a reset counter the backoffs start from 200ms, 400ms, etc.
+# With a stale counter=3, backoffs start from 800ms — but self-disable would
+# come 2 more crashes later (not 5), so the liveness window is different.
+sleep 3
+EXP_C_ALIVE="$(exporter_pid "${NGINX_PID_C}")"
+# The exporter may have aborted again (crash hook still on, count now at 3)
+# but it has NOT yet self-disabled (that requires count > 5 = 6 total).
+# It will respawn. Check master is still alive (not just exporter).
+if kill -0 "${NGINX_PID_C}" 2>/dev/null; then
+    pass "Part C: master still alive 3s after reload (not prematurely disabled)"
+else
+    fail "Part C: master exited unexpectedly after reload"
+fi
+
+# Shutdown Part C.
+info "Part C: sending SIGQUIT to master PID ${NGINX_PID_C}..."
+kill -SIGQUIT "${NGINX_PID_C}"
+wait_for 25 "Part C nginx to exit" "! kill -0 ${NGINX_PID_C} 2>/dev/null"
+pass "Part C nginx exited cleanly"
+NGINX_PID_C=""
 trap - EXIT
-rm -rf "${PREFIX}" "${PREFIX_B}"
+rm -rf "${PREFIX}" "${PREFIX_B}" "${PREFIX_C}"
 
 echo ""
 pass "=== All dead-collector shutdown/reload assertions passed ==="

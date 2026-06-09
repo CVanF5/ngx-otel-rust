@@ -214,6 +214,46 @@ echo "[tsan-run] === Running run_dns_dualstack.sh under TSAN (transport_dns asyn
 # (real async resolver I/O under TSAN).  TEST B connects via a v6 literal.
 bash tests/integration/run_dns_dualstack.sh
 
+echo ""
+echo "[tsan-run] === Running C2 chaos scripts under TSAN (C1 crash-counter cross-process atomics) ==="
+# F2 gap closure: the C4 artifact ran chaos tests in a NON-TSAN build.  Run
+# the three chaos scripts under the TSAN-instrumented nginx + module so that
+# the cross-process AtomicU64 paths (crash_count, window_start_unix in
+# control_shm) execute under ThreadSanitizer.
+#
+# run_chaos_kill9.sh: uses the release module (already built above with TSAN
+#   RUSTFLAGS via the prior scripts).  Exercises crash_count.fetch_add after
+#   SIGKILL respawn.
+#
+# run_chaos_crashloop.sh: builds the test-support module (NGX_OTEL_CRASH_ON_STARTUP
+#   hook) into a separate target-dir (target/test-support) under the exported TSAN
+#   RUSTFLAGS.  Exercises the full crash → respawn → crash_count.fetch_add cycle
+#   MULTIPLE times through self-disable.  TSAN ~10x slowdown is safe: backoff
+#   sleeps are real wall-clock sleeps (unaffected by instrumentation); MAX_WAIT_S
+#   overridden to 120s.
+#
+# run_chaos_dead_collector.sh: Parts A+B use the release module; Part C builds
+#   the test-support module (reuses target/test-support built above).  Exercises
+#   control_shm_zone_init's crash_count.store(0) (the SIGHUP reload zeroing path).
+#
+# cargo clean is NOT needed: test-support builds use --target-dir target/test-support
+# (separate from target/<triple>/release/), so there is no feature-flag cache
+# collision.
+
+echo ""
+echo "[tsan-run] == run_chaos_kill9.sh under TSAN =="
+bash tests/integration/run_chaos_kill9.sh
+
+echo ""
+echo "[tsan-run] == run_chaos_crashloop.sh under TSAN (MAX_WAIT_S=120 for TSAN overhead) =="
+# TSAN ~10x slowdown: total backoff remains ≤ 3s (real sleep), but nginx spawn
+# and cargo build overhead may take longer.  120s budget is conservative.
+MAX_WAIT_S=120 bash tests/integration/run_chaos_crashloop.sh
+
+echo ""
+echo "[tsan-run] == run_chaos_dead_collector.sh under TSAN =="
+bash tests/integration/run_chaos_dead_collector.sh
+
 # ── Step 5: Belt-and-suspenders ThreadSanitizer warning scan ─────────────────
 
 echo ""
@@ -229,7 +269,12 @@ for log in /tmp/ngx-otel-grpc-smoke.*/logs/error.log \
            /tmp/ngx-otel-dns-b.*/logs/error.log \
            /tmp/ngx-otel-dns-c.*/logs/error.log \
            /tmp/ngx-otel-dns-d.*/logs/error.log \
-           /tmp/ngx-otel-traces.*/logs/error.log; do
+           /tmp/ngx-otel-traces.*/logs/error.log \
+           /tmp/ngx-otel-kill9.*/logs/error.log \
+           /tmp/ngx-otel-crashloop.*/logs/error.log \
+           /tmp/ngx-otel-deadcoll.*/logs/error.log \
+           /tmp/ngx-otel-deadcoll-b.*/logs/error.log \
+           /tmp/ngx-otel-deadcoll-c.*/logs/error.log; do
     if [[ -f "${log}" ]]; then
         count=$(grep -c "WARNING: ThreadSanitizer" "${log}" 2>/dev/null || true)
         if [[ "${count}" -gt 0 ]]; then
