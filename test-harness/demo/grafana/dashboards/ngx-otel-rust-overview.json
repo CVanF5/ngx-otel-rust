@@ -7,7 +7,7 @@
     "ngx-otel-rust"
   ],
   "schemaVersion": 41,
-  "version": 1,
+  "version": 2,
   "editable": true,
   "time": {
     "from": "now-15m",
@@ -2019,6 +2019,175 @@
           }
         }
       ]
+    },
+    {
+      "id": 52,
+      "type": "timeseries",
+      "title": "Error-log events by severity (rate)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Companion rate metric for the coalesced nginx error LogRecords (ngx_otel.error_log.events), by severity class.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 113
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "sum by (severity_class) (rate(ngx_otel_error_log_events{service_name=\"$service\"}[$__rate_interval]))",
+          "legendFormat": "{{severity_class}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 25,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal"
+            },
+            "axisLabel": "",
+            "gradientMode": "opacity"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 53,
+      "type": "timeseries",
+      "title": "Dropped records (exporter self-obs)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Self-observability: span records dropped when the per-worker spans ring is full (ngx_otel.traces.dropped_records). 0 = no telemetry loss.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 113
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "rate(ngx_otel_traces_dropped_records{service_name=\"$service\"}[$__rate_interval])",
+          "legendFormat": "spans"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "Ards",
+          "expr": "rate(ngx_otel_logs_access_dropped_records{service_name=\"$service\"}[$__rate_interval])",
+          "legendFormat": "access logs"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "Erds",
+          "expr": "rate(ngx_otel_logs_error_dropped_records{service_name=\"$service\"}[$__rate_interval])",
+          "legendFormat": "error logs"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "Mrds",
+          "expr": "rate(ngx_otel_dropped_records{service_name=\"$service\"}[$__rate_interval])",
+          "legendFormat": "metric points"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 25,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal"
+            },
+            "axisLabel": "",
+            "gradientMode": "opacity"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
     }
   ]
 }
