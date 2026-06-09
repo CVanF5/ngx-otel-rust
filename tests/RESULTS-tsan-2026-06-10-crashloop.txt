@@ -1,0 +1,87 @@
+Date:     2026-06-10
+Platform: debian-vm (Linux aarch64 6.12.90+deb13.1-arm64)
+Commit:   5d9c6fc  C2: chaos test suite — kill-9, crash-loop, dead-collector containment
+
+=== 1. make check (fmt + clippy) ===
+OUTCOME: GREEN
+cargo fmt --all -- --check: PASS (no format violations)
+cargo clippy --all-targets -- -D warnings: PASS (0 errors, 0 denied warnings)
+Finished dev profile in ~10s
+
+=== 2. cargo test (unit tests) ===
+OUTCOME: PASS
+test result: ok. 152 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+=== 3. TSAN (make tsan-test — Docker, linux/arm64, TSAN_OPTIONS=halt_on_error=1) ===
+OUTCOME: PASS — 0 races
+
+Step 1: Compile sanity (make build BUILD=tsan) — PASS
+Step 2: Plain TSAN nginx (no --add-module) — PASS
+Step 2.5: bidi_echo_server pre-build (no TSAN) — PASS
+Step 3: TSAN env exported (RUSTFLAGS=-Zsanitizer=thread -Zexternal-clangrt)
+
+Scripts run under TSAN:
+  run_grpc_smoke.sh            — PASS
+  run_grpc_bidi_smoke.sh       — PASS
+  run_grpc_export.sh           — PASS
+  run_access_log.sh            — PASS
+  run_error_log.sh             — PASS (Stages A/B/C/D/E all PASS)
+  run_signal_storm.sh          — PASS (30s storm, drain progressed, no torn records)
+  run_traces.sh                — PASS (traceId/parentSpanId propagation confirmed)
+  run_dns_dualstack.sh         — PASS (TEST A DNS→v4, TEST B v6 literal, TEST C DNS→v6 AAAA, TEST D NXDOMAIN)
+
+Step 5 belt-and-suspenders scan:
+  [tsan-run] Zero ThreadSanitizer warnings.  TSAN gate: PASS.
+
+=== 4. C2 Chaos tests ===
+
+run_chaos_kill9.sh
+  [PASS] Exporter started, PID = 196317
+  [PASS] Workers have zero connections to :4317/:4318 (before kill) (architectural isolation)
+  [PASS] Workers return HTTP 200 while exporter is dead (200)
+  [PASS] Master respawned exporter: PID = 196384 (was 196317)
+  [PASS] Workers have zero connections to :4317/:4318 (after respawn) (architectural isolation)
+  [PASS] error.log contains 'cycle entered' 2 times (initial + respawn)
+  [PASS] Master and exporter exited cleanly after SIGQUIT
+  OUTCOME: PASS — All kill-9 containment assertions passed
+
+run_chaos_dead_collector.sh
+  Part A (SIGQUIT with dead collector):
+    [PASS] Exporter started with dead endpoint
+    [PASS] nginx exited 0s after SIGQUIT (budget 20s)
+    [PASS] No orphan exporter after SIGQUIT
+  Part B (SIGHUP reload with dead collector):
+    [PASS] Part B: exporter started, PID = 196488
+    [PASS] SIGHUP: new exporter PID = 196496 (was 196488)
+    [PASS] Workers return HTTP 200 after SIGHUP reload with dead collector
+    [PASS] New exporter still alive 3s after reload (crash counter reset on SIGHUP verified)
+    [PASS] Part B nginx exited cleanly
+  OUTCOME: PASS — All dead-collector shutdown/reload assertions passed
+
+run_chaos_crashloop.sh
+  [PASS] test-support module built
+  [PASS] Initial exporter appeared
+  [PASS] Self-disable ALERT observed in error.log
+    ALERT: otel exporter: disabled after 6 crashes in 60s — telemetry OFF, nginx request handling UNAFFECTED
+  [PASS] Backoff messages in error.log: 4 (exponential throttle active)
+  [PASS] No exporter process after self-disable
+  [PASS] ALERT message includes 'telemetry OFF' and 'nginx request handling UNAFFECTED'
+  [PASS] nginx master still responsive after exporter self-disable
+  [PASS] Workers return HTTP 200 after exporter self-disable (data plane UNAFFECTED)
+  [PASS] nginx master exited cleanly on SIGQUIT
+  OUTCOME: PASS — All crash-loop self-disable assertions passed
+
+=== 5. Socket isolation check ===
+Linux /proc/<pid>/net/tcp used — definitive PASS (not inconclusive like macOS).
+Workers have zero connections to :4317/:4318 confirmed pre-kill and post-respawn.
+
+=== Observations ===
+- cargo clean blocked by root-owned Docker build artifacts (.rootblk-* in target/).
+  make tsan-test uses Docker volumes and was unaffected; cargo clean not required for
+  the TSAN gate (Docker container uses isolated volume mounts).
+- make check target = fmt + clippy only (no integration tests). Unit tests run via
+  cargo test --lib (152 tests). Integration tests via individual scripts.
+- crash-loop self-disable count: 6 crashes in 60s window triggers ALERT + disables.
+  Exporter backoff messages: 4 (matches exponential throttle cadence).
+
+SUMMARY: ALL PASS. Commit 5d9c6fc is GREEN on debian-vm.
