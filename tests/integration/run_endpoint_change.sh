@@ -71,8 +71,8 @@ else
 fi
 
 SERVICE_NAME="ngx-otel-step10-epchange"
-ENDPOINT_A="http://127.0.0.1:4318/v1/metrics"   # real collector
-ENDPOINT_B="http://127.0.0.1:14318/v1/metrics"  # unreachable (no listener)
+ENDPOINT_A="http://127.0.0.1:4318"   # real collector
+ENDPOINT_B="http://127.0.0.1:14318"  # unreachable (no listener)
 METRIC_INTERVAL_S=2
 FLUSH_WAIT_S=$(( METRIC_INTERVAL_S + 2 ))
 N_REQUESTS=10

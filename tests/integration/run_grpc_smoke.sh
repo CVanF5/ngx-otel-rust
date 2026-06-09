@@ -171,7 +171,7 @@ http {
     # is_configured() gate lets init_process run.  Long interval so the
     # HTTP exporter doesn't fire during this test window.
     otel_exporter {
-        endpoint http://127.0.0.1:4318/v1/metrics;
+        endpoint http://127.0.0.1:4318;
     }
     otel_service_name ngx-otel-grpc-smoke-http;
     otel_metric_interval 60s;

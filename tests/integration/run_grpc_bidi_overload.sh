@@ -219,7 +219,7 @@ events {
 http {
     # Phase 1.1 OTLP/HTTP exporter — keeps is_configured() gate open.
     otel_exporter {
-        endpoint http://127.0.0.1:4318/v1/metrics;
+        endpoint http://127.0.0.1:4318;
     }
     otel_service_name ngx-otel-bidi-overload;
     otel_metric_interval 60s;

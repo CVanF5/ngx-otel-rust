@@ -150,7 +150,7 @@ events {
 
 http {
     otel_exporter {
-        endpoint http://127.0.0.1:4318/v1/metrics;
+        endpoint http://127.0.0.1:4318;
     }
     otel_service_name ${SERVICE_NAME};
     otel_metric_interval ${METRIC_INTERVAL_S}s;
