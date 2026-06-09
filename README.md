@@ -166,6 +166,42 @@ case rests on.
 
 [hyper]: https://hyper.rs/
 
+### Windowed aggregation and scaling characteristics
+
+The exporter is a **windowed-aggregation engine at the edge**: each signal is
+reduced over a time window before it leaves the process.  That is what keeps the
+hot path cheap and the exported volume bounded as load grows.
+
+- **Metrics** aggregate over the `otel_metric_interval` (a tumbling window):
+  workers bump histogram/counter slots continuously; once per interval the
+  exporter snapshots and emits one aggregated point per series.  The request path
+  never serialises a metric.
+- **Logs** are reduced over the drain window (250 ms): identical error templates
+  **coalesce** into a single `LogRecord` carrying `coalesced_count`, paired with a
+  companion rate metric, while the high-value exception tail rides a bounded
+  reservoir.  A firehose of repeated errors becomes *count + representative
+  sample* rather than N records — windowed reduction applied to logs.
+- **Traces** batch over the same 250 ms drain window: spans accumulate in a
+  per-worker ring and ship as one batch per window.
+
+Because the reduction happens inside the window, the **two aggregated signals
+(metrics and summary-logs) scale essentially for free** — more load raises the
+per-window counts, not the number of exported records or the per-request cost.
+That property is why they are default-on.
+
+**Traces are the exception, and we measured it.**  A span is per-request and
+non-aggregable, so it does not inherit the windowing win.  On a single worker at
+100 % sampling the exporter sustains **~10 k spans/s/worker** before the
+per-worker ring fills and excess spans drop — *gracefully* (drop-on-full is
+cheap; request latency is unaffected) and *observably*
+(`ngx_otel.traces.dropped_records`).  The ceiling is set by the **per-drain
+budget** (≤ 2 500 spans/worker drained every 250 ms), **not** by exporter CPU
+(~2 % at the ceiling) — a deliberate sizing choice, raised by enlarging the drain
+budget and ring together (and chunking the send below the gRPC max-message size).
+Practical guidance: metrics and summary-logs are cheap default-on; for
+high-volume tracing, sample down or raise the trace buffers.  Measurements:
+[`tests/bench/RESULTS-span-saturation-2026-06-09.md`](tests/bench/RESULTS-span-saturation-2026-06-09.md).
+
 ## Signals (what this module emits)
 
 The full producer-side contract — every metric, log record, and (Phase 3) trace,
