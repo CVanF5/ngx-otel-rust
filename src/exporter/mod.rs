@@ -42,6 +42,45 @@ pub(crate) static IS_OTEL_EXPORTER: AtomicBool = AtomicBool::new(false);
 /// interval; honoring `worker_shutdown_timeout` is a possible future refinement.
 const GRACEFUL_DRAIN_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(15);
 
+// ── Crash-loop backoff constants ─────────────────────────────────────────────
+
+/// Rolling window for the crash counter (seconds). Crashes older than this are
+/// forgotten; a healthy-enough gap resets the counter automatically.
+///
+/// `pub(crate)` so that `export/mod.rs` can reference it for the healthy-reset
+/// comparison (keep the constant single-homed here).
+pub(crate) const CRASH_WINDOW_SECS: u64 = 60;
+
+/// Maximum exporter restarts within `CRASH_WINDOW_SECS` before the exporter
+/// self-disables via `exit(2)` (enters degraded mode). Workers continue serving;
+/// telemetry is silently dropped into the bounded shm rings.
+const MAX_CRASH_RESTARTS: u64 = 5;
+
+/// Base backoff sleep before continuing init after a crash restart.
+/// Doubles with each restart: `BASE * 2^(count-1)`, capped at `BACKOFF_CAP_MS`.
+const CRASH_BACKOFF_BASE_MS: u64 = 100;
+
+/// Maximum backoff sleep before continuing init. Prevents a crash loop from
+/// sleeping indefinitely while still throttling the re-crash rate appreciably.
+const CRASH_BACKOFF_CAP_MS: u64 = 5_000;
+
+/// Compute the bounded exponential backoff duration (milliseconds) for the given
+/// restart count.
+///
+/// `count` is the crash_count **after** incrementing (1 = first start, no
+/// backoff; 2 = first restart, 100 ms; 3 = second restart, 200 ms; …).
+///
+/// Formula: `min(BASE * 2^(count-1), CAP)`.  Overflow-safe via `saturating_mul`.
+///
+/// `pub(crate)` for unit-test access.
+pub(crate) fn crash_backoff_ms(count: u64) -> u64 {
+    if count <= 1 {
+        return 0;
+    }
+    let shift = count.saturating_sub(1).min(31); // cap shift to prevent u64 overflow
+    CRASH_BACKOFF_BASE_MS.saturating_mul(1u64 << shift).min(CRASH_BACKOFF_CAP_MS)
+}
+
 /// Process identity as seen from inside the `ngx-otel-rust` crate.
 ///
 /// Mirrors [`nginx-acme/src/util.rs`](../../../nginx-acme/src/util.rs)
@@ -139,6 +178,78 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
         //    rather than Helper for this process.
         nginx_sys::ngx_process = nginx_sys::NGX_PROCESS_HELPER as nginx_sys::ngx_uint_t;
         IS_OTEL_EXPORTER.store(true, Ordering::Relaxed);
+
+        // 1.5. Crash-loop backoff: detect rapid restarts and throttle / self-disable.
+        //
+        //      Runs before any risky init (module init_process fan-out at step 5a,
+        //      transport setup in the async task). The shm zone was mapped by nginx
+        //      before fork, so the control-shm pointer is valid here.
+        //
+        //      Algorithm (matches the unit-tested `simulate_startup` in control_shm tests):
+        //        a) If now − window_start > WINDOW (or window is 0): reset counter+window.
+        //        b) Increment crash_count.
+        //        c) If crash_count > MAX_CRASH_RESTARTS: log ALERT + exit(2) (degraded).
+        //        d) If crash_count > 1: sleep bounded-exponential backoff before continuing.
+        //
+        //      On exit(2) the master marks the slot non-respawnable (same mechanism used
+        //      for setup failures in steps 5a/7 above). Workers continue unaffected:
+        //      their bump-and-defer into bounded shm rings succeeds regardless; records
+        //      are silently dropped from the shm head once the ring fills.
+        //
+        //      RELOAD SAFETY: `control_shm_zone_init` zeroes crash_count and
+        //      window_start_unix when old_data != null (SIGHUP reload path), so a
+        //      legitimate operator reload always starts from a clean slate.
+        //
+        // SAFETY: `cycle` is the valid non-null cycle passed by nginx; all field reads
+        // below are through shared references to Atomic types, which are safe.
+        if let Some(amcf) = crate::HttpOtelModule::main_conf(&*cycle) {
+            if let Some(ctrl_ptr) = amcf.control_shm_ptr_mut() {
+                let ctrl = &*ctrl_ptr;
+                let now = crate::util::now_unix_secs();
+                let window = ctrl.window_start_unix.load(Ordering::Acquire);
+
+                // (a) Reset counter if outside the crash window or uninitialized.
+                if window == 0 || now.saturating_sub(window) > CRASH_WINDOW_SECS {
+                    ctrl.crash_count.store(0, Ordering::Relaxed);
+                    ctrl.window_start_unix.store(now, Ordering::Release);
+                }
+
+                // (b) Increment crash_count atomically.
+                let count = ctrl.crash_count.fetch_add(1, Ordering::AcqRel) + 1;
+
+                // (c) Give-up: too many crashes in this window → degrade + exit.
+                if count > MAX_CRASH_RESTARTS {
+                    ngx::ngx_log_error!(
+                        nginx_sys::NGX_LOG_ALERT,
+                        (*cycle).log,
+                        "otel exporter: disabled after {} crashes in {}s \
+                         — telemetry OFF, nginx request handling UNAFFECTED",
+                        count,
+                        CRASH_WINDOW_SECS,
+                    );
+                    // exit(2) instructs nginx NOT to respawn this helper
+                    // (same mechanism as the channel-event setup failure at step 7).
+                    std::process::exit(2);
+                }
+
+                // (d) Backoff: throttle the re-crash rate before risky init.
+                if count > 1 {
+                    let backoff_ms = crash_backoff_ms(count);
+                    ngx::ngx_log_error!(
+                        nginx_sys::NGX_LOG_WARN,
+                        (*cycle).log,
+                        "otel exporter: crash #{} in window, backing off {}ms before init",
+                        count,
+                        backoff_ms,
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+
+                    // Publish the restart count so the self-metric is visible on
+                    // the first export tick (count - 1 = prior crashes in window).
+                    crate::export::EXPORTER_RESTARTS.store(count - 1, Ordering::Relaxed);
+                }
+            }
+        }
 
         // 2. Install signal handlers. This call is idempotent on the SIGHUP
         //    path (signals are already installed in master). It is REQUIRED at

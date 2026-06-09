@@ -102,6 +102,13 @@ pub static TRACES_DROPPED_RECORDS: AtomicU64 = AtomicU64::new(0);
 /// Cumulative traces transport send failures since exporter startup.
 pub static TRACES_SEND_FAILURES: AtomicU64 = AtomicU64::new(0);
 
+/// Number of prior exporter crashes observed in the crash-loop window when
+/// this exporter process started.  Set once by `otel_exporter_cycle` before
+/// `export_loop` runs; 0 on a clean first start.  Exposed as the
+/// `ngx_otel.exporter.restarts` gauge so operators can observe crash-loop
+/// recovery without tailing the error log.
+pub(crate) static EXPORTER_RESTARTS: AtomicU64 = AtomicU64::new(0);
+
 /// Master (parent) PID captured once at exporter startup via `nginx_sys::ngx_parent`.
 ///
 /// Written once by [`export_loop`] before the first export tick.  Used by
@@ -257,6 +264,7 @@ impl MetricSource for SelfMetricsSource {
         let error_logs_dropped = ERROR_LOGS_DROPPED.load(Ordering::Acquire) as i64;
         let logs_send_failures = LOGS_SEND_FAILURES.load(Ordering::Acquire) as i64;
         let traces_dropped = TRACES_DROPPED_RECORDS.load(Ordering::Acquire) as i64;
+        let exporter_restarts = EXPORTER_RESTARTS.load(Ordering::Acquire) as i64;
         std::vec![
             monotonic_sum_metric(
                 "ngx_otel.dropped_records",
@@ -319,6 +327,13 @@ impl MetricSource for SelfMetricsSource {
                 "Configured metric export interval",
                 "ms",
                 interval_ms,
+                now,
+            ),
+            gauge_metric(
+                "ngx_otel.exporter.restarts",
+                "Prior exporter crashes in the current crash-loop window at this process start (0 = clean start; nginx request handling is never affected by the exporter crash-loop state)",
+                "crashes",
+                exporter_restarts,
                 now,
             ),
         ]
@@ -454,6 +469,16 @@ pub async fn export_loop(amcf: &'static MainConfig) {
     // and never changed afterwards; reading it here is safe in a single process.
     let master_pid = unsafe { nginx_sys::ngx_parent } as i64;
     MASTER_PID.store(master_pid, Ordering::Relaxed);
+
+    // Crash-loop healthy-reset tracking: after running successfully for a full
+    // CRASH_WINDOW_SECS window the crash counter in shm is zeroed. This prevents
+    // a single crash after a long healthy run from being counted against old
+    // in-window crashes that happened during a previous short-lived startup.
+    // `healthy_since` is set to `worker_start_ns` on the first successful export
+    // tick (i.e. when `ngx_quit` / `ngx_terminate` were NOT set). The reset
+    // fires once and is idempotent (`crash_counter_reset` flag).
+    let healthy_since_ns = worker_start_ns;
+    let mut crash_counter_reset = false;
 
     // Retry buffer: (encoded bytes, number of data points in that batch).
     // Depth is configured (see `MainConfig::retry_buffer_depth`) so that
@@ -801,6 +826,37 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             // exporter's lifetime). `version` is an `AtomicU64`, so the
             // cross-process `fetch_add` is well-defined.
             unsafe { (*ctrl).version.fetch_add(1, Ordering::Relaxed) };
+        }
+
+        // ── Crash-loop healthy-reset ──────────────────────────────────────────
+        // Once the export loop has run for a full CRASH_WINDOW_SECS without
+        // crashing, clear the crash counter in shm.  This ensures a single crash
+        // after a long healthy run is not counted against stale in-window crashes,
+        // and prevents a legitimate SIGHUP-triggered exporter from being penalised
+        // for crashes that happened much earlier in a previous short session.
+        // The reset fires at most once per process lifetime (idempotent flag).
+        if !crash_counter_reset {
+            let elapsed_ns = crate::util::now_unix_nano().saturating_sub(healthy_since_ns);
+            // CRASH_WINDOW_SECS from exporter/mod.rs converted to nanoseconds.
+            const CRASH_WINDOW_NS: u64 = crate::exporter::CRASH_WINDOW_SECS * 1_000_000_000;
+            if elapsed_ns >= CRASH_WINDOW_NS {
+                if let Some(ctrl_ptr) = amcf.control_shm_ptr_mut() {
+                    // SAFETY: `control_shm_ptr_mut()` returned a valid, non-null
+                    // pointer to the live control-shm zone (mapped before fork,
+                    // valid for the exporter's lifetime). `crash_count` and
+                    // `window_start_unix` are `AtomicU64`; the stores are safe.
+                    let ctrl = unsafe { &*ctrl_ptr };
+                    ctrl.crash_count.store(0, Ordering::Relaxed);
+                    ctrl.window_start_unix.store(0, Ordering::Relaxed);
+                }
+                crash_counter_reset = true;
+                ngx::ngx_log_error!(
+                    NGX_LOG_INFO,
+                    log.as_ptr(),
+                    "otel export: exporter healthy for {}s — crash counter reset",
+                    crate::exporter::CRASH_WINDOW_SECS,
+                );
+            }
         }
 
         // ── Drain retry queue before collecting fresh data ────────────────
@@ -2006,7 +2062,8 @@ mod tests {
 
     /// SelfMetricsSource must produce exactly 8 metrics with the right names.
     /// (Updated in Phase 2.1 to include 3 new logs-path metrics;
-    ///  updated in P3 pre-promote to include traces.dropped_records.)
+    ///  updated in P3 pre-promote to include traces.dropped_records;
+    ///  updated in C1 to include ngx_otel.exporter.restarts.)
     #[test]
     fn self_metrics_source_produces_four_metrics() {
         let src = SelfMetricsSource {
@@ -2016,8 +2073,8 @@ mod tests {
         let metrics = src.collect();
         assert_eq!(
             metrics.len(),
-            8,
-            "SelfMetricsSource must emit 8 metrics (4 original + 3 log + 1 traces)"
+            9,
+            "SelfMetricsSource must emit 9 metrics (4 original + 3 log + 1 traces + 1 crash-loop)"
         );
 
         let names: std::vec::Vec<&str> = metrics.iter().map(|m| m.name.as_str()).collect();
@@ -2034,6 +2091,11 @@ mod tests {
         assert!(
             names.contains(&"ngx_otel.traces.dropped_records"),
             "traces.dropped_records must appear in self-metrics; names = {names:?}"
+        );
+        // C1 — crash-loop restart gauge
+        assert!(
+            names.contains(&"ngx_otel.exporter.restarts"),
+            "exporter.restarts must appear in self-metrics; names = {names:?}"
         );
     }
 

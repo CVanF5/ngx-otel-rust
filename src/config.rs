@@ -1288,6 +1288,39 @@ impl MainConfig {
             addr.cast::<u8>().add(offset).cast::<crate::exporter::control_shm::ControlShm>()
         })
     }
+
+    /// Returns a mutable pointer to the `ControlShm` data in the control zone.
+    ///
+    /// Used exclusively by the exporter process to write the crash-loop backoff
+    /// counter (`crash_count`, `window_start_unix`) on startup, and by the
+    /// export loop to reset the counter after a healthy WINDOW-length run.
+    ///
+    /// The `ControlShm` fields are `AtomicU64`, so concurrent reads by workers
+    /// (via [`control_shm_ptr`]) are data-race-free even without the caller
+    /// holding any lock.
+    ///
+    /// Returns `None` when:
+    /// - `control_shm_zone` is null (not registered — module not configured), or
+    /// - `control_shm_zone.shm.addr` is null (zone not yet mapped by nginx).
+    pub(crate) fn control_shm_ptr_mut(
+        &self,
+    ) -> Option<*mut crate::exporter::control_shm::ControlShm> {
+        // SAFETY: same as `control_shm_ptr` — `control_shm_zone` is either null
+        // (handled by `as_ref()?`) or the valid zone pointer from
+        // `register_control_shm_zone`.
+        let zone = unsafe { self.control_shm_zone.as_ref()? };
+        let addr = zone.shm.addr;
+        if addr.is_null() {
+            return None;
+        }
+        let offset = crate::shm::data_offset();
+        // SAFETY: `addr` is non-null and mapped; the pointer is only formed here
+        // (not dereferenced); callers must dereference through the `AtomicU64`
+        // methods for sound cross-process access.
+        Some(unsafe {
+            addr.cast::<u8>().add(offset).cast::<crate::exporter::control_shm::ControlShm>()
+        })
+    }
 }
 
 /* ─────────────────────────── inner exporter block ─────────────────────────── */

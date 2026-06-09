@@ -18,3 +18,13 @@ pub(crate) fn now_unix_nano() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64
 }
+
+/// Return the current wall-clock time as Unix seconds.
+///
+/// Used by the crash-loop backoff window check (whole-second granularity is
+/// sufficient for a 60 s window comparison; no OTLP timestamp involved).
+#[inline]
+pub(crate) fn now_unix_secs() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+}
