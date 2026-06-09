@@ -5,10 +5,10 @@ OpenTelemetry signals to an OTel collector.  Designed for migration to
 OTAP (OpenTelemetry Protocol with Apache Arrow) — the columnar evolution
 of OTLP — in a later phase.
 
-Everything it emits — metrics, logs, and (Phase 3) traces — is defined in
-**[`TELEMETRY_MODEL.md`](TELEMETRY_MODEL.md)** (OTel-semantic-conventions format),
-the producer-side contract, modelled on the F5 AVR nginx module (`avr-module/`)
-with OTel-semconv names/units. See [Signals](#signals-what-this-module-emits).
+Everything it emits — metrics, logs, and traces — is defined in
+**[`TELEMETRY_MODEL.md`](TELEMETRY_MODEL.md)**, the producer-side contract.
+It uses OTel semantic-convention names and units.
+See [Signals](#signals-what-this-module-emits).
 
 [NGINX]: https://nginx.org/
 [`ngx-rust`]: https://github.com/nginx/ngx-rust
@@ -20,15 +20,17 @@ process; pre-upstream-PR.**
 
 What this module emits:
 
-- **Metrics** (Phase 1, on by default): per-worker shm counter slots written
-  from a Log-phase handler — no allocations, no locks, no syscalls on the
-  request path.  A dedicated `nginx: otel exporter` child process owns the
-  entire cold path (async export loop, hyper-on-`ngx-rust`, no Tokio runtime).
-  Workers hold zero collector sockets.
+- **Metrics** (Phase 1, on by default): per-worker shared-memory counter
+  slots, written from a Log-phase handler with no allocations, no locks, and
+  no syscalls on the request path.  A dedicated `nginx: otel exporter` child
+  process owns the entire cold path: the async export loop runs hyper on
+  `ngx-rust`'s executor, with no Tokio runtime.  Workers hold zero collector
+  sockets.
 - **Access logs + exemplars** (Phase 2, `otel_access_log_sample <n>`):
-  reservoir-sampled exemplars and a thin exception tail (status ≥ 4xx / latency
-  outliers), written into a per-worker SPSC ring on the request path.  No
-  per-request log; metrics-primary.
+  reservoir-sampled exemplars plus a thin exception tail (status ≥ 4xx and
+  latency outliers), written into a per-worker single-producer ring on the
+  request path.  The bulk traffic is represented by metrics; there is no
+  per-request log.
 - **Error logs** (Phase 2, `otel_error_log`): coalesced error `LogRecord`s with
   a companion error-rate counter.
 - **Traces** (Phase 3, `otel_trace <expr>`): OTel server spans with W3C
@@ -53,24 +55,26 @@ Confluence proposal (link below) for the full phase plan.
 
 ## Architecture
 
-<!-- Context diagram per F5 Architecture Diagram Guidelines §1: left→right = origin→destination;
-     IBM-palette plane colours (user traffic=black, telemetry=#648FFF, control=#FFB000) on both nodes
-     and edges; cylinders = shared memory; labelled edges; colour key in the caption below. -->
+<!-- Context diagram: top→bottom = origin→destination (HTTP clients at the top,
+     OTel collector at the bottom); kept narrow to fit the default GitHub README width.
+     IBM-palette plane colours (user traffic=black, telemetry=#648FFF, control=#FFB000)
+     on both nodes and edges; cylinders = shared memory; labelled edges; colour key in
+     the caption below. -->
 ```mermaid
-flowchart LR
+flowchart TB
     Client(["HTTP clients"]):::ext
 
     subgraph NGINX["NGINX — one instance"]
         direction TB
         subgraph Workers["Workers · copy raw facts"]
-            direction TB
+            direction LR
             W1["Worker 1"]:::data
             W2["Worker 2"]:::data
             W3["Worker N"]:::data
         end
         subgraph Shm["Shared memory"]
-            direction TB
-            SHM[("<b>Per-worker shm</b><br/>histograms · log/span rings · counters")]:::tel
+            direction LR
+            SHM[("<b>Per-worker shm</b><br/>histograms · log/span<br/>rings · counters")]:::tel
             Ctl[("control shm<br/>flags · heartbeat")]:::ctl
             SHM ~~~ Ctl
         end
@@ -85,7 +89,7 @@ flowchart LR
     Client -->|"HTTP requests"| Workers
     Workers -->|"bump &amp; defer"| SHM
     SHM -->|"drain"| Drain
-    Tx --> Coll
+    Tx -->|"OTLP"| Coll
     Coll -.->|"control · Phase 5"| Tx
     Ctl -.->|"flags"| Workers
 
@@ -101,57 +105,67 @@ flowchart LR
 
 *Colour = plane: **user traffic** (black) · **telemetry** (blue `#648FFF`) · **control** (amber `#FFB000`) — on nodes and edges. Cylinders = shared memory; rounded = external. The single cold-path exporter handles all signals; Phase-5 control feedback lands at the **exporter** (which owns the gRPC connection), and the exporter publishes flags that workers read on the hot path.*
 
-Per-worker shm counter slots for instrumented metrics; atomic increments
-from a Log-phase handler write to the worker's own slot only (no
-cross-worker cache traffic).  A **dedicated `nginx: otel exporter` child
-process** owns the entire cold path — an async export loop driven by
-`ngx-rust`'s single-threaded executor that reads the worker slots plus
-NGINX core's `ngx_stat_*` atomics, encodes via OTLP protobuf, and sends
-either over [hyper] 1.x HTTP/1 or over OTLP/gRPC on HTTP/2 — both driven
-on a `NgxConnIo` adapter that wraps `ngx_peer_connection_t` and uses
-NGINX's event handlers for I/O readiness wakeup (no spinning, no
-blocking).  Workers never open a collector connection.  A small control
-shm carries a liveness heartbeat plus a flags word the workers load on
-the request path (one `Relaxed` atomic read — the sole hot-path branch,
-reserved for Phase 5 dynamic reconfiguration).  The `MetricSource` and
-`Encoder` trait boundaries — plus the `ExportTransport` enum that
-dispatches OTLP/HTTP vs OTLP/gRPC — keep an eventual OTAP / columnar
-migration a swap, not a rewrite.
+Instrumented metrics live in per-worker shared-memory counter slots.  A
+Log-phase handler increments them atomically, and each worker writes only
+to its own slot, so there is no cross-worker cache traffic.
+
+A **dedicated `nginx: otel exporter` child process** owns the entire cold
+path.  Its async export loop is driven by `ngx-rust`'s single-threaded
+executor.  It reads the worker slots plus NGINX core's `ngx_stat_*`
+atomics, encodes OTLP protobuf, and sends the result over either [hyper]
+1.x HTTP/1 or OTLP/gRPC on HTTP/2.  Both transports run on a `NgxConnIo`
+adapter, which wraps `ngx_peer_connection_t` and uses NGINX's own event
+handlers for I/O-readiness wakeup — no spinning, no blocking.  Workers
+never open a collector connection.
+
+A small control shared-memory zone carries a liveness heartbeat plus a
+flags word.  Workers load that flags word once per request — one `Relaxed`
+atomic read, the sole hot-path branch, reserved for Phase 5 dynamic
+reconfiguration.
+
+The `MetricSource` and `Encoder` trait boundaries, plus the
+`ExportTransport` enum that dispatches between OTLP/HTTP and OTLP/gRPC,
+keep an eventual OTAP / columnar migration an encoder swap rather than a
+rewrite.
 
 **Design principle: the worker copies raw facts and never encodes; all
 wire-format work is cold-path.**  Workers do a bounded amount of
-format-*independent* work; the exporter does everything format-specific.  On the request
-path a worker only *aggregates and defers* — a fixed set of `Relaxed`
-atomic increments into its own shm histogram slots, plus, for the
-sampled exception tail only, a single bounded, allocation-free copy into
-its own ring.  That work is constant per request, lock-free, and
-syscall-free, and its cost does **not** depend on the telemetry wire
-format.  Everything that *does* depend on the wire format — assembling
-OTel records, OTLP protobuf encoding today, OTAP / columnar later — runs
-only in the dedicated exporter on the cold path.  Because the data sits
-in shm in a **protocol-neutral shape**, moving OTLP → OTAP is an encoder
-swap inside one cold-path process and never reaches a worker or the
-request path.
+format-*independent* work; the exporter does everything format-specific.
+On the request path a worker only *aggregates and defers*: a fixed set of
+`Relaxed` atomic increments into its own shm histogram slots, plus — for
+the sampled exception tail only — a single bounded, allocation-free copy
+into its own ring.  That work is constant per request, lock-free, and
+syscall-free, and its cost does not depend on the telemetry wire format.
+Everything that *does* depend on the wire format — assembling OTel
+records, OTLP protobuf encoding today, OTAP / columnar later — runs only
+in the dedicated exporter on the cold path.  Because the data sits in
+shared memory in a protocol-neutral shape, moving from OTLP to OTAP is an
+encoder swap inside one cold-path process; it never reaches a worker or
+the request path.
 
-Three invariants follow.  **(1) The request path does zero wire-format
-work** — it copies raw facts (atomic bumps + bounded memcpys into shm)
-and never serialises; anything that shapes bytes for a wire format is
-pushed to the cold path.  **(2) Read once, derive many** — each request
-datum is read once, at the phase that owns it (inbound trace context at
-the `rewrite` phase, parsed once and cached on the per-request context;
-request outcome at the `log` phase, in one pass), and **every** signal
-(metric, log, span) is derived from those captured reads — no signal
-re-reads or re-scans a field another already read.  **(3) "Zero
-wire-byte change" is the bar for refactoring telemetry code** — a change
-that leaves the emitted OTLP bytes byte-for-byte identical is a pure
-refactor (gated by the existing tests); a change that alters them is a
-behaviour change, treated as such.  Invariants (1)–(2) govern *what a
-worker does* per request; (3) governs *how we change the code that
-produces bytes*.
+Three invariants follow.
+
+1. **The request path does zero wire-format work.**  It copies raw facts —
+   atomic bumps and bounded memcpys into shared memory — and never
+   serialises.  Anything that shapes bytes for a wire format is pushed to
+   the cold path.
+2. **Read once, derive many.**  Each request datum is read once, at the
+   phase that owns it: inbound trace context at the `rewrite` phase,
+   parsed once and cached on the per-request context; the request outcome
+   at the `log` phase, in one pass.  Every signal — metric, log, span —
+   is derived from those captured reads.  No signal re-reads or re-scans
+   a field another signal already read.
+3. **"Zero wire-byte change" is the bar for refactoring telemetry code.**
+   A change that leaves the emitted OTLP bytes byte-for-byte identical is
+   a pure refactor, gated by the existing tests.  A change that alters
+   them is a behaviour change, and is treated as such.
+
+Invariants (1) and (2) govern *what a worker does* per request;
+(3) governs *how we change the code that produces bytes*.
 
 This one dedicated exporter is deliberately the **single cold path for all
 three signals** — metrics (Phase 1), logs (Phase 2), and traces (Phase 3) —
-so per-signal differences stay confined to the shm shape on the left while
+so per-signal differences stay confined to the shared-memory shape while
 one process owns all collector I/O.  The per-worker-export alternative (the model the production
 C++ `nginx/nginx-otel` module uses: a background thread and its own connection
 in every worker) was weighed across all three signals and declined; the
@@ -189,32 +203,37 @@ Because the reduction happens inside the window, the **two aggregated signals
 per-window counts, not the number of exported records or the per-request cost.
 That property is why they are default-on.
 
-**Traces are the exception, and we measured it.**  A span is per-request and
-non-aggregable, so it does not inherit the windowing win.  On a single worker at
-100 % sampling the exporter sustains **~10 k spans/s/worker** before the
-per-worker ring fills and excess spans drop — *gracefully* (drop-on-full is
-cheap; request latency is unaffected) and *observably*
-(`ngx_otel.traces.dropped_records`).  The ceiling is set by the **per-drain
-budget** (≤ 2 500 spans/worker drained every 250 ms), **not** by exporter CPU
-(~2 % at the ceiling) — a deliberate sizing choice, raised by enlarging the drain
-budget and ring together (and chunking the send below the gRPC max-message size).
-Practical guidance: metrics and summary-logs are cheap default-on; for
-high-volume tracing, sample down or raise the trace buffers.  Measurements:
+**Traces are the exception, and we measured it.**  A span is per-request
+and cannot be aggregated, so it does not inherit the windowing win.  On a
+single worker at 100% sampling, the exporter sustains roughly 10k spans
+per second per worker; beyond that, the per-worker ring fills and excess
+spans drop.  The drop is graceful — drop-on-full is cheap and request
+latency is unaffected — and observable, counted by
+`ngx_otel.traces.dropped_records`.  The ceiling is set by the per-drain
+budget (at most 2,500 spans per worker drained every 250 ms), not by
+exporter CPU, which sits around 2% at the ceiling.  That is a deliberate
+sizing choice: raising the ceiling means enlarging the drain budget and
+the ring together, and chunking the send to stay below the gRPC maximum
+message size.  Practical guidance: metrics and summary-logs are cheap
+enough to leave on by default; for high-volume tracing, sample down or
+raise the trace buffers.  Measurements:
 [`tests/bench/RESULTS-span-saturation-2026-06-09.md`](tests/bench/RESULTS-span-saturation-2026-06-09.md).
 
 ## Signals (what this module emits)
 
-The full producer-side contract — every metric, log record, and (Phase 3) trace,
+The full producer-side contract — every metric, log record, and trace,
 with names, units, attributes, and temporality — lives in
 **[`TELEMETRY_MODEL.md`](TELEMETRY_MODEL.md)**. That file is the source of truth for
 building dashboards, alerts, or pipelines against this module; you do **not** need the
 design proposal to integrate. In brief:
 
-- **Metrics** (on by default): HTTP request duration as an OTel **exponential
-  histogram (µs)** decomposed into base (`method × status-class × protocol`),
-  per-`http.route`, and per-`nginx.upstream.zone` series; request/response/upstream
-  byte + timing histograms; nginx `stub_status` counters/gauges; and a
-  `ngx_otel.error_log.events` error-rate counter. Cumulative temporality.
+- **Metrics** (on by default): HTTP request duration as an OTel exponential
+  histogram, recorded in microseconds, decomposed three ways — a base series
+  keyed on method, status class, and protocol; a per-`http.route` series; and
+  a per-`nginx.upstream.zone` series. Plus request, response, and upstream
+  byte and timing histograms; the nginx `stub_status` counters and gauges;
+  and a `ngx_otel.error_log.events` error-rate counter. Cumulative
+  temporality.
 - **Logs — access** (`otel_access_log_sample <n>`): metrics-primary, plus
   reservoir-sampled **exemplars** (trace-linked) and a **thin exception tail** of
   `LogRecord`s for status ≥ 4xx / latency outliers. Not a per-request log.
@@ -224,8 +243,9 @@ design proposal to integrate. In brief:
   `traceparent` propagation (`otel_trace_context`); parent-based or ratio
   sampling; per-location span name + custom attrs; `$otel_trace_id` /
   `$otel_parent_sampled` nginx variables. Exemplars on the duration histogram
-  now carry `trace_id`/`span_id` from the module's own spans, completing the
-  metric→exemplar→Tempo drill-down (§6.6.5).
+  carry `trace_id` and `span_id` from the module's own spans, completing the
+  drill-down from a metric, through its exemplar, to the Tempo trace
+  (proposal §6.6.5).
 - **Exporter self-metrics**: `ngx_otel.dropped_records`, `ngx_otel.send_failures`,
   `ngx_otel.logs.access.dropped_records`, `ngx_otel.logs.error.dropped_records`,
   `ngx_otel.logs.send_failures`, `ngx_otel.traces.dropped_records`,
@@ -601,7 +621,7 @@ ngx-otel-rust/
 ## Related
 
 - F5-internal design proposal (Confluence):
-  *Proposal: ngx-otel-rust — column-oriented telemetry for NGINX*
+  *Proposal: a high-performance observability module for NGINX (ngx-otel-rust)*
   <https://docs.f5net.com/spaces/~vandesande/pages/1241830506>
 - C++ precedent: [`nginx/nginx-otel`](https://github.com/nginx/nginx-otel)
   (traces only).  Same directive vocabulary, different concurrency
