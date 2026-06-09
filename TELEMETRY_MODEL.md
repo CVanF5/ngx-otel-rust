@@ -120,20 +120,24 @@ Each is its own `ExpHistogramSlot` table in `WorkerSlots` (`src/shm.rs`).
 ### Exponential histogram parameters (`src/shm.rs`)
 
 - **Scale:** `EXP_HISTOGRAM_SCALE = 3` → base = 2^(2^-3) ≈ 1.091 (8 buckets
-  per power-of-two µs). 90µs / 150µs / 200µs land in distinct buckets.
+  per power-of-two µs). 90µs → bucket 51; 150µs → bucket 57; 200µs → bucket 61
+  — all distinct.
 - **Buckets:** `N_EXP_BUCKETS = 192`, `positive_offset = 0`, covering
   ≈ [1µs, 2^24µs ≈ 16.7s); values above clamp to the last bucket; 0µs →
   `zero_count`.
+- **Bucket computation is exact:** bucket index = `floor(log2(value_us) * 8)`,
+  computed in O(1) using only integer shifts and 7 precomputed u64 thresholds —
+  no float, no `log()` call, no syscall on the hot path. Verified exact for all
+  values in [1, 2^14] and a random sample up to 2^24.
 - **Boundary convention (note):** our bucket index uses a lower-inclusive
-  boundary `[base^k, base^(k+1))`, whereas the OTel exp-histogram spec defines
+  boundary `[base^k, base^(k+1))` (i.e. `floor(log2(v)*8) = k` iff
+  `2^(k/8) ≤ v < 2^((k+1)/8)`), whereas the OTel exp-histogram spec defines
   bucket `k` as the upper-inclusive `(base^k, base^(k+1)]`. The two differ for
   exactly one input: a value landing *precisely* on a boundary `base^k` (e.g.
-  2µs, 4µs) is counted in bucket `k` here vs `k-1` per spec — an off-by-one of
-  a single bucket only at exact powers. For general integer-µs latencies the
-  bucketing is identical, so the practical effect is negligible. We keep the
-  lower-inclusive form deliberately: it is what the verified low-end bucketing
-  fix (left-shift mantissa for `n < scale`) is built around, and changing the
-  boundary side risks reintroducing that bug. Documented, not "fixed."
+  2µs, 4µs, 8µs — exact powers of 2) is counted in bucket `k` here vs `k-1`
+  per spec — an off-by-one of a single bucket only at exact powers of 2. For
+  all other integer-µs latencies the bucketing is identical. Documented,
+  not "fixed."
 
 ---
 

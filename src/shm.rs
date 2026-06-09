@@ -66,7 +66,7 @@ pub const EXP_HISTOGRAM_BUCKET_OFFSET: i32 = 0;
 ///
 /// **Resolution (scale 3, µs input):** bucket `k` covers approximately
 /// [base^k, base^(k+1)) µs where base = 2^(2^-3) ≈ 1.091.
-/// 90µs → bucket 51; 150µs → 57; 200µs → 60 — all distinct.
+/// 90µs → bucket 51; 150µs → 57; 200µs → 61 — all distinct.
 /// All durations are positive so `negative` is empty.
 ///
 /// The record function computes the scale-3 bucket index with a few bit ops +
@@ -94,27 +94,41 @@ impl ExpHistogramSlot {
     /// distinct buckets.
     ///
     /// # Constraint: no allocation, no lock
-    /// Uses `leading_zeros()` + a few bit ops to compute
-    /// `floor(log2(value_us) * 2^scale)` in O(1).
+    ///
+    /// Computes the **exact** OTel scale-3 bucket index
+    /// `floor(log2(value_us) * 8)` = `n*8 + j` using only integer shifts and
+    /// comparisons — no float, no `log()`, no syscall:
+    ///
+    /// 1. `n = 63 - leading_zeros(value_us)` — the floor-log2 (octave).
+    /// 2. `m = value_us << (63 - n)` — normalise to `[2^63, 2^64)`.
+    /// 3. `j` = count of the 7 precomputed thresholds `T[k] = floor(2^63 · 2^((k+1)/8))`
+    ///    that satisfy `m > T[k]`.  Because `m` is a multiple of `2^(63-n)` and each
+    ///    `T[k]` is never such a multiple, `m > T[k]` is equivalent to
+    ///    `value_us ≥ ceil(2^(n+(k+1)/8))`, the exact integer boundary condition.
+    ///
+    /// **Correctness:** verified exact for all `v ∈ [1, 2^14]` and a random
+    /// sample of `[1, 2^24]` against `floor(log2(v) · 8)`.
     #[inline]
     pub fn record(&self, value_us: u64) {
         if value_us == 0 {
             self.zero_count.fetch_add(1, Ordering::Relaxed);
         } else {
-            let n = 63u32.saturating_sub(value_us.leading_zeros()); // floor(log2(value))
-            let s = EXP_HISTOGRAM_SCALE as u32; // = 3
-                                                // OTel exponential-histogram bucket index = floor(log2(value) * 2^scale),
-                                                // recovered from the exponent `n` plus the top `scale` mantissa bits.
-                                                // The encoder ships these buckets at offset=0, so the consumer decodes
-                                                // bucket `k` as the range (2^(k/2^scale), 2^((k+1)/2^scale)].
-            let upper = (n as usize) << s;
-            let frac = if n >= s {
-                ((value_us >> (n - s)) as usize) & ((1usize << s) - 1)
-            } else {
-                // n < s: shift the mantissa left (n - s would underflow as u32).
-                ((value_us << (s - n)) as usize) & ((1usize << s) - 1)
-            };
-            let idx = upper | frac;
+            // T[k] = floor(2^63 * 2^((k+1)/8)) for k = 0..6.
+            // Derivation: `python3 -c "import math; [print(math.floor(2**63 * 2**((j+1)/8))) for j in range(7)]"`
+            // Verified: T[3] == isqrt(2^127) (exact via integer square root).
+            const THRESHOLDS: [u64; 7] = [
+                10058158527438640870, // k=0: floor(2^63 * 2^(1/8))
+                10968499650544839023, // k=1: floor(2^63 * 2^(2/8))
+                11961233684655323370, // k=2: floor(2^63 * 2^(3/8))
+                13043817825332782212, // k=3: floor(2^63 * 2^(4/8)) = isqrt(2^127)
+                14224384202002324189, // k=4: floor(2^63 * 2^(5/8))
+                15511800964685064948, // k=5: floor(2^63 * 2^(6/8))
+                16915738899553466670, // k=6: floor(2^63 * 2^(7/8))
+            ];
+            let n = 63u32.saturating_sub(value_us.leading_zeros()); // floor(log2(value_us))
+            let m = value_us << (63 - n); // normalise to [2^63, 2^64)
+            let j = THRESHOLDS.iter().filter(|&&t| m > t).count(); // sub-bucket 0..7
+            let idx = (n as usize) * 8 + j;
             self.buckets[idx.min(N_EXP_BUCKETS - 1)].fetch_add(1, Ordering::Relaxed);
         }
         self.sum.fetch_add(value_us, Ordering::Relaxed);
@@ -1213,15 +1227,15 @@ mod tests {
         assert_eq!(total_sum, 1300);
 
         // Confirm no cross-write between slots.
-        // scale 3: bucket index = (n << 3) | frac   where n = floor(log2(v)), s = 3.
-        //   100µs: n=6 (64≤100<128), frac=((100>>3)&7)=(12&7)=4 → 6*8+4 = 52
-        //   500µs: n=8 (256≤500<512), frac=((500>>5)&7)=(15&7)=7 → 8*8+7 = 71
+        // Exact scale-3 bucket: floor(log2(v) * 8).
+        //   100µs: log2(100)≈6.644, floor(6.644*8)=floor(53.15)=53
+        //   500µs: log2(500)≈8.966, floor(8.966*8)=floor(71.73)=71
         let (buckets0, _, _, _) = slot0.request_duration_combos[combo].snapshot();
         let (buckets1, _, _, _) = slot1.request_duration_combos[combo].snapshot();
 
-        // Expected bucket indices — literals derived above, NOT recomputed via the same
+        // Expected bucket indices — hand-computed above, NOT recomputed via the same
         // formula under test (A1 anti-pattern: a self-referential helper never validates).
-        const BUCKET_100: usize = 52;
+        const BUCKET_100: usize = 53;
         const BUCKET_500: usize = 71;
         const _: () = assert!(BUCKET_100 != BUCKET_500, "100 and 500 must be in distinct buckets");
 
@@ -1353,19 +1367,47 @@ mod tests {
     /// The prior `n <= s` shortcut wrote `value` directly as the bucket index,
     /// mis-placing every sub-16µs observation and leaving buckets 16..31
     /// permanently empty.  The correct scale-3 index is `floor(log2(value) * 8)`,
-    /// verified here against hand-computed expectations spanning the n<s, n==s,
-    /// and n>s branches.
+    /// verified here against hand-computed expectations spanning:
+    /// - octave-aligned values (linear == geometric coincide; regression guard)
+    /// - mid-octave **divergence** values (linear gives n*8+(top-3 bits), geometric
+    ///   gives a higher index; these are the values that exposed the original bug)
+    ///
+    /// All expected indices are hard-coded literals from independent calculation —
+    /// never recomputed from the implementation under test.
     #[test]
     fn exp_histogram_low_end_bucket_placement() {
-        // (value_us, expected scale-3 bucket index)
+        // (value_us, expected scale-3 bucket index = floor(log2(value) * 8))
+        //
+        // Octave-aligned regression cases (linear == geometric here):
+        //   1  = 2^0         → bucket 0    (floor(0*8)=0)
+        //   2  = 2^1         → bucket 8    (floor(1*8)=8)
+        //   4  = 2^2         → bucket 16
+        //   8  = 2^3         → bucket 24
+        //   15 = 2^3 * 15/8  → bucket 31   (floor(log2(15)*8)=floor(3.907*8)=31)
+        //   16 = 2^4         → bucket 32
+        //
+        // Mid-octave divergence cases (old mantissa-linear code gave 52/60/68;
+        // exact geometric gives 53/61/69 — verified hand-computed below):
+        //   100: log2(100)≈6.644, floor(6.644*8)=floor(53.15)=53  (old code: 52)
+        //   200: log2(200)≈7.644, floor(7.644*8)=floor(61.15)=61  (old code: 60)
+        //   400: log2(400)≈8.644, floor(8.644*8)=floor(69.15)=69  (old code: 68)
+        //
+        // Also: 90µs (near-octave, was already correct in old code):
+        //   90:  log2(90)≈6.492, floor(6.492*8)=floor(51.93)=51
         let cases = [
+            // octave-aligned
             (1u64, 0usize),
             (2, 8),
             (4, 16),
-            (8, 24), // n == s boundary (was mis-placed at idx 8 by the old code)
+            (8, 24),
             (15, 31),
-            (16, 32), // n > s
+            (16, 32),
+            // near-octave (already correct before A1)
             (90, 51),
+            // mid-octave divergence (wrong under old code, correct under A1 fix)
+            (100, 53),
+            (200, 61),
+            (400, 69),
         ];
         for (value, expected) in cases {
             let mut buf = std::vec![0u8; mem::size_of::<ExpHistogramSlot>()];
@@ -1533,13 +1575,13 @@ mod tests {
             "90µs, 150µs, 200µs must each land in a distinct bucket (scale 3)"
         );
 
-        // Spot-check expected indices:
-        // 90µs: n=6, k=6*8+((90>>3)&7)=48+3=51
-        // 150µs: n=7, k=7*8+((150>>4)&7)=56+1=57
-        // 200µs: n=7, k=7*8+((200>>4)&7)=56+4=60
+        // Spot-check expected indices (exact: floor(log2(v) * 8)):
+        // 90µs:  log2(90)≈6.492,  floor(6.492*8)=floor(51.93)=51
+        // 150µs: log2(150)≈7.229, floor(7.229*8)=floor(57.83)=57
+        // 200µs: log2(200)≈7.644, floor(7.644*8)=floor(61.15)=61
         assert_eq!(buckets[51], 1, "90µs → bucket 51");
         assert_eq!(buckets[57], 1, "150µs → bucket 57");
-        assert_eq!(buckets[60], 1, "200µs → bucket 60");
+        assert_eq!(buckets[61], 1, "200µs → bucket 61");
     }
 
     #[test]
