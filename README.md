@@ -61,64 +61,62 @@ Confluence proposal (link below) for the full phase plan.
      all wire-format work per interval, with shared memory as the only coupling between
      them.  Plane colours: user traffic = black (thick), telemetry = #648FFF (blue),
      control = #FFB000 (amber, dashed — the feedback half is Phase 5).
-     Cylinders = shared memory. -->
+     Cylinders = shared memory.  LAYOUT NOTES (hard-won): the exporter pipeline is ONE
+     node because mermaid ignores a subgraph's `direction` when any internal node has
+     an external edge, and cluster-level edges don't constrain dagre's ranking; the
+     flags edges point downstream (workers READ the control shm) so the macro flow
+     ranks correctly; no pure-white fills (clashes on dark backgrounds). -->
 ```mermaid
 flowchart TB
     Client(["HTTP clients"]):::ext
 
-    subgraph NGINX["NGINX — one instance · the master spawns workers and the exporter"]
+    subgraph NGINX["NGINX — one instance"]
         direction TB
-        subgraph Hot["Hot path · every request · constant, lock-free, no syscalls"]
-            Workers["Workers ×N<br/>serve traffic · bump &amp; defer"]:::data
+        subgraph Hot["Hot path — every request"]
+            Workers["Workers ×N<br/>serve traffic · bump &amp; defer<br/>constant, lock-free, no syscalls"]:::data
         end
-        subgraph Buf["Shared memory — the only worker/exporter coupling"]
-            direction LR
-            SHM[("per-worker slots + rings ×N<br/>histograms · log/span rings<br/>drop-newest when full · counted")]:::tel
-            Ctl[("control<br/>flags · heartbeat")]:::ctl
-            SHM ~~~ Ctl
-        end
-        subgraph Cold["Cold path · nginx: otel exporter · dedicated child process · per interval"]
-            direction LR
-            Drain["drain"]:::tel --> Proc["process<br/>filter · sample"]:::tel --> Encode["encode<br/>OTLP · OTAP at Phase 5"]:::tel --> Tx["transport<br/>HTTP/1 · gRPC/h2"]:::tel
+        SHM[("shared memory — the only coupling<br/>per-worker slots + rings ×N<br/>drop-newest when full · counted")]:::tel
+        Ctl[("control shm<br/>flags · heartbeat")]:::ctl
+        subgraph Cold["Cold path — per interval"]
+            Exp["<b>nginx: otel exporter</b><br/>dedicated child process · owns all egress<br/>drain → process → encode → transport"]:::tel
         end
     end
 
     Coll(["OTel collector"]):::ext
 
     Client ==>|"requests"| Workers
-    Workers -->|"atomic bumps +<br/>bounded memcpy"| SHM
-    SHM -->|"drained on interval"| Drain
-    Tx -->|"OTLP/HTTP · OTLP/gRPC"| Coll
-    Cold -.->|"publish flags"| Ctl
-    Ctl -.->|"one relaxed load<br/>per request"| Workers
-    Coll -.->|"control feedback · Phase 5"| Tx
+    Workers -->|"atomic bumps + bounded memcpy"| SHM
+    Workers -.->|"reads flags · 1 relaxed load/req"| Ctl
+    SHM -->|"drained on interval"| Exp
+    Ctl -. "flags published by exporter" .- Exp
+    Exp -->|"OTLP/HTTP · OTLP/gRPC<br/>(OTAP at Phase 5)"| Coll
+    Coll -.->|"control feedback · Phase 5"| Exp
 
-    classDef data fill:#e8e8e8,stroke:#000000,stroke-width:2px,color:#000000;
+    classDef data fill:#e8e8e8,stroke:#333333,stroke-width:2px,color:#000000;
     classDef tel fill:#d0e2ff,stroke:#648FFF,stroke-width:2px,color:#000000;
     classDef ctl fill:#ffe8cc,stroke:#FFB000,stroke-width:2px,color:#000000;
-    classDef ext fill:#ffffff,stroke:#000000,stroke-width:2px,color:#000000;
+    classDef ext fill:#ececec,stroke:#333333,stroke-width:2px,color:#000000;
 
-    style Hot fill:#fafafa,stroke:#aaaaaa,stroke-width:1px;
-    style Buf fill:#ffffff,stroke:#aaaaaa,stroke-width:1px;
-    style Cold fill:#eef3ff,stroke:#648FFF,stroke-width:1px;
-    style NGINX fill:#ffffff,stroke:#000000,stroke-width:2px;
+    style Hot fill:#f5f5f5,stroke:#999999,stroke-width:1px,color:#000000;
+    style Cold fill:#e4edff,stroke:#648FFF,stroke-width:1px,color:#000000;
+    style NGINX fill:transparent,stroke:#888888,stroke-width:2px;
 
-    linkStyle 1,2,3,5,6,7 stroke:#648FFF,stroke-width:2px;
-    linkStyle 4 stroke:#000000,stroke-width:3px;
-    linkStyle 8,9,10 stroke:#FFB000,stroke-width:2px;
+    linkStyle 1,3,5 stroke:#648FFF,stroke-width:2px;
+    linkStyle 0 stroke:#000000,stroke-width:3px;
+    linkStyle 2,4,6 stroke:#FFB000,stroke-width:2px;
 ```
 
-*Read it top-left to bottom-right: requests fall through the bands and
-telemetry leaves at the bottom. The two tinted bands are the design thesis —
-the **hot path** (grey) does constant, lock-free work on every request and
-never serialises; the **cold path** (blue) is one dedicated process that does
-all wire-format work, once per interval. Shared memory (cylinders) is the only
-thing the two share: workers hold zero collector sockets, and when a ring
-fills, telemetry drops — counted — while traffic is untouched. Edge colours:
-**user traffic** black (thick) · **telemetry** blue `#648FFF` · **control**
-amber `#FFB000`, dashed — the exporter publishes flags that workers read with
-one relaxed atomic load per request; the collector-side feedback half of that
-loop is Phase 5.*
+*Read it top to bottom: requests enter at the top, telemetry leaves at the
+bottom. The two tinted bands are the design thesis — the **hot path** (grey)
+does constant, lock-free work on every request and never serialises; the
+**cold path** (blue) is one dedicated process, spawned and respawned by the
+nginx master, that does all wire-format work once per interval. Shared memory
+(cylinders) is the only thing the two share: workers hold zero collector
+sockets, and when a ring fills, telemetry drops — counted — while traffic is
+untouched. Edge colours: **user traffic** black (thick) · **telemetry** blue
+`#648FFF` · **control** amber `#FFB000`, dashed — the exporter publishes flags
+that workers read with one relaxed atomic load per request; the collector-side
+feedback half of that loop is Phase 5.*
 
 Instrumented metrics live in per-worker shared-memory counter slots.  A
 Log-phase handler increments them atomically, and each worker writes only
