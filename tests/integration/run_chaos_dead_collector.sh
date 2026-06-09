@@ -374,10 +374,6 @@ if [[ "${SEEN_COUNT3}" != "true" ]]; then
 fi
 pass "Part C: crash_count=3 confirmed in error.log ('crash #3 in window' observed)"
 
-# Record the current log line count so we can isolate post-reload entries.
-LOG_LINES_BEFORE_RELOAD=$(wc -l < "${PREFIX_C}/logs/error.log" 2>/dev/null || echo 0)
-info "Part C: log line offset before SIGHUP = ${LOG_LINES_BEFORE_RELOAD}"
-
 # Give the exporter time to actually start (back off + setproctitle) before
 # the reload races with it.  The 300ms crash-hook sleep in the crash path means
 # the exporter is alive for ~300-500ms before aborting; add a beat to let it
@@ -403,36 +399,78 @@ done
     || fail "Part C: no new exporter appeared within 10s after SIGHUP"
 pass "Part C: new exporter after reload, PID = ${EXP_PID_C_NEW}"
 
-# Wait for the first "crash #N in window" entry AFTER the reload.
-# The new exporter still has NGX_OTEL_CRASH_ON_STARTUP inherited, so it will
-# crash and log the backoff message on its second startup (count=2 after reset).
-info "Part C: waiting for first post-reload crash log entry..."
+# Wait for the first "crash #N in window" entry from the POST-RELOAD cycle.
+#
+# The new exporter (EXP_PID_C_NEW) inherits NGX_OTEL_CRASH_ON_STARTUP and
+# crashes on its first startup (count=1, no backoff log).  The master respawns
+# it; that second start in the new cycle increments count to 2 and logs
+# "crash #2 in window" (if counter was reset) or "crash #4 in window" (if
+# stale from the pre-reload count=3).
+#
+# To avoid picking up crash log lines from the OLD exporter that races with
+# the reload (the old exporter may log "crash #3" or "crash #4" from its
+# own pre-reload counter), we:
+#   (a) wait for EXP_PID_C_NEW to die (first crash in new cycle, no log),
+#   (b) capture the NEXT exporter PID from the master (EXP_PID_C_NEW2),
+#   (c) grep for "crash #N in window" lines in the log that contain
+#       EXP_PID_C_NEW2's PID.
+#
+# Using the PID in the log line as the discriminator makes this precise
+# regardless of log ordering.
+
+info "Part C: waiting for first post-reload exporter (${EXP_PID_C_NEW}) to crash (count=1)..."
 deadline_c2=$(( $(date +%s) + 20 ))
-POST_RELOAD_CRASH_LINE=""
-while (( $(date +%s) < deadline_c2 )); do
-    if POST_RELOAD_CRASH_LINE="$(tail -n +"${LOG_LINES_BEFORE_RELOAD}" \
-            "${PREFIX_C}/logs/error.log" 2>/dev/null \
-            | grep "crash #" | head -1)"; then
-        if [[ -n "${POST_RELOAD_CRASH_LINE}" ]]; then
-            break
-        fi
+while kill -0 "${EXP_PID_C_NEW}" 2>/dev/null; do
+    if (( $(date +%s) > deadline_c2 )); then
+        fail "Part C: post-reload exporter ${EXP_PID_C_NEW} did not crash within 20s"
     fi
-    sleep 0.5
+    sleep 0.3
+done
+info "Part C: post-reload exporter ${EXP_PID_C_NEW} crashed (count=1, no backoff log expected)"
+
+# Capture the second post-reload exporter PID (the one that will log "crash #2").
+EXP_PID_C_NEW2=""
+deadline_c3=$(( $(date +%s) + 15 ))
+while (( $(date +%s) < deadline_c3 )); do
+    CUR="$(exporter_pid "${NGINX_PID_C}")"
+    if [[ -n "${CUR}" && "${CUR}" != "${EXP_PID_C_NEW}" ]]; then
+        EXP_PID_C_NEW2="${CUR}"
+        break
+    fi
+    sleep 0.3
+done
+[[ -n "${EXP_PID_C_NEW2}" ]] \
+    || fail "Part C: master did not respawn after second post-reload crash within 15s"
+info "Part C: second post-reload exporter PID = ${EXP_PID_C_NEW2}"
+
+# Wait for EXP_PID_C_NEW2 to log its backoff message (PID-keyed grep).
+# Format: "<timestamp> [warn] <pid>#0: otel exporter: crash #N in window, backing off Nms"
+POST_RELOAD_CRASH_LINE=""
+deadline_c4=$(( $(date +%s) + 20 ))
+while (( $(date +%s) < deadline_c4 )); do
+    LINE="$(grep "${EXP_PID_C_NEW2}#.*crash #" \
+        "${PREFIX_C}/logs/error.log" 2>/dev/null | head -1 || true)"
+    if [[ -n "${LINE}" ]]; then
+        POST_RELOAD_CRASH_LINE="${LINE}"
+        break
+    fi
+    sleep 0.3
 done
 if [[ -z "${POST_RELOAD_CRASH_LINE}" ]]; then
-    fail "Part C: no 'crash #N in window' line appeared after reload within 20s"
+    fail "Part C: no 'crash #N in window' line from PID ${EXP_PID_C_NEW2} appeared within 20s"
 fi
-info "Part C: first post-reload crash line: ${POST_RELOAD_CRASH_LINE}"
+info "Part C: second post-reload exporter crash line (PID ${EXP_PID_C_NEW2}): ${POST_RELOAD_CRASH_LINE}"
 
-# Hard assertion: the sequence number must be 2, not 4.
-# "crash #2 in window" → counter was reset to 0 on SIGHUP (PASS).
-# "crash #4 in window" → counter was NOT reset (stale value 3 carried over → FAIL).
+# Hard assertion: the sequence number must be 2 (counter reset → 0 on SIGHUP)
+# and NOT 4 (stale counter 3 carried over).
+# "crash #2 in window" → store(0) ran on SIGHUP: PASS.
+# "crash #4 in window" → store(0) neutered: FAIL.
 if echo "${POST_RELOAD_CRASH_LINE}" | grep -q "crash #2 in window"; then
-    pass "Part C: post-reload crash log shows 'crash #2 in window' — counter reset on SIGHUP CONFIRMED"
+    pass "Part C: PID ${EXP_PID_C_NEW2} logs 'crash #2 in window' — counter reset on SIGHUP CONFIRMED"
 elif echo "${POST_RELOAD_CRASH_LINE}" | grep -qE "crash #[3-9] in window|crash #[0-9]{2,}"; then
-    fail "Part C: post-reload crash log shows high sequence number — counter NOT reset on SIGHUP: ${POST_RELOAD_CRASH_LINE}"
+    fail "Part C: PID ${EXP_PID_C_NEW2} logs high crash# — counter NOT reset on SIGHUP: ${POST_RELOAD_CRASH_LINE}"
 else
-    fail "Part C: unexpected post-reload crash log format: ${POST_RELOAD_CRASH_LINE}"
+    fail "Part C: unexpected crash line format from PID ${EXP_PID_C_NEW2}: ${POST_RELOAD_CRASH_LINE}"
 fi
 
 # Assertion (a): new exporter is still alive 3s after reload (liveness guard).
