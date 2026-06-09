@@ -69,7 +69,14 @@ CARGO_MODULE="${CRATE_DIR}/target/release/libngx_http_otel_module.${MODULE_EXT}"
 if [[ -n "${CARGO_BUILD_TARGET:-}" ]]; then
     CARGO_MODULE="${CRATE_DIR}/target/${CARGO_BUILD_TARGET}/release/libngx_http_otel_module.${MODULE_EXT}"
 fi
-if [[ -f "${RELEASE_MODULE}" ]]; then
+# When CARGO_BUILD_TARGET is set (i.e., inside the TSAN Docker gate), the
+# cross-compiled module in target/ was just freshly built by run_grpc_export.sh
+# in the same gate run.  Prefer it over objs-release/ which can be stale.
+# In a native (non-TSAN) run, CARGO_BUILD_TARGET is unset and objs-release/ is
+# preferred as before.
+if [[ -n "${CARGO_BUILD_TARGET:-}" ]] && [[ -f "${CARGO_MODULE}" ]]; then
+    MODULE_PATH="${CARGO_MODULE}"
+elif [[ -f "${RELEASE_MODULE}" ]]; then
     MODULE_PATH="${RELEASE_MODULE}"
 elif [[ -f "${CARGO_MODULE}" ]]; then
     MODULE_PATH="${CARGO_MODULE}"
