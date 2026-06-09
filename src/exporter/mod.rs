@@ -202,6 +202,12 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
         //
         // SAFETY: `cycle` is the valid non-null cycle passed by nginx; all field reads
         // below are through shared references to Atomic types, which are safe.
+        //
+        // test_crash_count: captured in step 1.5, consumed by the test-support crash
+        // hook at step 10.  None when the control-shm pointer is unavailable (hook
+        // is skipped).  Declared here so it survives to step 10.
+        #[cfg(feature = "test-support")]
+        let mut test_crash_count: Option<u64> = None;
         if let Some(amcf) = crate::HttpOtelModule::main_conf(&*cycle) {
             if let Some(ctrl_ptr) = amcf.control_shm_ptr_mut() {
                 let ctrl = &*ctrl_ptr;
@@ -247,6 +253,12 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
                     // Publish the restart count so the self-metric is visible on
                     // the first export tick (count - 1 = prior crashes in window).
                     crate::export::EXPORTER_RESTARTS.store(count - 1, Ordering::Relaxed);
+                }
+
+                // Capture crash count for the test-support hook at step 10.
+                #[cfg(feature = "test-support")]
+                {
+                    test_crash_count = Some(count);
                 }
             }
         }
@@ -354,6 +366,41 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
         //     "otel exporter" in ps is the signal that the exporter is
         //     fully initialised.
         nginx_sys::ngx_setproctitle(c"otel exporter".as_ptr().cast_mut());
+
+        // ── Test-support crash hook (after setproctitle) ──────────────────────
+        // Fires here — AFTER step 10 — so the process is visible as
+        // "nginx: otel exporter" in `ps` when the abort() happens. The crash
+        // counter was already incremented and the backoff sleep already applied
+        // at step 1.5; by the time we reach here the master has entered its
+        // event loop and the SIGCHLD handler is installed (timing safe).
+        //
+        // A 300ms sleep before the first crash ensures the master has left
+        // ngx_init_cycle and entered ngx_master_process_cycle + sigsuspend,
+        // making SIGCHLD delivery deterministic even on slow CI hosts.
+        //
+        // Enabled only with `--features test-support`; zero code in production.
+        // search: NGX_OTEL_CRASH_ON_STARTUP
+        #[cfg(feature = "test-support")]
+        if let Some(tcc) = test_crash_count {
+            if std::env::var_os("NGX_OTEL_CRASH_ON_STARTUP").is_some() {
+                // Sleep so the process is visible as "nginx: otel exporter" in
+                // ps for at least one 500ms poll cycle.  For crash #1, also gives
+                // the master time to enter ngx_master_process_cycle + sigsuspend.
+                let sleep_ms: u64 = if tcc == 1 { 500 } else { 300 };
+                std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+                ngx::ngx_log_error!(
+                    nginx_sys::NGX_LOG_WARN,
+                    (*cycle).log,
+                    "otel exporter: [test-support] NGX_OTEL_CRASH_ON_STARTUP set \
+                     — calling abort() to simulate crash #{} (proctitle set)",
+                    tcc,
+                );
+                // SAFETY: `abort()` is always safe to call; it terminates the
+                // process immediately. nginx's SIGCHLD handler will see a
+                // non-clean exit and respawn the exporter (NGX_PROCESS_RESPAWN).
+                libc::abort();
+            }
+        }
 
         // 11. Spawn the async export task. The task lives for the process
         //     lifetime; allocating it on the exporter's pool keeps it pinned
