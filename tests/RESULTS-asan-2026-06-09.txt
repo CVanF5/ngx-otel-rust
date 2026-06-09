@@ -1,0 +1,96 @@
+AddressSanitizer (ASan) run — deferred-wake use-after-free check
+================================================================
+Date:      2026-06-09
+Host:      debian-vm (aarch64 Linux — the correctness/verification platform; NOT host-1/bench)
+Harness:   build/asan-run.sh
+Toolchain: rustc 1.95.0 (RUSTC_BOOTSTRAP=1 + rust-src for -Zbuild-std), clang 19.1.7
+
+Code under test
+---------------
+  ngx-rust (SDK):  a7ecee8  (branch ngx-otel-rust-deadlock-fix)
+      └─ carries ae3ff68 "async: always defer task wakes via ngx_post_event"
+         = the change proposed in ngx-rust PR #295.
+  module:          5c160ae  (ngx-otel-rust main; promote-fixes, reviewed-clean)
+
+WHY
+---
+ngx-rust PR #295 drops the synchronous inline re-poll from the async executor
+and always defers a wake by one event-loop tick (ngx_post_event). The open
+review concern (bavshin-f5) is a USE-AFTER-FREE: a deferred wake could be
+processed after nginx has already torn down / freed the connection or event
+context that the woken task then touches. TSAN (our standing gate) catches
+data races, not UAF. This run exercises the executor's wake/teardown paths
+under ASan to surface any UAF that actually occurs.
+
+  NOTE: ASan cannot prove the ABSENCE of UAF — it only checks code paths the
+  tests actually exercise. It catches the ones that do occur. This run is
+  evidence, not a proof.
+
+ASan configuration
+------------------
+  C (nginx):  -O1 -fsanitize=address -fno-omit-frame-pointer
+              -DNGX_DEBUG_PALLOC=1   <- routes nginx pool allocs through malloc
+                                        so ASan poisons freed pool memory; this
+                                        is what makes a UAF on a freed nginx
+                                        connection/event DETECTABLE.
+  Rust:       -Zsanitizer=address -Zexternal-clangrt -Zbuild-std
+  ASAN_OPTIONS: detect_leaks=0 : detect_stack_use_after_return=1 :
+                detect_odr_violation=0 : abort_on_error=1 : log_path=<rundir>/asan
+      detect_leaks=0 — this gate answers the USE-AFTER-FREE question (the PR
+        concern), not leaks; nginx has intentional pool non-frees that would
+        otherwise be LSan noise.
+      log_path — ASan reports go to files so a finding is captured even when
+        an nginx worker dies.
+
+Instrumentation was confirmed ACTIVE (not vacuous):
+  - objs-asan-plain/nginx is an ASan-linked ELF.
+  - libngx_http_otel_module.so exports 40 __asan_* symbols.
+
+Results
+-------
+Wake/teardown path exercised                                    ASan reports
+  run_grpc_export.sh        hyper/h2 persistent export + Sleep-timer wake   0  PASS
+  run_grpc_bidi_smoke.sh    h2 bidi-stream connection lifecycle + drain     0  PASS
+  run_dns_dualstack.sh      Resolver::handler wake (1 of 2 prod sites)      0  PASS
+  run_reload.sh             worker task-context teardown on reload          0  PASS
+  run_exporter_reload_overlap.sh  exporter teardown overlap                 0  (see note 1)
+  run_traces.sh             full span export E2E                            0  PASS
+  run_access_log.sh         metrics + exemplars + exception-tail            0  PASS
+
+  TOTAL AddressSanitizer reports: 0
+
+The two production wake sites in ngx-rust (Resolver::handler, Sleep::timer_handler)
+and the hyper/h2 connection setup+teardown path (origin of the #294 h2
+Streams::drop deadlock) are all covered, plus reload/exporter-teardown where
+nginx drops the task context (the specific scenario raised in review).
+
+Notes — two non-passes, both NON-MEMORY and orthogonal to the PR question
+-------------------------------------------------------------------------
+1) run_exporter_reload_overlap.sh exited non-zero (rc=2). The reload/teardown
+   itself ran CLEAN: old/new exporter PIDs distinct, old exporter drained and
+   exited within 15s, ZERO ASan reports. The failed assertion was "collector
+   received nothing" — caused by the collector returning HTTP 404 on every
+   export (an endpoint-path mismatch in that test's setup; the other export
+   tests against the same collector succeeded). Deterministic/config, not a
+   sanitizer or timing artifact, not a UAF.
+
+2) run_grpc_bidi_overload.sh was REPLACED by run_grpc_bidi_smoke.sh. The
+   overload script unconditionally rebuilds the standalone Tokio example
+   (bidi_echo_server) under the active sanitizer RUSTFLAGS; a standalone Rust
+   binary cannot link there (undefined __asan_* references — it isn't linked
+   through clang's -fsanitize=address line). bidi_smoke honors a pre-built
+   non-ASan ECHO_BINARY (the same pattern the TSAN gate uses) and runs the
+   identical h2 bidi connection lifecycle. Tooling limitation, not a defect.
+
+Verdict
+-------
+No use-after-free / heap error on any exercised executor wake or teardown path
+under the always-defer change (PR #295). This is empirical evidence addressing
+the review concern; it does not prove absence on unexercised paths.
+
+Reproduce
+---------
+  # on debian-vm, ngx-rust on branch ngx-otel-rust-deadlock-fix:
+  cd ~/project-nginx-otel/ngx-otel-rust
+  bash build/asan-run.sh
+  # override the script set with: ASAN_SCRIPTS="run_traces.sh ..." bash build/asan-run.sh

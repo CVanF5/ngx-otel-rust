@@ -1,0 +1,8 @@
+# The sanitizer Docker images (Dockerfile.tsan) only install a toolchain; the
+# repos are bind-mounted at run time, so the build context is unused.  Exclude
+# heavy build outputs so `docker build .` doesn't tar gigabytes.
+target/
+target-*/
+objs-*/
+tests/asan-logs-*/
+.git/

@@ -256,3 +256,38 @@ tsan-test-error: collector-up
 	    -v "$(CURDIR)/../ngx-rust":/work/ngx-rust \
 	    ngx-otel-tsan:latest \
 	    bash /work/ngx-otel-rust/build/tsan-run-error-only.sh
+
+# AddressSanitizer (ASan) gate: exercises the async-executor wake/teardown
+# paths under -fsanitize=address / -Zsanitizer=address to catch use-after-free
+# (the open concern on ngx-rust PR #295's always-defer change).  Linux arm64
+# only — ASan needs Linux; the macOS dev box runs it via this dockerized gate.
+# Reuses the Dockerfile.tsan toolchain image (clang + libclang-rt-dev provides
+# the ASan runtime too).  Named volumes isolate the container's build outputs
+# (target + objs-sanitize + objs-asan-plain) so the root-running build never
+# pollutes host artifacts AND never reuses host-generated objs-* whose Makefiles
+# bake absolute host paths (the container path /work/... differs).  ASAN_OPTIONS
+# is set inside build/asan-run.sh (detect_leaks=0; UAF-focused).
+.PHONY: asan-test
+asan-test: ## ASan UAF gate: executor wake/teardown paths under AddressSanitizer (Linux arm64 only)
+asan-test: collector-up
+	DOCKER_ARCH="$$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"; \
+	docker build \
+	    --platform "linux/$${DOCKER_ARCH}" \
+	    -f build/Dockerfile.tsan \
+	    -t ngx-otel-sanitize:latest \
+	    .; \
+	docker run --rm \
+	    --network=host \
+	    --cap-add=SYS_PTRACE \
+	    --security-opt seccomp=unconfined \
+	    --platform "linux/$${DOCKER_ARCH}" \
+	    -e OTEL_COLLECTOR_AUTOSTART=0 \
+	    -e ASAN_SCRIPTS="$(ASAN_SCRIPTS)" \
+	    -v "$(CURDIR)":/work/ngx-otel-rust \
+	    -v "$(CURDIR)/../nginx":/work/nginx \
+	    -v "$(CURDIR)/../ngx-rust":/work/ngx-rust \
+	    -v ngx-otel-asan-target:/work/ngx-otel-rust/target \
+	    -v ngx-otel-asan-objs-sanitize:/work/ngx-otel-rust/objs-sanitize \
+	    -v ngx-otel-asan-objs-plain:/work/ngx-otel-rust/objs-asan-plain \
+	    ngx-otel-sanitize:latest \
+	    bash /work/ngx-otel-rust/build/asan-run.sh
