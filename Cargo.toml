@@ -24,6 +24,17 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 bytes = "1.10.1"
+# getrandom: one-shot OS-entropy seed for the per-thread ChaCha20 DRBG (D-1 fix).
+# Already in the transitive dep tree (via tempfile); listed here as a direct dep
+# to call getrandom::fill() from ctx.rs. No new crate added to the tree.
+getrandom = { version = "0.4", default-features = false }
+# rand_chacha + rand_core: ChaCha20-based CSPRNG for trace/span ID generation
+# (D-1 fix). Seeded once per worker thread from getrandom (cold path); zero
+# per-request syscalls thereafter.
+# rand_chacha 0.10 + rand_core 0.10 + ppv-lite86 0.2: all MIT OR Apache-2.0,
+# MSRV 1.85 (matches ours). No duplicate getrandom (0.4 already in tree).
+rand_chacha = { version = "0.10", default-features = false }
+rand_core = { version = "0.10", default-features = false }
 # futures-channel: provides mpsc channel for fire_one_bidi_stream's outbound
 # stream.  Already present transitively via tonic/h2; listed here so
 # `futures_channel` is accessible as a first-class module path in smoke.rs.

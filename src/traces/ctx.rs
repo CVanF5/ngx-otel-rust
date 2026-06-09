@@ -101,61 +101,59 @@ pub unsafe fn pool_from_request(r: *mut ngx_http_request_t) -> Pool {
     unsafe { Pool::from_ngx_pool((*r).pool) }
 }
 
-// ── PRNG — per-thread xorshift64 ─────────────────────────────────────────────
+// ── DRBG — per-thread ChaCha20 CSPRNG (D-1 fix) ─────────────────────────────
+//
+// The prior xorshift64 was reversible: an observer of a few IDs could recover
+// the state and predict future trace IDs.  Replaced with a seeded ChaCha20
+// DRBG: cryptographically-unpredictable IDs, zero per-request syscalls.
+//
+// Design (OTel-SDK-idiomatic):
+//   - Seeded ONCE per worker thread (#[cold]) from `getrandom::fill()` (one
+//     OS-entropy syscall per worker at the first trace request).
+//   - Thereafter: pure ChaCha20 block operations, no syscall per request.
+//   - Thread-local `Cell<Option<ChaCha20Rng>>` (infallible take/set access).
 
 use std::cell::Cell;
 
+use rand_chacha::ChaCha20Rng;
+use rand_core::{Rng, SeedableRng};
+
 thread_local! {
-    static PRNG: Cell<u64> = const { Cell::new(0) };
+    static DRBG: Cell<Option<ChaCha20Rng>> = const { Cell::new(None) };
 }
 
-/// Return the next pseudo-random `u64` from the per-thread xorshift64 PRNG.
+/// Return the next pseudo-random `u64` from the per-thread ChaCha20 DRBG.
 ///
-/// Seeds itself on first call in each thread from `SystemTime::now()` XOR
-/// the stack address of the local (adds per-worker address-space entropy) XOR
-/// a Fibonacci-hashing constant.
+/// Seeds itself on first call in each worker thread from OS entropy (one
+/// `getrandom` syscall, #[cold]).  All subsequent calls are pure ChaCha20
+/// block operations — lock-free, no syscall.
 ///
-/// **Hot-path note:** TLS segment lookup + 3 bit ops — lock-free, no syscall.
+/// **Hot-path note:** TLS lookup + ChaCha20 word extraction — effectively
+/// free relative to the request path.
 #[inline]
-pub(crate) fn prng64() -> u64 {
-    PRNG.with(|c| {
-        let mut x = c.get();
-        if x == 0 {
-            x = seed_prng();
-        }
-        // xorshift64 (period 2^64 − 1; passes BigCrush)
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        c.set(x);
-        x
+pub(crate) fn drbg64() -> u64 {
+    DRBG.with(|c| {
+        let mut rng = c.take().unwrap_or_else(seed_drbg);
+        let val = rng.next_u64();
+        c.set(Some(rng));
+        val
     })
 }
 
-/// One-time per-thread seed for the PRNG.
+/// One-time per-thread DRBG seed from OS entropy.
 ///
-/// Combines `SystemTime::now()` (varies per process/thread start time) with
-/// the stack address of a local (varies per address-space layout — ASLR) and a
-/// golden-ratio constant, then runs through `splitmix64` to whiten the bits.
+/// Called #[cold] at most once per worker thread (lazily on the first
+/// trace/span ID request).  `getrandom::fill` uses the OS CSPRNG
+/// (getrandom(2) on Linux, arc4random_buf on macOS) — never a filesystem
+/// read, never blocks after boot.
+///
+/// Panics if the OS RNG is unavailable (hardware fault / FIPS failure);
+/// this is a catastrophic condition, not a recoverable error.
 #[cold]
-fn seed_prng() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
-    // Use the address of a stack variable as additional per-ASLR-instance entropy.
-    let stack_addr: u64 = {
-        let local: u64 = t;
-        core::ptr::addr_of!(local) as u64
-    };
-    splitmix64(t ^ stack_addr ^ 0x9e3779b97f4a7c15u64)
-}
-
-/// Avalanche hash used to whiten the seed bits (Vigna's splitmix64 step).
-#[inline(always)]
-fn splitmix64(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9e3779b97f4a7c15);
-    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
-    x ^ (x >> 31)
+fn seed_drbg() -> ChaCha20Rng {
+    let mut seed = [0u8; 32];
+    getrandom::fill(&mut seed).expect("getrandom::fill failed — OS RNG unavailable");
+    ChaCha20Rng::from_seed(seed)
 }
 
 // ── ID generation ─────────────────────────────────────────────────────────────
@@ -167,8 +165,8 @@ fn splitmix64(mut x: u64) -> u64 {
 #[inline]
 pub(crate) fn gen_trace_id() -> [u8; 16] {
     loop {
-        let a = prng64();
-        let b = prng64();
+        let a = drbg64();
+        let b = drbg64();
         if a != 0 || b != 0 {
             let mut id = [0u8; 16];
             id[..8].copy_from_slice(&a.to_le_bytes());
@@ -184,7 +182,7 @@ pub(crate) fn gen_trace_id() -> [u8; 16] {
 #[inline]
 pub(crate) fn gen_span_id() -> [u8; 8] {
     loop {
-        let v = prng64();
+        let v = drbg64();
         if v != 0 {
             return v.to_le_bytes();
         }
@@ -199,18 +197,57 @@ mod tests {
 
     /// PRNG should produce non-zero values.
     #[test]
-    fn prng64_nonzero() {
+    fn drbg64_nonzero() {
         for _ in 0..100 {
-            assert_ne!(prng64(), 0, "prng64 must never return 0");
+            assert_ne!(drbg64(), 0, "drbg64 must never return 0");
         }
     }
 
-    /// PRNG values in a short sequence should all be distinct.
+    /// DRBG values in a short sequence should all be distinct.
     #[test]
-    fn prng64_distinct() {
-        let vals: std::vec::Vec<u64> = (0..64).map(|_| prng64()).collect();
+    fn drbg64_distinct() {
+        let vals: std::vec::Vec<u64> = (0..64).map(|_| drbg64()).collect();
         let set: std::collections::HashSet<u64> = vals.iter().copied().collect();
-        assert_eq!(set.len(), vals.len(), "prng64 sequence must not repeat in 64 calls");
+        assert_eq!(set.len(), vals.len(), "drbg64 sequence must not repeat in 64 calls");
+    }
+
+    /// D-1: two ChaCha20Rng instances with different seeds must diverge.
+    ///
+    /// Verifies the D-1 fix property: IDs from distinct workers (which each
+    /// seed their DRBG independently from `getrandom`) cannot collide in bulk.
+    /// Different seeds produce statistically independent streams.
+    #[test]
+    fn drbg_different_seeds_diverge() {
+        let seed1 = [0x01u8; 32];
+        let seed2 = [0x02u8; 32];
+        let mut rng1 = ChaCha20Rng::from_seed(seed1);
+        let mut rng2 = ChaCha20Rng::from_seed(seed2);
+
+        let vals1: std::vec::Vec<u64> = (0..16).map(|_| rng1.next_u64()).collect();
+        let vals2: std::vec::Vec<u64> = (0..16).map(|_| rng2.next_u64()).collect();
+        assert_ne!(vals1, vals2, "ChaCha20Rng with different seeds must produce different output");
+    }
+
+    /// D-1: trace IDs are 16 bytes, distinct across a batch of generations.
+    #[test]
+    fn trace_ids_batch_unique() {
+        let ids: std::vec::Vec<[u8; 16]> = (0..100).map(|_| gen_trace_id()).collect();
+        let mut seen = std::collections::HashSet::new();
+        for id in &ids {
+            assert_ne!(*id, [0u8; 16], "trace ID must not be all-zero");
+            assert!(seen.insert(*id), "trace ID collision in batch of 100");
+        }
+    }
+
+    /// D-1: span IDs are 8 bytes, distinct across a batch of generations.
+    #[test]
+    fn span_ids_batch_unique() {
+        let ids: std::vec::Vec<[u8; 8]> = (0..100).map(|_| gen_span_id()).collect();
+        let mut seen = std::collections::HashSet::new();
+        for id in &ids {
+            assert_ne!(*id, [0u8; 8], "span ID must not be all-zero");
+            assert!(seen.insert(*id), "span ID collision in batch of 100");
+        }
     }
 
     /// gen_trace_id returns 16 bytes, never all-zero.
