@@ -7,8 +7,7 @@ of OTLP — in a later phase.
 
 Everything it emits — metrics, logs, and traces — is defined in
 **[`TELEMETRY_MODEL.md`](TELEMETRY_MODEL.md)**, the producer-side contract.
-It uses OTel semantic-convention names and units, and its metric surface is
-modelled on the F5 AVR nginx module (`avr-module/`).
+It uses OTel semantic-convention names and units.
 See [Signals](#signals-what-this-module-emits).
 
 [NGINX]: https://nginx.org/
@@ -56,24 +55,26 @@ Confluence proposal (link below) for the full phase plan.
 
 ## Architecture
 
-<!-- Context diagram per F5 Architecture Diagram Guidelines §1: left→right = origin→destination;
-     IBM-palette plane colours (user traffic=black, telemetry=#648FFF, control=#FFB000) on both nodes
-     and edges; cylinders = shared memory; labelled edges; colour key in the caption below. -->
+<!-- Context diagram: top→bottom = origin→destination (HTTP clients at the top,
+     OTel collector at the bottom); kept narrow to fit the default GitHub README width.
+     IBM-palette plane colours (user traffic=black, telemetry=#648FFF, control=#FFB000)
+     on both nodes and edges; cylinders = shared memory; labelled edges; colour key in
+     the caption below. -->
 ```mermaid
-flowchart LR
+flowchart TB
     Client(["HTTP clients"]):::ext
 
     subgraph NGINX["NGINX — one instance"]
         direction TB
         subgraph Workers["Workers · copy raw facts"]
-            direction TB
+            direction LR
             W1["Worker 1"]:::data
             W2["Worker 2"]:::data
             W3["Worker N"]:::data
         end
         subgraph Shm["Shared memory"]
-            direction TB
-            SHM[("<b>Per-worker shm</b><br/>histograms · log/span rings · counters")]:::tel
+            direction LR
+            SHM[("<b>Per-worker shm</b><br/>histograms · log/span<br/>rings · counters")]:::tel
             Ctl[("control shm<br/>flags · heartbeat")]:::ctl
             SHM ~~~ Ctl
         end
@@ -88,7 +89,7 @@ flowchart LR
     Client -->|"HTTP requests"| Workers
     Workers -->|"bump &amp; defer"| SHM
     SHM -->|"drain"| Drain
-    Tx --> Coll
+    Tx -->|"OTLP"| Coll
     Coll -.->|"control · Phase 5"| Tx
     Ctl -.->|"flags"| Workers
 
@@ -164,7 +165,7 @@ Invariants (1) and (2) govern *what a worker does* per request;
 
 This one dedicated exporter is deliberately the **single cold path for all
 three signals** — metrics (Phase 1), logs (Phase 2), and traces (Phase 3) —
-so per-signal differences stay confined to the shm shape on the left while
+so per-signal differences stay confined to the shared-memory shape while
 one process owns all collector I/O.  The per-worker-export alternative (the model the production
 C++ `nginx/nginx-otel` module uses: a background thread and its own connection
 in every worker) was weighed across all three signals and declined; the
