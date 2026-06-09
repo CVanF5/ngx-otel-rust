@@ -84,8 +84,8 @@ start_traffic() {
 
 cmd_up() {
     ensure_built
-    info "starting docker stack (collector + prometheus + grafana + loki)..."
-    "${COMPOSE[@]}" up -d
+    info "starting docker stack (collector + prometheus + grafana + loki + tempo)..."
+    "${COMPOSE[@]}" --profile traces up -d
 
     info "waiting for collector on ${COLLECTOR_HTTP} ..."
     wait_for_collector || { err "collector did not come up; see: ${COMPOSE[*]} logs collector"; exit 1; }

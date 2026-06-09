@@ -51,6 +51,16 @@ http {
     # NGX_LOG_ERR floor unless an explicit level is given.
     otel_error_log warn;
 
+    # ── Phase 3 traces (server spans → Tempo) ───────────────────────────────
+    # Emit an OTel server span per request. `propagate` reads the inbound W3C
+    # traceparent (the traffic generator sends one) AND injects it downstream,
+    # so an /api/ request yields a 2-span trace (front server → backend). With
+    # otel_access_log_sample above, the duration-histogram exemplars carry the
+    # span's trace_id — the metric → exemplar → Tempo trace → Loki log drill-down.
+    otel_trace on;
+    otel_trace_context propagate;
+    otel_span_attr deployment.environment demo;
+
     # Backend the front server proxies to (populates upstream.* metrics).
     upstream demo_backend {
         # The shared-memory `zone` names this upstream — the module keys the

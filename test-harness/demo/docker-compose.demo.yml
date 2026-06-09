@@ -10,7 +10,8 @@
 #
 # Services:
 #   (default)   collector + prometheus + grafana + loki  → metrics AND logs
-#   traces      adds tempo (--profile traces)             → future (traces)
+#   traces      adds tempo (--profile traces)             → traces (shipped;
+#               run-demo.sh up enables this profile by default)
 #
 #   docker compose -f docker-compose.demo.yml up -d                    # metrics + logs
 #   docker compose -f docker-compose.demo.yml --profile traces up -d   # + tempo
@@ -88,7 +89,7 @@ services:
       - "127.0.0.1:13100:3100"
     restart: unless-stopped
 
-  # ── Traces (Phase 3) — `--profile traces` ─────────────────────────────
+  # ── Traces — `--profile traces` (enabled by default by run-demo.sh up) ──
   tempo:
     image: grafana/tempo:2.7.0
     container_name: ngx-otel-demo-tempo
