@@ -264,7 +264,8 @@ design proposal to integrate. In brief:
 - **Exporter self-metrics**: `ngx_otel.dropped_records`, `ngx_otel.send_failures`,
   `ngx_otel.logs.access.dropped_records`, `ngx_otel.logs.error.dropped_records`,
   `ngx_otel.logs.send_failures`, `ngx_otel.traces.dropped_records`,
-  `ngx_otel.bidi_backpressure_drops`, `ngx_otel.export_interval`. See
+  `ngx_otel.bidi_backpressure_drops`, `ngx_otel.export_interval`,
+  `ngx_otel.exporter.restarts`. See
   `TELEMETRY_MODEL.md` § "Exporter self-observability metrics".
 
 A ready-made Grafana dashboard is provided at
@@ -598,7 +599,7 @@ ngx-otel-rust/
 │   ├── exporter/          # dedicated "nginx: otel exporter" process: control_shm
 │   │                      # (flags + heartbeat), worker->exporter channel, supervisor
 │   └── export/            # export loop, graceful drain, retry buffer,
-│                          # SelfMetricsSource (8 self-metrics incl. traces.dropped_records)
+│                          # SelfMetricsSource (9 self-metrics incl. exporter.restarts)
 ├── tests/
 │   ├── transport_integration.rs  # async transport integration test (test-support feature)
 │   ├── transport_errors.rs       # error-path coverage
