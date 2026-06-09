@@ -381,7 +381,7 @@ pub fn parse_span_record(buf: &[u8], observed_ns: u64) -> Option<crate::data_mod
     if duration_us > 0 {
         attributes.push(KeyValue {
             key: "http.server.request.duration".into(),
-            value: AnyValue::Double(duration_us as f64 / 1_000.0),
+            value: AnyValue::Double(duration_us as f64 / 1_000_000.0),
         });
     }
 
@@ -488,5 +488,27 @@ mod tests {
         assert!(keys.contains(&"http.request.method"));
         assert!(keys.contains(&"http.response.status_code"));
         assert!(keys.contains(&"url.path"));
+        assert!(
+            keys.contains(&"http.server.request.duration"),
+            "duration attribute must be present"
+        );
+
+        // S1 regression guard: duration must be in seconds (µs / 1_000_000), not ms.
+        // rec.duration_us == 1000 → 0.001 s exactly.
+        let dur_attr = span
+            .attributes
+            .iter()
+            .find(|kv| kv.key == "http.server.request.duration")
+            .expect("http.server.request.duration must be present");
+        let expected_secs = rec.duration_us as f64 / 1_000_000.0;
+        match &dur_attr.value {
+            crate::data_model::AnyValue::Double(v) => {
+                assert!(
+                    (*v - expected_secs).abs() < 1e-12,
+                    "http.server.request.duration must be {expected_secs:.9} s (seconds), got {v:.9}"
+                );
+            }
+            other => panic!("http.server.request.duration must be a Double, got {other:?}"),
+        }
     }
 }

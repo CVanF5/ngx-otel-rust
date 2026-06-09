@@ -369,6 +369,7 @@ Standard OTel HTTP semconv attributes recorded on every span:
 | `http.request.method` | HTTP method string | `r->method_name` |
 | `url.path` | request URI path (≤ `MAX_SPAN_URL_PATH` bytes) | `r->unparsed_uri` |
 | `http.response.status_code` | raw status code | `r->headers_out.status` |
+| `http.server.request.duration` | request duration **in seconds** (derived from µs measurement; same field, same unit as the access-tail LogRecord — enables coherent metric→exemplar→log→trace drill-down) | `src/traces/mod.rs` |
 | `http.route` | matched location name | `clcf->name` via `route_from_location` |
 | `network.protocol.version` | `"1.0"` / `"1.1"` / `"2.0"` / `"3.0"` | `r->http_version` |
 | `user_agent.original` | User-Agent header value (≤ `MAX_SPAN_USER_AGENT` bytes) | `headers_in.user_agent` |
