@@ -14,7 +14,7 @@
 
 FROM debian:13-slim
 RUN apt-get update && apt-get install -y \
-    clang make curl pkg-config libssl-dev libpcre2-dev zlib1g-dev \
+    clang libclang-rt-dev make curl pkg-config libssl-dev libpcre2-dev zlib1g-dev \
     protobuf-compiler \
     ca-certificates perl git netcat-openbsd lsof \
     python3-minimal \
