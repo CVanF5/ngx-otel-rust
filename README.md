@@ -55,55 +55,70 @@ Confluence proposal (link below) for the full phase plan.
 
 ## Architecture
 
-<!-- Context diagram: top→bottom = origin→destination (HTTP clients at the top,
-     OTel collector at the bottom); kept narrow to fit the default GitHub README width.
-     IBM-palette plane colours (user traffic=black, telemetry=#648FFF, control=#FFB000)
-     on both nodes and edges; cylinders = shared memory; labelled edges; colour key in
-     the caption below. -->
+<!-- The diagram is a waterfall: requests enter top-left, telemetry exits bottom-right.
+     The two tinted bands ARE the architecture thesis — a hot path that does constant
+     lock-free work on every request, and a cold path (one dedicated process) that does
+     all wire-format work per interval, with shared memory as the only coupling between
+     them.  Plane colours: user traffic = black (thick), telemetry = #648FFF (blue),
+     control = #FFB000 (amber, dashed — the feedback half is Phase 5).
+     Cylinders = shared memory. -->
 ```mermaid
 flowchart TB
     Client(["HTTP clients"]):::ext
 
-    subgraph NGINX["NGINX — one instance"]
+    subgraph NGINX["NGINX — one instance · the master spawns workers and the exporter"]
         direction TB
-        subgraph Workers["Workers · copy raw facts"]
-            direction LR
-            W1["Worker 1"]:::data
-            W2["Worker 2"]:::data
-            W3["Worker N"]:::data
+        subgraph Hot["Hot path · every request · constant, lock-free, no syscalls"]
+            Workers["Workers ×N<br/>serve traffic · bump &amp; defer"]:::data
         end
-        subgraph Shm["Shared memory"]
+        subgraph Buf["Shared memory — the only worker/exporter coupling"]
             direction LR
-            SHM[("<b>Per-worker shm</b><br/>histograms · log/span<br/>rings · counters")]:::tel
-            Ctl[("control shm<br/>flags · heartbeat")]:::ctl
+            SHM[("per-worker slots + rings ×N<br/>histograms · log/span rings<br/>drop-newest when full · counted")]:::tel
+            Ctl[("control<br/>flags · heartbeat")]:::ctl
             SHM ~~~ Ctl
         end
-        subgraph Exporter["<b>nginx: otel exporter</b>"]
+        subgraph Cold["Cold path · nginx: otel exporter · dedicated child process · per interval"]
             direction LR
-            Drain["drain"]:::tel --> Proc["processor"]:::tel --> Encode["encode<br/>OTLP / OTAP"]:::tel --> Tx["transport<br/>HTTP/1 · gRPC/h2"]:::tel
+            Drain["drain"]:::tel --> Proc["process<br/>filter · sample"]:::tel --> Encode["encode<br/>OTLP · OTAP at Phase 5"]:::tel --> Tx["transport<br/>HTTP/1 · gRPC/h2"]:::tel
         end
     end
 
-    Coll["<b>OTel Collector</b>"]:::ext
+    Coll(["OTel collector"]):::ext
 
-    Client -->|"HTTP requests"| Workers
-    Workers -->|"bump &amp; defer"| SHM
-    SHM -->|"drain"| Drain
-    Tx -->|"OTLP"| Coll
-    Coll -.->|"control · Phase 5"| Tx
-    Ctl -.->|"flags"| Workers
+    Client ==>|"requests"| Workers
+    Workers -->|"atomic bumps +<br/>bounded memcpy"| SHM
+    SHM -->|"drained on interval"| Drain
+    Tx -->|"OTLP/HTTP · OTLP/gRPC"| Coll
+    Cold -.->|"publish flags"| Ctl
+    Ctl -.->|"one relaxed load<br/>per request"| Workers
+    Coll -.->|"control feedback · Phase 5"| Tx
 
     classDef data fill:#e8e8e8,stroke:#000000,stroke-width:2px,color:#000000;
     classDef tel fill:#d0e2ff,stroke:#648FFF,stroke-width:2px,color:#000000;
     classDef ctl fill:#ffe8cc,stroke:#FFB000,stroke-width:2px,color:#000000;
     classDef ext fill:#ffffff,stroke:#000000,stroke-width:2px,color:#000000;
 
+    style Hot fill:#fafafa,stroke:#aaaaaa,stroke-width:1px;
+    style Buf fill:#ffffff,stroke:#aaaaaa,stroke-width:1px;
+    style Cold fill:#eef3ff,stroke:#648FFF,stroke-width:1px;
+    style NGINX fill:#ffffff,stroke:#000000,stroke-width:2px;
+
     linkStyle 1,2,3,5,6,7 stroke:#648FFF,stroke-width:2px;
-    linkStyle 4 stroke:#000000,stroke-width:2px;
-    linkStyle 8,9 stroke:#FFB000,stroke-width:2px;
+    linkStyle 4 stroke:#000000,stroke-width:3px;
+    linkStyle 8,9,10 stroke:#FFB000,stroke-width:2px;
 ```
 
-*Colour = plane: **user traffic** (black) · **telemetry** (blue `#648FFF`) · **control** (amber `#FFB000`) — on nodes and edges. Cylinders = shared memory; rounded = external. The single cold-path exporter handles all signals; Phase-5 control feedback lands at the **exporter** (which owns the gRPC connection), and the exporter publishes flags that workers read on the hot path.*
+*Read it top-left to bottom-right: requests fall through the bands and
+telemetry leaves at the bottom. The two tinted bands are the design thesis —
+the **hot path** (grey) does constant, lock-free work on every request and
+never serialises; the **cold path** (blue) is one dedicated process that does
+all wire-format work, once per interval. Shared memory (cylinders) is the only
+thing the two share: workers hold zero collector sockets, and when a ring
+fills, telemetry drops — counted — while traffic is untouched. Edge colours:
+**user traffic** black (thick) · **telemetry** blue `#648FFF` · **control**
+amber `#FFB000`, dashed — the exporter publishes flags that workers read with
+one relaxed atomic load per request; the collector-side feedback half of that
+loop is Phase 5.*
 
 Instrumented metrics live in per-worker shared-memory counter slots.  A
 Log-phase handler increments them atomically, and each worker writes only
