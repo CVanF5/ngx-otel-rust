@@ -424,6 +424,24 @@ Spans are sent to `/v1/traces` (OTLP/HTTP) or on the traces gRPC endpoint
 
 ---
 
+## Exporter self-observability metrics (`SelfMetricsSource`)
+
+The exporter process emits its own health metrics every export interval
+(`src/export/mod.rs`, `SelfMetricsSource`). All Sums are monotonic cumulative.
+
+| Metric | Instrument | Unit | Description |
+|---|---|---|---|
+| `ngx_otel.dropped_records` | Sum (monotonic) | `{point}` | Metric data points dropped due to a full retry buffer |
+| `ngx_otel.send_failures` | Sum (monotonic) | `{failure}` | Cumulative export send failures since worker startup |
+| `ngx_otel.bidi_backpressure_drops` | Sum (monotonic) | `{message}` | Bidi outbound messages dropped due to channel backpressure |
+| `ngx_otel.logs.access.dropped_records` | Sum (monotonic) | `{record}` | Access log records dropped because the per-worker ring was full |
+| `ngx_otel.logs.error.dropped_records` | Sum (monotonic) | `{record}` | Error log records dropped because the per-worker ring was full |
+| `ngx_otel.logs.send_failures` | Sum (monotonic) | `{failure}` | Cumulative logs transport send failures since exporter startup |
+| `ngx_otel.traces.dropped_records` | Sum (monotonic) | `{record}` | Span records dropped because the per-worker spans ring was full (P3 pre-promote fix — was written to `TRACES_DROPPED_RECORDS` but never emitted) |
+| `ngx_otel.export_interval` | Gauge | `ms` | Configured metric export interval |
+
+---
+
 ## avr-module signals not yet ported
 
 Present in the avr model but not currently emitted by ngx-otel-rust —

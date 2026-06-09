@@ -256,6 +256,7 @@ impl MetricSource for SelfMetricsSource {
         let access_logs_dropped = ACCESS_LOGS_DROPPED.load(Ordering::Acquire) as i64;
         let error_logs_dropped = ERROR_LOGS_DROPPED.load(Ordering::Acquire) as i64;
         let logs_send_failures = LOGS_SEND_FAILURES.load(Ordering::Acquire) as i64;
+        let traces_dropped = TRACES_DROPPED_RECORDS.load(Ordering::Acquire) as i64;
         std::vec![
             monotonic_sum_metric(
                 "ngx_otel.dropped_records",
@@ -302,6 +303,14 @@ impl MetricSource for SelfMetricsSource {
                 "Cumulative logs transport send failures since exporter startup",
                 "failures",
                 logs_send_failures,
+                self.start_time_unix_nano,
+                now,
+            ),
+            monotonic_sum_metric(
+                "ngx_otel.traces.dropped_records",
+                "Span records dropped because the per-worker spans ring was full",
+                "records",
+                traces_dropped,
                 self.start_time_unix_nano,
                 now,
             ),
@@ -1967,8 +1976,9 @@ mod tests {
         assert_eq!(dropped, 1 + 2, "evicted data-point counts (helper return) must sum to 3");
     }
 
-    /// SelfMetricsSource must produce exactly 7 metrics with the right names.
-    /// (Updated in Phase 2.1 to include 3 new logs-path metrics.)
+    /// SelfMetricsSource must produce exactly 8 metrics with the right names.
+    /// (Updated in Phase 2.1 to include 3 new logs-path metrics;
+    ///  updated in P3 pre-promote to include traces.dropped_records.)
     #[test]
     fn self_metrics_source_produces_four_metrics() {
         let src = SelfMetricsSource {
@@ -1976,7 +1986,11 @@ mod tests {
             start_time_unix_nano: 1_700_000_000_000_000_000,
         };
         let metrics = src.collect();
-        assert_eq!(metrics.len(), 7, "SelfMetricsSource must emit 7 metrics (4 original + 3 log)");
+        assert_eq!(
+            metrics.len(),
+            8,
+            "SelfMetricsSource must emit 8 metrics (4 original + 3 log + 1 traces)"
+        );
 
         let names: std::vec::Vec<&str> = metrics.iter().map(|m| m.name.as_str()).collect();
         // Original 4
@@ -1984,10 +1998,15 @@ mod tests {
         assert!(names.contains(&"ngx_otel.send_failures"));
         assert!(names.contains(&"ngx_otel.bidi_backpressure_drops"));
         assert!(names.contains(&"ngx_otel.export_interval"));
-        // Phase 2.1 — 3 new log metrics
+        // Phase 2.1 — 3 log metrics
         assert!(names.contains(&"ngx_otel.logs.access.dropped_records"));
         assert!(names.contains(&"ngx_otel.logs.error.dropped_records"));
         assert!(names.contains(&"ngx_otel.logs.send_failures"));
+        // P3 pre-promote — traces drop metric (was written but never emitted)
+        assert!(
+            names.contains(&"ngx_otel.traces.dropped_records"),
+            "traces.dropped_records must appear in self-metrics; names = {names:?}"
+        );
     }
 
     /// `collect_log_records` with empty rings produces an empty LogsBatch.

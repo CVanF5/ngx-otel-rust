@@ -201,6 +201,11 @@ design proposal to integrate. In brief:
   `$otel_parent_sampled` nginx variables. Exemplars on the duration histogram
   now carry `trace_id`/`span_id` from the module's own spans, completing the
   metric→exemplar→Tempo drill-down (§6.6.5).
+- **Exporter self-metrics**: `ngx_otel.dropped_records`, `ngx_otel.send_failures`,
+  `ngx_otel.logs.access.dropped_records`, `ngx_otel.logs.error.dropped_records`,
+  `ngx_otel.logs.send_failures`, `ngx_otel.traces.dropped_records`,
+  `ngx_otel.bidi_backpressure_drops`, `ngx_otel.export_interval`. See
+  `TELEMETRY_MODEL.md` § "Exporter self-observability metrics".
 
 A ready-made Grafana dashboard is provided at
 [`test-harness/demo/grafana/dashboards/ngx-otel-rust-overview.json`](test-harness/demo/grafana/dashboards/ngx-otel-rust-overview.json).
@@ -521,7 +526,7 @@ ngx-otel-rust/
 │   ├── exporter/          # dedicated "nginx: otel exporter" process: control_shm
 │   │                      # (flags + heartbeat), worker->exporter channel, supervisor
 │   └── export/            # export loop, graceful drain, retry buffer,
-│                          # SelfMetricsSource (dropped_records, send_failures, export_interval)
+│                          # SelfMetricsSource (8 self-metrics incl. traces.dropped_records)
 ├── tests/
 │   ├── transport_integration.rs  # async transport integration test (test-support feature)
 │   ├── transport_errors.rs       # error-path coverage
