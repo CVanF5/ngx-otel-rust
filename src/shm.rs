@@ -46,7 +46,7 @@ pub const N_DURATION_BUCKETS: usize = 15;
 ///
 /// **Resolution:** scale 3 → base = 2^(2^-3) = 2^0.125 ≈ 1.091
 /// → 8 buckets per power-of-2 microsecond.  At this scale, 90µs, 150µs,
-/// and 200µs land in distinct buckets (indices 51, 57, 60 respectively),
+/// and 200µs land in distinct buckets (indices 51, 57, 61 respectively),
 /// resolving the ~90–200µs operating regime.  Scale 0 with integer-ms input
 /// collapsed everything < 1ms into `zero_count` — this fixes that.
 pub const EXP_HISTOGRAM_SCALE: i32 = 3;
