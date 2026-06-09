@@ -420,8 +420,9 @@ Standard OTel HTTP semconv attributes recorded on every span:
 ### Transport
 
 OTLP via the same dedicated `nginx: otel exporter` process as metrics and logs.
-Spans are sent to `/v1/traces` (OTLP/HTTP) or on the traces gRPC endpoint
-(`otlp_grpc`). All span encoding and I/O happen on the cold path.
+Spans are sent to the derived traces path (`base/v1/traces` for OTLP/HTTP, or
+overridden by `traces_endpoint` in `otel_exporter {}`; `otlp_grpc` uses the gRPC
+TraceService method). All span encoding and I/O happen on the cold path.
 
 > **Structural correctness verified (Phase 3 S5).** The TSAN gate
 > (`tests/RESULTS-tsan-2026-06-08-traces.txt`) exercises the spans-ring writer + REWRITE

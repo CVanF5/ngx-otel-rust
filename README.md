@@ -353,9 +353,13 @@ load_module modules/ngx_http_otel_module.so;
 
 http {
     otel_exporter {
-        endpoint http://127.0.0.1:4317;              # OTLP/gRPC collector
-        # endpoint http://127.0.0.1:4318/v1/metrics; # OTLP/HTTP (the default protocol)
-        # endpoint unix:/run/otel-collector.sock;    # Unix sockets also supported
+        endpoint http://127.0.0.1:4318;   # OTLP/HTTP: base URL; /v1/{metrics,logs,traces} appended per signal
+        # endpoint http://127.0.0.1:4317; # OTLP/gRPC: host:port only (path N/A for gRPC)
+        # endpoint unix:/run/otel-collector.sock;   # Unix socket (base path "/"; signals appended)
+        # Per-signal overrides (optional; used as-is, no path appended):
+        # metrics_endpoint http://metrics-host:4318/v1/metrics;
+        # logs_endpoint    http://logs-host:4318/v1/logs;
+        # traces_endpoint  http://traces-host:4318/v1/traces;
     }
     otel_export_protocol otlp_grpc;         # otlp_http (default) | otlp_grpc
     otel_service_name my-nginx;
@@ -402,6 +406,14 @@ Notes:
 - The module imposes **zero per-request cost when `otel_exporter` is
   not configured**.  Verified statistically via the zero-cost benchmark
   harness (see `tests/bench/RESULTS.md`).
+- `endpoint` is the **base** URL.  For OTLP/HTTP the module appends
+  `/v1/metrics`, `/v1/logs`, `/v1/traces` to the base automatically
+  (OTel spec behaviour for `OTEL_EXPORTER_OTLP_ENDPOINT`).
+  Optional per-signal overrides (`metrics_endpoint`, `logs_endpoint`,
+  `traces_endpoint`) inside `otel_exporter {}` are used as-is (no path
+  appended), matching `OTEL_EXPORTER_OTLP_{SIGNAL}_ENDPOINT`.
+  For OTLP/gRPC, `endpoint` is `host:port` only; path is irrelevant
+  (routing is by gRPC service method).
 - `otel_export_protocol` selects the export wire protocol: `otlp_http`
   (default, OTLP/HTTP over HTTP/1.1) or `otlp_grpc` (OTLP/gRPC unary over
   HTTP/2).  The example above uses gRPC; omit the directive for HTTP.

@@ -61,7 +61,7 @@ use crate::shm::{
     logs_access_ring, logs_coalesce_table, logs_error_ring, logs_n_workers_from_zone,
     spans_n_workers_from_zone, spans_ring, DEFAULT_SPAN_RING_CAP,
 };
-use crate::transport::hyper_http::NgxConnector;
+use crate::transport::hyper_http::{extract_http_path, NgxConnector};
 use crate::transport::{GrpcTransport, HyperHttpTransport};
 
 // ── Self-metric atomics ──────────────────────────────────────────────────────
@@ -173,7 +173,8 @@ impl ExportTransport {
 
     /// Send logs bytes to the OTel logs endpoint.
     ///
-    /// For HTTP: POSTs to `/v1/logs` on the same host as metrics.
+    /// For HTTP: POSTs to the derived logs path (`base/v1/logs` by default,
+    /// or the `logs_endpoint` per-signal override if configured).
     /// For gRPC: calls `LogsService/Export`.
     ///
     /// Logs ship over the same transport selected by `otel_export_protocol`.
@@ -182,25 +183,24 @@ impl ExportTransport {
         bytes: std::vec::Vec<u8>,
     ) -> Result<(), crate::transport::TransportError> {
         match self {
-            Self::Http(t) => t.send_to_path("/v1/logs", bytes).await,
+            Self::Http(t) => t.send_logs(bytes).await,
             Self::Grpc(t) => t.send_logs(bytes).await,
         }
     }
 
     /// Send trace bytes to the OTel traces endpoint.
     ///
-    /// For HTTP: POSTs to `/v1/traces` on the same host as metrics.
+    /// For HTTP: POSTs to the derived traces path (`base/v1/traces` by default,
+    /// or the `traces_endpoint` per-signal override if configured).
     /// For gRPC: calls `TraceService/Export`.
     ///
     /// Traces ship over the same transport selected by `otel_export_protocol`.
-    /// Called by the spans drain (S2). Added here in S1 alongside the encoder
-    /// so the transport interface is complete before the ring plumbing lands.
     async fn send_traces(
         &mut self,
         bytes: std::vec::Vec<u8>,
     ) -> Result<(), crate::transport::TransportError> {
         match self {
-            Self::Http(t) => t.send_to_path("/v1/traces", bytes).await,
+            Self::Http(t) => t.send_traces(bytes).await,
             Self::Grpc(t) => t.send_traces(bytes).await,
         }
     }
@@ -411,6 +411,34 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             }
         }
     };
+
+    // ── Apply B2 per-signal endpoint overrides (HTTP transport only) ─────────
+    //
+    // If `metrics_endpoint`, `logs_endpoint`, or `traces_endpoint` is set in
+    // the `otel_exporter {}` block, use it as-is (no path appended) instead of
+    // the base-derived path.  Accepts full URLs (`http://host:port/path`) or
+    // bare paths (`/v1/metrics`); `extract_http_path` normalises to the path
+    // component.  gRPC is unaffected (path is irrelevant for gRPC routing).
+    if let ExportTransport::Http(ref mut t) = transport {
+        let me = &amcf.exporter.metrics_endpoint;
+        if !me.is_empty() {
+            if let Ok(s) = core::str::from_utf8(me.as_bytes()) {
+                t.set_metrics_path(extract_http_path(s));
+            }
+        }
+        let le = &amcf.exporter.logs_endpoint;
+        if !le.is_empty() {
+            if let Ok(s) = core::str::from_utf8(le.as_bytes()) {
+                t.set_logs_path(extract_http_path(s));
+            }
+        }
+        let te = &amcf.exporter.traces_endpoint;
+        if !te.is_empty() {
+            if let Ok(s) = core::str::from_utf8(te.as_bytes()) {
+                t.set_traces_path(extract_http_path(s));
+            }
+        }
+    }
 
     // Capture worker start time once — used as the start_time_unix_nano
     // for cumulative monotonic Sum self-metrics so that downstream rate

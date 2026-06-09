@@ -422,8 +422,9 @@ mod tests {
     /// Same shape as the TCP test, but with a unix-socket endpoint.  Verifies:
     ///   - the unix-socket branch is wired up at all (was previously rejected
     ///     with `UnsupportedScheme`)
-    ///   - the request line is `POST /v1/metrics HTTP/1.1\r\n` (the hardcoded
-    ///     http_path from `ParsedEndpoint::parse` for unix endpoints)
+    ///   - the request line is `POST / HTTP/1.1\r\n` (the base path `/` stored
+    ///     by `ParsedEndpoint::parse` for unix endpoints; per-signal paths are
+    ///     appended by `HyperHttpTransport`, not by `sync_post`)
     ///   - the `Host` header is `localhost` (matches HyperHttpTransport)
     ///   - Content-Type / Content-Length are well-formed
     #[test]
@@ -464,7 +465,7 @@ mod tests {
 
         let raw = std::string::String::from_utf8_lossy(&request_bytes);
         assert!(
-            raw.starts_with("POST /v1/metrics HTTP/1.1\r\n"),
+            raw.starts_with("POST / HTTP/1.1\r\n"),
             "request line mismatch; got: {:?}",
             raw.get(..60.min(raw.len())).unwrap_or(&raw)
         );

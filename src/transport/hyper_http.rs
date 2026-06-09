@@ -111,17 +111,17 @@ impl ParsedEndpoint {
         } else if let Some(rest) = input.strip_prefix("unix:///") {
             Ok(ParsedEndpoint::Unix {
                 socket_path: std::format!("/{}", rest),
-                http_path: std::string::String::from("/v1/metrics"),
+                http_path: std::string::String::from("/"),
             })
         } else if let Some(rest) = input.strip_prefix("unix://") {
             Ok(ParsedEndpoint::Unix {
                 socket_path: std::string::String::from(rest),
-                http_path: std::string::String::from("/v1/metrics"),
+                http_path: std::string::String::from("/"),
             })
         } else if let Some(rest) = input.strip_prefix("unix:") {
             Ok(ParsedEndpoint::Unix {
                 socket_path: std::string::String::from(rest),
-                http_path: std::string::String::from("/v1/metrics"),
+                http_path: std::string::String::from("/"),
             })
         } else {
             Err(TransportError::InvalidEndpoint {
@@ -144,12 +144,64 @@ impl ParsedEndpoint {
         }
     }
 
-    fn http_path(&self) -> &str {
+    /// The configured base path (normalized at parse time; may be `/`).
+    ///
+    /// This is the raw path from the endpoint URL — NOT a per-signal path.
+    /// Call [`derive_signal_paths`] to get the three per-signal paths.
+    pub(crate) fn base_path(&self) -> &str {
         match self {
             ParsedEndpoint::Http { path, .. } => path,
             ParsedEndpoint::Unix { http_path, .. } => http_path,
         }
     }
+}
+
+/// Derive the three per-signal HTTP request paths from a base endpoint path.
+///
+/// Normalises `base` to end with `/`, then appends `v1/metrics`, `v1/logs`,
+/// `v1/traces`.  This matches the OTel spec rule for
+/// `OTEL_EXPORTER_OTLP_ENDPOINT`:
+///
+/// > For HTTP, exporters MUST append the signal-relative path to the base
+/// > (normalize base to end with `/`, then append).
+///
+/// Examples:
+/// - `"/"` → `("/v1/metrics", "/v1/logs", "/v1/traces")`
+/// - `"/custom/base"` → `("/custom/base/v1/metrics", …)`
+pub(crate) fn derive_signal_paths(
+    base: &str,
+) -> (std::string::String, std::string::String, std::string::String) {
+    // Normalise base to end with '/' without allocating when it already does.
+    let buf;
+    let b: &str = if base.ends_with('/') {
+        base
+    } else {
+        buf = std::format!("{}/", base);
+        &buf
+    };
+    (std::format!("{}v1/metrics", b), std::format!("{}v1/logs", b), std::format!("{}v1/traces", b))
+}
+
+/// Extract the HTTP request path from a URL-or-path string.
+///
+/// If `s` starts with `http://` or `https://`, strips the scheme+authority
+/// and returns the path component (or `"/"` when no path is present).
+/// Otherwise returns `s` unchanged (treating it as a bare path).
+///
+/// Used by the export loop to normalise per-signal endpoint overrides so
+/// that `metrics_endpoint http://host:4318/v1/metrics;` and
+/// `metrics_endpoint /v1/metrics;` are both accepted.
+pub(crate) fn extract_http_path(s: &str) -> std::string::String {
+    for prefix in &["http://", "https://"] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            return if let Some(idx) = rest.find('/') {
+                std::string::String::from(&rest[idx..])
+            } else {
+                std::string::String::from("/")
+            };
+        }
+    }
+    std::string::String::from(s)
 }
 
 fn parse_authority(authority: &str, default_port: u16) -> (&str, u16) {
@@ -1252,6 +1304,12 @@ pub struct HyperHttpTransport<C> {
     endpoint: ParsedEndpoint,
     headers: std::vec::Vec<(std::string::String, std::string::String)>,
     connector: C,
+    /// HTTP request path for metrics (`/v1/metrics` from base, or per-signal override).
+    metrics_path: std::string::String,
+    /// HTTP request path for logs (`/v1/logs` from base, or per-signal override).
+    logs_path: std::string::String,
+    /// HTTP request path for traces (`/v1/traces` from base, or per-signal override).
+    traces_path: std::string::String,
 }
 
 // Manual Debug so we don't require C: Debug on the struct itself.
@@ -1280,13 +1338,37 @@ impl core::fmt::Debug for NgxConnector {
 #[allow(private_bounds)] // Connector is pub(crate); with_connector is only called within this crate.
 impl<C: Connector> HyperHttpTransport<C> {
     /// Generic constructor — used by the type-specific constructors below.
+    ///
+    /// Derives the three per-signal HTTP paths from the configured base
+    /// endpoint (OTel spec: normalize base to end with `/`, append
+    /// `v1/{signal}`).  Callers may override individual paths afterwards
+    /// via [`set_metrics_path`], [`set_logs_path`], [`set_traces_path`].
     pub fn with_connector(
         endpoint_str: &str,
         headers: std::vec::Vec<(std::string::String, std::string::String)>,
         connector: C,
     ) -> Result<Self, TransportError> {
         let endpoint = ParsedEndpoint::parse(endpoint_str)?;
-        Ok(Self { endpoint, headers, connector })
+        let (metrics_path, logs_path, traces_path) = derive_signal_paths(endpoint.base_path());
+        Ok(Self { endpoint, headers, connector, metrics_path, logs_path, traces_path })
+    }
+
+    /// Override the HTTP request path used for metrics.
+    ///
+    /// Called by the export loop when `metrics_endpoint` is configured —
+    /// the override is used as-is (no `v1/metrics` appended).
+    pub fn set_metrics_path(&mut self, path: std::string::String) {
+        self.metrics_path = path;
+    }
+
+    /// Override the HTTP request path used for logs.
+    pub fn set_logs_path(&mut self, path: std::string::String) {
+        self.logs_path = path;
+    }
+
+    /// Override the HTTP request path used for traces.
+    pub fn set_traces_path(&mut self, path: std::string::String) {
+        self.traces_path = path;
     }
 }
 
@@ -1323,25 +1405,44 @@ impl HyperHttpTransport<NgxConnector> {
 
 #[allow(private_bounds)] // Connector is pub(crate); see note on struct above.
 impl<C: Connector> HyperHttpTransport<C> {
-    /// Send a batch of OTLP/HTTP protobuf metrics to the configured endpoint.
+    /// Send a batch of OTLP/HTTP protobuf metrics to the derived metrics path.
     ///
-    /// Maintains no cached connection across calls; a failure leaves nothing to
-    /// clean up so the next call simply reconnects.
+    /// Uses `self.metrics_path` (derived from the base endpoint as
+    /// `base/v1/metrics`, or overridden via [`set_metrics_path`]).
+    /// Maintains no cached connection; a failure leaves nothing to clean up.
     pub async fn send(&mut self, bytes: std::vec::Vec<u8>) -> Result<(), TransportError> {
         let io = self.connector.connect(&self.endpoint).await?;
         let authority = self.endpoint.authority();
-        let http_path = std::string::String::from(self.endpoint.http_path());
-        http_post(io, &authority, &http_path, &self.headers, bytes).await
+        let path = self.metrics_path.clone();
+        http_post(io, &authority, &path, &self.headers, bytes).await
     }
 
-    /// POST `bytes` to an explicit `path`, overriding the endpoint's default path.
+    /// Send a batch of OTLP/HTTP log records to the derived logs path.
     ///
-    /// Used by the export loop to send logs to `/v1/logs` on the same host as
-    /// the metrics endpoint (which uses `/v1/metrics`).  Everything else (host,
-    /// port, TLS, headers) comes from the existing configured endpoint.
+    /// Uses `self.logs_path` (derived from the base endpoint as
+    /// `base/v1/logs`, or overridden via [`set_logs_path`]).
+    pub async fn send_logs(&mut self, bytes: std::vec::Vec<u8>) -> Result<(), TransportError> {
+        let io = self.connector.connect(&self.endpoint).await?;
+        let authority = self.endpoint.authority();
+        let path = self.logs_path.clone();
+        http_post(io, &authority, &path, &self.headers, bytes).await
+    }
+
+    /// Send a batch of OTLP/HTTP spans to the derived traces path.
     ///
-    /// Kept separate from `send` so the logs path can target its own endpoint
-    /// path without disturbing the metrics call.
+    /// Uses `self.traces_path` (derived from the base endpoint as
+    /// `base/v1/traces`, or overridden via [`set_traces_path`]).
+    pub async fn send_traces(&mut self, bytes: std::vec::Vec<u8>) -> Result<(), TransportError> {
+        let io = self.connector.connect(&self.endpoint).await?;
+        let authority = self.endpoint.authority();
+        let path = self.traces_path.clone();
+        http_post(io, &authority, &path, &self.headers, bytes).await
+    }
+
+    /// POST `bytes` to an explicit `path`, overriding any derived path.
+    ///
+    /// Retained for test use and any caller that needs full path control.
+    /// Production callers should prefer `send`, `send_logs`, or `send_traces`.
     pub async fn send_to_path(
         &mut self,
         path: &str,
@@ -1571,5 +1672,84 @@ mod tests {
         assert_eq!(strip_v6_brackets("127.0.0.1"), "127.0.0.1");
         assert_eq!(strip_v6_brackets("otel-collector.example.com"), "otel-collector.example.com");
         assert_eq!(strip_v6_brackets("::1"), "::1"); // already unbracketed
+    }
+
+    // ── B1: base endpoint → per-signal path derivation ───────────────────────
+
+    /// `http://host:4318` (no trailing slash) → each signal gets `/v1/{signal}`.
+    #[test]
+    fn base_endpoint_no_path_derives_signal_paths() {
+        let t = HyperHttpTransport::<SpinConnector>::new("http://127.0.0.1:4318", vec![])
+            .expect("parse");
+        assert_eq!(t.metrics_path, "/v1/metrics");
+        assert_eq!(t.logs_path, "/v1/logs");
+        assert_eq!(t.traces_path, "/v1/traces");
+    }
+
+    /// `http://host:4318/` (trailing slash) → same derivation.
+    #[test]
+    fn base_endpoint_trailing_slash_derives_signal_paths() {
+        let t = HyperHttpTransport::<SpinConnector>::new("http://127.0.0.1:4318/", vec![])
+            .expect("parse");
+        assert_eq!(t.metrics_path, "/v1/metrics");
+        assert_eq!(t.logs_path, "/v1/logs");
+        assert_eq!(t.traces_path, "/v1/traces");
+    }
+
+    /// `http://host:4318/custom/base` → per-signal paths use the custom prefix.
+    #[test]
+    fn base_endpoint_custom_path_derives_signal_paths() {
+        let t =
+            HyperHttpTransport::<SpinConnector>::new("http://127.0.0.1:4318/custom/base", vec![])
+                .expect("parse");
+        assert_eq!(t.metrics_path, "/custom/base/v1/metrics");
+        assert_eq!(t.logs_path, "/custom/base/v1/logs");
+        assert_eq!(t.traces_path, "/custom/base/v1/traces");
+    }
+
+    /// `derive_signal_paths` with a base that already ends with `/`.
+    #[test]
+    fn derive_signal_paths_already_slash_terminated() {
+        let (m, l, t) = derive_signal_paths("/");
+        assert_eq!(m, "/v1/metrics");
+        assert_eq!(l, "/v1/logs");
+        assert_eq!(t, "/v1/traces");
+    }
+
+    /// `derive_signal_paths` with a base without trailing slash.
+    #[test]
+    fn derive_signal_paths_adds_slash() {
+        let (m, l, t) = derive_signal_paths("/prefix");
+        assert_eq!(m, "/prefix/v1/metrics");
+        assert_eq!(l, "/prefix/v1/logs");
+        assert_eq!(t, "/prefix/v1/traces");
+    }
+
+    // ── B2: per-signal path overrides ────────────────────────────────────────
+
+    /// `set_metrics_path` overrides the derived metrics path; logs/traces unchanged.
+    #[test]
+    fn set_metrics_path_overrides_derived_path() {
+        let mut t = HyperHttpTransport::<SpinConnector>::new("http://127.0.0.1:4318", vec![])
+            .expect("parse");
+        t.set_metrics_path(std::string::String::from("/custom/metrics"));
+        assert_eq!(t.metrics_path, "/custom/metrics");
+        assert_eq!(t.logs_path, "/v1/logs"); // unchanged
+        assert_eq!(t.traces_path, "/v1/traces"); // unchanged
+    }
+
+    /// `extract_http_path` strips scheme+authority from a full URL.
+    #[test]
+    fn extract_http_path_from_url() {
+        assert_eq!(extract_http_path("http://host:4318/v1/metrics"), "/v1/metrics");
+        assert_eq!(extract_http_path("https://host:4318/v1/logs"), "/v1/logs");
+        assert_eq!(extract_http_path("http://host:4318"), "/");
+    }
+
+    /// `extract_http_path` passes through a bare path unchanged.
+    #[test]
+    fn extract_http_path_from_bare_path() {
+        assert_eq!(extract_http_path("/v1/metrics"), "/v1/metrics");
+        assert_eq!(extract_http_path("/custom/path"), "/custom/path");
     }
 }

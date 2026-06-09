@@ -82,13 +82,27 @@ pub struct KvPair {
 /// Exporter sub-block configuration.
 #[derive(Debug, Default)]
 pub struct ExporterConfig {
-    /// The OTLP/HTTP endpoint URL.
-    /// Accepted schemes: `unix:`, `http://`, `https://`
+    /// Base OTLP endpoint URL.  For HTTP, the per-signal paths `/v1/metrics`,
+    /// `/v1/logs`, `/v1/traces` are appended to this base at export-loop startup
+    /// (OTel spec §`OTEL_EXPORTER_OTLP_ENDPOINT` behaviour).
+    /// Accepted schemes: `unix:`, `http://`, `https://`.
     pub endpoint: ngx_str_t,
     /// Path to a trusted CA certificate for HTTPS. RESERVED: parsed and stored,
     /// but has no effect until TLS (`https://`) is implemented — `https://` is
     /// rejected at parse today, so this is inert until then.
     pub trusted_cert: ngx_str_t,
+    /// Per-signal override for metrics (optional).  If non-empty, used as-is
+    /// (no path appended) instead of the base-derived `/v1/metrics`.
+    /// Mirrors `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`.
+    pub metrics_endpoint: ngx_str_t,
+    /// Per-signal override for logs (optional).  If non-empty, used as-is
+    /// instead of the base-derived `/v1/logs`.
+    /// Mirrors `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`.
+    pub logs_endpoint: ngx_str_t,
+    /// Per-signal override for traces (optional).  If non-empty, used as-is
+    /// instead of the base-derived `/v1/traces`.
+    /// Mirrors `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`.
+    pub traces_endpoint: ngx_str_t,
 }
 
 impl ExporterConfig {
@@ -1279,7 +1293,7 @@ impl MainConfig {
 /* ─────────────────────────── inner exporter block ─────────────────────────── */
 
 /// Commands valid inside `otel_exporter { ... }`.
-static mut NGX_HTTP_OTEL_EXPORTER_COMMANDS: [ngx_command_t; 3] = [
+static mut NGX_HTTP_OTEL_EXPORTER_COMMANDS: [ngx_command_t; 6] = [
     ngx_command_t {
         name: ngx_string!("endpoint"),
         type_: NGX_CONF_TAKE1 as ngx_uint_t,
@@ -1292,6 +1306,30 @@ static mut NGX_HTTP_OTEL_EXPORTER_COMMANDS: [ngx_command_t; 3] = [
         name: ngx_string!("trusted_certificate"),
         type_: NGX_CONF_TAKE1 as ngx_uint_t,
         set: Some(cmd_exporter_set_trusted_cert),
+        conf: 0,
+        offset: 0,
+        post: ptr::null_mut(),
+    },
+    ngx_command_t {
+        name: ngx_string!("metrics_endpoint"),
+        type_: NGX_CONF_TAKE1 as ngx_uint_t,
+        set: Some(cmd_exporter_set_metrics_endpoint),
+        conf: 0,
+        offset: 0,
+        post: ptr::null_mut(),
+    },
+    ngx_command_t {
+        name: ngx_string!("logs_endpoint"),
+        type_: NGX_CONF_TAKE1 as ngx_uint_t,
+        set: Some(cmd_exporter_set_logs_endpoint),
+        conf: 0,
+        offset: 0,
+        post: ptr::null_mut(),
+    },
+    ngx_command_t {
+        name: ngx_string!("traces_endpoint"),
+        type_: NGX_CONF_TAKE1 as ngx_uint_t,
+        set: Some(cmd_exporter_set_traces_endpoint),
         conf: 0,
         offset: 0,
         post: ptr::null_mut(),
@@ -1338,6 +1376,54 @@ extern "C" fn cmd_exporter_set_trusted_cert(
     // holds the parsed tokens.
     let args = unsafe { cf_args(cf) };
     ecf.trusted_cert = args[1];
+    NGX_CONF_OK
+}
+
+extern "C" fn cmd_exporter_set_metrics_endpoint(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    // SAFETY: `conf` is the `otel_exporter` block conf pointer (an `ExporterConfig`).
+    let ecf = unsafe { conf.cast::<ExporterConfig>().as_mut().expect("exporter config") };
+    if !ecf.metrics_endpoint.is_empty() {
+        return c"is duplicate".as_ptr().cast_mut();
+    }
+    // SAFETY: `cf` is the valid non-null directive parse context.
+    let args = unsafe { cf_args(cf) };
+    ecf.metrics_endpoint = args[1];
+    NGX_CONF_OK
+}
+
+extern "C" fn cmd_exporter_set_logs_endpoint(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    // SAFETY: `conf` is the `otel_exporter` block conf pointer (an `ExporterConfig`).
+    let ecf = unsafe { conf.cast::<ExporterConfig>().as_mut().expect("exporter config") };
+    if !ecf.logs_endpoint.is_empty() {
+        return c"is duplicate".as_ptr().cast_mut();
+    }
+    // SAFETY: `cf` is the valid non-null directive parse context.
+    let args = unsafe { cf_args(cf) };
+    ecf.logs_endpoint = args[1];
+    NGX_CONF_OK
+}
+
+extern "C" fn cmd_exporter_set_traces_endpoint(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    // SAFETY: `conf` is the `otel_exporter` block conf pointer (an `ExporterConfig`).
+    let ecf = unsafe { conf.cast::<ExporterConfig>().as_mut().expect("exporter config") };
+    if !ecf.traces_endpoint.is_empty() {
+        return c"is duplicate".as_ptr().cast_mut();
+    }
+    // SAFETY: `cf` is the valid non-null directive parse context.
+    let args = unsafe { cf_args(cf) };
+    ecf.traces_endpoint = args[1];
     NGX_CONF_OK
 }
 
