@@ -511,4 +511,150 @@ mod tests {
             other => panic!("http.server.request.duration must be a Double, got {other:?}"),
         }
     }
+
+    /// S2 — Structural golden: encode a maximally-populated SpanRecord, parse it
+    /// back, and assert every decoded field value precisely.
+    ///
+    /// This is the regression seal for S3–S5: those steps are wire-format-neutral
+    /// for well-formed input — this test MUST stay green across them.  A failure
+    /// here means a nominally-neutral change altered emitted bytes.
+    ///
+    /// Regeneration: update the `SpanRecord` input literal below if the wire
+    /// format is intentionally changed (requires deliberate review).
+    #[test]
+    fn span_golden_structural() {
+        use crate::data_model::{AnyValue, SpanKind, StatusCode};
+
+        struct VecProducer(std::sync::Mutex<std::vec::Vec<u8>>);
+        impl LogProducer for VecProducer {
+            fn push(&self, data: &[u8]) -> bool {
+                let mut v = self.0.lock().unwrap();
+                let len = data.len() as u32;
+                v.extend_from_slice(&len.to_be_bytes());
+                v.extend_from_slice(data);
+                true
+            }
+        }
+
+        // Fixed inputs — deterministic, no timestamps from SystemTime.
+        let trace_id: [u8; 16] = [
+            0xde, 0xad, 0xbe, 0xef, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
+            0x0a, 0x0b,
+        ];
+        let span_id: [u8; 8] = [0xca, 0xfe, 0xba, 0xbe, 0x11, 0x22, 0x33, 0x44];
+        let parent_span_id: [u8; 8] = [0xfe, 0xed, 0xfa, 0xce, 0x55, 0x66, 0x77, 0x88];
+        let extra: [(&[u8], &[u8]); 1] = [(&b"env"[..], &b"prod"[..])];
+
+        let rec = SpanRecord {
+            trace_id,
+            span_id,
+            parent_span_id,
+            flags: 0x01,
+            start_time_unix_nano: 1_700_000_000_000_000_000,
+            end_time_unix_nano: 1_700_000_001_234_567_000,
+            status_code: StatusCode::Ok as u8,
+            kind: SpanKind::Server as u8,
+            name: b"GET /api/v1/users",
+            method: b"GET",
+            http_status: 200,
+            url_path: b"/api/v1/users",
+            duration_us: 1_234_567,
+            extra_attrs: &extra,
+        };
+
+        let producer = VecProducer(std::sync::Mutex::new(std::vec::Vec::new()));
+        assert!(emit_span_record(&producer, &rec), "push must succeed");
+
+        let raw = producer.0.lock().unwrap();
+        let len = u32::from_be_bytes(raw[..4].try_into().unwrap()) as usize;
+        let payload = &raw[4..4 + len];
+        let span = parse_span_record(payload, 0).expect("parse must succeed");
+
+        // ── Identity fields ───────────────────────────────────────────────────
+        assert_eq!(span.trace_id, trace_id.to_vec(), "trace_id must round-trip");
+        assert_eq!(span.span_id, span_id.to_vec(), "span_id must round-trip");
+        assert_eq!(span.parent_span_id, parent_span_id.to_vec(), "parent_span_id must round-trip");
+        assert_eq!(span.flags, 0x01, "flags must round-trip");
+
+        // ── Timing fields ─────────────────────────────────────────────────────
+        assert_eq!(
+            span.start_time_unix_nano, 1_700_000_000_000_000_000,
+            "start_time_unix_nano must round-trip"
+        );
+        assert_eq!(
+            span.end_time_unix_nano, 1_700_000_001_234_567_000,
+            "end_time_unix_nano must round-trip"
+        );
+
+        // ── Semantic fields ───────────────────────────────────────────────────
+        assert_eq!(span.name, "GET /api/v1/users", "span name must round-trip");
+        assert_eq!(span.kind, SpanKind::Server, "span kind must be Server");
+        assert_eq!(span.status.code, StatusCode::Ok, "status code must be Ok");
+
+        // ── HTTP attributes ───────────────────────────────────────────────────
+        let find_attr = |key: &str| -> Option<&AnyValue> {
+            span.attributes.iter().find(|kv| kv.key == key).map(|kv| &kv.value)
+        };
+
+        // http.request.method
+        match find_attr("http.request.method").expect("http.request.method must be present") {
+            AnyValue::String(s) => assert_eq!(s, "GET", "method must be GET"),
+            other => panic!("http.request.method must be String, got {other:?}"),
+        }
+
+        // http.response.status_code
+        match find_attr("http.response.status_code")
+            .expect("http.response.status_code must be present")
+        {
+            AnyValue::Int(v) => assert_eq!(*v, 200, "status code must be 200"),
+            other => panic!("http.response.status_code must be Int, got {other:?}"),
+        }
+
+        // url.path
+        match find_attr("url.path").expect("url.path must be present") {
+            AnyValue::String(s) => {
+                assert_eq!(s, "/api/v1/users", "url.path must round-trip")
+            }
+            other => panic!("url.path must be String, got {other:?}"),
+        }
+
+        // http.server.request.duration — S1 fix: seconds, not ms
+        // 1_234_567 µs == 1.234567 s exactly (no floating-point loss at this magnitude).
+        match find_attr("http.server.request.duration")
+            .expect("http.server.request.duration must be present")
+        {
+            AnyValue::Double(v) => {
+                let expected = rec.duration_us as f64 / 1_000_000.0;
+                assert!(
+                    (*v - expected).abs() < 1e-9,
+                    "http.server.request.duration must be {expected:.9} s, got {v:.9}"
+                );
+            }
+            other => {
+                panic!("http.server.request.duration must be Double, got {other:?}")
+            }
+        }
+
+        // ── Extra attributes (S2 golden covers the extra-attrs path) ──────────
+        match find_attr("env").expect("extra attr 'env' must be present") {
+            AnyValue::String(s) => assert_eq!(s, "prod", "env attr value must be 'prod'"),
+            other => panic!("extra attr 'env' must be String, got {other:?}"),
+        }
+        // No more extra attrs than what we emitted.
+        let extra_keys: std::vec::Vec<&str> = span
+            .attributes
+            .iter()
+            .filter(|kv| {
+                ![
+                    "http.request.method",
+                    "http.response.status_code",
+                    "url.path",
+                    "http.server.request.duration",
+                ]
+                .contains(&kv.key.as_str())
+            })
+            .map(|kv| kv.key.as_str())
+            .collect();
+        assert_eq!(extra_keys, vec!["env"], "only 'env' extra attr expected");
+    }
 }

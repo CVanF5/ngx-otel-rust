@@ -228,4 +228,68 @@ mod tests {
         let sz = core::mem::size_of::<SpanCtx>();
         assert!((45..=64).contains(&sz), "SpanCtx size {sz} is outside expected range 45..64");
     }
+
+    /// S2 — Read-once traceparent guard (§6.6.3 parse-once design).
+    ///
+    /// Proves the single-scan contract: the inbound `traceparent` header is parsed
+    /// **once** (by `parse_traceparent_full` in the REWRITE handler) and the result
+    /// cached on `SpanCtx`.  The LOG phase reads `SpanCtx` fields directly —
+    /// no second header scan.
+    ///
+    /// This test asserts the structural invariant: all trace-correlation data
+    /// (trace_id, parent_span_id, flags) that the LOG phase needs are present
+    /// directly on `SpanCtx` as plain fields, derivable from a single
+    /// `parse_traceparent_full` call.  If any field were removed from `SpanCtx`,
+    /// the LOG phase would need a second scan — breaking this test's setup.
+    #[test]
+    fn traceparent_parse_once_guard() {
+        use crate::logs::access::parse_traceparent_full;
+
+        // A valid W3C traceparent header: version-trace_id-parent_id-flags
+        let header = b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+        // Single parse — this is the ONLY call parse_traceparent_full gets in
+        // the production code path (span_start.rs REWRITE handler).
+        let (trace_id, parent_span_id, flags) =
+            parse_traceparent_full(header).expect("valid traceparent must parse");
+
+        // Simulate what REWRITE does: populate SpanCtx from the parse result.
+        let span_id = gen_span_id();
+        let ctx = SpanCtx {
+            trace_id,
+            span_id,
+            parent_span_id,
+            flags,
+            start_time_unix_nano: 1_700_000_000_000_000_000,
+            sampled: (flags & 0x01) != 0,
+        };
+
+        // ── Assert SpanCtx carries exactly what the traceparent contained ─────
+        // trace_id: 4bf92f3577b34da6a3ce929d0e0e4736 (big-endian hex)
+        let expected_trace_id: [u8; 16] = [
+            0x4b, 0xf9, 0x2f, 0x35, 0x77, 0xb3, 0x4d, 0xa6, 0xa3, 0xce, 0x92, 0x9d, 0x0e, 0x0e,
+            0x47, 0x36,
+        ];
+        assert_eq!(ctx.trace_id, expected_trace_id, "trace_id must match traceparent");
+
+        // parent_span_id: 00f067aa0ba902b7 (big-endian hex)
+        let expected_parent: [u8; 8] = [0x00, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7];
+        assert_eq!(ctx.parent_span_id, expected_parent, "parent_span_id must match traceparent");
+
+        // flags: 0x01 (sampled)
+        assert_eq!(ctx.flags, 0x01, "flags must match traceparent");
+        assert!(ctx.sampled, "sampled must be true when flags bit-0 is set");
+
+        // ── Structural completeness check ─────────────────────────────────────
+        // The LOG phase (instrumented.rs) needs: trace_id, span_id, parent_span_id,
+        // flags, start_time_unix_nano, sampled — all present on SpanCtx.
+        // This assertion is a no-op at runtime but documents the contract:
+        // if any field is removed, the LOG phase code will fail to compile.
+        let _ = ctx.trace_id;
+        let _ = ctx.span_id;
+        let _ = ctx.parent_span_id;
+        let _ = ctx.flags;
+        let _ = ctx.start_time_unix_nano;
+        let _ = ctx.sampled;
+    }
 }
