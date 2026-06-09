@@ -54,15 +54,22 @@ pub(crate) const CRASH_WINDOW_SECS: u64 = 60;
 /// Maximum exporter restarts within `CRASH_WINDOW_SECS` before the exporter
 /// self-disables via `exit(2)` (enters degraded mode). Workers continue serving;
 /// telemetry is silently dropped into the bounded shm rings.
-const MAX_CRASH_RESTARTS: u64 = 5;
+///
+/// `pub(crate)` so that cross-module unit tests (control_shm) can reference
+/// the authoritative constant rather than duplicating the literal.
+pub(crate) const MAX_CRASH_RESTARTS: u64 = 5;
 
 /// Base backoff sleep before continuing init after a crash restart.
 /// Doubles with each restart: `BASE * 2^(count-1)`, capped at `BACKOFF_CAP_MS`.
-const CRASH_BACKOFF_BASE_MS: u64 = 100;
+///
+/// `pub(crate)` for cross-module unit-test cross-check (control_shm).
+pub(crate) const CRASH_BACKOFF_BASE_MS: u64 = 100;
 
 /// Maximum backoff sleep before continuing init. Prevents a crash loop from
 /// sleeping indefinitely while still throttling the re-crash rate appreciably.
-const CRASH_BACKOFF_CAP_MS: u64 = 5_000;
+///
+/// `pub(crate)` for cross-module unit-test cross-check (control_shm).
+pub(crate) const CRASH_BACKOFF_CAP_MS: u64 = 5_000;
 
 /// Compute the bounded exponential backoff duration (milliseconds) for the given
 /// restart count.
@@ -730,5 +737,94 @@ mod tests {
             nginx_sys::ngx_process = nginx_sys::NGX_PROCESS_SINGLE as nginx_sys::ngx_uint_t;
         }
         assert_eq!(result, NgxProcess::Worker(0));
+    }
+
+    // ── Direct tests of the REAL `crash_backoff_ms()` function ───────────────
+    //
+    // These tests call the production function, not a simulation.  They guard
+    // against the "duplicate-logic" masking pattern that previously hid a real
+    // histogram bug in this project: the control_shm `simulate_startup` tests
+    // re-implement the backoff formula locally; if the formula in
+    // `crash_backoff_ms` changed silently those tests would not catch it.
+
+    /// count = 0: first start (pre-increment value), no backoff expected.
+    /// count <= 1 returns 0 per the contract comment.
+    #[test]
+    fn backoff_count_zero_is_no_backoff() {
+        assert_eq!(crash_backoff_ms(0), 0, "count=0 must return 0ms");
+    }
+
+    /// count = 1: first start (post-increment value), no backoff expected.
+    #[test]
+    fn backoff_count_one_is_no_backoff() {
+        assert_eq!(crash_backoff_ms(1), 0, "count=1 must return 0ms (first start)");
+    }
+
+    /// count = 2: first restart.  Formula: BASE * 2^(count-1) = 100 * 2^1 = 200ms.
+    #[test]
+    fn backoff_count_two_is_200ms() {
+        assert_eq!(crash_backoff_ms(2), 200, "count=2 must return 200ms");
+    }
+
+    /// count = 3: second restart.  Formula: 100 * 2^2 = 400ms.
+    #[test]
+    fn backoff_count_three_is_400ms() {
+        assert_eq!(crash_backoff_ms(3), 400, "count=3 must return 400ms");
+    }
+
+    /// count = 4: third restart.  Formula: 100 * 2^3 = 800ms.
+    #[test]
+    fn backoff_count_four_is_800ms() {
+        assert_eq!(crash_backoff_ms(4), 800, "count=4 must return 800ms");
+    }
+
+    /// count = 5: fourth restart (last before self-disable in the default config).
+    /// Formula: 100 * 2^4 = 1600ms.
+    #[test]
+    fn backoff_count_five_is_1600ms() {
+        assert_eq!(crash_backoff_ms(5), 1_600, "count=5 must return 1600ms");
+    }
+
+    /// count = MAX_CRASH_RESTARTS (5) — the give-up boundary.  The exporter
+    /// calls exit(2) at count > MAX_CRASH_RESTARTS, so count == MAX_CRASH_RESTARTS
+    /// is the last value that still produces a backoff rather than an exit.
+    /// Verified identical to the count=5 case above.
+    #[test]
+    fn backoff_at_max_crash_restarts_boundary() {
+        // MAX_CRASH_RESTARTS = 5; count == 5 is still a backoff (not give-up).
+        // count == 6 would be give-up (exit(2)), but crash_backoff_ms itself has
+        // no knowledge of that threshold — it just returns the capped formula.
+        let at_boundary = crash_backoff_ms(MAX_CRASH_RESTARTS);
+        // Formula: 100 * 2^(5-1) = 100 * 16 = 1600ms (below the 5000ms cap).
+        assert_eq!(at_boundary, 1_600, "backoff at MAX_CRASH_RESTARTS must be 1600ms");
+    }
+
+    /// count > MAX_CRASH_RESTARTS: backoff formula still computes (the give-up
+    /// branch in `otel_exporter_cycle` exits BEFORE calling `crash_backoff_ms`,
+    /// but the function itself should be total and cap at CRASH_BACKOFF_CAP_MS).
+    #[test]
+    fn backoff_exceeding_max_restarts_caps_at_5000ms() {
+        // count=6: 100 * 2^5 = 3200ms (still under 5000ms cap).
+        assert_eq!(crash_backoff_ms(6), 3_200, "count=6 must return 3200ms");
+
+        // count=7: 100 * 2^6 = 6400ms → capped at 5000ms.
+        assert_eq!(crash_backoff_ms(7), CRASH_BACKOFF_CAP_MS, "count=7 must return cap (5000ms)");
+
+        // Large count: must not overflow or panic; must equal the cap.
+        assert_eq!(
+            crash_backoff_ms(100),
+            CRASH_BACKOFF_CAP_MS,
+            "large count must return cap (5000ms)"
+        );
+    }
+
+    /// Overflow safety: count = u64::MAX must not panic; the shift is capped at 31.
+    #[test]
+    fn backoff_u64_max_does_not_overflow() {
+        let result = crash_backoff_ms(u64::MAX);
+        assert_eq!(
+            result, CRASH_BACKOFF_CAP_MS,
+            "u64::MAX count must return cap (5000ms), not overflow"
+        );
     }
 }

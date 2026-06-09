@@ -340,4 +340,65 @@ mod tests {
         let (_, action8) = simulate_startup(7, 900, 950, 60, 10, 100, 5_000);
         assert_eq!(action8, StartupAction::Backoff(5_000));
     }
+
+    /// Cross-check: `simulate_startup`'s inline backoff formula must agree with
+    /// the REAL `crash_backoff_ms()` in `exporter/mod.rs` across every count
+    /// from 1 to MAX_CRASH_RESTARTS + 2.
+    ///
+    /// This prevents the "duplicate-logic masking" pattern: if `crash_backoff_ms`
+    /// is silently changed (or its constants drift), this test catches it.
+    #[test]
+    fn simulate_startup_backoff_matches_real_crash_backoff_ms() {
+        use crate::exporter::{
+            crash_backoff_ms, CRASH_BACKOFF_BASE_MS, CRASH_BACKOFF_CAP_MS, CRASH_WINDOW_SECS,
+            MAX_CRASH_RESTARTS,
+        };
+
+        // Test every count from 2 (first restart) through MAX_CRASH_RESTARTS + 2.
+        // count=1 is first start (no backoff for either); skip count=0 (window reset).
+        for prior_count in 1..=(MAX_CRASH_RESTARTS + 2) {
+            // simulate_startup with an unexpired window so it doesn't reset.
+            let (new_count, action) = simulate_startup(
+                prior_count,
+                900,
+                950,
+                CRASH_WINDOW_SECS,
+                MAX_CRASH_RESTARTS + 99, // set max_restarts artificially high so Exit is not triggered
+                CRASH_BACKOFF_BASE_MS,
+                CRASH_BACKOFF_CAP_MS,
+            );
+            // new_count = prior_count + 1 (no reset because window is unexpired).
+            let expected_backoff = crash_backoff_ms(new_count);
+            match action {
+                StartupAction::Backoff(ms) => {
+                    assert_eq!(
+                        ms, expected_backoff,
+                        "simulate_startup backoff for count={} differs from crash_backoff_ms: \
+                         simulate={ms}ms real={expected_backoff}ms",
+                        new_count,
+                    );
+                }
+                StartupAction::Ok => {
+                    // count=1 → Ok is only valid if new_count == 1 (first start,
+                    // no backoff). crash_backoff_ms(1) == 0.
+                    assert_eq!(
+                        new_count, 1,
+                        "simulate_startup returned Ok for count={} (expected only at count=1)",
+                        new_count,
+                    );
+                    assert_eq!(
+                        expected_backoff, 0,
+                        "crash_backoff_ms must return 0 at count=1 to match simulate_startup Ok",
+                    );
+                }
+                StartupAction::Exit => {
+                    // Should not happen — we set max_restarts artificially high.
+                    panic!(
+                        "simulate_startup returned Exit for count={} with artificially high max_restarts",
+                        new_count
+                    );
+                }
+            }
+        }
+    }
 }
