@@ -18,10 +18,10 @@
 //! [1]  kind                (SpanKind as u8)
 //! [2]  name_len            (big-endian u16, ≤ MAX_SPAN_NAME)
 //! [name_len] name          (UTF-8 span name)
-//! [2]  method_len          (big-endian u16, ≤ MAX_SPAN_METHOD)
+//! [2]  method_len          (big-endian u16, ≤ MAX_METHOD from logs::access)
 //! [method_len] method      (http.request.method)
 //! [2]  status_code_http    (big-endian u16, HTTP status code, 0 if absent)
-//! [2]  url_path_len        (big-endian u16, ≤ MAX_SPAN_URL_PATH)
+//! [2]  url_path_len        (big-endian u16, ≤ MAX_URL_PATH from logs::access)
 //! [url_path_len] url_path  (url.path)
 //! [8]  duration_us         (big-endian u64, request duration in µs)
 //! [2]  n_attrs             (big-endian u16, number of extra attributes; 0 = none)
@@ -45,15 +45,15 @@
 pub mod ctx;
 
 use crate::logs::LogProducer;
+// S3: method and url.path caps are single-homed in logs::access (same semantic
+// field on the same nginx request).  Import them here so span and access records
+// always use the same value — a bump to MAX_URL_PATH propagates automatically.
+use crate::logs::access::{MAX_METHOD, MAX_URL_PATH};
 
 // ── Named field caps ──────────────────────────────────────────────────────────
 
 /// Maximum span name bytes stored in the record.
 pub const MAX_SPAN_NAME: usize = 64;
-/// Maximum `http.request.method` bytes stored in the record.
-pub const MAX_SPAN_METHOD: usize = 16;
-/// Maximum `url.path` bytes stored in the record.
-pub const MAX_SPAN_URL_PATH: usize = 64;
 /// Maximum number of extra span attributes from `otel_span_attr` directives.
 pub const MAX_SPAN_EXTRA_ATTRS: usize = 4;
 /// Maximum attribute key length (bytes) per extra attribute.
@@ -71,14 +71,17 @@ pub const SPAN_RECORD_FIXED_HDR: usize = 16 + 8 + 8 + 4 + 8 + 8 + 1 + 1;
 
 /// Worst-case span record length, derived from named caps.
 ///
-/// Fixed header + name(2+MAX_SPAN_NAME) + method(2+MAX_SPAN_METHOD)
-/// + http_status(2) + url_path(2+MAX_SPAN_URL_PATH) + duration_us(8)
+/// Fixed header + name(2+MAX_SPAN_NAME) + method(2+MAX_METHOD)
+/// + http_status(2) + url_path(2+MAX_URL_PATH) + duration_us(8)
 /// + n_attrs(2) + MAX_SPAN_EXTRA_ATTRS × (1+MAX_SPAN_ATTR_KEY + 2+MAX_SPAN_ATTR_VAL)
+///
+/// `MAX_METHOD` and `MAX_URL_PATH` are imported from `crate::logs::access`
+/// (single-homed there — same semantic field on the same nginx request).
 pub const SPAN_RECORD_WORST_CASE: usize = SPAN_RECORD_FIXED_HDR
     + (2 + MAX_SPAN_NAME)
-    + (2 + MAX_SPAN_METHOD)
+    + (2 + MAX_METHOD)
     + 2
-    + (2 + MAX_SPAN_URL_PATH)
+    + (2 + MAX_URL_PATH)
     + 8
     + 2
     + MAX_SPAN_EXTRA_ATTRS * (1 + MAX_SPAN_ATTR_KEY + 2 + MAX_SPAN_ATTR_VAL);
@@ -213,9 +216,9 @@ pub fn emit_span_record(producer: &dyn LogProducer, rec: &SpanRecord<'_>) -> boo
 
     // Variable-length fields.
     write_capped!(rec.name, MAX_SPAN_NAME, u16);
-    write_capped!(rec.method, MAX_SPAN_METHOD, u16);
+    write_capped!(rec.method, MAX_METHOD, u16);
     write_u16_be!(rec.http_status);
-    write_capped!(rec.url_path, MAX_SPAN_URL_PATH, u16);
+    write_capped!(rec.url_path, MAX_URL_PATH, u16);
     write_u64_be!(rec.duration_us);
 
     // Extra attributes from otel_span_attr directives (Phase 3.5 S3).
