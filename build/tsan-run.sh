@@ -192,9 +192,10 @@ bash tests/integration/run_error_log.sh
 echo ""
 echo "[tsan-run] === Running run_signal_storm.sh under TSAN (Phase 2.3 re-entrancy gate) ==="
 # THE load-bearing safety gate: busy-flag + lock-free coalescer under
-# SIGUSR1 signal delivery.  30-second flood + signal storm.
+# SIGUSR1 signal delivery.  TSAN ~10x slowdown: use a 90s window (3× the
+# default 30s) so the drain cycle has time to progress under instrumentation.
 # Asserts: no crash, no panic, no torn records, drain progresses.
-STORM_DURATION_S=30 bash tests/integration/run_signal_storm.sh
+STORM_DURATION_S=90 bash tests/integration/run_signal_storm.sh
 
 echo ""
 echo "[tsan-run] === Running run_traces.sh under TSAN (Phase 3 span emit→ring→drain→encode→collector) ==="
