@@ -1,0 +1,89 @@
+ASan Chaos Test Results — F2 Closure (v2)
+==========================================
+Date:      2026-06-10
+Host:      debian-vm (Linux arm64)
+Branch:    main @ 01d7191
+Harness:   build/asan-run.sh (ASAN_SCRIPTS override; MAX_WAIT_S=120)
+ASAN_OPTIONS: detect_leaks=0 : detect_stack_use_after_return=1 :
+              detect_odr_violation=0 : abort_on_error=1 : log_path=<rundir>/asan
+Run log:   debian-vm ~/asan-chaos-f2.out (EXIT_CODE=0)
+Report dir: tests/asan-logs-20260610T090130Z (debian-vm)
+
+PURPOSE
+-------
+Companion to RESULTS-tsan-2026-06-10-chaos-v3.txt: run the C2 chaos scripts
+(exporter kill-9 / crash-loop / dead-collector + reload-reset) under
+AddressSanitizer-INSTRUMENTED modules.  The kill-9 → respawn cycle is the
+prime location for a use-after-free on a freed cycle/connection; the prior
+2026-06-10 attempt ran the chaos scripts against uninstrumented modules
+(documented honestly in RESULTS-asan-2026-06-10-chaos.txt) and therefore
+proved nothing for this path.  Instrumentation fixes: e2edf9f + d4c21b0
+(test-support module built with sanitizer RUSTFLAGS; harness build-dir and
+module-path priority respected).
+
+NOTE: the fresh-target rebuild for this run followed a `mv target
+target-root-tsan-20260610` — the Docker TSAN harness leaves root-owned files
+in target/ that block `cargo clean` (second occurrence; harness debt: give
+build/tsan-run.sh the named-volume target/ the ASan harness already uses).
+
+1. nm SYMBOL VERIFICATION (the exact .so files the chaos tests load)
+--------------------------------------------------------------------
+Release module (kill9 + dead_collector Parts A/B):
+  Path: target/aarch64-unknown-linux-gnu/release/libngx_http_otel_module.so
+  __asan_* symbols: 137
+
+Test-support module (crashloop + dead_collector Part C):
+  Path: target/test-support/aarch64-unknown-linux-gnu/debug/libngx_http_otel_module.so
+  __asan_* symbols: 235
+
+nginx binary: objs-asan-plain/nginx, built with
+  -O1 -fsanitize=address -fno-omit-frame-pointer -DNGX_DEBUG_PALLOC=1
+  (NGX_DEBUG_PALLOC routes pool allocs through malloc so ASan poisons freed
+  pool memory — without it a UAF on a freed connection would be invisible.)
+
+2. SCRIPT RESULTS (from ~/asan-chaos-f2.out; each chaos script ran twice —
+   once in the harness default pass and once in the chaos pass)
+---------------------------------------------------------------------------
+  run_grpc_export.sh           exit 0  PASS (canary: production export path)
+  run_chaos_kill9.sh           exit 0  PASS  "All kill-9 containment assertions passed"
+                                       (log lines 1406; second pass)
+  run_chaos_crashloop.sh       exit 0  PASS  "All crash-loop self-disable assertions passed"
+                                       (line 1431; exporter crashed via the
+                                       test-support hook through backoff to
+                                       give-up — each abort exercised under ASan)
+  run_chaos_dead_collector.sh  exit 0  PASS  "All dead-collector shutdown/reload
+                                       assertions passed" (line 1491; includes
+                                       the hardened Part C reload-reset:
+                                       self-disable → SIGHUP → counter reset →
+                                       "crash #2 in window")
+
+3. REPORT SCAN
+--------------
+  [asan-run] Scanning tests/asan-logs-20260610T090130Z for AddressSanitizer reports...
+  [asan-run] Zero AddressSanitizer reports across: run_grpc_export.sh
+             run_chaos_kill9.sh run_chaos_crashloop.sh run_chaos_dead_collector.sh
+             run_chaos_kill9.sh run_chaos_crashloop.sh run_chaos_dead_collector.sh
+  [asan-run] ASan gate: PASS (no use-after-free / heap error on the exercised wake paths).
+  EXIT_CODE=0
+
+  The crash hook's deliberate abort() calls are NOT ASan findings (no report
+  file is written for a plain abort); the gate is report files, and there are
+  zero.  The zeros are meaningful because section 1 establishes the executed
+  code was instrumented and section 2 establishes the paths actually ran.
+
+VERDICT
+-------
+Zero AddressSanitizer reports across kill-9 → respawn, crash-loop → backoff →
+give-up, and dead-collector shutdown + reload-reset, executed by
+ASan-instrumented modules under an ASan-instrumented nginx.  Together with
+RESULTS-tsan-2026-06-10-chaos-v3.txt (zero TSAN warnings on the same paths +
+the SIGHUP-during-crash-loop interleaving), review finding F2 is CLOSED.
+
+Caveat (standing): sanitizers only speak to exercised paths; this is evidence,
+not proof of absence.
+
+Reproduce
+---------
+  # debian-vm, repo at >= 01d7191, target/ free of root-owned files:
+  MAX_WAIT_S=120 ASAN_SCRIPTS="run_grpc_export.sh run_chaos_kill9.sh \
+    run_chaos_crashloop.sh run_chaos_dead_collector.sh" bash build/asan-run.sh
