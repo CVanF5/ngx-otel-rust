@@ -205,8 +205,25 @@ pub(crate) fn extract_http_path(s: &str) -> std::string::String {
 }
 
 fn parse_authority(authority: &str, default_port: u16) -> (&str, u16) {
-    match authority.rfind(':') {
-        Some(idx) => {
+    // IPv6 literals are bracketed: `[::1]` or `[::1]:4318`.
+    // Bare `rfind(':')` would match the last colon INSIDE the brackets for a
+    // port-less IPv6 literal — e.g. `rfind` on `"[2001:db8::1]"` returns the
+    // colon before `"1]"`, yielding host `"[2001:db8:"` and a failed port
+    // parse (default).  DNS lookup of the garbage host fails permanently.
+    //
+    // Fix: only look for the port-separator colon AFTER the closing `]`.
+    // For non-IPv6 authority strings `search_start` is 0 — identical to
+    // the prior `rfind` over the whole string (no colons in plain hostnames
+    // or IPv4 dotted-quads).
+    let search_start = if authority.starts_with('[') {
+        // Malformed (no `]`): fall back to 0 so behaviour is best-effort.
+        authority.find(']').map_or(0, |i| i + 1)
+    } else {
+        0
+    };
+    match authority[search_start..].rfind(':') {
+        Some(rel_idx) => {
+            let idx = search_start + rel_idx;
             let port = authority[idx + 1..].parse().unwrap_or(default_port);
             (&authority[..idx], port)
         }
@@ -1803,5 +1820,53 @@ mod tests {
         // stub does not dereference it.
         unsafe { super::close_and_clear(&mut conn) };
         assert!(conn.is_null(), "E1: close_and_clear must null the connection slot");
+    }
+
+    // ── E2: bracket-aware IPv6 authority parsing ──────────────────────────
+
+    /// E2 regression: `parse_authority` must only split on the port-separator
+    /// colon, not on colons inside an IPv6 bracket literal.
+    ///
+    /// Pre-fix: bare `rfind(':')` on `"[::1]"` returned index 2 (last colon
+    /// inside the brackets), producing host `"[:"` and a failed port parse
+    /// (default).  DNS lookup of that garbage host fails permanently — telemetry
+    /// is silently broken for any IPv6 literal endpoint that omits the port.
+    ///
+    /// Post-fix: `parse_authority` skips to after the closing `]` before
+    /// searching for `:` — the port-separator colon is unambiguous from there.
+    ///
+    /// Regression marker: the `[::1]`-no-port and `[2001:db8::1]`-no-port rows
+    /// assert `host == "[::1]"` / `"[2001:db8::1]"` respectively.  On pre-fix
+    /// code those assertions fail (`host == "[:"` / `"[2001:db8:"`).
+    #[test]
+    fn e2_parse_authority_ipv6_bracket_aware() {
+        // (url, expected_host, expected_port)
+        let cases: &[(&str, &str, u16)] = &[
+            // IPv6 without port — the broken case on pre-fix code.
+            ("http://[::1]/", "[::1]", 80),
+            ("http://[2001:db8::1]/", "[2001:db8::1]", 80),
+            // IPv6 with port — worked before fix; must continue to work.
+            ("http://[::1]:4318/", "[::1]", 4318),
+            ("http://[2001:db8::1]:4318/", "[2001:db8::1]", 4318),
+            // Plain hostname without port.
+            ("http://host/", "host", 80),
+            // Plain hostname with port.
+            ("http://host:4318/", "host", 4318),
+            // IPv4 literal without port.
+            ("http://1.2.3.4/", "1.2.3.4", 80),
+            // IPv4 literal with port.
+            ("http://1.2.3.4:4318/", "1.2.3.4", 4318),
+        ];
+        for (url, want_host, want_port) in cases {
+            let ep = ParsedEndpoint::parse(url)
+                .unwrap_or_else(|_| panic!("ParsedEndpoint::parse failed for {url}"));
+            match ep {
+                ParsedEndpoint::Http { host, port, .. } => {
+                    assert_eq!(host, *want_host, "url={url}: host mismatch");
+                    assert_eq!(port, *want_port, "url={url}: port mismatch");
+                }
+                _ => panic!("expected Http variant for {url}"),
+            }
+        }
     }
 }
