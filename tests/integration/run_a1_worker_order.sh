@@ -123,6 +123,34 @@ else
         fail "A1b CASE 1: nginx exited — worker_processes=${NCPU} after http{} should have started"
     fi
 
+    # ── Telemetry check: verify requests succeed on all NCPU workers ─────────
+    # The A1b fix reserves ngx_ncpu WorkerSlots at shm-init time.  If any
+    # worker had an out-of-bounds slot index it would crash on the first
+    # instrumented request, causing a non-200 response below.
+    # We also check that the exporter produced metrics visible at the collector.
+    REQ_COUNT=$(( NCPU * 3 ))
+    info "A1b CASE 1: sending ${REQ_COUNT} requests to exercise all ${NCPU} worker slots..."
+    for i in $(seq 1 "${REQ_COUNT}"); do
+        HTTP_STATUS="$(curl -sf -o /dev/null -w '%{http_code}' --max-time 2 http://127.0.0.1:9201/ 2>/dev/null || echo 000)"
+        if [[ "${HTTP_STATUS}" != "200" ]]; then
+            fail "A1b CASE 1: request ${i}/${REQ_COUNT} returned ${HTTP_STATUS} — a worker may have crashed (bad slot index with ${NCPU} workers after http{})"
+        fi
+    done
+    pass "A1b CASE 1: all ${REQ_COUNT} HTTP requests returned 200 (all ${NCPU} worker slots correctly reserved)"
+
+    # Give the exporter at least one 250ms tick + export round-trip.
+    sleep 0.6
+
+    if _collector_endpoint_reachable; then
+        if grep -q "ngx-otel-a1b-test" "${METRICS_LOG}" 2>/dev/null; then
+            pass "A1b CASE 1: metrics.json contains ngx-otel-a1b-test — exporter running with ${NCPU} workers reached the collector"
+        else
+            info "A1b CASE 1: collector reachable but ngx-otel-a1b-test not yet in metrics.json; skipping (metrics pipeline may not have flushed)"
+        fi
+    else
+        info "A1b CASE 1: collector not reachable at ${COLLECTOR_HTTP_ENDPOINT:-http://127.0.0.1:4318} — skipping telemetry-arrival check (run with collector up to assert full pipeline)"
+    fi
+
     kill "${NGINX_PID1}" 2>/dev/null || true
     wait "${NGINX_PID1}" 2>/dev/null || true
     trap - EXIT

@@ -300,6 +300,27 @@ Floods of identical lines are collapsed at the producer.
   errors fall through to nginx's own `error_log` (structural; not exported over OTel).
 - Source: `src/logs/error_writer.rs`, `src/logs/coalesce.rs`, drain in `src/export/mod.rs`.
 
+#### F5 — orphaned-slot synthetic `LogRecord`
+
+When the error-log ring is full a verbatim sample cannot be stored, but the
+coalesced-count entry for that template still exists.  On drain, if the count
+slot has a non-zero `orphaned_count` but no verbatim record, the exporter emits
+a **synthetic `LogRecord`** that preserves the occurrence total without a real body:
+
+| `LogRecord` field | Value |
+|---|---|
+| `severity_number` / `severity_text` | same mapping as normal error records |
+| `event_name` | `nginx.error` |
+| `body` | `"[nginx.error.coalesced_orphaned: N occurrences dropped (ring full)]"` where N = orphaned count |
+| attr `nginx.error.template_hash` | same hash as the dropped verbatim sample |
+| attr `nginx.error.coalesced_count` | total occurrence count for this template this interval |
+| attr `nginx.error.coalesced_orphaned` | `true` — marks this as a synthetic (no real body) |
+
+The companion metric `ngx_otel.logs.error.coalesced_orphaned_records` counts
+these events (see [Metrics](#metrics)).  A high value indicates the error-log
+ring is saturated and some verbatim samples are being lost while counts are
+preserved.  Source: `src/export/mod.rs` (`drain_coalesce_table`, F5 path).
+
 ## Traces
 
 OTel **server spans** are emitted for requests where `otel_trace` is configured.
@@ -349,7 +370,7 @@ Standard OTel HTTP semconv attributes recorded on every span:
 | Attribute | Value | Source |
 |---|---|---|
 | `http.request.method` | HTTP method string | `r->method_name` |
-| `url.path` | request URI path (≤ `MAX_SPAN_URL_PATH` bytes) | `r->unparsed_uri` |
+| `url.path` | request URI path (≤ `MAX_SPAN_URL_PATH` bytes) | `r->uri` |
 | `http.response.status_code` | raw status code | `r->headers_out.status` |
 | `http.server.request.duration` | request duration **in seconds** (derived from µs measurement; same field, same unit as the access-tail LogRecord — enables coherent metric→exemplar→log→trace drill-down) | `src/traces/mod.rs` |
 | `http.route` | matched location name | `clcf->name` via `route_from_location` |

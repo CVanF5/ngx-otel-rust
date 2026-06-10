@@ -108,6 +108,16 @@ Because E1's PPID is not M, M never receives `SIGCHLD` when E1 dies.
 If E1 crashes or is killed (`kill -9`), M does not respawn it and telemetry
 is silently lost until the next reload.
 
+Every daemonized graceful-stop (`nginx -s quit` / `nginx -s stop`) also
+triggers a one-time `kill() failed` ALERT and a short delay: M sends SIGQUIT
+to E1's PID; E1 runs its graceful drain and exits; because M never received
+`SIGCHLD` (PPID mismatch), M's process table still lists E1 as live; after
+the graceful-timeout window nginx escalates to SIGKILL and calls `kill(E1,
+SIGKILL)` — at which point E1 has already exited so the kernel returns
+`ESRCH`; nginx logs `kill() failed` at ALERT level
+(`ngx_process_cycle.c:517-521`).  This is bookkeeping, not a crash; the
+process exits cleanly regardless.
+
 This is a gap in nginx's respawn model, not a bug in the module code: there is
 no extension point in nginx 1.31.x that runs post-daemonize inside the
 long-lived master.
