@@ -1197,6 +1197,26 @@ mod nginx_test_stubs {
     #[no_mangle]
     pub static mut ngx_test_config: nginx_sys::ngx_uint_t = 0;
 
+    // B4 discriminant: `is_pre_daemon_initial_start` reads these two globals to
+    // decide whether the gen-1 supervision ALERT should fire.  Unit tests never
+    // exercise init_module, but the symbols must exist in the flat namespace on
+    // macOS (dyld resolves all data symbols eagerly at load time).
+    // Stub values: 0 = "not yet daemonized, not an inherited binary-upgrade
+    // child" — the safe initial state; the actual value is irrelevant because no
+    // unit test drives the init_module path.
+    #[no_mangle]
+    pub static mut ngx_daemonized: nginx_sys::ngx_uint_t = 0;
+
+    #[no_mangle]
+    pub static mut ngx_inherited: nginx_sys::ngx_uint_t = 0;
+
+    // A1b: shm zone capacity uses ngx_ncpu as a headroom multiplier at parse
+    // time (src/config.rs).  macOS flat-namespace requires the symbol to exist
+    // at load time; 0 is a safe sentinel (config parsing is never driven in
+    // unit tests — pool alloc returns null before any zone-sizing call).
+    #[no_mangle]
+    pub static mut ngx_ncpu: nginx_sys::ngx_int_t = 0;
+
     // Exporter cycle helpers: accept-mutex flag, channel fd, process table.
     #[no_mangle]
     pub static mut ngx_use_accept_mutex: nginx_sys::ngx_uint_t = 0;
