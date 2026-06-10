@@ -356,7 +356,13 @@ info "All rounds done. Total unique paths sent: ${SEQ_AFTER_ROUNDS} (SEQ 1..${SE
 
 # ── Assertion (a): check for duplicates in logs.json ─────────────────────────
 
-FLUSH_WAIT=$(( METRIC_INTERVAL_S + 3 ))
+# With USE_SLOW_SINK=1 each batch takes SLOW_SINK_DELAY_S to reach the collector;
+# add extra headroom so in-transit batches arrive before we check logs.json.
+if [[ "${USE_SLOW_SINK:-0}" == "1" ]]; then
+    FLUSH_WAIT=$(( METRIC_INTERVAL_S + SLOW_SINK_DELAY_S + 5 ))
+else
+    FLUSH_WAIT=$(( METRIC_INTERVAL_S + 3 ))
+fi
 info "Waiting ${FLUSH_WAIT}s for collector to receive all records..."
 sleep "${FLUSH_WAIT}"
 
