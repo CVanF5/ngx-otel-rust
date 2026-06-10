@@ -49,11 +49,11 @@ pub const COALESCE_CAPACITY: usize = 256;
 ///
 /// # Memory layout (`#[repr(C)]`, 24 bytes)
 /// ```text
-/// offset 0:  key_hash:       AtomicU64  — stable until evicted (never cleared)
-/// offset 8:  severity:       AtomicU8   — written once with key_hash
+/// offset 0:  key_hash:       AtomicU64  — 0=empty; cleared (evicted) by drain each interval
+/// offset 8:  severity:       AtomicU8   — written on insert; cleared by drain on eviction
 /// offset 9:  _pad:           [u8; 3]
 /// offset 12: count:          AtomicU32  — bumped by writer; swap-to-0 by drain
-/// offset 16: sample_emitted: AtomicBool — set by writer; swap-to-false by drain
+/// offset 16: sample_emitted: AtomicBool — set by writer; cleared by drain on eviction
 /// offset 17: _pad2:          [u8; 7]
 /// ```
 ///
@@ -335,22 +335,32 @@ pub const fn coalesce_table_bytes() -> usize {
 /// Called by the exporter's `collect_log_records` once per drain cycle.
 /// Sweeps all occupied slots, atomically reads-and-resets `count`, and
 /// returns `(key_hash, severity, count)` for every slot that had `count > 0`.
-/// Also resets `sample_emitted` so the next interval CAN emit a fresh verbatim
-/// sample (the writer path sees `!already_emitted` and calls `EmitVerbatim`).
-/// Best-effort, not guaranteed: a cross-process race between this reset and the
-/// writer's `sample_emitted` check can carry a `count` into the next interval
-/// without an accompanying verbatim sample for that interval.
 ///
-/// # Ownership of key_hash / severity
-/// These fields are NEVER cleared by the drain — evicted templates persist in
-/// the table until their slot is probed-over by a new insert (impossible at 256
-/// slots since the table never shrinks entries; the drain only zeroes `count`
-/// and flips `sample_emitted`).
+/// # F4 fix: per-drain eviction
+/// Every occupied slot is **evicted** after its count is collected: `key_hash`,
+/// `severity`, and `sample_emitted` are all cleared (written to 0/false).  This
+/// prevents the table from accumulating lifetime templates that fill the 256-slot
+/// capacity permanently — the failure mode that rendered coalescing permanently
+/// off after 256 distinct templates were ever seen.
+///
+/// After the drain, the table is empty.  Writers re-register templates at the
+/// first occurrence in the next interval, emitting one verbatim sample each —
+/// identical behaviour to the previously-working first-interval case.
+///
+/// **Concurrency at the interval boundary:** a writer that probes a slot
+/// concurrently with the drain's eviction may find a stale non-zero `key_hash`
+/// (before the drain's `Release` propagates) and increment `count` on a slot
+/// the drain just zeroed.  This is bounded to ≤ 1 lost observation per slot
+/// per interval-boundary race — within the coalescer's best-effort contract.
 ///
 /// # Memory ordering
-/// The `count.swap(0, AcqRel)` Acquire half synchronises with the `count.store(1,
-/// Release)` in the writer's novel-insert path, ensuring `key_hash` and
-/// `severity` (written before that Release) are visible here.
+/// - `count.swap(0, AcqRel)`: Acquire half synchronises with the
+///   `count.store(1, Release)` in the writer's novel-insert path, making
+///   `key_hash`/`severity` visible before we read them.
+/// - `key_hash.store(0, Release)`: Release ensures subsequent writer probes
+///   see the cleared slot (don't alias the evicted template on strongly-ordered
+///   hardware; Relaxed would also be safe here in practice but Release is
+///   cheaper than SeqCst and clearer in intent).
 ///
 /// # Safety
 /// `table` must be a valid, non-null pointer to a `[CoalesceSlot; COALESCE_CAPACITY]`
@@ -362,23 +372,27 @@ pub unsafe fn drain_coalesce_table(table: *mut CoalesceSlot) -> std::vec::Vec<(u
         // COALESCE_CAPACITY]`; `i < COALESCE_CAPACITY`, so it is in-bounds. The
         // exporter is the single draining reader.
         let slot = unsafe { &*table.add(i) };
-        // Cheap pre-filter: a zero key_hash means the slot was never written.
-        // (key_hash is only written once, before count; if count > 0 then
-        //  key_hash is definitely non-zero, so this skips all empty slots.)
+        // Cheap pre-filter: zero key_hash means the slot is empty.
         if slot.key_hash.load(Ordering::Relaxed) == 0 {
             continue;
         }
         // AcqRel: the Acquire half synchronises with the Release count.store(1)
         // on the writer's novel-insert path, making key_hash/severity visible.
         let count = slot.count.swap(0, Ordering::AcqRel);
+        // Read key_hash and severity AFTER the Acquire swap (correct ordering).
+        let key_hash = slot.key_hash.load(Ordering::Relaxed);
+        let severity = slot.severity.load(Ordering::Relaxed);
+
+        // F4 fix: evict every slot on drain so the table doesn't fill permanently.
+        // Release on key_hash ensures subsequent writer probes see the cleared slot.
+        // Severity and sample_emitted use Relaxed — they are ordered by the
+        // key_hash Release (a writer inserting in the next interval will first
+        // store key_hash with a paired Release, making severity visible).
+        slot.key_hash.store(0, Ordering::Release);
+        slot.severity.store(0, Ordering::Relaxed);
+        slot.sample_emitted.store(false, Ordering::Relaxed);
+
         if count > 0 {
-            // Read key_hash and severity AFTER the Acquire swap for correct ordering.
-            let key_hash = slot.key_hash.load(Ordering::Relaxed);
-            let severity = slot.severity.load(Ordering::Relaxed);
-            // Reset sample_emitted so the next interval re-emits a fresh sample.
-            // The Release ensures the reset is visible to the writer before it
-            // loads sample_emitted with Acquire.
-            slot.sample_emitted.store(false, Ordering::Release);
             out.push((key_hash, severity, count));
         }
     }
@@ -589,6 +603,64 @@ mod tests {
         assert!(
             matches!(r, CoalesceResult::EmitVerbatim { .. }),
             "table-full must degrade to verbatim emit, never panic"
+        );
+    }
+
+    /// F4 regression: after a drain, the table must be empty so new templates
+    /// can be inserted.  Pre-fix, `drain_coalesce_table()` never cleared `key_hash`
+    /// — after 256 distinct templates the table was permanently full, and every
+    /// subsequent novel template fell back to verbatim with `template_hash = 0`
+    /// (coalescing silently off forever).
+    ///
+    /// This test FAILS on pre-fix code: step 3 would see the post-drain table
+    /// still full (all slots occupied), so `coalesce()` returns `EmitVerbatim{
+    /// template_hash: 0}` rather than a real slot assignment.
+    #[test]
+    fn f4_drain_evicts_all_slots_allowing_new_templates() {
+        let mut table = make_table();
+        let ptr = table.as_mut_ptr();
+
+        // Step 1: Fill the table with COALESCE_CAPACITY distinct templates.
+        for i in 0..COALESCE_CAPACITY {
+            table[i].key_hash.store((i as u64) + 1, Ordering::Relaxed);
+            table[i].severity.store(4, Ordering::Relaxed);
+            table[i].count.store(1, Ordering::Relaxed);
+            table[i].sample_emitted.store(true, Ordering::Relaxed);
+        }
+
+        // Step 2: Confirm table is full — a novel message must fall back to verbatim
+        // with template_hash=0 (no slot can be assigned).
+        let novel = b"2024/01/01 12:00:00 [error] 1#1: novel message before drain xyz\n";
+        // SAFETY: `ptr` from make_table(); satisfies coalesce() contract.
+        let pre_drain = unsafe { coalesce(ptr, 4, novel, true) };
+        assert!(
+            matches!(pre_drain, CoalesceResult::EmitVerbatim { template_hash: 0 }),
+            "F4 precondition: full table must return template_hash=0 (no slot assigned)"
+        );
+
+        // Step 3: Drain the table.
+        // SAFETY: `ptr` from make_table(); satisfies drain_coalesce_table() contract.
+        let drained = unsafe { drain_coalesce_table(ptr) };
+        // All 256 slots had count=1, so all should be collected.
+        assert_eq!(drained.len(), COALESCE_CAPACITY, "all filled slots must be drained");
+
+        // Step 4: After drain, every slot must be empty (key_hash == 0).
+        for i in 0..COALESCE_CAPACITY {
+            assert_eq!(
+                table[i].key_hash.load(Ordering::Relaxed),
+                0,
+                "F4: slot {i} key_hash must be 0 after drain (pre-fix: never cleared)"
+            );
+        }
+
+        // Step 5: A new novel message must now get a real slot (template_hash ≠ 0).
+        // Pre-fix: drain left table full → still returns template_hash=0.
+        // Post-fix: drain evicted all slots → novel template gets assigned.
+        // SAFETY: `ptr` from make_table(); satisfies coalesce() contract.
+        let post_drain = unsafe { coalesce(ptr, 4, novel, true) };
+        assert!(
+            matches!(post_drain, CoalesceResult::EmitVerbatim { template_hash } if template_hash != 0),
+            "F4: post-drain novel message must get a real slot (template_hash != 0)"
         );
     }
 
