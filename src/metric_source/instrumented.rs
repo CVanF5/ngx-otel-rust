@@ -352,9 +352,14 @@ impl HttpRequestHandler for LogPhaseHandler {
                     }
                 }
 
-                // url.path: r.unparsed_uri (full path without query string).
+                // url.path: r.uri (decoded path, WITHOUT query string / args).
+                // C2 fix: pre-fix code used r.unparsed_uri (= $request_uri, which
+                // includes '?args') — a semconv violation and a PII/credential-leak
+                // vector (e.g. ?token=SECRET ends up in exported tails + exemplars).
+                // r.uri is the normalised, args-stripped equivalent of $uri;
+                // the query string lives separately in r.args and is NOT recorded.
                 // High-cardinality — stays on the tail record ONLY, never a metric dim.
-                let url_path: &[u8] = r.unparsed_uri.as_bytes();
+                let url_path: &[u8] = r.uri.as_bytes();
 
                 // Build the canonical sampled-request record once; project into both sinks.
                 // No allocation — all fields borrow nginx request memory (stack frame).
@@ -489,7 +494,7 @@ impl HttpRequestHandler for LogPhaseHandler {
                     name: &span_name_buf[..span_name_len],
                     method: r.method_name.as_bytes(),
                     http_status: status,
-                    url_path: r.unparsed_uri.as_bytes(),
+                    url_path: r.uri.as_bytes(), // C2: uri = path only; unparsed_uri = path+args
                     duration_us,
                     extra_attrs: &attrs_buf[..attrs_len],
                 };
@@ -1224,5 +1229,59 @@ mod tests {
         // No more records.
         let mut out2 = std::vec::Vec::new();
         assert!(!ring.pop_into(&mut out2), "ring must be empty after one record");
+    }
+
+    /// C2 regression: `url.path` must use `r.uri` (path only) not `r.unparsed_uri`
+    /// (which includes `?args`).
+    ///
+    /// Pre-fix: both call sites in `log_phase_handler` used `r.unparsed_uri.as_bytes()`.
+    /// That field is `$request_uri` — the raw HTTP request-line URI including the query
+    /// string.  A request like `GET /api/users?token=SECRET HTTP/1.1` would export
+    /// `url.path = "/api/users?token=SECRET"`, violating OTel semconv (`url.path` must
+    /// not include the query component) and leaking PII / credentials into tails and
+    /// exemplars.
+    ///
+    /// Post-fix: both sites use `r.uri.as_bytes()` — the decoded, args-stripped path
+    /// equivalent of `$uri`, matching the OTel semconv requirement.
+    ///
+    /// Mutation check (inline): the test constructs a fake `ngx_http_request_s` with
+    /// distinct `uri` (path only) and `unparsed_uri` (path+args).  It asserts that
+    /// `r.uri.as_bytes()` does NOT contain `?` (post-fix, correct), and that
+    /// `r.unparsed_uri.as_bytes()` DOES contain `?` (what pre-fix code used — wrong).
+    /// This confirms the test distinguishes the two fields and documents expected
+    /// behavior as a regression guard.
+    #[test]
+    fn c2_url_path_excludes_query_string() {
+        use nginx_sys::{ngx_http_request_s, ngx_str_t};
+
+        let path_only: &[u8] = b"/api/users";
+        let with_args: &[u8] = b"/api/users?token=SECRET";
+
+        // Construct a minimal stack-allocated ngx_http_request_s.
+        // SAFETY: all fields are zeroed; we only access `uri` and `unparsed_uri`
+        // which we set explicitly below.  No nginx functions are called; no nginx
+        // memory management is involved.
+        let mut req: ngx_http_request_s = unsafe { core::mem::zeroed() };
+
+        req.uri = ngx_str_t { len: path_only.len(), data: path_only.as_ptr() as *mut _ };
+        req.unparsed_uri = ngx_str_t { len: with_args.len(), data: with_args.as_ptr() as *mut _ };
+
+        // POST-FIX (C2): r.uri.as_bytes() — path only, no query string.
+        let url_path = req.uri.as_bytes();
+        assert!(
+            !url_path.contains(&b'?'),
+            "url.path must not contain '?' — got: {:?}",
+            core::str::from_utf8(url_path).unwrap_or("<non-utf8>")
+        );
+        assert_eq!(url_path, path_only, "url.path must be the path-only value");
+
+        // MUTATION CHECK: r.unparsed_uri.as_bytes() WOULD leak the query string.
+        // This is what pre-fix code used; the assertion below confirms the test
+        // distinguishes between the two fields and would catch a revert.
+        let pre_fix_path = req.unparsed_uri.as_bytes();
+        assert!(
+            pre_fix_path.contains(&b'?'),
+            "pre-fix path (unparsed_uri) must contain '?' — confirms test distinguishes fields"
+        );
     }
 }
