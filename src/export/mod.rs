@@ -1071,6 +1071,27 @@ pub async fn export_loop(amcf: &'static MainConfig) {
 
 // ── Graceful drain ────────────────────────────────────────────────────────────
 
+/// F6: Credits `counter` for all pending `(bytes, n_records)` batches in
+/// `queue`, then clears it.
+///
+/// Called from `graceful_drain`'s send-failure and timeout arms for the logs
+/// and spans retry queues.  Pre-fix, `clear()` ran without accumulating the
+/// count — queued records were silently discarded without incrementing any
+/// drop counter.
+///
+/// Extracted to a named function so the test can call the production logic
+/// directly rather than re-implementing the pattern inline.
+fn account_drops_and_clear(
+    queue: &mut VecDeque<(std::vec::Vec<u8>, u64)>,
+    counter: &core::sync::atomic::AtomicU64,
+) {
+    let remaining: u64 = queue.iter().map(|(_, n)| *n).sum();
+    if remaining > 0 {
+        counter.fetch_add(remaining, Ordering::Relaxed);
+    }
+    queue.clear();
+}
+
 /// B1-FU1: Returns `true` when a successor exporter generation has been
 /// announced — `ControlShm::successor_gen > my_gen` — meaning this exporter
 /// must abdicate mutating ring pops (logs/spans).
@@ -1300,11 +1321,7 @@ async fn graceful_drain(
                 // F6: credit remaining queued logs records to DROPPED_RECORDS before
                 // clearing so the self-metric reflects the full drop, not just the
                 // current batch.  Mirrors the metrics-lane drain-abort pattern.
-                let remaining: u64 = queues.logs.iter().map(|(_, n)| n).sum();
-                if remaining > 0 {
-                    DROPPED_RECORDS.fetch_add(remaining, Ordering::Relaxed);
-                }
-                queues.logs.clear();
+                account_drops_and_clear(queues.logs, &DROPPED_RECORDS);
                 break;
             }
             Err(DeadlineExceeded) => {
@@ -1315,11 +1332,7 @@ async fn graceful_drain(
                     n_logs
                 );
                 // F6: same as the error arm above.
-                let remaining: u64 = queues.logs.iter().map(|(_, n)| n).sum();
-                if remaining > 0 {
-                    DROPPED_RECORDS.fetch_add(remaining, Ordering::Relaxed);
-                }
-                queues.logs.clear();
+                account_drops_and_clear(queues.logs, &DROPPED_RECORDS);
                 break;
             }
         }
@@ -1401,11 +1414,7 @@ async fn graceful_drain(
                     e
                 );
                 // F6: credit remaining queued spans records before clearing.
-                let remaining: u64 = queues.spans.iter().map(|(_, n)| n).sum();
-                if remaining > 0 {
-                    DROPPED_RECORDS.fetch_add(remaining, Ordering::Relaxed);
-                }
-                queues.spans.clear();
+                account_drops_and_clear(queues.spans, &DROPPED_RECORDS);
                 break;
             }
             Err(DeadlineExceeded) => {
@@ -1416,11 +1425,7 @@ async fn graceful_drain(
                     n_spans
                 );
                 // F6: same as the error arm above.
-                let remaining: u64 = queues.spans.iter().map(|(_, n)| n).sum();
-                if remaining > 0 {
-                    DROPPED_RECORDS.fetch_add(remaining, Ordering::Relaxed);
-                }
-                queues.spans.clear();
+                account_drops_and_clear(queues.spans, &DROPPED_RECORDS);
                 break;
             }
         }
@@ -2361,43 +2366,30 @@ mod tests {
     /// called without computing `remaining`, so queued records were silently
     /// discarded without incrementing any drop counter.
     ///
-    /// This test FAILS on pre-fix code because the accounting logic was absent.
-    /// Post-fix, the drain-abort pattern (compute `remaining` → `fetch_add` →
-    /// `clear`) is present for both logs and spans lanes, matching the metrics lane.
-    ///
-    /// We test the pattern directly (not through async graceful_drain) because
-    /// the async drain requires a real transport.  The logic is identical to
-    /// what was added inside graceful_drain's send-failed / timeout arms.
+    /// This test calls the PRODUCTION `account_drops_and_clear` function
+    /// (extracted from `graceful_drain`'s send-failed / timeout arms for both
+    /// logs and spans lanes).  Reverting the `fetch_add` inside that function
+    /// causes this test to FAIL — ensuring the test is not teethless.
     #[test]
     fn f6_drain_abort_credits_dropped_records_for_logs_and_spans() {
-        // Simulate a non-empty logs retry queue with 2 entries.
+        // Prepare a logs retry queue with 2 entries (13 + 7 = 20 records).
         let mut logs_q: VecDeque<(std::vec::Vec<u8>, u64)> = VecDeque::new();
         logs_q.push_back((std::vec![0u8], 13));
         logs_q.push_back((std::vec![0u8], 7));
 
-        // Simulate a non-empty spans retry queue with 1 entry.
+        // Prepare a spans retry queue with 1 entry (42 records).
         let mut spans_q: VecDeque<(std::vec::Vec<u8>, u64)> = VecDeque::new();
         spans_q.push_back((std::vec![0u8], 42));
 
-        // Record baseline before the drain-abort accounting runs.
+        // Baseline before the drain-abort accounting runs.
         let before = DROPPED_RECORDS.load(Ordering::Acquire);
 
-        // ── Logs drain-abort pattern (what the fix adds to graceful_drain) ──
-        let logs_remaining: u64 = logs_q.iter().map(|(_, n)| n).sum();
-        if logs_remaining > 0 {
-            DROPPED_RECORDS.fetch_add(logs_remaining, Ordering::Relaxed);
-        }
-        logs_q.clear();
-
-        // ── Spans drain-abort pattern (what the fix adds to graceful_drain) ─
-        let spans_remaining: u64 = spans_q.iter().map(|(_, n)| n).sum();
-        if spans_remaining > 0 {
-            DROPPED_RECORDS.fetch_add(spans_remaining, Ordering::Relaxed);
-        }
-        spans_q.clear();
+        // Call the PRODUCTION function — not an inline reimplementation.
+        super::account_drops_and_clear(&mut logs_q, &DROPPED_RECORDS);
+        super::account_drops_and_clear(&mut spans_q, &DROPPED_RECORDS);
 
         let after = DROPPED_RECORDS.load(Ordering::Acquire);
-        // Pre-fix: no accounting → after == before (FAILS on pre-fix code)
+        // Pre-fix: no fetch_add in account_drops_and_clear → after == before
         // Post-fix: 13 + 7 + 42 = 62 records credited
         assert!(
             after >= before + 62,

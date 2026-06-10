@@ -31,8 +31,8 @@ use crate::logs::{
 };
 use crate::shm::{
     combo_index, logs_access_ring, spans_ring, worker_slots, HttpMethod, ProtoVersion, StatusClass,
-    BYTES_BOUNDS, DEFAULT_SPAN_RING_CAP, DURATION_BOUNDS_MS, N_BYTES_BUCKETS, N_DURATION_BUCKETS,
-    UPSTREAM_IDX_OTHER,
+    WorkerSlots, BYTES_BOUNDS, DEFAULT_SPAN_RING_CAP, DURATION_BOUNDS_MS, N_BYTES_BUCKETS,
+    N_DURATION_BUCKETS, UPSTREAM_IDX_OTHER,
 };
 use crate::traces::{emit_span_record, SpanRecord, MAX_SPAN_EXTRA_ATTRS, MAX_SPAN_NAME};
 use crate::HttpOtelModule;
@@ -48,6 +48,29 @@ use crate::HttpOtelModule;
 /// value without filtering would add ~1.8 × 10^19 to the cumulative sum on
 /// every refused-connection event, permanently poisoning the metric.
 const NGX_MSEC_SENTINEL: u64 = usize::MAX as u64;
+
+/// Records a request into the base `{method × status_class × protocol}` combo
+/// histogram.
+///
+/// F2: skips when `status == 0` — a client abort where nginx sent no response
+/// headers.  Per OTel HTTP semconv, `http.response.status_code` is CONDITIONALLY
+/// REQUIRED only when a response was sent; it is ABSENT for aborted requests.
+/// Counting status-0 as 5xx inflated server-error-rate metrics on every
+/// port-scan / TLS-probe / aborted keep-alive event.
+///
+/// `base_idx` is `combo_index(method, status_class, proto)`, pre-computed by
+/// the caller (also needed for the exemplar reservoir, so computing it once
+/// avoids duplication on the hot path).
+///
+/// # Hot-path guarantees
+/// Zero allocation, no locks: one `u16 == 0` compare + one conditional
+/// `AtomicU64::fetch_add` per request.
+#[inline]
+fn record_base_combo(slot: &WorkerSlots, status: u16, base_idx: usize, duration_us: u64) {
+    if status != 0 {
+        slot.request_duration_combos[base_idx].record(duration_us);
+    }
+}
 
 /// Unit struct for the log-phase handler; all state lives in the shm zone.
 pub struct LogPhaseHandler;
@@ -201,9 +224,7 @@ impl HttpRequestHandler for LogPhaseHandler {
         // resources regardless of the abort.
         let status_class = StatusClass::from_status(status);
         let base_idx = combo_index(method, status_class, proto);
-        if status != 0 {
-            slot.request_duration_combos[base_idx].record(duration_us);
-        }
+        record_base_combo(slot, status, base_idx, duration_us);
 
         // 2. Per-route table: http.route = location name.
         let route_idx = {
@@ -1313,12 +1334,13 @@ mod tests {
     /// port-scan / TLS-probe / aborted keep-alive incremented the S5xx combo,
     /// inflating server-error-rate metrics.
     ///
-    /// Post-fix: the `if status != 0` guard skips the base combo entirely.
+    /// Post-fix: `record_base_combo` skips the histogram bump when `status == 0`.
     /// Route and upstream histograms are unaffected (they still record, as the
     /// request consumed real resources regardless of the abort).
     ///
-    /// This test FAILS on pre-fix code because the S5xx combo would have count=1
-    /// after the status-0 record, but asserts count=0.
+    /// This test calls the PRODUCTION `record_base_combo` function (not an
+    /// inline copy of its guard), so reverting the `status != 0` check in that
+    /// function causes this test to FAIL.
     #[test]
     fn f2_status_zero_skips_base_combo() {
         use crate::shm::{
@@ -1336,17 +1358,16 @@ mod tests {
         let proto = ProtoVersion::Http11;
         let duration_us: u64 = 1_500;
 
-        // ── Post-fix path: status == 0, histogram record is skipped ──
-        // Production code always computes status_class/base_idx (needed for
-        // exemplar reservoir), then guards only the histogram bump.
+        // ── status == 0: production record_base_combo must skip the bump ──
+        // The S5xx combo is computed (as production code does — needed for the
+        // exemplar reservoir) but the histogram bump must be skipped.
         let status: u16 = 0;
         let status_class_0 = StatusClass::from_status(status); // = S5xx (catch-all)
         let base_idx_0 = combo_index(method, status_class_0, proto);
-        if status != 0 {
-            slot.request_duration_combos[base_idx_0].record(duration_us);
-        }
+        // Call the PRODUCTION function — not an inline reimplementation.
+        super::record_base_combo(slot, status, base_idx_0, duration_us);
 
-        // All 160 combos must remain zero — the guard skipped the histogram bump.
+        // All 160 combos must remain zero — record_base_combo skipped the bump.
         for idx in 0..N_COMBOS {
             let (_, _, _, count) = slot.request_duration_combos[idx].snapshot();
             assert_eq!(
@@ -1371,13 +1392,12 @@ mod tests {
             "F2 sanity: S5xx combo must be the one pre-fix would have incremented"
         );
 
-        // ── Post-fix: a real status (200) DOES record into the S2xx combo ──
+        // ── status 200: production record_base_combo must record into S2xx ──
         let status200: u16 = 200;
         let status_class_200 = StatusClass::from_status(status200);
         let base_idx_200 = combo_index(method, status_class_200, proto);
-        if status200 != 0 {
-            slot.request_duration_combos[base_idx_200].record(duration_us);
-        }
+        // Call the PRODUCTION function.
+        super::record_base_combo(slot, status200, base_idx_200, duration_us);
         let s2xx_idx = combo_index(method, StatusClass::S2xx, proto);
         let (_, _, _, s2xx_count) = slot.request_duration_combos[s2xx_idx].snapshot();
         assert_eq!(s2xx_count, 1, "F2: status-200 request must be recorded into S2xx combo");
