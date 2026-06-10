@@ -286,6 +286,23 @@ impl Drop for OwnedNgxPool {
 // (Pattern ported line-by-line from nginx-acme/src/net/peer_conn.rs)
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Close an nginx connection and null the owning pointer in one atomic step.
+///
+/// This is the only approved way to close an nginx connection held in a
+/// `*mut ngx_connection_t` field.  Callers that close without nulling risk a
+/// double-close when a subsequent `close()`/`Drop` also calls
+/// `ngx_close_connection` on the stale (already-freed) pointer — leading to
+/// ALERT spam and potential use-after-recycle of a reused connection slot.
+///
+/// # Safety
+/// `conn_slot` must be non-null and must contain a live `ngx_connection_t`
+/// pointer (i.e. `*conn_slot` is non-null and has not already been closed).
+#[inline]
+unsafe fn close_and_clear(conn_slot: &mut *mut ngx_connection_t) {
+    nginx_sys::ngx_close_connection(*conn_slot);
+    *conn_slot = core::ptr::null_mut();
+}
+
 /// Wraps an `ngx_peer_connection_t` for use as hyper's async IO.
 ///
 /// **Waking contract:**
@@ -381,9 +398,14 @@ impl NgxConnIo {
             // connection's lifetime. We read the `timedout` bitfield and (on
             // timeout) hand `c` back to `ngx_close_connection`, or re-install our
             // handlers on the still-open connection.
+            // SAFETY: `c` is non-null here (checked above, `c = self.pc.connection`).
+            // On timeout, `close_and_clear` closes the connection AND nulls
+            // `self.pc.connection` so the Drop/close() path cannot double-close.
+            // Without the null, Drop calls close() → ngx_close_connection(stale ptr)
+            // → ALERT spam + potential use-after-recycle if the slot is reused (E1).
             let rv = unsafe {
                 if (*(*c).read).timedout() != 0 || (*(*c).write).timedout() != 0 {
-                    nginx_sys::ngx_close_connection(c);
+                    close_and_clear(&mut self.pc.connection);
                     Err(io::ErrorKind::TimedOut.into())
                 } else {
                     (*(*c).read).handler = Some(ngx_otel_conn_read_handler);
@@ -429,11 +451,9 @@ impl NgxConnIo {
     fn close(&mut self) {
         if !self.pc.connection.is_null() {
             // SAFETY: `pc.connection` is non-null (checked), so it is a live
-            // nginx connection from `connect_peer`; `ngx_close_connection` is
-            // the matching nginx FFI to release it. We immediately null the
-            // field so a later `close`/`Drop` cannot double-free.
-            unsafe { nginx_sys::ngx_close_connection(self.pc.connection) };
-            self.pc.connection = core::ptr::null_mut();
+            // nginx connection from `connect_peer`; `close_and_clear` closes it
+            // AND nulls the field so a later `close`/`Drop` cannot double-free.
+            unsafe { close_and_clear(&mut self.pc.connection) };
         }
     }
 }
@@ -1751,5 +1771,37 @@ mod tests {
     fn extract_http_path_from_bare_path() {
         assert_eq!(extract_http_path("/v1/metrics"), "/v1/metrics");
         assert_eq!(extract_http_path("/custom/path"), "/custom/path");
+    }
+
+    /// E1 regression: `close_and_clear` must null the owning pointer after
+    /// calling `ngx_close_connection`.
+    ///
+    /// Pre-fix: the timeout path in `poll_connect` (line ~386) called
+    /// `ngx_close_connection(c)` without nulling `self.pc.connection`.
+    /// Subsequent `Drop` → `close()` → `ngx_close_connection(stale_ptr)`
+    /// → double-close → ALERT spam + potential use-after-recycle if the
+    /// freed slot is reassigned before Drop runs.
+    ///
+    /// This test verifies the structural invariant: any call to
+    /// `close_and_clear` nulls the slot.  If the invariant is violated
+    /// (e.g. the null is removed), the assertion below fails.
+    /// Under ASan the double-close also shows as a use-after-free report.
+    ///
+    /// The `ngx_close_connection` call in `close_and_clear` is safe to make
+    /// with a sentinel pointer in test because `lib.rs` provides a no-op
+    /// stub for the test-support build (`#[cfg(test)]`).
+    #[test]
+    fn e1_close_and_clear_nulls_slot() {
+        // Sentinel: `NonNull::dangling()` gives a non-null, well-aligned,
+        // non-dereferenceable pointer.  The test-support stub for
+        // `ngx_close_connection` is a no-op that ignores its argument, so
+        // the pointer is never dereferenced.
+        let mut conn: *mut nginx_sys::ngx_connection_t =
+            core::ptr::NonNull::<nginx_sys::ngx_connection_t>::dangling().as_ptr();
+        assert!(!conn.is_null(), "precondition: slot must be non-null");
+        // SAFETY: `conn` is a sentinel; the test-support `ngx_close_connection`
+        // stub does not dereference it.
+        unsafe { super::close_and_clear(&mut conn) };
+        assert!(conn.is_null(), "E1: close_and_clear must null the connection slot");
     }
 }
