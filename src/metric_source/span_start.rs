@@ -75,8 +75,9 @@ impl HttpRequestHandler for SpanStartHandler {
         // Pull both the complex-value pointer and trace_context mode from
         // LocationConf in one borrow so the borrow ends before we call
         // set_module_ctx (which borrows mutably).
-        let r_ptr = request.as_ref() as *const nginx_sys::ngx_http_request_t
-            as *mut nginx_sys::ngx_http_request_t;
+        // as_mut() yields &mut provenance; casting immediately to *mut releases
+        // the Rust borrow so subsequent immutable borrows of `request` are valid.
+        let r_ptr = request.as_mut() as *mut nginx_sys::ngx_http_request_t;
         let (otel_trace_cv, trace_context): (
             *mut nginx_sys::ngx_http_complex_value_t,
             TraceContextMode,
