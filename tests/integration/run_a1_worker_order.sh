@@ -1,14 +1,22 @@
 #!/usr/bin/env bash
-# tests/integration/run_a1_worker_order.sh — A1 regression test
+# tests/integration/run_a1_worker_order.sh — A1 / A1b regression test
 #
-# Verifies that nginx refuses to start (exits non-zero) when the module's shm
-# zones are undersized because `worker_processes` appears after the `http {}`
-# block.  Before the A1 fix, nginx would start silently and workers 1-3 would
-# write past the zone end into adjacent memory.  After the fix, init_module
-# detects the mismatch and returns NGX_ERROR.
+# Covers three assertions:
 #
-# Also verifies the NORMAL ordering (worker_processes before http{}) still
-# works, as a regression guard.
+#   CASE 1 — A1b POSITIVE (would FAIL on pre-A1b code):
+#     worker_processes == ncpu placed AFTER http{}.  Before A1b, zones were
+#     reserved for 1 slot (UNSET → 1), so check_zone_sizing would refuse any
+#     count > 1.  After A1b, zones are reserved for ngx_ncpu slots, so this
+#     starts cleanly.  Skipped on single-CPU machines where ncpu == 1 (pre/post
+#     A1b indistinguishable: both succeed).
+#
+#   CASE 2 — A1b RESIDUAL ERROR:
+#     worker_processes == ncpu+1 placed AFTER http{}.  init_module must refuse
+#     and log "shm zones were reserved for".  Operator instruction: move
+#     worker_processes before http{} or reduce it.
+#
+#   CASE 3 — NORMAL ORDERING (regression guard):
+#     worker_processes before http{} → nginx must start.
 #
 # Exit codes:
 #   0  all assertions passed
@@ -21,8 +29,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CRATE_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 REPO_ROOT="$(cd "${CRATE_DIR}/.." && pwd)"
 
-CONF_TEMPLATE="${SCRIPT_DIR}/nginx_worker_processes_after_http.conf"
-NORMAL_CONF_TEMPLATE="${SCRIPT_DIR}/nginx.conf"
+HOSTILE_CONF="${SCRIPT_DIR}/nginx_worker_processes_after_http.conf"
+A1B_POSITIVE_CONF="${SCRIPT_DIR}/nginx_wp_after_http_under_ncpu.conf"
+NORMAL_CONF="${SCRIPT_DIR}/nginx.conf"
 
 . "${CRATE_DIR}/test-harness/lib.sh"
 resolve_nginx_binary || true
@@ -45,15 +54,16 @@ NC='\033[0m'
 pass()  { echo -e "${GREEN}[PASS]${NC} $*"; }
 fail()  { echo -e "${RED}[FAIL]${NC} $*" >&2; exit 2; }
 info()  { echo -e "${YELLOW}[INFO]${NC} $*"; }
+skip()  { echo -e "${YELLOW}[SKIP]${NC} $*"; }
 
-# ─── Pre-flight ──────────────────────────────────────────────────────────────
+# ─── Pre-flight ───────────────────────────────────────────────────────────────
 
 if [[ ! -x "${NGINX_BINARY}" ]]; then
     echo "ERROR: nginx binary not found at ${NGINX_BINARY}" >&2
     exit 1
 fi
 
-# ─── Build ───────────────────────────────────────────────────────────────────
+# ─── Build ────────────────────────────────────────────────────────────────────
 
 info "Building release module..."
 (
@@ -68,89 +78,141 @@ if [[ ! -f "${MODULE_PATH}" ]]; then
 fi
 info "Module built: ${MODULE_PATH}"
 
-# ─── Assertion 1: hostile ordering → nginx refuses to start ─────────────────
+# Determine ngx_ncpu equivalent from the OS (matches nginx's ngx_os_init).
+NCPU="$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1)"
+info "Detected ncpu=${NCPU}"
 
-info "--- A1 assertion 1: hostile ordering (worker_processes after http{}) ---"
+# ─── CASE 1: A1b positive ─────────────────────────────────────────────────────
+# worker_processes == ncpu AFTER http{} → must START (A1b: ncpu-headroom fix).
+# Pre-A1b: reserved = 1 < ncpu → check_zone_sizing would refuse (FAIL).
+# Post-A1b: reserved = ncpu ≥ ncpu → init_module accepts (PASS).
 
-PREFIX="$(mktemp -d /tmp/ngx-otel-a1.XXXXXX)"
-cleanup_hostile() {
-    echo "=== error.log (hostile ordering) ==="
-    cat "${PREFIX}/logs/error.log" 2>/dev/null || echo "(not found)"
-    rm -rf "${PREFIX}"
-}
-trap cleanup_hostile EXIT
+info "--- CASE 1: A1b positive (worker_processes=${NCPU} after http{}) ---"
 
-mkdir -p "${PREFIX}/logs"
-
-sed \
-    -e "s|@MODULE_PATH@|${MODULE_PATH}|g" \
-    -e "s|@PREFIX@|${PREFIX}|g" \
-    "${CONF_TEMPLATE}" > "${PREFIX}/nginx.conf"
-
-# Run nginx; it must exit with a non-zero status (init_module returns NGX_ERROR).
-NGINX_EXIT=0
-"${NGINX_BINARY}" \
-    -p "${PREFIX}" \
-    -c "${PREFIX}/nginx.conf" \
-    2>/dev/null \
-    || NGINX_EXIT=$?
-
-if [[ "${NGINX_EXIT}" -eq 0 ]]; then
-    fail "A1: nginx exited 0 with hostile ordering — expected non-zero (init_module did not fail)"
-fi
-pass "A1: nginx exited ${NGINX_EXIT} (non-zero) with hostile ordering"
-
-# Assert the error log contains our A1 message.
-if grep -q "shm zones were sized for 1 worker" "${PREFIX}/logs/error.log" 2>/dev/null; then
-    pass "A1: error.log contains the expected sizing mismatch message"
+if [[ "${NCPU}" -lt 2 ]]; then
+    skip "CASE 1: ncpu=${NCPU} — single-CPU machine, pre/post A1b indistinguishable; skipping"
 else
-    echo "=== error.log tail (looking for A1 message) ==="
-    tail -20 "${PREFIX}/logs/error.log" 2>/dev/null
-    fail "A1: error.log does NOT contain the expected sizing mismatch message"
+    PREFIX1="$(mktemp -d /tmp/ngx-otel-a1b-pos.XXXXXX)"
+    cleanup1() {
+        [[ -n "${NGINX_PID1:-}" ]] && kill "${NGINX_PID1}" 2>/dev/null || true
+        echo "=== error.log (A1b positive) ==="
+        cat "${PREFIX1}/logs/error.log" 2>/dev/null || echo "(not found)"
+        rm -rf "${PREFIX1}"
+    }
+    trap cleanup1 EXIT
+    mkdir -p "${PREFIX1}/logs"
+
+    sed \
+        -e "s|@MODULE_PATH@|${MODULE_PATH}|g" \
+        -e "s|@PREFIX@|${PREFIX1}|g" \
+        -e "s|@WORKER_PROCESSES@|${NCPU}|g" \
+        "${A1B_POSITIVE_CONF}" > "${PREFIX1}/nginx.conf"
+
+    "${NGINX_BINARY}" \
+        -p "${PREFIX1}" \
+        -c "${PREFIX1}/nginx.conf" &
+    NGINX_PID1=$!
+
+    sleep 1
+
+    if kill -0 "${NGINX_PID1}" 2>/dev/null; then
+        pass "A1b CASE 1: nginx starts with worker_processes=${NCPU} after http{}"
+    else
+        echo "=== error.log (A1b positive) ==="
+        cat "${PREFIX1}/logs/error.log" 2>/dev/null || echo "(not found)"
+        fail "A1b CASE 1: nginx exited — worker_processes=${NCPU} after http{} should have started"
+    fi
+
+    kill "${NGINX_PID1}" 2>/dev/null || true
+    wait "${NGINX_PID1}" 2>/dev/null || true
+    trap - EXIT
+    rm -rf "${PREFIX1}"
 fi
 
-trap - EXIT
-rm -rf "${PREFIX}"
+# ─── CASE 2: A1b residual error ───────────────────────────────────────────────
+# worker_processes == ncpu+1 AFTER http{} → init_module must REFUSE.
+# (reserved = ncpu, actual = ncpu+1 > reserved → error)
 
-# ─── Assertion 2: normal ordering → nginx starts correctly ──────────────────
+ABOVE_NCPU=$(( NCPU + 1 ))
+info "--- CASE 2: A1b residual error (worker_processes=${ABOVE_NCPU} after http{}) ---"
 
-info "--- A1 assertion 2: normal ordering (worker_processes before http{}) ---"
-
-PREFIX2="$(mktemp -d /tmp/ngx-otel-a1-normal.XXXXXX)"
-cleanup_normal() {
-    [[ -n "${NGINX_PID2:-}" ]] && kill "${NGINX_PID2}" 2>/dev/null || true
+PREFIX2="$(mktemp -d /tmp/ngx-otel-a1b-err.XXXXXX)"
+cleanup2() {
+    echo "=== error.log (A1b residual error) ==="
+    cat "${PREFIX2}/logs/error.log" 2>/dev/null || echo "(not found)"
     rm -rf "${PREFIX2}"
 }
-trap cleanup_normal EXIT
-
+trap cleanup2 EXIT
 mkdir -p "${PREFIX2}/logs"
 
 sed \
     -e "s|@MODULE_PATH@|${MODULE_PATH}|g" \
     -e "s|@PREFIX@|${PREFIX2}|g" \
-    "${NORMAL_CONF_TEMPLATE}" > "${PREFIX2}/nginx.conf"
+    -e "s|@WORKER_PROCESSES@|${ABOVE_NCPU}|g" \
+    "${HOSTILE_CONF}" > "${PREFIX2}/nginx.conf"
 
+NGINX_EXIT2=0
 "${NGINX_BINARY}" \
     -p "${PREFIX2}" \
-    -c "${PREFIX2}/nginx.conf" &
-NGINX_PID2=$!
+    -c "${PREFIX2}/nginx.conf" \
+    2>/dev/null \
+    || NGINX_EXIT2=$?
+
+if [[ "${NGINX_EXIT2}" -eq 0 ]]; then
+    fail "A1b CASE 2: nginx exited 0 with worker_processes=${ABOVE_NCPU} after http{} — expected refusal"
+fi
+pass "A1b CASE 2: nginx exited ${NGINX_EXIT2} (non-zero) with worker_processes=${ABOVE_NCPU} after http{}"
+
+if grep -q "shm zones were reserved for" "${PREFIX2}/logs/error.log" 2>/dev/null; then
+    pass "A1b CASE 2: error.log contains expected A1b ncpu-headroom message"
+else
+    echo "=== error.log tail ==="
+    tail -20 "${PREFIX2}/logs/error.log" 2>/dev/null
+    fail "A1b CASE 2: error.log missing 'shm zones were reserved for' — A1b message not emitted"
+fi
+
+trap - EXIT
+rm -rf "${PREFIX2}"
+
+# ─── CASE 3: normal ordering guard ───────────────────────────────────────────
+# worker_processes before http{} → must start (basic regression guard).
+
+info "--- CASE 3: normal ordering (worker_processes before http{}) ---"
+
+PREFIX3="$(mktemp -d /tmp/ngx-otel-a1b-norm.XXXXXX)"
+cleanup3() {
+    [[ -n "${NGINX_PID3:-}" ]] && kill "${NGINX_PID3}" 2>/dev/null || true
+    rm -rf "${PREFIX3}"
+}
+trap cleanup3 EXIT
+mkdir -p "${PREFIX3}/logs"
+
+sed \
+    -e "s|@MODULE_PATH@|${MODULE_PATH}|g" \
+    -e "s|@PREFIX@|${PREFIX3}|g" \
+    "${NORMAL_CONF}" > "${PREFIX3}/nginx.conf"
+
+"${NGINX_BINARY}" \
+    -p "${PREFIX3}" \
+    -c "${PREFIX3}/nginx.conf" &
+NGINX_PID3=$!
 
 sleep 1
 
-if kill -0 "${NGINX_PID2}" 2>/dev/null; then
-    pass "A1: nginx starts correctly with normal ordering"
+if kill -0 "${NGINX_PID3}" 2>/dev/null; then
+    pass "A1b CASE 3: nginx starts correctly with normal ordering"
 else
     echo "=== error.log (normal ordering) ==="
-    cat "${PREFIX2}/logs/error.log" 2>/dev/null || echo "(not found)"
-    fail "A1: nginx exited unexpectedly with normal ordering"
+    cat "${PREFIX3}/logs/error.log" 2>/dev/null || echo "(not found)"
+    fail "A1b CASE 3: nginx exited with normal ordering — unexpected failure"
 fi
 
-kill "${NGINX_PID2}" 2>/dev/null || true
-wait "${NGINX_PID2}" 2>/dev/null || true
+kill "${NGINX_PID3}" 2>/dev/null || true
+wait "${NGINX_PID3}" 2>/dev/null || true
 trap - EXIT
-rm -rf "${PREFIX2}"
+rm -rf "${PREFIX3}"
 
 # ─── Summary ─────────────────────────────────────────────────────────────────
 
 echo ""
-pass "A1 worker_processes-after-http{} regression test: all assertions passed"
+pass "A1b worker_processes-order regression test: all assertions passed"

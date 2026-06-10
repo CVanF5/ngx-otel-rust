@@ -228,6 +228,28 @@ pub struct MainConfig {
     /// `DEFAULT_SPAN_RING_CAP` bytes per ring.  The hot path is gated in
     /// the exporter by checking `spans_shm_base()` is non-null.
     pub spans_shm_zone: *mut nginx_sys::ngx_shm_zone_t,
+
+    // ── A1b: zone-init data ──────────────────────────────────────────────────
+    //
+    // Each zone registration stores a `ZoneInitData` in these fields and points
+    // `ngx_shm_zone_t.data` at it.  Storing inside `MainConfig` (config pool)
+    // guarantees the pointer stays valid from postconfiguration through the
+    // zone-init callbacks fired by the same `ngx_init_cycle` call.
+    //
+    /// Zone-init parameters for the metrics shm zone.
+    pub metrics_zone_init_data: crate::shm::ZoneInitData,
+    /// Zone-init parameters for the logs shm zone.
+    pub logs_zone_init_data: crate::shm::ZoneInitData,
+    /// Zone-init parameters for the spans shm zone.
+    pub spans_zone_init_data: crate::shm::ZoneInitData,
+
+    /// Final active worker count set by `check_zone_sizing` in `init_module`.
+    ///
+    /// Zones may be reserved for more capacity (ncpu-headroom from A1b); the
+    /// exporter drains only `n_active_workers` slots.
+    /// `0` = not yet set; callers fall back to zone-size-derived count.
+    pub n_active_workers: core::sync::atomic::AtomicUsize,
+
     /// `otel_access_log_sample <size>` — reservoir size for the exception-tail
     /// exemplar reservoir.  `0` = not configured (default off).
     /// Presence ⇒ exception tail + exemplar sampling on; absent ⇒ off.
@@ -329,6 +351,12 @@ impl Default for MainConfig {
             control_shm_zone: ptr::null_mut(),
             logs_shm_zone: ptr::null_mut(),
             spans_shm_zone: ptr::null_mut(),
+            // A1b: filled in at zone registration time.
+            metrics_zone_init_data: crate::shm::ZoneInitData { ring_cap: 0, cycle_addr: 0 },
+            logs_zone_init_data: crate::shm::ZoneInitData { ring_cap: 0, cycle_addr: 0 },
+            spans_zone_init_data: crate::shm::ZoneInitData { ring_cap: 0, cycle_addr: 0 },
+            // A1b: set by check_zone_sizing in init_module (0 = not yet set).
+            n_active_workers: core::sync::atomic::AtomicUsize::new(0),
             // 0 = not configured (off by default).
             access_sample_size: 0,
             log_ring_size: 0,
@@ -388,6 +416,31 @@ unsafe fn n_workers_from_cf(cf: *const ngx_conf_t) -> Option<usize> {
         None
     } else {
         Some(wp as usize)
+    }
+}
+
+/// Worker-slot count to reserve in shm zones at parse time (A1b).
+///
+/// When `worker_processes` is already known (≥ 1), returns that exact count.
+/// When still `NGX_CONF_UNSET` (directive appears after `http{}`), returns
+/// `ngx_ncpu` — what `worker_processes auto` resolves to — so the zone fits
+/// any later-placed count ≤ ncpu.  Falls back to 1 only if ncpu itself is 0
+/// (should not happen on any real system).
+///
+/// # Safety
+/// `cf` must be a valid, non-null `ngx_conf_t` at postconfiguration time.
+unsafe fn n_workers_to_reserve(cf: *const ngx_conf_t) -> usize {
+    // SAFETY: `cf` is valid, non-null per this `unsafe fn`'s contract.
+    if let Some(wp) = unsafe { n_workers_from_cf(cf) } {
+        return wp;
+    }
+    // worker_processes is UNSET — use ncpu headroom.
+    // SAFETY: ngx_ncpu is set by nginx before any postconfiguration handler runs.
+    let ncpu = unsafe { nginx_sys::ngx_ncpu };
+    if ncpu > 0 {
+        ncpu as usize
+    } else {
+        1
     }
 }
 
@@ -670,14 +723,10 @@ impl MainConfig {
         cf: *mut ngx_conf_t,
         module: *mut ngx_module_t,
     ) -> Result<(), Status> {
-        // A1: Read worker_processes from the core conf.  When the directive
-        // appears AFTER the http{} block, `worker_processes` is still
-        // NGX_CONF_UNSET (-1) at postconfiguration time.  We use 1 as a
-        // provisional size and let `ngx_otel_init_module` catch the mismatch
-        // after the full parse is done and the value is final.
-        //
+        // A1b: reserve capacity for ngx_ncpu slots when worker_processes is UNSET
+        // (directive appears after http{}); fall back to the known count otherwise.
         // SAFETY: `cf` is the valid non-null parse context at postconfiguration.
-        let n_workers: usize = unsafe { n_workers_from_cf(cf) }.unwrap_or(1);
+        let n_workers: usize = unsafe { n_workers_to_reserve(cf) };
 
         // Compute required zone size.
         let required_size = shm::zone_size_for(n_workers);
@@ -704,13 +753,24 @@ impl MainConfig {
             return Err(Status::NGX_ERROR);
         };
 
+        // A1b: fill the ZoneInitData for the zone-init callback.
+        // SAFETY: `cf` is valid and non-null per the postconfiguration contract.
+        let cycle_addr = unsafe { (*cf).cycle as usize };
+        self.metrics_zone_init_data = crate::shm::ZoneInitData {
+            ring_cap: 0, // metrics zone has no ring
+            cycle_addr,
+        };
+
         // Configure the zone init callback.
         // SAFETY: `register_zone` returned a non-null `ngx_shm_zone_t*` that nginx
         // owns in the conf pool; writing its `init`/`data` fields is sound, and
         // `self` outlives the zone (it lives in the same conf pool).
         unsafe {
             (*zone).init = Some(shm::otel_shm_zone_init);
-            (*zone).data = ptr::from_mut(self).cast();
+            // A1b: point data at ZoneInitData (was: MainConfig*).
+            // The reload-detection in otel_shm_zone_init only checks old_data.is_null()
+            // so the type change is transparent to reload semantics.
+            (*zone).data = ptr::from_mut(&mut self.metrics_zone_init_data).cast();
         }
 
         self.shm_zone = zone;
@@ -766,9 +826,9 @@ impl MainConfig {
         cf: *mut ngx_conf_t,
         module: *mut ngx_module_t,
     ) -> Result<(), Status> {
-        // A1: same provisional-sizing contract as `register_shm_zone`.
+        // A1b: reserve capacity for ncpu slots when worker_processes is UNSET.
         // SAFETY: `cf` is the valid non-null parse context at postconfiguration.
-        let n_workers: usize = unsafe { n_workers_from_cf(cf) }.unwrap_or(1);
+        let n_workers: usize = unsafe { n_workers_to_reserve(cf) };
 
         let cap = self.log_ring_cap();
         let zone_size = shm::logs_zone_size_for(n_workers, cap);
@@ -786,15 +846,17 @@ impl MainConfig {
             return Err(Status::NGX_ERROR);
         };
 
+        // A1b: fill ZoneInitData for the zone-init callback.
+        // SAFETY: `cf` is valid and non-null per the postconfiguration contract.
+        let cycle_addr = unsafe { (*cf).cycle as usize };
+        self.logs_zone_init_data = crate::shm::ZoneInitData { ring_cap: cap, cycle_addr };
+
         // SAFETY: `register_zone` returned a non-null `ngx_shm_zone_t*` owned by
-        // nginx in the conf pool; writing its `init`/`data` fields is sound. `cap`
-        // is stored as a tagged-pointer value (usize fits in a pointer).
+        // nginx in the conf pool; writing its `init`/`data` fields is sound.
         unsafe {
             (*zone).init = Some(shm::logs_shm_zone_init);
-            // Store `cap` as a tagged pointer in `zone.data` so the init
-            // callback can stamp it into every ring header without needing a
-            // MainConfig pointer (which would be stale after a reload).
-            (*zone).data = cap as *mut core::ffi::c_void;
+            // A1b: store ZoneInitData* instead of tagged cap.
+            (*zone).data = ptr::from_mut(&mut self.logs_zone_init_data).cast();
         }
 
         self.logs_shm_zone = zone;
@@ -810,9 +872,9 @@ impl MainConfig {
         cf: *mut ngx_conf_t,
         module: *mut ngx_module_t,
     ) -> Result<(), Status> {
-        // A1: same provisional-sizing contract as `register_shm_zone`.
+        // A1b: reserve capacity for ncpu slots when worker_processes is UNSET.
         // SAFETY: `cf` is the valid non-null parse context at postconfiguration.
-        let n_workers: usize = unsafe { n_workers_from_cf(cf) }.unwrap_or(1);
+        let n_workers: usize = unsafe { n_workers_to_reserve(cf) };
 
         let cap = shm::DEFAULT_SPAN_RING_CAP;
         let zone_size = shm::spans_zone_size_for(n_workers, cap);
@@ -829,10 +891,16 @@ impl MainConfig {
             return Err(Status::NGX_ERROR);
         };
 
+        // A1b: fill ZoneInitData for the zone-init callback.
+        // SAFETY: `cf` is valid and non-null per the postconfiguration contract.
+        let cycle_addr = unsafe { (*cf).cycle as usize };
+        self.spans_zone_init_data = crate::shm::ZoneInitData { ring_cap: cap, cycle_addr };
+
         // SAFETY: same contract as `register_logs_zone`.
         unsafe {
             (*zone).init = Some(shm::spans_shm_zone_init);
-            (*zone).data = cap as *mut core::ffi::c_void;
+            // A1b: store ZoneInitData* instead of tagged cap.
+            (*zone).data = ptr::from_mut(&mut self.spans_zone_init_data).cast();
         }
 
         self.spans_shm_zone = zone;

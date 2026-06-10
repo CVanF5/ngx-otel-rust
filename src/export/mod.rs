@@ -647,10 +647,24 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                     // points to a live `ngx_shm_zone_t` valid for the exporter's
                     // lifetime (cycle-pool allocated). The `&*` borrow does not
                     // escape this block, and `shm.size` is a plain field read.
-                    let n_workers = unsafe {
-                        let zone = &*amcf.logs_shm_zone;
-                        let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
-                        logs_n_workers_from_zone(avail, amcf.log_ring_cap())
+                    // A1b: use n_active_workers to drain only active slots; the
+                    // zone may be reserved for more (ncpu-headroom) but inactive
+                    // slots are OS-zeroed pages — scanning them faults RAM in.
+                    let n_workers = {
+                        use core::sync::atomic::Ordering;
+                        let n = amcf.n_active_workers.load(Ordering::Relaxed);
+                        if n > 0 {
+                            n
+                        } else {
+                            // Fallback for callers that did not go through check_zone_sizing.
+                            // SAFETY: amcf.logs_shm_zone is non-null when logs_shm_base()
+                            // returned Some above; `&*` and `shm.size` read do not escape.
+                            unsafe {
+                                let zone = &*amcf.logs_shm_zone;
+                                let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
+                                logs_n_workers_from_zone(avail, amcf.log_ring_cap())
+                            }
+                        }
                     };
                     // Pdata pipeline: wrap → process → encode → send (Step U2).
                     let mut logs_pd = Pdata::Logs(collect_log_records(
@@ -739,10 +753,21 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                 // points to a live `ngx_shm_zone_t` valid for the exporter's
                 // lifetime. The `&*` borrow does not escape this block, and
                 // `shm.size` is a plain field read.
-                let n_workers = unsafe {
-                    let zone = &*amcf.spans_shm_zone;
-                    let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
-                    spans_n_workers_from_zone(avail, DEFAULT_SPAN_RING_CAP)
+                // A1b: use n_active_workers (same rationale as logs above).
+                let n_workers = {
+                    use core::sync::atomic::Ordering;
+                    let n = amcf.n_active_workers.load(Ordering::Relaxed);
+                    if n > 0 {
+                        n
+                    } else {
+                        // SAFETY: amcf.spans_shm_zone is non-null when spans_shm_base()
+                        // returned Some above; `&*` and `shm.size` read do not escape.
+                        unsafe {
+                            let zone = &*amcf.spans_shm_zone;
+                            let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
+                            spans_n_workers_from_zone(avail, DEFAULT_SPAN_RING_CAP)
+                        }
+                    }
                 };
                 // Pdata pipeline: wrap → process → encode → send (Step U2).
                 let mut spans_pd = Pdata::Spans(collect_span_records(amcf, spans_base, n_workers));
@@ -1132,14 +1157,23 @@ async fn graceful_drain(
     // Final freshly-collected logs batch (access + error rings).
     if amcf.is_access_sample_enabled() || amcf.error_log_enabled {
         if let Some(logs_base) = amcf.logs_shm_base() {
-            // SAFETY: `logs_shm_base()` returned `Some`, so the logs zone is
-            // registered and mapped; `amcf.logs_shm_zone` points to a live
-            // `ngx_shm_zone_t` valid for the exporter's lifetime. The `&*`
-            // borrow does not escape this block; `shm.size` is a plain read.
-            let n_workers = unsafe {
-                let zone = &*amcf.logs_shm_zone;
-                let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
-                logs_n_workers_from_zone(avail, amcf.log_ring_cap())
+            // A1b: use n_active_workers (same rationale as export path).
+            let n_workers = {
+                use core::sync::atomic::Ordering;
+                let n = amcf.n_active_workers.load(Ordering::Relaxed);
+                if n > 0 {
+                    n
+                } else {
+                    // SAFETY: `logs_shm_base()` returned `Some`, so the logs zone is
+                    // registered and mapped; `amcf.logs_shm_zone` points to a live
+                    // `ngx_shm_zone_t` valid for the exporter's lifetime. The `&*`
+                    // borrow does not escape this block; `shm.size` is a plain read.
+                    unsafe {
+                        let zone = &*amcf.logs_shm_zone;
+                        let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
+                        logs_n_workers_from_zone(avail, amcf.log_ring_cap())
+                    }
+                }
             };
             // Pdata pipeline: wrap → process → encode → send (Step U2).
             let mut logs_pd =
@@ -1212,14 +1246,23 @@ async fn graceful_drain(
 
     // Final freshly-collected spans batch (Pdata pipeline, Step U2).
     if let Some(spans_base) = amcf.spans_shm_base() {
-        // SAFETY: `spans_shm_base()` returned `Some`, so the spans zone is
-        // registered and mapped; `amcf.spans_shm_zone` points to a live
-        // `ngx_shm_zone_t` valid for the exporter's lifetime. The `&*`
-        // borrow does not escape this block; `shm.size` is a plain read.
-        let n_workers = unsafe {
-            let zone = &*amcf.spans_shm_zone;
-            let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
-            spans_n_workers_from_zone(avail, DEFAULT_SPAN_RING_CAP)
+        // A1b: use n_active_workers (same rationale as export path).
+        let n_workers = {
+            use core::sync::atomic::Ordering;
+            let n = amcf.n_active_workers.load(Ordering::Relaxed);
+            if n > 0 {
+                n
+            } else {
+                // SAFETY: `spans_shm_base()` returned `Some`, so the spans zone is
+                // registered and mapped; `amcf.spans_shm_zone` points to a live
+                // `ngx_shm_zone_t` valid for the exporter's lifetime. The `&*`
+                // borrow does not escape this block; `shm.size` is a plain read.
+                unsafe {
+                    let zone = &*amcf.spans_shm_zone;
+                    let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
+                    spans_n_workers_from_zone(avail, DEFAULT_SPAN_RING_CAP)
+                }
+            }
         };
         let mut spans_pd = Pdata::Spans(collect_span_records(amcf, spans_base, n_workers));
         processor.process(&mut spans_pd);

@@ -23,7 +23,10 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::{mem, ptr};
 
-use nginx_sys::{ngx_conf_t, ngx_int_t, ngx_shared_memory_add, ngx_shm_zone_t, ngx_slab_pool_t};
+use nginx_sys::{
+    ngx_conf_t, ngx_core_conf_t, ngx_cycle_t, ngx_int_t, ngx_shared_memory_add, ngx_shm_zone_t,
+    ngx_slab_pool_t,
+};
 use ngx::core::Status;
 
 use crate::logs::access::{SampledRequest, MAX_URL_PATH, MAX_USER_AGENT};
@@ -817,6 +820,53 @@ pub unsafe fn register_zone(
     }
 }
 
+// ── A1b: zone-init data + active-worker helper ───────────────────────────────
+
+/// Data threaded through `ngx_shm_zone_t.data` to our zone-init callbacks.
+///
+/// Stored as a field of `MainConfig` (nginx config pool) so the pointer in
+/// `zone->data` stays valid from postconfiguration through the zone-init
+/// callbacks (which nginx fires from within the same `ngx_init_cycle` call).
+pub struct ZoneInitData {
+    /// Per-worker ring capacity in bytes.  `0` for the metrics zone (no ring).
+    pub ring_cap: usize,
+    /// Address of the `ngx_cycle_t` being built, stored as `usize` so
+    /// `ZoneInitData` remains `Send` without an unsafe impl.
+    /// Cast to `*const ngx_cycle_t` before use.
+    pub cycle_addr: usize,
+}
+
+/// Read the final `worker_processes` from a `ngx_cycle_t`.
+///
+/// Called from zone-init callbacks after `ngx_core_module_init_conf` has run,
+/// so `worker_processes` is guaranteed ≥ 1 by that point.  Returns `None`
+/// only on unexpected failures (null cycle, unreachable conf_ctx, etc.).
+///
+/// # Safety
+/// `cycle` must be a valid, non-null `ngx_cycle_t` pointer (or null — null
+/// is handled gracefully by returning `None`).
+unsafe fn wp_from_cycle(cycle: *const ngx_cycle_t) -> Option<usize> {
+    if cycle.is_null() {
+        return None;
+    }
+    // SAFETY: caller guarantees `cycle` is valid.
+    let cycle_ref = unsafe { &*cycle };
+    // SAFETY: nginx fills conf_ctx before zone-init callbacks fire.
+    let raw_conf: *mut *mut *mut core::ffi::c_void =
+        unsafe { *cycle_ref.conf_ctx.add(nginx_sys::ngx_core_module.index) };
+    let core_conf = raw_conf.cast::<ngx_core_conf_t>();
+    if core_conf.is_null() {
+        return None;
+    }
+    // SAFETY: core_conf is non-null per above check.
+    let wp = unsafe { (*core_conf).worker_processes };
+    if wp >= 1 {
+        Some(wp as usize)
+    } else {
+        None
+    }
+}
+
 /// Zone initialisation callback, called by nginx on each (re)start.
 ///
 /// # Safety
@@ -844,25 +894,43 @@ pub unsafe extern "C" fn otel_shm_zone_init(
         return Status::NGX_OK.into();
     }
 
-    // Fresh start: zero only the WorkerSlots area — never the slab-pool header.
-    // Explicit zeroing (rather than relying on the OS zero-filling fresh mmap
-    // pages) because the same zone can be reused — e.g. across a binary upgrade
-    // where `old_data` is null yet the pages are recycled.
+    // A1b: zero only the ACTIVE WorkerSlots — reserved-but-inactive slots
+    // from the ncpu-headroom reservation are OS-zeroed anonymous pages and
+    // must not be touched here (doing so would fault them in, wasting RAM).
     // SAFETY: nginx invokes this callback with a valid, non-null
     // `ngx_shm_zone_t` (fn contract); the reference does not outlive the call.
     let zone = unsafe { &*shm_zone };
     let offset = data_offset();
-    if zone.shm.size > offset {
-        // SAFETY: `offset == data_offset()` and we checked `zone.shm.size >
-        // offset`, so `addr + offset` is within the mapped zone.
-        let base: *mut u8 = unsafe { zone.shm.addr.cast::<u8>().add(offset) };
-        let size = zone.shm.size - offset;
-        // SAFETY: `base` is within the zone and `size = zone.shm.size - offset`
-        // bytes remain after it, so the zero-fill stays in-bounds. It clears only
-        // the WorkerSlots area, never the slab-pool header in [0, offset) (see
-        // the doc above — zeroing it would crash the master).
-        unsafe { ptr::write_bytes(base, 0, size) };
+    if zone.shm.size <= offset {
+        return Status::NGX_OK.into();
     }
+
+    // Derive the active worker count from the ZoneInitData stored in zone->data.
+    // A1b: `cycle_addr` was written at postconfiguration from `cf->cycle`; the
+    // same cycle pointer remains valid through the zone-init call (same
+    // ngx_init_cycle invocation).
+    // SAFETY: zone->data is either null (legacy / test) or points at a `ZoneInitData`
+    // stored in amcf (nginx conf pool, which outlives this zone-init callback).
+    let n_active = if let Some(zid) = unsafe { zone.data.cast::<ZoneInitData>().as_ref() } {
+        let cycle = zid.cycle_addr as *const ngx_cycle_t;
+        // SAFETY: cycle is non-null (set from cf->cycle, which is non-null at
+        // postconfiguration) and valid for the duration of ngx_init_cycle.
+        unsafe { wp_from_cycle(cycle) }.unwrap_or(1)
+    } else {
+        1
+    };
+
+    let slot_bytes = mem::size_of::<WorkerSlots>();
+    let n_reserved = (zone.shm.size - offset) / slot_bytes;
+    let n_init = n_active.min(n_reserved).max(1);
+
+    // SAFETY: `offset == data_offset()` and we checked `zone.shm.size > offset`.
+    let base: *mut u8 = unsafe { zone.shm.addr.cast::<u8>().add(offset) };
+    let size = n_init * slot_bytes;
+    // SAFETY: `base` starts past the slab-pool header; `size = n_init * slot_bytes`
+    // with `n_init ≤ n_reserved = (zone.shm.size - offset) / slot_bytes`, so the
+    // write stays within the mapped zone.
+    unsafe { ptr::write_bytes(base, 0, size) };
 
     Status::NGX_OK.into()
 }
@@ -1062,34 +1130,44 @@ pub unsafe extern "C" fn logs_shm_zone_init(
     // `addr + offset` is within the mapped zone (past the slab-pool header).
     let base: *mut u8 = unsafe { zone.shm.addr.cast::<u8>().add(offset) };
 
-    // Recover `cap` from the tagged-pointer stored in zone.data.
-    // `register_logs_zone` stores `cap` as `usize` → `*mut c_void`.
-    let cap = zone.data as usize;
+    // A1b: recover cap and cycle from ZoneInitData stored in zone->data.
+    // `register_logs_zone` now stores `*mut ZoneInitData` instead of a tagged cap.
+    // SAFETY: zone->data was written by `register_logs_zone` to point at a
+    // `ZoneInitData` in amcf (nginx conf pool, outlives this callback); or null
+    // for a legacy caller — handled by the `else` branch.
+    let Some(zid) = (unsafe { zone.data.cast::<ZoneInitData>().as_ref() }) else {
+        return Status::NGX_OK.into();
+    };
+    let cap = zid.ring_cap;
+    let cycle = zid.cycle_addr as *const ngx_cycle_t;
+
     let slot_sz = logs_slot_size(cap);
     if slot_sz == 0 {
         return Status::NGX_OK.into();
     }
 
-    // Zero the whole slot area first.
-    // SAFETY: `base` is within the zone and exactly `zone_data_bytes` bytes
-    // remain after it, so the zero-fill stays in-bounds (and never touches the
-    // slab-pool header in [0, offset)).
-    unsafe { ptr::write_bytes(base, 0, zone_data_bytes) };
+    let n_reserved = zone_data_bytes / slot_sz;
+    // A1b: only initialise ACTIVE worker slots — reserved-but-inactive slots
+    // are OS-zeroed anonymous pages and must not be touched here.
+    // `wp_from_cycle` returns the final value after `ngx_core_module_init_conf`.
+    // SAFETY: cycle is non-null (set from cf->cycle at postconfiguration) and
+    // valid for the duration of this ngx_init_cycle call.
+    let n_active = unsafe { wp_from_cycle(cycle) }.unwrap_or(n_reserved).min(n_reserved).max(1);
 
-    // Then stamp `cap` into every ring header so push/pop know the capacity.
-    let n_workers = (zone_data_bytes / slot_sz).max(1);
-    for w in 0..n_workers {
+    // Zero the ACTIVE slot area only.
+    // SAFETY: `base` is past the slab-pool header; `n_active * slot_sz ≤ zone_data_bytes`.
+    unsafe { ptr::write_bytes(base, 0, n_active * slot_sz) };
+
+    // Stamp `cap` into the ring headers of active slots only.
+    for w in 0..n_active {
         let slot_off = w * slot_sz;
         // Access ring header.
-        // SAFETY: `slot_off = w * slot_sz` with `w < n_workers = zone_data_bytes
-        // / slot_sz`, so `base + slot_off` is within the just-zeroed slot area;
-        // the header type lives at the start of each slot.
+        // SAFETY: `slot_off = w * slot_sz` with `w < n_active ≤ n_reserved`,
+        // so `base + slot_off` is within the just-zeroed active slot area.
         let access_hdr = unsafe { base.add(slot_off).cast::<LogsWorkerRingHeader>() };
-        // SAFETY: `access_hdr` points to a valid (just-zeroed) header; this runs
-        // at zone-init before any worker forks (single exclusive writer), and
-        // `cap` is an `AtomicU64`.
+        // SAFETY: valid just-zeroed header; exclusive init-time write.
         unsafe { (*access_hdr).cap.store(cap as u64, Ordering::Relaxed) };
-        // Error ring header.
+        // Error ring header (immediately follows the access ring payload).
         // SAFETY: the error header sits one `ring_size_bytes(cap)` past the
         // access header, still within the same in-bounds slot.
         let error_hdr =
@@ -1193,23 +1271,35 @@ pub unsafe extern "C" fn spans_shm_zone_init(
     // bytes, so `addr + offset` is within the zone.
     let base: *mut u8 = unsafe { zone.shm.addr.cast::<u8>().add(offset) };
 
-    // Recover `cap` from the tagged pointer stored at zone registration.
-    let cap = zone.data as usize;
+    // A1b: recover cap and cycle from ZoneInitData stored in zone->data.
+    // SAFETY: zone->data was written by `register_spans_zone` to point at a
+    // `ZoneInitData` in amcf (nginx conf pool, outlives this callback); or null
+    // for a legacy caller — handled by the `else` branch.
+    let Some(zid) = (unsafe { zone.data.cast::<ZoneInitData>().as_ref() }) else {
+        return Status::NGX_OK.into();
+    };
+    let cap = zid.ring_cap;
+    let cycle = zid.cycle_addr as *const ngx_cycle_t;
+
     let slot_sz = spans_slot_size(cap);
     if slot_sz == 0 {
         return Status::NGX_OK.into();
     }
 
-    // Zero the whole slot area.
-    // SAFETY: `base` to `base + zone_data_bytes` is within the mapped zone.
-    unsafe { ptr::write_bytes(base, 0, zone_data_bytes) };
+    let n_reserved = zone_data_bytes / slot_sz;
+    // A1b: only initialise ACTIVE worker slots — same rationale as logs_shm_zone_init.
+    // SAFETY: cycle is non-null and valid (set from cf->cycle at postconfiguration).
+    let n_active = unsafe { wp_from_cycle(cycle) }.unwrap_or(n_reserved).min(n_reserved).max(1);
 
-    // Stamp `cap` into every ring header.
-    let n_workers = (zone_data_bytes / slot_sz).max(1);
-    for w in 0..n_workers {
+    // Zero the ACTIVE slot area only.
+    // SAFETY: `base` is past the slab-pool header; `n_active * slot_sz ≤ zone_data_bytes`.
+    unsafe { ptr::write_bytes(base, 0, n_active * slot_sz) };
+
+    // Stamp `cap` into ring headers of active slots only.
+    for w in 0..n_active {
         let slot_off = w * slot_sz;
-        // SAFETY: `slot_off = w * slot_sz` with `w < n_workers`, so `base + slot_off`
-        // is within the just-zeroed slot area; the ring header lives at slot offset 0.
+        // SAFETY: `slot_off = w * slot_sz` with `w < n_active ≤ n_reserved`,
+        // so `base + slot_off` is within the just-zeroed active slot area.
         let hdr = unsafe { base.add(slot_off).cast::<LogsWorkerRingHeader>() };
         // SAFETY: valid just-zeroed header; exclusive init-time write.
         unsafe { (*hdr).cap.store(cap as u64, Ordering::Relaxed) };

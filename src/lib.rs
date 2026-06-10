@@ -215,17 +215,23 @@ unsafe fn worker_processes_from_cycle(cycle: *const nginx_sys::ngx_cycle_t) -> O
     }
 }
 
-/// A1 — Fail-fast zone-sizing validation.
+/// A1/A1b — Zone-sizing validation at init_module time.
 ///
-/// Compares every shm zone's registered size against what is required for the
-/// actual (post-parse, final) `worker_processes` value.  Returns `Err(())` and
-/// logs `NGX_LOG_EMERG` when any zone is undersized.
+/// Computes the RESERVED capacity (from each zone's registered size) and
+/// compares it against the ACTUAL (post-parse, final) `worker_processes`.
 ///
-/// This catches the case where `worker_processes N;` appears **after** the
-/// `http {}` block in nginx.conf.  In that position, postconfiguration sees
-/// `NGX_CONF_UNSET` (-1) and sizes all zones for 1 worker; `init_module` then
-/// runs with the final value and catches the mismatch here before any worker
-/// forks.
+/// - Normal case: actual_workers ≤ reserved → `amcf.n_active_workers` is set
+///   and the exporter uses it to drain only active slots.
+/// - Residual error case: actual_workers > reserved — this happens when an
+///   explicit large count appears after `http{}` on a box where ncpu < count.
+///   The operator gets a clear error and nginx refuses to start/reload.
+///
+/// A1b: zones are now sized for `max(ngx_ncpu, actual_workers)` at parse time,
+/// so the typical `worker_processes N;` after `http{}` succeeds as long as
+/// N ≤ ncpu.
+///
+/// `nginx -t` skips `init_module` (ngx_test_config is set, caller returns
+/// early), so this check does not apply during config-test runs.
 ///
 /// # Safety
 /// `cycle` and `amcf` must be valid non-null pointers.
@@ -233,49 +239,77 @@ unsafe fn check_zone_sizing(
     cycle: *mut nginx_sys::ngx_cycle_t,
     amcf: &crate::config::MainConfig,
 ) -> Result<(), ()> {
+    use core::sync::atomic::Ordering;
+
     // SAFETY: `cycle` is valid per the `unsafe fn` contract.
     let actual_workers = unsafe { worker_processes_from_cycle(cycle) }.unwrap_or(1);
 
-    // Helper: compare a zone pointer's registered size against a required size.
-    let check =
-        |zone_ptr: *mut nginx_sys::ngx_shm_zone_t, required: usize, _zone_label: &str| -> bool {
-            if zone_ptr.is_null() {
-                return true; // zone not registered — nothing to check
-            }
-            // SAFETY: zone_ptr is non-null per the check above; shm.size is set at
-            // ngx_shared_memory_add time and immutable thereafter.
-            let registered = unsafe { (*zone_ptr).shm.size };
-            registered >= required
-        };
-
-    let metrics_required = crate::shm::zone_size_for(actual_workers);
-    let metrics_ok = check(amcf.shm_zone, metrics_required, "metrics");
+    // Helper: derive the reserved capacity from the registered zone size.
+    let reserved_metrics = |zone_ptr: *mut nginx_sys::ngx_shm_zone_t| -> usize {
+        if zone_ptr.is_null() {
+            return usize::MAX; // not registered — no constraint
+        }
+        // SAFETY: zone_ptr non-null; shm.size is immutable after registration.
+        let size = unsafe { (*zone_ptr).shm.size };
+        crate::shm::n_workers_from_zone_size(size)
+    };
+    let reserved_logs = |zone_ptr: *mut nginx_sys::ngx_shm_zone_t, cap: usize| -> usize {
+        if zone_ptr.is_null() {
+            return usize::MAX;
+        }
+        // SAFETY: zone_ptr is non-null per the guard above; shm.size is written
+        // at zone registration and immutable thereafter.
+        let size = unsafe { (*zone_ptr).shm.size };
+        let avail = size.saturating_sub(crate::shm::data_offset());
+        let slot = crate::shm::logs_slot_size(cap);
+        avail.checked_div(slot).unwrap_or(usize::MAX)
+    };
+    let reserved_spans = |zone_ptr: *mut nginx_sys::ngx_shm_zone_t, cap: usize| -> usize {
+        if zone_ptr.is_null() {
+            return usize::MAX;
+        }
+        // SAFETY: zone_ptr is non-null per the guard above; shm.size is written
+        // at zone registration and immutable thereafter.
+        let size = unsafe { (*zone_ptr).shm.size };
+        let avail = size.saturating_sub(crate::shm::data_offset());
+        let slot = crate::shm::spans_slot_size(cap);
+        avail.checked_div(slot).unwrap_or(usize::MAX)
+    };
 
     let logs_cap = amcf.log_ring_cap();
-    let logs_required = crate::shm::logs_zone_size_for(actual_workers, logs_cap);
-    let logs_ok = check(amcf.logs_shm_zone, logs_required, "logs");
-
     let spans_cap = crate::shm::DEFAULT_SPAN_RING_CAP;
-    let spans_required = crate::shm::spans_zone_size_for(actual_workers, spans_cap);
-    let spans_ok = check(amcf.spans_shm_zone, spans_required, "spans");
 
-    if metrics_ok && logs_ok && spans_ok {
+    let res_metrics = reserved_metrics(amcf.shm_zone);
+    let res_logs = reserved_logs(amcf.logs_shm_zone, logs_cap);
+    let res_spans = reserved_spans(amcf.spans_shm_zone, spans_cap);
+
+    // The minimum reserved capacity across all registered zones.
+    let min_reserved = res_metrics.min(res_logs).min(res_spans);
+
+    if actual_workers <= min_reserved {
+        // All zones have sufficient capacity.  Record the active count so the
+        // exporter drains only active slots (not reserved-but-inactive ones).
+        // SAFETY: amcf is valid per the `unsafe fn` contract.
+        amcf.n_active_workers.store(actual_workers, Ordering::Relaxed);
         return Ok(());
     }
 
-    // At least one zone is undersized — this is the hostile-ordering case.
-    // Log EMERG and refuse to start so the operator gets a clear message
-    // instead of silent memory corruption.
-    // SAFETY: `cycle` is valid per the `unsafe fn` contract; `.log` is a
-    // non-null `ngx_log_t*` nginx initialises before calling any module hook.
+    // actual_workers > reserved — the residual A1b error case.
+    // This happens when an explicit large count (e.g. `worker_processes 64`)
+    // appears AFTER `http{}` on a box where ncpu (= reserved capacity) < 64.
+    // Refuse to start so the operator gets a clear message.
+    //
+    // SAFETY: `cycle` is valid; `.log` is non-null.
     let log = unsafe { (*cycle).log };
     ngx::ngx_log_error!(
         nginx_sys::NGX_LOG_EMERG,
         log,
-        "otel: shm zones were sized for 1 worker but worker_processes={} — \
-         move the worker_processes directive BEFORE the http{{}} block and reload; \
-         refusing to start to prevent out-of-zone writes",
-        actual_workers
+        "otel: shm zones were reserved for {} worker slots (ngx_ncpu at parse time) \
+         but worker_processes={}; move the worker_processes directive BEFORE the \
+         http{{}} block, or reduce it to ≤ {}, and reload",
+        min_reserved,
+        actual_workers,
+        min_reserved
     );
     Err(())
 }
