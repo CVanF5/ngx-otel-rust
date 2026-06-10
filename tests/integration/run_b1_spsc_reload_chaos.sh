@@ -84,9 +84,11 @@ if [[ -n "${CARGO_BUILD_TARGET:-}" ]]; then
 else
     CARGO_MODULE="${CRATE_DIR}/target/release/libngx_http_otel_module.${MODULE_EXT}"
 fi
-# Prefer CARGO_BUILD_TARGET module (TSAN/ASan harness), then objs-release,
-# then cargo/release as fallback.
-if [[ -n "${CARGO_BUILD_TARGET:-}" && -f "${CARGO_MODULE}" ]]; then
+# MODULE_PATH may be explicitly passed (e.g. test-support build for mutation evidence).
+# If not set, resolve: CARGO_BUILD_TARGET module → objs-release → cargo/release fallback.
+if [[ -n "${MODULE_PATH:-}" ]]; then
+    : # use the caller-supplied path as-is
+elif [[ -n "${CARGO_BUILD_TARGET:-}" && -f "${CARGO_MODULE}" ]]; then
     MODULE_PATH="${CARGO_MODULE}"
 elif [[ -f "${RELEASE_MODULE}" ]]; then
     MODULE_PATH="${RELEASE_MODULE}"

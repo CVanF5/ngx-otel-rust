@@ -536,6 +536,21 @@ pub async fn export_loop(amcf: &'static MainConfig) {
     // safe across the overlap window (the valid-dedup case from B1).
     let mut periodic_abdicated = false;
 
+    // test-support: QUIT-DEFER hook ──────────────────────────────────────────
+    // NGX_OTEL_QUIT_DEFER_TICKS delays ngx_quit processing for N × 250 ms
+    // periodic ticks, keeping the old exporter's ring drains alive during the
+    // overlap window with a newly-started successor exporter.  Used by
+    // mutation-evidence runs to create a deterministic SPSC race window:
+    //   fixed code  + defer → abdicates within one tick (successor_announced
+    //               returns true) → chaos PASSES
+    //   mutated code + defer → both exporters drain the same rings for N ticks
+    //               → duplicates / conservation FAIL
+    // This variable is only compiled when the "test-support" feature is
+    // enabled — zero production code change.
+    #[cfg(feature = "test-support")]
+    let mut quit_defer_ticks: u32 =
+        std::env::var("NGX_OTEL_QUIT_DEFER_TICKS").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+
     // Capture the master (parent) PID once at export loop startup.
     // nginx_sys::ngx_parent is set by ngx_spawn_process to the master's PID
     // before fork, so in the exporter child it always equals the master PID.
@@ -613,26 +628,42 @@ pub async fn export_loop(amcf: &'static MainConfig) {
         // the master's NGX_CMD_QUIT channel handler and read here in the
         // single-threaded exporter process; a plain read of it is well-defined.
         if unsafe { nginx_sys::ngx_quit } != 0 {
-            ngx::ngx_log_error!(
-                NGX_LOG_NOTICE,
-                log.as_ptr(),
-                "otel export: ngx_quit set, starting graceful drain"
-            );
-            graceful_drain(
-                &mut transport,
-                &mut DrainQueues {
-                    metrics: &mut retry_queue,
-                    logs: &mut logs_retry_queue,
-                    spans: &mut spans_retry_queue,
-                },
-                amcf,
-                worker_start_ns,
-                &processor,
-                my_gen,
-            )
-            .await;
-            EXPORT_LOOP_DONE.store(true, Ordering::Release);
-            return;
+            // test-support: QUIT-DEFER — if ticks remain, fall through to the
+            // inner sleep loop so periodic ring drains keep running during the
+            // overlap window.  Compiled away in production builds.
+            let should_drain_now: bool = {
+                #[cfg(feature = "test-support")]
+                {
+                    quit_defer_ticks == 0
+                }
+                #[cfg(not(feature = "test-support"))]
+                {
+                    true
+                }
+            };
+            if should_drain_now {
+                ngx::ngx_log_error!(
+                    NGX_LOG_NOTICE,
+                    log.as_ptr(),
+                    "otel export: ngx_quit set, starting graceful drain"
+                );
+                graceful_drain(
+                    &mut transport,
+                    &mut DrainQueues {
+                        metrics: &mut retry_queue,
+                        logs: &mut logs_retry_queue,
+                        spans: &mut spans_retry_queue,
+                    },
+                    amcf,
+                    worker_start_ns,
+                    &processor,
+                    my_gen,
+                )
+                .await;
+                EXPORT_LOOP_DONE.store(true, Ordering::Release);
+                return;
+            }
+            // else (test-support with ticks > 0): fall through to inner loop
         }
 
         // ── Chunked sleep for the configured export interval ──────────────────
@@ -672,8 +703,22 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             // here in the single-threaded exporter process, the read is
             // well-defined.
             if unsafe { nginx_sys::ngx_quit } != 0 {
-                shutdown_during_sleep = ShutdownKind::Exiting;
-                break;
+                // test-support: QUIT-DEFER — consume one tick; the periodic
+                // drain code below the check still runs this sub-interval.
+                // When ticks reach zero we fall through to the normal exit.
+                #[cfg(feature = "test-support")]
+                if quit_defer_ticks > 0 {
+                    quit_defer_ticks -= 1;
+                    // Do NOT break — let periodic drain fire this tick.
+                } else {
+                    shutdown_during_sleep = ShutdownKind::Exiting;
+                    break;
+                }
+                #[cfg(not(feature = "test-support"))]
+                {
+                    shutdown_during_sleep = ShutdownKind::Exiting;
+                    break;
+                }
             }
 
             // B1-FU1: Check for successor before periodic ring pops.
@@ -915,6 +960,16 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             // single-threaded exporter process — a plain read is well-defined.
             || unsafe { nginx_sys::ngx_quit } != 0
         {
+            // test-support: QUIT-DEFER — if the inner loop exhausted the
+            // full sleep interval (slept >= interval, no break) while quit
+            // was set and ticks were still being consumed, we need to
+            // continue the outer loop for another round of periodic drains.
+            #[cfg(feature = "test-support")]
+            if quit_defer_ticks > 0 {
+                // shutdown_during_sleep is re-declared at the top of each
+                // outer loop iteration, so no reset needed — just continue.
+                continue; // outer loop: back to top
+            }
             ngx::ngx_log_error!(
                 NGX_LOG_NOTICE,
                 log.as_ptr(),
