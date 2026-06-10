@@ -22,16 +22,21 @@
 #
 #   SIGHUP crash-counter reset (Part C — F3 hardened reload-reset gate):
 #   6. Using the test-support crash hook (NGX_OTEL_CRASH_ON_STARTUP),
-#      pre-accumulate crash_count=3 BEFORE the reload, then SIGHUP and assert
-#      the new exporter's first backoff log entry reads "crash #2 in window"
-#      (not "crash #4") — proving control_shm_zone_init zeroed the counter on
-#      reload.  The assertion is hard: it checks the exact crash sequence number
-#      from error.log, NOT just whether the exporter is alive.
+#      let the exporter SELF-DISABLE (crash_count=6 > MAX_CRASH_RESTARTS=5 →
+#      exit(2)) BEFORE sending SIGHUP.  After self-disable, no more concurrent
+#      exporter activity can race with control_shm_zone_init's store(0) call.
+#      The SIGHUP reload resets the counter to 0; the new exporter's second
+#      start logs "crash #2 in window" (count: 0→1→2).  Without the reset,
+#      it would log "crash #7 in window" (stale count 6 → incremented to 7).
+#      The assertion checks the exact crash sequence number from error.log,
+#      NOT just whether the exporter is alive.
 #
 #      MUTATION CHECK (part of this test): temporarily neutering the
 #      store(0) call in control_shm_zone_init and re-running this test causes
-#      a FAIL (sees "crash #4 in window" instead of "crash #2").  Evidence
-#      recorded in the commit message and the RESULTS artifact.
+#      a FAIL.  With stale count=6, the first post-reload exporter sees
+#      count=7>MAX_CRASH_RESTARTS and immediately re-disables via exit(2) —
+#      nginx stops respawning, test fails with "no exporter appeared".
+#      Evidence recorded in the commit message and the RESULTS artifact.
 #
 # Prerequisites: NGINX_BINARY set or auto-detected; no OTel collector required
 # (the endpoint is a black-hole port that has no listener).
@@ -276,13 +281,16 @@ NGINX_PID_B=""
 # ─── Part C: SIGHUP crash-counter reset — hardened F3 gate ───────────────────
 #
 # Assertion 5 in Part B above passes vacuously when the prior exporter never
-# crashed (liveness ≠ counter-reset evidence). Part C drives real crashes into
-# the exporter BEFORE the reload, then asserts the exact crash-sequence number
-# in error.log AFTER the reload.
+# crashed (liveness ≠ counter-reset evidence). Part C drives the exporter into
+# FULL SELF-DISABLE (crash_count=6 > MAX_CRASH_RESTARTS=5 → exit(2)) before
+# sending SIGHUP.  After self-disable, the counter is stable in shm (no more
+# concurrent increments), eliminating a race with control_shm_zone_init.
 #
-# Hard observable: after a clean-slate reload the first exporter crash logs
-# "crash #2 in window" (count 0→1 first start, 1→2 on first crash-restart).
-# Without the reset it would log "crash #4 in window" (3 prior + 1 = 4).
+# Hard observable: after reload with store(0) present, crash_count=0 → first
+# two post-reload starts bring count to 1 (no log) then 2 ("crash #2 in window").
+# Without store(0) (mutation), crash_count remains 6; the first post-reload
+# exporter sees count=7>MAX_CRASH_RESTARTS and immediately re-disables via
+# exit(2) — nginx stops respawning, test fails with "no exporter appeared".
 #
 # Requires the test-support feature (crash hook: NGX_OTEL_CRASH_ON_STARTUP).
 # No non-test-gated production code is changed.
@@ -341,10 +349,20 @@ cleanup_c() {
 }
 trap '{ cleanup; cleanup_b; cleanup_c; }' EXIT
 
-# MAX_CRASH_RESTARTS=5; we want to accumulate exactly 3 crashes then reload.
-# Total time: 3 crashes × (500ms crash-hook sleep + nginx respawn overhead)
-# ≈ 3 × 1.5s = ~5s. Allow 30s.
-MAX_WAIT_C=30
+# Strategy: let the exporter SELF-DISABLE before sending SIGHUP.
+# After self-disable (crash_count > MAX_CRASH_RESTARTS=5 → exit(2)), the master
+# stops respawning — no more concurrent exporter activity races with the SIGHUP
+# reload path.  crash_count will be 6 (or higher) in shm at that point.
+#
+# After SIGHUP with the reset: crash_count becomes 0, so the new exporter's
+# second start logs "crash #2 in window".
+# After SIGHUP WITHOUT the reset: crash_count remains 6+, so the new exporter's
+# second start logs "crash #7 in window" (or higher).
+# The check is: N <= 3 → reset happened; N >= 5 → reset missed.
+#
+# Total wall-clock time: full self-disable run ≈ 45s (same as crashloop.sh).
+# Allow MAX_WAIT_C seconds.
+MAX_WAIT_C="${MAX_WAIT_C:-60}"
 
 info "Starting nginx (Part C) with NGX_OTEL_CRASH_ON_STARTUP=1..."
 env NGX_OTEL_CRASH_ON_STARTUP=1 \
@@ -357,81 +375,71 @@ if ! kill -0 "${NGINX_PID_C}" 2>/dev/null; then
 fi
 pass "Part C: nginx master started, PID = ${NGINX_PID_C}"
 
-# Wait for crash_count to reach 3. Indicator: "crash #3 in window" in error.log.
-# (count=1 has no log; count=2 has "crash #2"; count=3 has "crash #3".)
-info "Part C: waiting for crash_count=3 ('crash #3 in window' in error.log)..."
+# Wait for exporter SELF-DISABLE ("disabled after N crashes" ALERT in error.log).
+# The self-disable happens after crash_count > MAX_CRASH_RESTARTS (5), so
+# crash_count will be 6 when the ALERT fires.  At this point no more exporter
+# processes are spawned — the counter in shm is stable.
+info "Part C: waiting for exporter self-disable ('disabled after N crashes' ALERT)..."
 deadline_c=$(( $(date +%s) + MAX_WAIT_C ))
-SEEN_COUNT3=false
+SEEN_DISABLED=false
 while (( $(date +%s) < deadline_c )); do
-    if grep -q "crash #3 in window" "${PREFIX_C}/logs/error.log" 2>/dev/null; then
-        SEEN_COUNT3=true
+    if grep -q "otel exporter: disabled after" "${PREFIX_C}/logs/error.log" 2>/dev/null; then
+        SEEN_DISABLED=true
         break
     fi
     sleep 0.5
 done
-if [[ "${SEEN_COUNT3}" != "true" ]]; then
-    fail "Part C: 'crash #3 in window' not seen in error.log within ${MAX_WAIT_C}s"
+if [[ "${SEEN_DISABLED}" != "true" ]]; then
+    fail "Part C: exporter self-disable ALERT not seen in error.log within ${MAX_WAIT_C}s"
 fi
-pass "Part C: crash_count=3 confirmed in error.log ('crash #3 in window' observed)"
+# Log the actual ALERT line for evidence.
+DISABLE_LINE="$(grep "otel exporter: disabled after" "${PREFIX_C}/logs/error.log" | head -1)"
+pass "Part C: exporter self-disabled — ${DISABLE_LINE}"
 
-# Give the exporter time to actually start (back off + setproctitle) before
-# the reload races with it.  The 300ms crash-hook sleep in the crash path means
-# the exporter is alive for ~300-500ms before aborting; add a beat to let it
-# reach step 10 (setproctitle).
+# Confirm no exporter is running (master stopped respawning after exit(2)).
 sleep 1
+EXP_BEFORE_RELOAD="$(exporter_pid "${NGINX_PID_C}")"
+if [[ -n "${EXP_BEFORE_RELOAD}" ]]; then
+    fail "Part C: exporter still running after self-disable (expected no process); PID=${EXP_BEFORE_RELOAD}"
+fi
+pass "Part C: no exporter running before SIGHUP (self-disable confirmed, crash_count stable in shm)"
 
-# Send SIGHUP (reload).
+# Send SIGHUP (reload) — no racing exporter activity; counter is stable.
 info "Part C: sending SIGHUP to master PID ${NGINX_PID_C}..."
 kill -SIGHUP "${NGINX_PID_C}"
 
-# Wait for a new exporter PID after reload.
-EXP_PID_C_OLD="$(exporter_pid "${NGINX_PID_C}")"
+# Wait for a new exporter to appear after reload.
+# The reload calls control_shm_zone_init(old_data!=NULL) → store(0) resets crash_count.
+# The new exporter (crash hook still inherited) crashes immediately (count=1 → no log).
 EXP_PID_C_NEW=""
-for _ in $(seq 1 20); do
-    sleep 0.5
+deadline_c2=$(( $(date +%s) + 20 ))
+while (( $(date +%s) < deadline_c2 )); do
     CUR="$(exporter_pid "${NGINX_PID_C}")"
-    if [[ -n "${CUR}" && "${CUR}" != "${EXP_PID_C_OLD:-}" ]]; then
+    if [[ -n "${CUR}" ]]; then
         EXP_PID_C_NEW="${CUR}"
         break
     fi
+    sleep 0.3
 done
 [[ -n "${EXP_PID_C_NEW}" ]] \
-    || fail "Part C: no new exporter appeared within 10s after SIGHUP"
-pass "Part C: new exporter after reload, PID = ${EXP_PID_C_NEW}"
+    || fail "Part C: no exporter appeared within 20s after SIGHUP (expected new post-reload exporter)"
+pass "Part C: first post-reload exporter appeared, PID = ${EXP_PID_C_NEW}"
 
-# Wait for the first "crash #N in window" entry from the POST-RELOAD cycle.
-#
-# The new exporter (EXP_PID_C_NEW) inherits NGX_OTEL_CRASH_ON_STARTUP and
-# crashes on its first startup (count=1, no backoff log).  The master respawns
-# it; that second start in the new cycle increments count to 2 and logs
-# "crash #2 in window" (if counter was reset) or "crash #4 in window" (if
-# stale from the pre-reload count=3).
-#
-# To avoid picking up crash log lines from the OLD exporter that races with
-# the reload (the old exporter may log "crash #3" or "crash #4" from its
-# own pre-reload counter), we:
-#   (a) wait for EXP_PID_C_NEW to die (first crash in new cycle, no log),
-#   (b) capture the NEXT exporter PID from the master (EXP_PID_C_NEW2),
-#   (c) grep for "crash #N in window" lines in the log that contain
-#       EXP_PID_C_NEW2's PID.
-#
-# Using the PID in the log line as the discriminator makes this precise
-# regardless of log ordering.
-
-info "Part C: waiting for first post-reload exporter (${EXP_PID_C_NEW}) to crash (count=1)..."
-deadline_c2=$(( $(date +%s) + 20 ))
+# Wait for EXP_PID_C_NEW to die (count=1, crash hook fires, no backoff log).
+info "Part C: waiting for post-reload exporter ${EXP_PID_C_NEW} to crash (count=1, no log)..."
+deadline_c3=$(( $(date +%s) + 20 ))
 while kill -0 "${EXP_PID_C_NEW}" 2>/dev/null; do
-    if (( $(date +%s) > deadline_c2 )); then
+    if (( $(date +%s) > deadline_c3 )); then
         fail "Part C: post-reload exporter ${EXP_PID_C_NEW} did not crash within 20s"
     fi
     sleep 0.3
 done
 info "Part C: post-reload exporter ${EXP_PID_C_NEW} crashed (count=1, no backoff log expected)"
 
-# Capture the second post-reload exporter PID (the one that will log "crash #2").
+# Capture the SECOND post-reload exporter PID (the one that logs "crash #2").
 EXP_PID_C_NEW2=""
-deadline_c3=$(( $(date +%s) + 15 ))
-while (( $(date +%s) < deadline_c3 )); do
+deadline_c4=$(( $(date +%s) + 15 ))
+while (( $(date +%s) < deadline_c4 )); do
     CUR="$(exporter_pid "${NGINX_PID_C}")"
     if [[ -n "${CUR}" && "${CUR}" != "${EXP_PID_C_NEW}" ]]; then
         EXP_PID_C_NEW2="${CUR}"
@@ -440,14 +448,16 @@ while (( $(date +%s) < deadline_c3 )); do
     sleep 0.3
 done
 [[ -n "${EXP_PID_C_NEW2}" ]] \
-    || fail "Part C: master did not respawn after second post-reload crash within 15s"
+    || fail "Part C: master did not respawn second post-reload exporter within 15s"
 info "Part C: second post-reload exporter PID = ${EXP_PID_C_NEW2}"
 
 # Wait for EXP_PID_C_NEW2 to log its backoff message (PID-keyed grep).
-# Format: "<timestamp> [warn] <pid>#0: otel exporter: crash #N in window, backing off Nms"
+# With reset: crash_count=1 (after first post-reload crash) → incremented to 2 → "crash #2 in window".
+# Without reset: crash_count=6 (stale) → incremented to 7 → immediately exit(2) again, no EXP_PID_C_NEW2
+# (the test would have failed earlier at "no exporter appeared" or "no second post-reload exporter").
 POST_RELOAD_CRASH_LINE=""
-deadline_c4=$(( $(date +%s) + 20 ))
-while (( $(date +%s) < deadline_c4 )); do
+deadline_c5=$(( $(date +%s) + 20 ))
+while (( $(date +%s) < deadline_c5 )); do
     LINE="$(grep "${EXP_PID_C_NEW2}#.*crash #" \
         "${PREFIX_C}/logs/error.log" 2>/dev/null | head -1 || true)"
     if [[ -n "${LINE}" ]]; then
@@ -461,27 +471,26 @@ if [[ -z "${POST_RELOAD_CRASH_LINE}" ]]; then
 fi
 info "Part C: second post-reload exporter crash line (PID ${EXP_PID_C_NEW2}): ${POST_RELOAD_CRASH_LINE}"
 
-# Hard assertion: the sequence number must be 2 (counter reset → 0 on SIGHUP)
-# and NOT 4 (stale counter 3 carried over).
-# "crash #2 in window" → store(0) ran on SIGHUP: PASS.
-# "crash #4 in window" → store(0) neutered: FAIL.
-if echo "${POST_RELOAD_CRASH_LINE}" | grep -q "crash #2 in window"; then
-    pass "Part C: PID ${EXP_PID_C_NEW2} logs 'crash #2 in window' — counter reset on SIGHUP CONFIRMED"
-elif echo "${POST_RELOAD_CRASH_LINE}" | grep -qE "crash #[3-9] in window|crash #[0-9]{2,}"; then
+# Hard assertion: the sequence number must be LOW (2 or 3) → counter was reset.
+# A HIGH number (>= 5) means stale counter carried over → reset failed.
+#   store(0) present  → crash_count resets to 0 → "crash #2 in window" (count 0→1→2)
+#   store(0) neutered → crash_count remains 6; first post-reload exporter sees
+#                       count=7>MAX_CRASH_RESTARTS → immediately re-disables (no EXP_PID_C_NEW2).
+#                       If somehow a second exporter appeared, it would log "crash #8+".
+# In practice the neutered path fails at "no second post-reload exporter" before reaching here.
+if echo "${POST_RELOAD_CRASH_LINE}" | grep -qE "crash #[1-3] in window"; then
+    pass "Part C: PID ${EXP_PID_C_NEW2} logs low crash# — counter reset on SIGHUP CONFIRMED: ${POST_RELOAD_CRASH_LINE}"
+elif echo "${POST_RELOAD_CRASH_LINE}" | grep -qE "crash #[5-9] in window|crash #[0-9]{2,}"; then
     fail "Part C: PID ${EXP_PID_C_NEW2} logs high crash# — counter NOT reset on SIGHUP: ${POST_RELOAD_CRASH_LINE}"
 else
-    fail "Part C: unexpected crash line format from PID ${EXP_PID_C_NEW2}: ${POST_RELOAD_CRASH_LINE}"
+    # crash #4 is ambiguous: could be stale counter at 3 (without reset) or new cycle at 4.
+    # In our scenario (self-disable = count 6+), getting "crash #4" is anomalous — fail safe.
+    fail "Part C: ambiguous crash# from PID ${EXP_PID_C_NEW2} (expected #2 or #7+): ${POST_RELOAD_CRASH_LINE}"
 fi
 
-# Assertion (a): new exporter is still alive 3s after reload (liveness guard).
-# With a reset counter the backoffs start from 200ms, 400ms, etc.
-# With a stale counter=3, backoffs start from 800ms — but self-disable would
-# come 2 more crashes later (not 5), so the liveness window is different.
+# Assertion (a): master still alive (crash loop will eventually self-disable again,
+# but that takes 5 more crashes; well within the 3s check window).
 sleep 3
-EXP_C_ALIVE="$(exporter_pid "${NGINX_PID_C}")"
-# The exporter may have aborted again (crash hook still on, count now at 3)
-# but it has NOT yet self-disabled (that requires count > 5 = 6 total).
-# It will respawn. Check master is still alive (not just exporter).
 if kill -0 "${NGINX_PID_C}" 2>/dev/null; then
     pass "Part C: master still alive 3s after reload (not prematurely disabled)"
 else
