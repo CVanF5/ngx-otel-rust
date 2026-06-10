@@ -458,10 +458,14 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
                 // normally, so the export loop detects ngx_quit within at most
                 // SHUTDOWN_POLL_INTERVAL (250 ms) and runs graceful_drain.
                 //
-                // Q2 RESOLVED — option (a): on SIGHUP the old exporter races
-                // workers. Dedup via time_unix_nano (cumulative-counter model).
-                // Phase 2 (logs) reopens this when log-drain semantics force
-                // ordered handoff.
+                // B1 RESOLVED Q2: the old "dedup via time_unix_nano" approach was
+                // valid only for cumulative metrics and FALSE for log/span rings
+                // (concurrent pop_into races on read_offset with no CAS → garbage
+                // record lengths).  B1 fixes this via successor_gen abdication:
+                // the master writes successor_gen = N+1 before forking the new
+                // exporter; the old exporter checks it here and skips ring pops
+                // when a successor is present.  See graceful_drain in
+                // export/mod.rs for the abdication logic.
                 // Drive the event loop until the export loop signals it finished
                 // draining, or the backstop elapses. `ngx_process_events_and_timers`
                 // BLOCKS on epoll/kqueue (the same call as the main loop below) —
