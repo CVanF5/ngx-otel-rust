@@ -81,6 +81,17 @@ table in `WorkerSlots` (`src/shm.rs`).
   already baseline on restart.  The base-series (`by method × status × protocol`)
   and all global aggregate histograms carry over unchanged (their indices are
   config-independent).
+- **Client-abort behaviour (F2):** requests where nginx never sent response
+  headers (`headers_out.status == 0`) are **excluded from the base series**
+  (`http.server.request.duration`).  This covers port-scan SYN probes,
+  TLS-to-plaintext probes, and client disconnects that arrive before the
+  response status is set.  Per OTel HTTP semconv, `http.response.status_code`
+  is CONDITIONALLY REQUIRED only when a response was actually sent — it is
+  absent for aborted requests.  Counting status-0 as `5xx` (the prior
+  `StatusClass::from_status` catch-all) inflated server-error rates on any
+  environment exposed to port scans.  The `by_route` and `by_upstream`
+  histograms **do** record these requests — the request still consumed real
+  nginx resources regardless of the abort.
 - **Exemplars:** the base series attaches reservoir-sampled exemplars
   (value + `trace_id`/`span_id` + `filtered_attributes`) per combo, populated
   from the access-log sampling path (`otel_access_log_sample`).
