@@ -233,20 +233,22 @@ if [[ -n "${ASAN_CHAOS_SCRIPTS}" ]]; then
             run_b4_daemon_on_gen1.sh)
                 # B4: no special timeout override needed; daemon-on lifecycle
                 # test has its own internal timing (kill-9 + respawn checks).
-                bash "tests/integration/${s}" || rc=$?
-                if [[ "${rc:-0}" -ne 0 ]]; then
-                    log "${s}: NON-ZERO exit ${rc:-0} — continuing" >&2
-                    FAILED_SCRIPTS+=("${s}(rc=${rc:-0})")
+                B4_RC=0
+                bash "tests/integration/${s}" || B4_RC=$?
+                if [[ "${B4_RC}" -ne 0 ]]; then
+                    log "${s}: NON-ZERO exit ${B4_RC} — continuing" >&2
+                    FAILED_SCRIPTS+=("${s}(rc=${B4_RC})")
                 fi
                 ;;
             run_b1_spsc_reload_chaos.sh)
                 # B1-chaos: USE_SLOW_SINK=1 enables the Python slow-proxy (2s
                 # POST delay) to widen the SIGHUP overlap window so mutation (a)
                 # is reliable on Linux under ASan overhead.
-                USE_SLOW_SINK=1 bash "tests/integration/${s}" || rc=$?
-                if [[ "${rc:-0}" -ne 0 ]]; then
-                    log "${s}: NON-ZERO exit ${rc:-0} — continuing" >&2
-                    FAILED_SCRIPTS+=("${s}(rc=${rc:-0})")
+                B1_RC=0
+                USE_SLOW_SINK=1 bash "tests/integration/${s}" || B1_RC=$?
+                if [[ "${B1_RC}" -ne 0 ]]; then
+                    log "${s}: NON-ZERO exit ${B1_RC} — continuing" >&2
+                    FAILED_SCRIPTS+=("${s}(rc=${B1_RC})")
                 fi
                 ;;
             *)
