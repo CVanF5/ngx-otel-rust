@@ -774,7 +774,7 @@ pub unsafe fn worker_slots(base_addr: *mut u8, worker_id: usize) -> *mut WorkerS
 /// We therefore place our WorkerSlots array **after** the slab-pool header and
 /// never touch the first `data_offset()` bytes of the zone.
 #[inline]
-pub fn data_offset() -> usize {
+pub const fn data_offset() -> usize {
     mem::size_of::<ngx_slab_pool_t>()
 }
 
@@ -871,6 +871,35 @@ pub unsafe extern "C" fn otel_shm_zone_init(
 
 use crate::logs::ring::{ring_size_bytes, LogsWorkerRing, LogsWorkerRingHeader};
 
+// ── Compile-time alignment guards (A2) ───────────────────────────────────────
+//
+// The logs shm slot layout is:
+//   [0, ring_size_bytes(cap))                 — access ring header + payload
+//   [ring_size_bytes(cap), 2*rbs)             — error ring header + payload
+//   [2*ring_size_bytes(cap), 2*rbs+tbl)       — CoalesceSlot table
+//
+// `LogsWorkerRingHeader` contains four `AtomicU64` fields → alignment = 8 bytes.
+// `CoalesceSlot` contains an `AtomicU64` at offset 0 → alignment = 8 bytes.
+//
+// For both sub-structures to land at aligned addresses:
+//   1. RING_HEADER_SIZE % 8 == 0  (so header + 8-aligned cap → rbs % 8 == 0)
+//   2. coalesce_table_bytes() % 8 == 0  (so slot stride is 8-aligned)
+//   3. data_offset() % 8 == 0  (so slot 0 starts 8-aligned inside the mmap zone)
+//
+// cap % 8 == 0 is enforced at config-parse time by `cmd_set_log_ring_size`.
+const _: () = assert!(
+    crate::logs::ring::RING_HEADER_SIZE % 8 == 0,
+    "LogsWorkerRingHeader size must be a multiple of 8: error-ring header alignment depends on this",
+);
+const _: () = assert!(
+    crate::logs::coalesce::coalesce_table_bytes() % 8 == 0,
+    "coalesce table byte count must be a multiple of 8 for CoalesceSlot (AtomicU64) alignment",
+);
+const _: () = assert!(
+    data_offset() % 8 == 0,
+    "data_offset (= size_of::<ngx_slab_pool_t>()) must be 8-aligned so ring headers start aligned",
+);
+
 /// Bytes occupied by one worker's logs slot (access ring + error ring + coalescer table).
 ///
 /// Layout within a slot:
@@ -922,6 +951,10 @@ pub fn logs_n_workers_from_zone(zone_data_bytes: usize, cap: usize) -> usize {
 /// - The returned ring must not outlive the zone mapping.
 #[inline]
 pub unsafe fn logs_access_ring(base_addr: *mut u8, worker_id: usize, cap: usize) -> LogsWorkerRing {
+    // A2: cap must be a multiple of 8 so that ring headers and the coalescer
+    // table land at 8-byte-aligned addresses within the slot.  Enforced at
+    // config parse time by `cmd_set_log_ring_size`; catch stale callers here.
+    debug_assert_eq!(cap % 8, 0, "A2: ring cap must be a multiple of 8 for AtomicU64 alignment");
     let slot_off = worker_id * logs_slot_size(cap);
     // SAFETY: per the fn contract `base_addr` is `shm.addr + data_offset()`,
     // `worker_id < n_workers`, and `cap` matches registration, so `slot_off` is
@@ -935,6 +968,8 @@ pub unsafe fn logs_access_ring(base_addr: *mut u8, worker_id: usize, cap: usize)
 /// Error ring follows immediately after the access ring within the same slot.
 #[inline]
 pub unsafe fn logs_error_ring(base_addr: *mut u8, worker_id: usize, cap: usize) -> LogsWorkerRing {
+    // A2: same cap alignment requirement as `logs_access_ring`.
+    debug_assert_eq!(cap % 8, 0, "A2: ring cap must be a multiple of 8 for AtomicU64 alignment");
     let slot_off = worker_id * logs_slot_size(cap);
     let error_off = slot_off + ring_size_bytes(cap);
     // SAFETY: same contract as `logs_access_ring`; the error ring header begins
@@ -1651,5 +1686,55 @@ mod tests {
         // 3. combo_index is 3-arg (no url/ua/route/upstream) — route and upstream
         //    use separate WorkerSlots fields (route_duration_combos / upstream_duration_combos).
         let _ = combo_index(HttpMethod::Get, StatusClass::S2xx, ProtoVersion::Http11);
+    }
+
+    /// A2 regression test — ring-size alignment: enforce, don't comment.
+    ///
+    /// Before the A2 fix, `otel_log_ring_size 4097` was stored as-is.
+    /// `ring_size_bytes(4097) = 32 + 4097 = 4129`; 4129 % 8 = 1 → the error
+    /// ring header landed at an unaligned address (UB / SIGBUS on aarch64).
+    /// The fix rounds cap up to the next multiple of 8 at config-parse time.
+    #[test]
+    fn a2_ring_cap_alignment() {
+        use crate::logs::coalesce::coalesce_table_bytes;
+        use crate::logs::ring::{ring_size_bytes, RING_HEADER_SIZE};
+
+        // ── Demonstrate the pre-fix bug ───────────────────────────────────────
+        let cap_raw = 4097usize;
+        let rbs_raw = ring_size_bytes(cap_raw); // 32 + 4097 = 4129
+        assert_eq!(rbs_raw, 4129);
+        assert_ne!(
+            rbs_raw % 8,
+            0,
+            "without rounding: error-ring header at offset rbs_raw is NOT 8-aligned (pre-fix bug)"
+        );
+
+        // ── After the A2 fix: round up to next multiple of 8 ─────────────────
+        let cap = cap_raw.next_multiple_of(8); // 4104
+        assert_eq!(cap, 4104);
+
+        let rbs = ring_size_bytes(cap); // 32 + 4104 = 4136
+        assert_eq!(rbs, 4136);
+        assert_eq!(rbs % 8, 0, "ring_size_bytes(rounded cap) must be 8-aligned");
+
+        // Access-ring header: at slot_base + 0 — aligned by mmap (page-aligned base)
+        // Error-ring header:  at slot_base + rbs — aligned iff rbs % 8 == 0
+        assert_eq!(rbs % 8, 0, "error-ring header offset is 8-aligned");
+
+        // Coalescer table:    at slot_base + 2*rbs — aligned iff rbs % 8 == 0
+        assert_eq!((2 * rbs) % 8, 0, "coalescer table offset is 8-aligned");
+
+        // Slot stride must also be 8-aligned for workers i > 0.
+        let slot = logs_slot_size(cap); // 2*rbs + 6144
+        assert_eq!(slot % 8, 0, "logs_slot_size must be 8-aligned");
+
+        // ── Structural invariants (pinned by the const-asserts in shm.rs) ─────
+        assert_eq!(RING_HEADER_SIZE % 8, 0, "RING_HEADER_SIZE must be a multiple of 8");
+        assert_eq!(coalesce_table_bytes() % 8, 0, "coalesce_table_bytes must be a multiple of 8");
+
+        // ── Powers-of-two defaults are fine either way ────────────────────────
+        for &default_cap in &[512 * 1024usize, 256 * 1024usize, 4096usize] {
+            assert_eq!(default_cap % 8, 0, "default cap {} is already aligned", default_cap);
+        }
     }
 }

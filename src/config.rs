@@ -15,7 +15,7 @@ use nginx_sys::{
     ngx_http_compile_complex_value_t, ngx_http_complex_value_t, ngx_module_t, ngx_str_t,
     ngx_uint_t, NGX_CONF_BLOCK, NGX_CONF_FLAG, NGX_CONF_NOARGS, NGX_CONF_TAKE1, NGX_CONF_TAKE2,
     NGX_HTTP_LOC_CONF, NGX_HTTP_LOC_CONF_OFFSET, NGX_HTTP_MAIN_CONF, NGX_HTTP_MAIN_CONF_OFFSET,
-    NGX_HTTP_SRV_CONF, NGX_LOG_DEBUG, NGX_LOG_EMERG,
+    NGX_HTTP_SRV_CONF, NGX_LOG_DEBUG, NGX_LOG_EMERG, NGX_LOG_WARN,
 };
 use ngx::core::{Status, NGX_CONF_ERROR, NGX_CONF_OK};
 use ngx::http::{HttpModuleLocationConf, HttpModuleMainConf, NgxHttpCoreModule};
@@ -2016,7 +2016,23 @@ extern "C" fn cmd_set_log_ring_size(
 
     match parse_size_bytes(raw) {
         Some(n) if n > 0 => {
-            amcf.log_ring_size = n;
+            // `LogsWorkerRingHeader` holds four `AtomicU64` fields (align = 8).
+            // `CoalesceSlot` holds an `AtomicU64` at offset 0 (align = 8).
+            // The error-ring header starts at slot_base + ring_size_bytes(cap) and
+            // the coalescer table starts at slot_base + 2 * ring_size_bytes(cap).
+            // For both to be 8-byte aligned, cap must be a multiple of 8.
+            // Round up silently and emit a warning so the operator knows.
+            let aligned = n.next_multiple_of(8);
+            if aligned != n {
+                ngx_conf_log_error!(
+                    NGX_LOG_WARN,
+                    &raw mut *cf,
+                    "otel_log_ring_size: {} rounded up to {} (must be a multiple of 8 for AtomicU64 alignment in shm)",
+                    n,
+                    aligned
+                );
+            }
+            amcf.log_ring_size = aligned;
             NGX_CONF_OK
         }
         _ => {
