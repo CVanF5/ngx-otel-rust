@@ -60,15 +60,19 @@ else
     TEST_SUPPORT_MODULE="${TEST_SUPPORT_TARGET_DIR}/debug/libngx_http_otel_module.${MODULE_EXT}"
 fi
 
-NGINX_BUILD_DIR="${CRATE_DIR}/objs-${BUILD:-debug}"
-# Fall back to any available objs-* directory.
+# Use the NGINX_BUILD_DIR from the environment (e.g. set by the TSAN/ASan harness)
+# if it points to a valid directory; otherwise compute from BUILD flag or fall back
+# to any available objs-* directory.
+if [[ -z "${NGINX_BUILD_DIR:-}" || ! -d "${NGINX_BUILD_DIR}" ]]; then
+    NGINX_BUILD_DIR="${CRATE_DIR}/objs-${BUILD:-debug}"
+fi
 if [[ ! -d "${NGINX_BUILD_DIR}" ]]; then
     NGINX_BUILD_DIR="$(ls -d "${CRATE_DIR}"/objs-* 2>/dev/null | head -1)"
 fi
 if [[ -z "${NGINX_BUILD_DIR}" ]]; then
     echo "ERROR: no objs-* build dir found. Run 'make' first." >&2; exit 1
 fi
-NGINX_SOURCE_DIR="${CRATE_DIR}/../nginx"
+NGINX_SOURCE_DIR="${NGINX_SOURCE_DIR:-${CRATE_DIR}/../nginx}"
 if [[ ! -d "${NGINX_SOURCE_DIR}" ]]; then
     echo "ERROR: nginx source dir not found at ${NGINX_SOURCE_DIR}." >&2; exit 1
 fi
