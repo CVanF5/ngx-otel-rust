@@ -41,7 +41,7 @@ use core::task::{Context, Poll};
 use core::time::Duration;
 use std::collections::VecDeque;
 
-use nginx_sys::{NGX_LOG_ERR, NGX_LOG_INFO, NGX_LOG_NOTICE};
+use nginx_sys::{NGX_LOG_ERR, NGX_LOG_INFO, NGX_LOG_NOTICE, NGX_LOG_WARN};
 use pin_project_lite::pin_project;
 
 use crate::config::{ExportProtocol, MainConfig};
@@ -489,7 +489,27 @@ pub async fn export_loop(amcf: &'static MainConfig) {
     // the `otel_exporter {}` block, use it as-is (no path appended) instead of
     // the base-derived path.  Accepts full URLs (`http://host:port/path`) or
     // bare paths (`/v1/metrics`); `extract_http_path` normalises to the path
-    // component.  gRPC is unaffected (path is irrelevant for gRPC routing).
+    // component.  gRPC is unaffected (path routing is not applicable to gRPC).
+    //
+    // H2F5: under gRPC transport the per-signal endpoint directives are silently
+    // ignored.  Warn once at exporter startup so the operator knows the config
+    // has no effect.
+    if let ExportTransport::Grpc(_) = transport {
+        let warn_if_set = |field: &nginx_sys::ngx_str_t, name: &str| {
+            if !field.is_empty() {
+                ngx::ngx_log_error!(
+                    NGX_LOG_WARN,
+                    log.as_ptr(),
+                    "otel export: {}_endpoint ignored under grpc transport \
+                     (path routing is not applicable)",
+                    name
+                );
+            }
+        };
+        warn_if_set(&amcf.exporter.metrics_endpoint, "metrics");
+        warn_if_set(&amcf.exporter.logs_endpoint, "logs");
+        warn_if_set(&amcf.exporter.traces_endpoint, "traces");
+    }
     if let ExportTransport::Http(ref mut t) = transport {
         let me = &amcf.exporter.metrics_endpoint;
         if !me.is_empty() {
