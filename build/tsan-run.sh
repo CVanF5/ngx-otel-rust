@@ -150,6 +150,53 @@ export NGINX_BUILD_DIR="${PLAIN_OBJS}"
 echo "[tsan-run] TSAN nginx:  ${NGINX_BINARY}"
 echo "[tsan-run] RUSTFLAGS:   ${RUSTFLAGS}"
 
+# ── Step 3.5: nm-verification — confirm __tsan_* symbols in the cdylib ───────
+#
+# FU4: the previous TSAN artifact contained only a "Step 1 OK" compile-sanity
+# note and no evidence that __tsan_* instrumentation symbols are actually
+# present in the .so files the test nginx loads.  This step counts __tsan_*
+# symbols in the exact release cdylib produced under the TSAN RUSTFLAGS above
+# and fails the run if zero are found (= the module was NOT instrumented).
+#
+# The cdylib is built by the first integration script that calls
+# `cargo build --release`.  We pre-build it once here so the nm check runs
+# before any test relies on it, and so subsequent scripts get a cache hit.
+
+echo "[tsan-run] Step 3.5: Pre-building TSAN-instrumented cdylib..."
+(
+    cd /work/ngx-otel-rust
+    NGINX_SOURCE_DIR=/work/nginx \
+    NGINX_BUILD_DIR="${PLAIN_OBJS}" \
+    cargo build --release 2>&1
+)
+
+# Locate the cdylib (path depends on whether CARGO_BUILD_TARGET is set).
+case "$(uname -s)" in
+    Darwin) _MEXT="dylib" ;;
+    *)      _MEXT="so"    ;;
+esac
+if [[ -n "${CARGO_BUILD_TARGET:-}" ]]; then
+    NM_SO="/work/ngx-otel-rust/target/${CARGO_BUILD_TARGET}/release/libngx_http_otel_module.${_MEXT}"
+else
+    NM_SO="/work/ngx-otel-rust/target/release/libngx_http_otel_module.${_MEXT}"
+fi
+
+echo "[tsan-run] Step 3.5: nm-check: ${NM_SO}"
+if [[ ! -f "${NM_SO}" ]]; then
+    echo "[tsan-run] FAIL: cdylib not found at ${NM_SO}" >&2
+    exit 1
+fi
+
+TSAN_SYM_COUNT="$(nm "${NM_SO}" 2>/dev/null | grep -c '__tsan_' || echo 0)"
+echo "[tsan-run] Step 3.5: __tsan_* symbol count in cdylib: ${TSAN_SYM_COUNT}"
+if [[ "${TSAN_SYM_COUNT}" -eq 0 ]]; then
+    echo "[tsan-run] FAIL: zero __tsan_* symbols in ${NM_SO} — module was NOT compiled with -Zsanitizer=thread." >&2
+    echo "[tsan-run]        RUSTFLAGS=${RUSTFLAGS}" >&2
+    exit 1
+fi
+echo "[tsan-run] Step 3.5: OK — ${TSAN_SYM_COUNT} __tsan_* symbols confirmed in $(basename "${NM_SO}")."
+echo "[tsan-run] Step 3.5: full path: ${NM_SO}"
+
 # ── Step 4: Run integration scripts ──────────────────────────────────────────
 
 echo ""
@@ -362,11 +409,35 @@ if [[ "${DEADCOLL_RC}" -ne 0 ]]; then
     echo "[tsan-run] run_chaos_dead_collector.sh: NON-ZERO exit ${DEADCOLL_RC}" >&2
 fi
 
+# FU4: run_b4_daemon_on_gen1.sh — gen-1 exporter orphan + reload remedy.
+# Added in FU4 to close the gap identified in the hostile-fixes gate review:
+# B4 test was absent from the prior TSAN artifact.
+echo ""
+echo "[tsan-run] == run_b4_daemon_on_gen1.sh under TSAN (FU4: was missing from prior artifact) =="
+B4_RC=0
+( bash tests/integration/run_b4_daemon_on_gen1.sh ) || B4_RC=$?
+if [[ "${B4_RC}" -ne 0 ]]; then
+    echo "[tsan-run] run_b4_daemon_on_gen1.sh: NON-ZERO exit ${B4_RC}" >&2
+fi
+
+# FU4: run_b1_spsc_reload_chaos.sh — SPSC ring dup-detection + quit-completeness.
+# Added in FU1; now exercised under TSAN so the periodic_abdicated latch and
+# successor_gen Acquire load run under ThreadSanitizer.
+# USE_SLOW_SINK=1 enables the Python slow-proxy (2s POST delay) to widen the
+# SIGHUP overlap window, making mutation (a) reliable on Linux.
+echo ""
+echo "[tsan-run] == run_b1_spsc_reload_chaos.sh under TSAN (FU1 chaos test) =="
+B1_RC=0
+( USE_SLOW_SINK=1 bash tests/integration/run_b1_spsc_reload_chaos.sh ) || B1_RC=$?
+if [[ "${B1_RC}" -ne 0 ]]; then
+    echo "[tsan-run] run_b1_spsc_reload_chaos.sh: NON-ZERO exit ${B1_RC}" >&2
+fi
+
 # After all chaos scripts: fail the TSAN run if any of them failed.
 # The TSAN warning scan in step 5 is the definitive gate for races.
 # These functional failures indicate harness/timing issues, not TSAN races.
-if [[ "${KILL9_RC}" -ne 0 || "${CRASHLOOP_RC}" -ne 0 || "${DEADCOLL_RC}" -ne 0 ]]; then
-    echo "[tsan-run] NOTE: chaos script(s) exited non-zero (kill9=${KILL9_RC}, crashloop=${CRASHLOOP_RC}, deadcoll=${DEADCOLL_RC})"
+if [[ "${KILL9_RC}" -ne 0 || "${CRASHLOOP_RC}" -ne 0 || "${DEADCOLL_RC}" -ne 0 || "${B4_RC}" -ne 0 || "${B1_RC}" -ne 0 ]]; then
+    echo "[tsan-run] NOTE: chaos/lifecycle script(s) exited non-zero (kill9=${KILL9_RC}, crashloop=${CRASHLOOP_RC}, deadcoll=${DEADCOLL_RC}, b4=${B4_RC}, b1_chaos=${B1_RC})"
     echo "[tsan-run] NOTE: these are functional/timing failures — check the TSAN warning scan for actual races."
 fi
 
@@ -391,7 +462,9 @@ for log in /tmp/ngx-otel-grpc-smoke.*/logs/error.log \
            /tmp/ngx-otel-deadcoll.*/logs/error.log \
            /tmp/ngx-otel-deadcoll-b.*/logs/error.log \
            /tmp/ngx-otel-deadcoll-c.*/logs/error.log \
-           /tmp/ngx-otel-sighup-interleave.*/logs/error.log; do
+           /tmp/ngx-otel-sighup-interleave.*/logs/error.log \
+           /tmp/ngx-otel-b4-daemon.*/logs/error.log \
+           /tmp/ngx-otel-b1chaos.*/logs/error.log; do
     if [[ -f "${log}" ]]; then
         count=$(grep -c "WARNING: ThreadSanitizer" "${log}" 2>/dev/null || true)
         if [[ "${count}" -gt 0 ]]; then
@@ -411,7 +484,7 @@ fi
 echo "[tsan-run] Zero ThreadSanitizer warnings.  TSAN gate: PASS."
 
 # Report chaos functional failures (non-zero exits unrelated to TSAN races).
-if [[ "${KILL9_RC:-0}" -ne 0 || "${CRASHLOOP_RC:-0}" -ne 0 || "${DEADCOLL_RC:-0}" -ne 0 ]]; then
-    echo "[tsan-run] CHAOS NOTE: kill9=${KILL9_RC:-0} crashloop=${CRASHLOOP_RC:-0} deadcoll=${DEADCOLL_RC:-0} — functional/timing failure; no TSAN race." >&2
+if [[ "${KILL9_RC:-0}" -ne 0 || "${CRASHLOOP_RC:-0}" -ne 0 || "${DEADCOLL_RC:-0}" -ne 0 || "${B4_RC:-0}" -ne 0 || "${B1_RC:-0}" -ne 0 ]]; then
+    echo "[tsan-run] CHAOS NOTE: kill9=${KILL9_RC:-0} crashloop=${CRASHLOOP_RC:-0} deadcoll=${DEADCOLL_RC:-0} b4=${B4_RC:-0} b1_chaos=${B1_RC:-0} — functional/timing failure; no TSAN race." >&2
     exit 3
 fi

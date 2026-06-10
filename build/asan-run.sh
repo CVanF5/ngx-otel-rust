@@ -67,7 +67,9 @@ mkdir -p "${RUNDIR}"
 ASAN_SCRIPTS="${ASAN_SCRIPTS:-run_grpc_export.sh run_grpc_bidi_smoke.sh run_dns_dualstack.sh run_reload.sh run_traces.sh run_access_log.sh}"
 # Chaos scripts: run after the main loop with ASan-overhead-aware timeout overrides.
 # Set ASAN_CHAOS_SCRIPTS="" to skip chaos scripts (e.g. for a quick wake-path-only run).
-ASAN_CHAOS_SCRIPTS="${ASAN_CHAOS_SCRIPTS:-run_chaos_kill9.sh run_chaos_crashloop.sh run_chaos_dead_collector.sh}"
+# FU4: run_b4_daemon_on_gen1.sh and run_b1_spsc_reload_chaos.sh added; both were
+# absent from the prior ASan artifact.
+ASAN_CHAOS_SCRIPTS="${ASAN_CHAOS_SCRIPTS:-run_chaos_kill9.sh run_chaos_crashloop.sh run_chaos_dead_collector.sh run_b4_daemon_on_gen1.sh run_b1_spsc_reload_chaos.sh}"
 
 log() { echo "[asan-run] $*"; }
 
@@ -138,6 +140,48 @@ log "RUSTFLAGS:   ${RUSTFLAGS}"
 log "ASAN_OPTIONS:${ASAN_OPTIONS}"
 log "Report dir:  ${RUNDIR}"
 
+# ── Step 3.5: nm-verification — confirm __asan_* symbols in the cdylib ───────
+#
+# FU4: the previous ASan artifact contained no evidence that __asan_*
+# instrumentation symbols are actually present in the .so the test nginx loads.
+# This step counts __asan_* symbols in the exact release cdylib produced under
+# the ASan RUSTFLAGS above and fails the run if zero are found.
+#
+# Pre-build once here; subsequent scripts get a cache hit.
+log "Step 3.5: Pre-building ASan-instrumented cdylib..."
+(
+    cd "${CRATE}"
+    NGINX_SOURCE_DIR="${NGINX_SRC}" \
+    NGINX_BUILD_DIR="${PLAIN_OBJS}" \
+    cargo build --release 2>&1
+)
+
+case "$(uname -s)" in
+    Darwin) _MEXT="dylib" ;;
+    *)      _MEXT="so"    ;;
+esac
+if [[ -n "${CARGO_BUILD_TARGET:-}" ]]; then
+    NM_SO="${CRATE}/target/${CARGO_BUILD_TARGET}/release/libngx_http_otel_module.${_MEXT}"
+else
+    NM_SO="${CRATE}/target/release/libngx_http_otel_module.${_MEXT}"
+fi
+
+log "Step 3.5: nm-check: ${NM_SO}"
+if [[ ! -f "${NM_SO}" ]]; then
+    log "FAIL: cdylib not found at ${NM_SO}" >&2
+    exit 1
+fi
+
+ASAN_SYM_COUNT="$(nm "${NM_SO}" 2>/dev/null | grep -c '__asan_' || echo 0)"
+log "Step 3.5: __asan_* symbol count in cdylib: ${ASAN_SYM_COUNT}"
+if [[ "${ASAN_SYM_COUNT}" -eq 0 ]]; then
+    log "FAIL: zero __asan_* symbols in ${NM_SO} — module was NOT compiled with -Zsanitizer=address." >&2
+    log "      RUSTFLAGS=${RUSTFLAGS}" >&2
+    exit 1
+fi
+log "Step 3.5: OK — ${ASAN_SYM_COUNT} __asan_* symbols confirmed in $(basename "${NM_SO}")."
+log "Step 3.5: full path: ${NM_SO}"
+
 # ── Step 4: Run integration scripts ──────────────────────────────────────────
 FAILED_SCRIPTS=()
 for s in ${ASAN_SCRIPTS}; do
@@ -184,6 +228,25 @@ if [[ -n "${ASAN_CHAOS_SCRIPTS}" ]]; then
                 if [[ "${CHAOS_DEADCOLL_RC}" -ne 0 ]]; then
                     log "${s}: NON-ZERO exit ${CHAOS_DEADCOLL_RC} — continuing" >&2
                     FAILED_SCRIPTS+=("${s}(rc=${CHAOS_DEADCOLL_RC})")
+                fi
+                ;;
+            run_b4_daemon_on_gen1.sh)
+                # B4: no special timeout override needed; daemon-on lifecycle
+                # test has its own internal timing (kill-9 + respawn checks).
+                bash "tests/integration/${s}" || rc=$?
+                if [[ "${rc:-0}" -ne 0 ]]; then
+                    log "${s}: NON-ZERO exit ${rc:-0} — continuing" >&2
+                    FAILED_SCRIPTS+=("${s}(rc=${rc:-0})")
+                fi
+                ;;
+            run_b1_spsc_reload_chaos.sh)
+                # B1-chaos: USE_SLOW_SINK=1 enables the Python slow-proxy (2s
+                # POST delay) to widen the SIGHUP overlap window so mutation (a)
+                # is reliable on Linux under ASan overhead.
+                USE_SLOW_SINK=1 bash "tests/integration/${s}" || rc=$?
+                if [[ "${rc:-0}" -ne 0 ]]; then
+                    log "${s}: NON-ZERO exit ${rc:-0} — continuing" >&2
+                    FAILED_SCRIPTS+=("${s}(rc=${rc:-0})")
                 fi
                 ;;
             *)
