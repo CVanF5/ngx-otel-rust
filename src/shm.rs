@@ -933,7 +933,8 @@ unsafe fn wp_from_cycle(cycle: *const ngx_cycle_t) -> Option<usize> {
 /// OTLP cumulative reset at the reload boundary.
 ///
 /// Dying old workers may write a few more counts into just-zeroed slots in the seconds
-/// before they exit.  The writes are atomic (no UB); the counts vanish with the old
+/// before they exit.  Each word is zeroed via AtomicU64::store(Relaxed), so concurrent
+/// fetch_add from old workers is well-defined; the stale counts vanish with the old
 /// workers and are negligible versus incoming new traffic.  Accepted.
 ///
 /// # Safety
@@ -945,17 +946,31 @@ unsafe fn zero_route_upstream_histograms(base: *mut u8, n_slots: usize) {
     const ROUTE_SZ: usize = mem::size_of::<[ExpHistogramSlot; N_ROUTE_SLOTS]>();
     const UPSTREAM_OFF: usize = core::mem::offset_of!(WorkerSlots, upstream_duration_combos);
     const UPSTREAM_SZ: usize = mem::size_of::<[ExpHistogramSlot; N_UPSTREAM_SLOTS]>();
+    // ExpHistogramSlot consists entirely of AtomicU64 fields; both arrays must be
+    // multiples of 8 bytes so every word can be zeroed via AtomicU64::store(Relaxed).
+    // ptr::write_bytes would race with concurrent fetch_add from dying old-generation
+    // workers during SIGHUP reload (non-atomic write vs. atomic RMW = UB).
+    const _: () =
+        assert!(ROUTE_SZ % 8 == 0, "ROUTE_SZ must be a multiple of 8 for AtomicU64 zeroing");
+    const _: () =
+        assert!(UPSTREAM_SZ % 8 == 0, "UPSTREAM_SZ must be a multiple of 8 for AtomicU64 zeroing");
     let slot_bytes = mem::size_of::<WorkerSlots>();
     for i in 0..n_slots {
         // SAFETY: `i < n_slots` (fn contract) → `i * slot_bytes < n_slots * slot_bytes ≤`
         // zone bytes past data_offset() (fn contract).  ROUTE_OFF and UPSTREAM_OFF are
         // compile-time offset_of! values within WorkerSlots (< slot_bytes); adding their
-        // respective sizes also stays within slot_bytes.  All-zeros is the valid initial
-        // state for AtomicU64, AtomicU32, and AtomicU8.
+        // respective sizes also stays within slot_bytes.  Each word is zeroed via
+        // AtomicU64::store(Relaxed) to avoid RMW races with concurrent old-worker writes.
         unsafe {
             let slot_base: *mut u8 = base.add(i * slot_bytes);
-            ptr::write_bytes(slot_base.add(ROUTE_OFF), 0, ROUTE_SZ);
-            ptr::write_bytes(slot_base.add(UPSTREAM_OFF), 0, UPSTREAM_SZ);
+            let route_ptr = slot_base.add(ROUTE_OFF) as *mut AtomicU64;
+            for w in 0..(ROUTE_SZ / 8) {
+                (*route_ptr.add(w)).store(0, Ordering::Relaxed);
+            }
+            let upstream_ptr = slot_base.add(UPSTREAM_OFF) as *mut AtomicU64;
+            for w in 0..(UPSTREAM_SZ / 8) {
+                (*upstream_ptr.add(w)).store(0, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -2079,5 +2094,57 @@ mod tests {
         drop(buf);
 
         assert_eq!(violations, 0, "F3: count > Σbuckets observed {violations} times — pre-fix code (count written Relaxed, read last) is the root cause; post-fix Release+Acquire on count makes this invariant unconditional");
+    }
+
+    /// H2F2 regression: `zero_route_upstream_histograms` must use AtomicU64::store(Relaxed),
+    /// not ptr::write_bytes, to avoid UB when old-generation workers concurrently fetch_add
+    /// the same words during SIGHUP reload.
+    ///
+    /// This test spawns a thread doing fetch_add in a tight loop on one AtomicU64 inside
+    /// route_duration_combos while the main thread calls zero_route_upstream_histograms.
+    /// The point is that it compiles and runs without TSAN/sanitizer warnings — not that
+    /// a particular value is observed after the race (the race outcome is intentionally
+    /// "stale counts vanish with old workers", which is accepted).
+    ///
+    /// Guarded by #[cfg(not(miri))] because Miri is single-threaded and would deadlock.
+    #[test]
+    #[cfg(not(miri))]
+    fn f_shm_atomic_zero() {
+        use core::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        // SAFETY: WorkerSlots contains only atomic types; all-zeros is a valid initial state.
+        let mut buf: std::boxed::Box<WorkerSlots> =
+            unsafe { std::boxed::Box::new_zeroed().assume_init() };
+        let slot_ptr: *mut WorkerSlots = &raw mut *buf;
+        // Pick the AtomicU64 at the start of route_duration_combos[0].buckets[0].
+        // SAFETY: offset is within the live Box<WorkerSlots>; we keep `buf` alive.
+        let atomic_ptr: *mut AtomicU64 = unsafe {
+            (slot_ptr as *mut u8).add(core::mem::offset_of!(WorkerSlots, route_duration_combos))
+                as *mut AtomicU64
+        };
+        // SAFETY: atomic_ptr points into a live Box<WorkerSlots>; we keep `buf` alive
+        // for the duration of the test and join the writer thread before dropping.
+        let atomic_ref: &'static AtomicU64 = unsafe { &*atomic_ptr };
+
+        let running = Arc::new(AtomicBool::new(true));
+        let running_clone = running.clone();
+        let writer = std::thread::spawn(move || {
+            while running_clone.load(Ordering::Relaxed) {
+                atomic_ref.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        // Call zero_route_upstream_histograms concurrently with the writer thread.
+        // SAFETY: buf is a valid single WorkerSlots object; n_slots=1.
+        unsafe {
+            zero_route_upstream_histograms(slot_ptr as *mut u8, 1);
+        }
+
+        running.store(false, Ordering::Relaxed);
+        writer.join().unwrap();
+        // Keep buf alive until after join so the writer's atomic_ref is valid.
+        drop(buf);
+        // If we reach here without TSAN/sanitizer complaints the test passes.
     }
 }
