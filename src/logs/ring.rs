@@ -387,4 +387,151 @@ pub(crate) mod tests {
         assert!(ring.pop_into(&mut out));
         assert_eq!(out.as_slice(), data.as_slice());
     }
+
+    /// (a2) Dual-consumer documents the SPSC ring's load-then-store contract.
+    ///
+    /// `pop_into` reads `read_offset` with `Acquire`, copies the record, then
+    /// advances `read_offset` with `Release` — there is NO compare-exchange.
+    /// Two concurrent consumers can both load the same offset before either
+    /// stores, producing duplicate records (total > N).
+    ///
+    /// This test verifies that ONE consumer reads exactly N records (the
+    /// positive case); it also demonstrates the dual-consumer violation: the
+    /// test body shows the race condition that B1-FU1 prevents.
+    ///
+    /// The violation half is NOT run automatically (it would be a failing test)
+    /// but IS captured in the mutation evidence artifact to document the causal
+    /// chain: ring is fragile → gate is load-bearing → removal causes harm.
+    #[test]
+    fn b1_single_consumer_reads_exactly_n_records() {
+        // Positive case: one consumer, one ring, N records → total == N.
+        // The corresponding dual-consumer violation evidence (total != N) is
+        // captured by `b1_dual_consumer_violation` below — see its doc comment
+        // for the expected failure mode and the B1-FU1 causal link.
+        const N: usize = 500;
+        const RECORD_BYTES: usize = 8;
+        let cap = N * (4 + RECORD_BYTES) * 2;
+        let (_buf, ring) = make_ring_with_cap(cap);
+
+        for i in 0u64..N as u64 {
+            ring.push(&i.to_be_bytes());
+        }
+
+        let mut out = std::vec::Vec::new();
+        let mut count = 0usize;
+        while ring.pop_into(&mut out) {
+            out.clear();
+            count += 1;
+        }
+        assert_eq!(
+            count, N,
+            "single consumer must pop exactly N records with no duplicates or skips"
+        );
+    }
+
+    /// (a2-race) Documents the dual-consumer violation: TWO concurrent threads
+    /// calling `pop_into` on the same ring, each asserting exclusivity.
+    ///
+    /// `pop_into` uses load → read → store, NOT compare-exchange.  Two threads
+    /// on separate cores can both load the same `read_offset` value, both copy
+    /// the same record slot, and both store the same advanced offset — producing
+    /// a DUPLICATE record.  The total popped will exceed N.
+    ///
+    /// This test is `#[ignore]` because it is expected to FAIL (the violation
+    /// IS the evidence).  Run explicitly with `cargo test -- --ignored
+    /// b1_dual_consumer_violation` to capture the FAIL output for the artifact.
+    ///
+    /// On a single-core machine the race may not manifest; see the chaos (a-iv)
+    /// assertion for the deterministic pid-keyed observable.
+    #[test]
+    #[ignore = "expected to FAIL — run explicitly for mutation evidence (a2)"]
+    fn b1_dual_consumer_violation() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        // 5 000 records × (4-byte length + 8-byte payload) = 60 KB per pass.
+        // Two threads spinning at ~ns per pop → thousands of load/store windows
+        // → very high probability of at least one duplicate on a multi-core CPU.
+        const N: usize = 5_000;
+        const RECORD_BYTES: usize = 8;
+
+        let cap = N * (4 + RECORD_BYTES) * 2;
+        let (buf, ring) = make_ring_with_cap(cap);
+
+        for i in 0u64..N as u64 {
+            ring.push(&i.to_be_bytes());
+        }
+        // ring is Copy (pointer-only view) — no drop needed; ring_ptr remains valid.
+
+        // Extract the raw data pointer BEFORE wrapping in Arc so both threads
+        // get the same address.  The Arc clones keep the buffer alive while the
+        // threads run.
+        // SAFETY: `buf` was just returned by `make_ring_with_cap`; the pointer
+        // is valid for the ring's full memory region.  We cast to *mut u8 to
+        // satisfy `from_shm_ptr`'s contract.
+        let ring_ptr: usize = buf.as_ptr() as usize; // store as usize — Send-safe
+        let buf_arc = Arc::new(buf);
+        let _buf_guard1 = Arc::clone(&buf_arc); // keep alive for thread 1
+        let _buf_guard2 = Arc::clone(&buf_arc); // keep alive for thread 2
+
+        let barrier = Arc::new(Barrier::new(2));
+        let b1 = Arc::clone(&barrier);
+        let b2 = Arc::clone(&barrier);
+
+        let count1 = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let count2 = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let c1 = Arc::clone(&count1);
+        let c2 = Arc::clone(&count2);
+
+        // SAFETY: we deliberately violate the SPSC single-consumer invariant to
+        // document the ring's fragility.  Both threads use the same raw pointer
+        // derived from the same allocation; no writes to the ring's metadata
+        // are concurrent with reads (atomic offsets guard against data corruption,
+        // but NOT against the load-then-store dup window we are measuring).
+        let h1 = thread::spawn(move || {
+            b1.wait(); // start simultaneously with thread 2
+                       // SAFETY: ring_ptr points to the ring buffer (kept alive by buf_arc).
+            let ring = unsafe { LogsWorkerRing::from_shm_ptr(ring_ptr as *mut u8) };
+            let mut out = std::vec::Vec::new();
+            let mut count = 0usize;
+            while ring.pop_into(&mut out) {
+                out.clear();
+                count += 1;
+            }
+            c1.store(count, core::sync::atomic::Ordering::Relaxed);
+        });
+
+        let h2 = thread::spawn(move || {
+            b2.wait();
+            // SAFETY: same rationale as h1.
+            let ring = unsafe { LogsWorkerRing::from_shm_ptr(ring_ptr as *mut u8) };
+            let mut out = std::vec::Vec::new();
+            let mut count = 0usize;
+            while ring.pop_into(&mut out) {
+                out.clear();
+                count += 1;
+            }
+            c2.store(count, core::sync::atomic::Ordering::Relaxed);
+        });
+
+        h1.join().unwrap();
+        h2.join().unwrap();
+
+        let total = count1.load(core::sync::atomic::Ordering::Relaxed)
+            + count2.load(core::sync::atomic::Ordering::Relaxed);
+
+        // This assertion FAILS when the race fires: both threads read the same
+        // slot → total > N.  That is the expected outcome and the evidence that
+        // the ring is SPSC-only.  B1-FU1's gate prevents this in production.
+        assert_eq!(
+            total,
+            N,
+            "dual-consumer SPSC violation: expected {} pops (one per record), \
+            got {} — {} duplicate(s) produced by concurrent load-then-store in pop_into \
+            (this FAILURE is the evidence for B1-FU1)",
+            N,
+            total,
+            total.saturating_sub(N),
+        );
+    }
 }

@@ -304,6 +304,10 @@ N_POST_SIGHUP=5     # requests after old exporter exits
 
 SEQ_END_BEFORE_TEST=0  # will record SEQ after all rounds
 
+# Accumulate old exporter PIDs across rounds for assertion (a-iv).
+# Only used when NGX_OTEL_QUIT_DEFER_TICKS is set (mutation evidence mode).
+declare -a OLD_PIDS=()
+
 info "Running ${N_ROUNDS} SIGHUP rounds (${N_PRE_SIGHUP} pre + ${N_OVERLAP} overlap + ${N_POST_SIGHUP} post per round)..."
 
 for round in $(seq 1 "${N_ROUNDS}"); do
@@ -314,6 +318,7 @@ for round in $(seq 1 "${N_ROUNDS}"); do
 
     OLD_EXP_PID=$(exporter_pid_of "${NGINX_PID}")
     [[ -n "${OLD_EXP_PID}" ]] || fail "Round ${round}: no exporter before SIGHUP"
+    OLD_PIDS+=("${OLD_EXP_PID}")
 
     # SIGHUP — master writes successor_gen > my_gen then signals old exporter.
     kill -HUP "${NGINX_PID}" 2>/dev/null || fail "Round ${round}: SIGHUP failed"
@@ -485,6 +490,52 @@ if [[ "${SCAN_ERRORS}" -gt 0 ]]; then
 fi
 
 pass "assertion (a-iii): zero parse/garbage-length errors in error.log and collector logs"
+
+# ── Assertion (a-iv): QUIT-DEFER abdication send check ───────────────────────
+# Active only when NGX_OTEL_QUIT_DEFER_TICKS is set (mutation evidence mode).
+#
+# After successor_announced() fires the old exporter logs:
+#   "otel export: successor announced — abdicating periodic ring pops (my_gen=N)"
+# The FIXED code (B1-FU1 gate present) then STOPS draining the rings, so NO
+# "otel export: sent N log|span records to collector" lines from the old
+# exporter's PID should appear AFTER the abdication log line.
+#
+# With the B1-FU1 gate REMOVED (mutation), the old exporter keeps draining
+# during the QUIT-DEFER window → sends appear after abdication → FAIL.
+#
+# The check is pid-keyed (PID#0: in nginx error.log format) and filtered by
+# line number, so it is immune to timing races with concurrent log output.
+if [[ -n "${NGX_OTEL_QUIT_DEFER_TICKS:-}" && "${NGX_OTEL_QUIT_DEFER_TICKS:-0}" -gt 0 ]]; then
+    info "Assertion (a-iv): QUIT-DEFER mode — checking post-abdication send counts..."
+    POST_ABD_TOTAL=0
+    for pid in "${OLD_PIDS[@]:-}"; do
+        [[ -z "${pid}" ]] && continue
+        # Find last abdication log line for this PID
+        ABD_LINE=$(grep -n "${pid}#.*successor announced.*abdicating periodic" \
+            "${PREFIX}/logs/error.log" 2>/dev/null | tail -1 | cut -d: -f1)
+        if [[ -z "${ABD_LINE}" ]]; then
+            info "  PID ${pid}: no abdication line in error.log (abdication may not have fired)"
+            continue
+        fi
+        # Count ring-record sends from this PID after abdication
+        POST_SENDS=$(awk -v pid="${pid}#" -v start="${ABD_LINE}" '
+            NR > start && index($0, pid) > 0 &&
+            (index($0, "otel export: sent") > 0) &&
+            (index($0, "log records to collector") > 0 || index($0, "span records to collector") > 0) {
+                count++
+            }
+            END { print count+0 }
+        ' "${PREFIX}/logs/error.log" 2>/dev/null || echo "0")
+        info "  PID ${pid}: abdicated at line ${ABD_LINE}, post-abdication sends: ${POST_SENDS}"
+        POST_ABD_TOTAL=$(( POST_ABD_TOTAL + POST_SENDS ))
+    done
+    if [[ "${POST_ABD_TOTAL}" -gt 0 ]]; then
+        fail "assertion (a-iv): SPSC exclusivity violated — ${POST_ABD_TOTAL} ring-record send(s) \
+from old exporter(s) after abdication (FU1 gate missing → concurrent drains in defer window)"
+    fi
+    pass "assertion (a-iv): old exporter(s) sent zero ring records post-abdication \
+(SPSC exclusivity confirmed — FU1 gate held during QUIT-DEFER overlap)"
+fi
 
 # ── Assertion (b): quit-completeness ─────────────────────────────────────────
 # Push N records then nginx -s quit.  All N must arrive (no-successor sole-consumer
