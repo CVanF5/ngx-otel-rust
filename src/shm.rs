@@ -135,20 +135,35 @@ impl ExpHistogramSlot {
             self.buckets[idx.min(N_EXP_BUCKETS - 1)].fetch_add(1, Ordering::Relaxed);
         }
         self.sum.fetch_add(value_us, Ordering::Relaxed);
-        self.count.fetch_add(1, Ordering::Relaxed);
+        // F3 fix: Release on count so snapshot()'s Acquire(count) establishes
+        // a happens-before edge that covers all prior bucket/sum writes in this
+        // record() call.  Pre-fix this was Relaxed, pairing with no Release →
+        // count > Σbuckets observable on weakly-ordered hardware (ARM64).
+        self.count.fetch_add(1, Ordering::Release);
     }
 
     /// Snapshot all bucket counts, zero_count, sum, and count for export.
     ///
-    /// Uses `Ordering::Acquire` to synchronise with worker writes.
+    /// F3 fix: `count` is read **first** with `Acquire`, pairing with the
+    /// `Release` store in `record()`.  Since all `record()` calls on this slot
+    /// originate from the same single worker thread, by transitivity the
+    /// Acquire on count=N ensures all N bucket/sum/zero_count writes from
+    /// completed record() calls are visible.  The snapshot invariant
+    /// `Σbuckets + zero_count ≥ count` therefore holds.  Pre-fix code read
+    /// count **last** with an Acquire that had no paired Release → count >
+    /// Σbuckets was observable.
+    ///
+    /// Bucket/sum/zero_count loads use `Relaxed` — they are already ordered by
+    /// the `Acquire` load of count that precedes them.
     pub fn snapshot(&self) -> ([u64; N_EXP_BUCKETS], u64, u64, u64) {
+        // Read count FIRST to anchor the happens-before with record()'s Release.
+        let count = self.count.load(Ordering::Acquire);
         let mut buckets = [0u64; N_EXP_BUCKETS];
         for (i, b) in self.buckets.iter().enumerate() {
-            buckets[i] = b.load(Ordering::Acquire);
+            buckets[i] = b.load(Ordering::Relaxed);
         }
-        let zero_count = self.zero_count.load(Ordering::Acquire);
-        let sum = self.sum.load(Ordering::Acquire);
-        let count = self.count.load(Ordering::Acquire);
+        let zero_count = self.zero_count.load(Ordering::Relaxed);
+        let sum = self.sum.load(Ordering::Relaxed);
         (buckets, zero_count, sum, count)
     }
 }
@@ -162,7 +177,11 @@ pub const N_BYTES_BUCKETS: usize = 7;
 /// A fixed-width explicit-boundary histogram stored entirely in atomic counters.
 ///
 /// `BUCKETS` = number of explicit-boundary buckets + 1 overflow bucket.
-/// Writes: `Ordering::Relaxed`; reads: `Ordering::Acquire`.
+///
+/// Write protocol: all fields written `Relaxed`; `count` written `Release`
+/// (last in `record()`).  Read protocol: `count` read `Acquire` (first in
+/// `snapshot()`), remaining fields `Relaxed`.  The Acquire-Release pair on
+/// `count` establishes the snapshot invariant `Σbuckets ≥ count`.
 #[repr(C)]
 pub struct Histogram<const BUCKETS: usize> {
     /// Per-bucket cumulative count (bucket[i] counts values <= boundary[i-1]).
@@ -187,18 +206,24 @@ impl<const BUCKETS: usize> Histogram<BUCKETS> {
         let idx = bounds.partition_point(|&b| value > b);
         self.bucket[idx].fetch_add(1, Ordering::Relaxed);
         self.sum.fetch_add(value, Ordering::Relaxed);
-        self.count.fetch_add(1, Ordering::Relaxed);
+        // F3 fix: Release on count (mirrors ExpHistogramSlot::record).
+        self.count.fetch_add(1, Ordering::Release);
     }
 
     /// Read all bucket counts, sum, and count for export.
-    /// Uses `Ordering::Acquire` to synchronise with worker writes.
+    ///
+    /// F3 fix: `count` is read **first** with `Acquire`, pairing with the
+    /// `Release` store in `record()`.  All bucket/sum loads use `Relaxed` —
+    /// they are ordered by the preceding `Acquire` on count.  This mirrors
+    /// the `ExpHistogramSlot::snapshot` ordering invariant.
     pub fn snapshot(&self) -> ([u64; BUCKETS], u64, u64) {
+        // Read count FIRST to anchor the happens-before with record()'s Release.
+        let count = self.count.load(Ordering::Acquire);
         let mut counts = [0u64; BUCKETS];
         for (i, c) in self.bucket.iter().enumerate() {
-            counts[i] = c.load(Ordering::Acquire);
+            counts[i] = c.load(Ordering::Relaxed);
         }
-        let sum = self.sum.load(Ordering::Acquire);
-        let count = self.count.load(Ordering::Acquire);
+        let sum = self.sum.load(Ordering::Relaxed);
         (counts, sum, count)
     }
 }
@@ -1984,5 +2009,75 @@ mod tests {
             post_combo, pre_combo,
             "F1: zero_route_upstream_histograms must NOT touch request_duration_combos"
         );
+    }
+
+    /// F3 regression: `snapshot()` must never observe `count > Σbuckets + zero_count`.
+    ///
+    /// Pre-fix: `record()` wrote `count` last with `Ordering::Relaxed` (no Release);
+    /// `snapshot()` read `count` last with `Acquire` that had no paired Release.
+    /// On weakly-ordered hardware (ARM64) a concurrent snapshot could see `count`
+    /// incremented while the corresponding bucket write had not yet propagated →
+    /// `count > Σbuckets` is observable.
+    ///
+    /// Post-fix: `record()` writes `count` last with `Release`; `snapshot()` reads
+    /// `count` first with `Acquire`.  The Acquire-Release pair on `count` establishes
+    /// a happens-before edge covering all prior bucket/sum writes from completed
+    /// `record()` calls, so `Σbuckets + zero_count ≥ count` always holds.
+    ///
+    /// This test FAILS on pre-fix code on weakly-ordered hardware (ARM64) because the
+    /// stress loop will observe violations.  On strongly-ordered hardware (x86) the
+    /// violation may be rare but the fix is still correct (it eliminates a data race
+    /// in the C++ / Rust memory model sense, independent of hardware).
+    #[test]
+    fn f3_snapshot_count_le_bucket_sum_concurrent() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        // Allocate a zero-initialised buffer for one ExpHistogramSlot.
+        let mut buf = std::vec![0u8; mem::size_of::<ExpHistogramSlot>()];
+        let buf_ptr: *mut u8 = buf.as_mut_ptr();
+
+        // SAFETY: `buf_ptr` points to a freshly-zeroed heap Vec of exactly
+        // `sizeof(ExpHistogramSlot)`.  Zero is the valid initial state for all
+        // AtomicU64 fields.  The Vec is kept alive until after `writer.join()`.
+        // Only two concurrent accessors exist: the writer thread and the reader
+        // (this thread), each via `&ExpHistogramSlot` (mutations are through
+        // atomics, which require only a shared reference).
+        let slot_ref: &ExpHistogramSlot = unsafe { &*buf_ptr.cast::<ExpHistogramSlot>() };
+        // SAFETY: `buf` is not moved/dropped until after `writer.join()` below.
+        let slot_static: &'static ExpHistogramSlot = unsafe {
+            core::mem::transmute::<&ExpHistogramSlot, &'static ExpHistogramSlot>(slot_ref)
+        };
+
+        let running = Arc::new(AtomicBool::new(true));
+        let running_w = Arc::clone(&running);
+
+        // Writer thread: continuous record() calls with varying values.
+        let writer = std::thread::spawn(move || {
+            let mut v: u64 = 1;
+            while running_w.load(Ordering::Relaxed) {
+                slot_static.record(v);
+                // stay ≥ 1 so we exercise the bucket path, not just zero_count
+                v = v.wrapping_add(1).max(1);
+            }
+        });
+
+        // Reader: take snapshots and enforce the snapshot invariant.
+        let mut violations: u64 = 0;
+        for _ in 0..500_000 {
+            let (buckets, zero_count, _, count) = slot_ref.snapshot();
+            let bucket_sum: u64 = buckets.iter().sum::<u64>() + zero_count;
+            if count > bucket_sum {
+                violations += 1;
+            }
+        }
+
+        running.store(false, Ordering::Relaxed);
+        writer.join().unwrap();
+        // `buf` is explicitly kept alive here; the above `join()` ensures the writer
+        // has stopped before `buf` could be dropped.
+        drop(buf);
+
+        assert_eq!(violations, 0, "F3: count > Σbuckets observed {violations} times — pre-fix code (count written Relaxed, read last) is the root cause; post-fix Release+Acquire on count makes this invariant unconditional");
     }
 }
