@@ -50,7 +50,15 @@ case "$(uname -s)" in
 esac
 
 TEST_SUPPORT_TARGET_DIR="${CRATE_DIR}/target/test-support"
-TEST_SUPPORT_MODULE="${TEST_SUPPORT_TARGET_DIR}/debug/libngx_http_otel_module.${MODULE_EXT}"
+# When CARGO_BUILD_TARGET is set (TSAN/ASan harness), cargo writes the cdylib
+# to target/test-support/<triple>/debug/ — NOT target/test-support/debug/.
+# The harness exports CARGO_BUILD_TARGET, RUSTFLAGS, RUSTC_BOOTSTRAP, and
+# CARGO_UNSTABLE_BUILD_STD so this `cargo build` produces an instrumented .so.
+if [[ -n "${CARGO_BUILD_TARGET:-}" ]]; then
+    TEST_SUPPORT_MODULE="${TEST_SUPPORT_TARGET_DIR}/${CARGO_BUILD_TARGET}/debug/libngx_http_otel_module.${MODULE_EXT}"
+else
+    TEST_SUPPORT_MODULE="${TEST_SUPPORT_TARGET_DIR}/debug/libngx_http_otel_module.${MODULE_EXT}"
+fi
 
 NGINX_BUILD_DIR="${CRATE_DIR}/objs-${BUILD:-debug}"
 # Fall back to any available objs-* directory.

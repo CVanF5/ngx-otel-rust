@@ -92,10 +92,16 @@ if [[ -n "${CARGO_BUILD_TARGET:-}" ]]; then
 else
     CARGO_MODULE="${CRATE_DIR}/target/release/libngx_http_otel_module.${MODULE_EXT}"
 fi
-if [[ -f "${RELEASE_MODULE}" ]]; then
-    MODULE_PATH="${RELEASE_MODULE}"
+# When CARGO_BUILD_TARGET is set (TSAN/ASan harness), the sanitizer-instrumented
+# module is at target/<triple>/release/.  Prefer CARGO_MODULE over RELEASE_MODULE
+# in that case to avoid a stale non-instrumented objs-release artifact being loaded
+# by a TSAN/ASan nginx (which causes a runtime symbol mismatch and nginx to abort).
+if [[ -n "${CARGO_BUILD_TARGET:-}" && -f "${CARGO_MODULE}" ]]; then
+    MODULE_PATH="${CARGO_MODULE}"
 elif [[ -f "${CARGO_MODULE}" ]]; then
     MODULE_PATH="${CARGO_MODULE}"
+elif [[ -f "${RELEASE_MODULE}" ]]; then
+    MODULE_PATH="${RELEASE_MODULE}"
 else
     echo "ERROR: module not found. Run 'make build-release' first." >&2; exit 1
 fi
@@ -304,7 +310,15 @@ case "$(uname -s)" in
 esac
 
 TEST_SUPPORT_TARGET_DIR="${CRATE_DIR}/target/test-support"
-TEST_SUPPORT_MODULE="${TEST_SUPPORT_TARGET_DIR}/debug/libngx_http_otel_module.${MODULE_EXT}"
+# When CARGO_BUILD_TARGET is set (TSAN/ASan harness), cargo writes the cdylib
+# to target/test-support/<triple>/debug/ — NOT target/test-support/debug/.
+# The harness exports CARGO_BUILD_TARGET, RUSTFLAGS, RUSTC_BOOTSTRAP, and
+# CARGO_UNSTABLE_BUILD_STD so this `cargo build` produces an instrumented .so.
+if [[ -n "${CARGO_BUILD_TARGET:-}" ]]; then
+    TEST_SUPPORT_MODULE="${TEST_SUPPORT_TARGET_DIR}/${CARGO_BUILD_TARGET}/debug/libngx_http_otel_module.${MODULE_EXT}"
+else
+    TEST_SUPPORT_MODULE="${TEST_SUPPORT_TARGET_DIR}/debug/libngx_http_otel_module.${MODULE_EXT}"
+fi
 
 NGINX_BUILD_DIR_C="${CRATE_DIR}/objs-${BUILD:-debug}"
 if [[ ! -d "${NGINX_BUILD_DIR_C}" ]]; then

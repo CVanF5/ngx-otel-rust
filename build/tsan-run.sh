@@ -263,9 +263,101 @@ if [[ "${CRASHLOOP_RC}" -ne 0 ]]; then
 fi
 
 echo ""
-echo "[tsan-run] == run_chaos_dead_collector.sh under TSAN =="
+echo "[tsan-run] == SIGHUP-during-crash-loop interleaving exercise (F2 req 4) =="
+# Requirement: give TSAN eyes to the SIGHUP-while-crash-looping interleaving.
+# control_shm_zone_init (called on SIGHUP reload) does store(0) on crash_count;
+# a concurrent exporter crash-loop is doing fetch_add.  This is the exact race
+# identified in commit 3ff2fd3 as the SIGHUP/crash-counter contention path.
+#
+# Strategy: use the test-support module (already built by crashloop above) to
+# drive 3 reload-during-crash-loop rounds.  This is an EXERCISE (not an assert);
+# any TSAN warning produced is a finding — caught by the step-5 scan below.
+#
+# The test-support module is already at target/<triple>/debug/ after crashloop ran.
+SIGHUP_INTERLEAVE_EXERCISE_ERRORS=0
+(
+    CRATE=/work/ngx-otel-rust
+    case "$(uname -s)" in
+        Darwin) MEXT="dylib" ;;
+        *)      MEXT="so"    ;;
+    esac
+    # The instrumented test-support module built by crashloop.
+    TS_MODULE=""
+    if [[ -n "${CARGO_BUILD_TARGET:-}" ]]; then
+        TS_MODULE="${CRATE}/target/test-support/${CARGO_BUILD_TARGET}/debug/libngx_http_otel_module.${MEXT}"
+    else
+        TS_MODULE="${CRATE}/target/test-support/debug/libngx_http_otel_module.${MEXT}"
+    fi
+    if [[ ! -f "${TS_MODULE}" ]]; then
+        echo "[tsan-run] SIGHUP-interleave: test-support module not found at ${TS_MODULE} — skipping exercise"
+        exit 0
+    fi
+    echo "[tsan-run] SIGHUP-interleave: using module ${TS_MODULE}"
+    echo "[tsan-run] SIGHUP-interleave: running 3 rounds of SIGHUP-during-crash-loop..."
+    for round in 1 2 3; do
+        echo "[tsan-run] SIGHUP-interleave: round ${round}/3 — starting nginx..."
+        TMPDIR="$(mktemp -d /tmp/ngx-otel-sighup-interleave.XXXXXX)"
+        mkdir -p "${TMPDIR}/logs" "${TMPDIR}/client_body_temp"
+        cat > "${TMPDIR}/nginx.conf" <<EOF
+daemon off;
+master_process on;
+worker_processes 1;
+error_log ${TMPDIR}/logs/error.log debug;
+pid       ${TMPDIR}/logs/nginx.pid;
+
+load_module ${TS_MODULE};
+
+events {
+    worker_connections 32;
+}
+
+http {
+    otel_exporter {
+        endpoint http://127.0.0.1:19318;
+    }
+    otel_service_name ngx-otel-sighup-interleave;
+    otel_metric_interval 1s;
+
+    server {
+        listen 127.0.0.1:9202;
+        location / { return 200 "ok\n"; }
+    }
+}
+EOF
+        env NGX_OTEL_CRASH_ON_STARTUP=1 \
+            "${NGINX_BINARY}" -p "${TMPDIR}" -c "${TMPDIR}/nginx.conf" &
+        NGINX_PID=$!
+        # Wait for first crash to fire (exporter spawned, crashes immediately).
+        sleep 2
+        if ! kill -0 "${NGINX_PID}" 2>/dev/null; then
+            echo "[tsan-run] SIGHUP-interleave: round ${round} — master exited prematurely (skip)"
+            rm -rf "${TMPDIR}"
+            continue
+        fi
+        echo "[tsan-run] SIGHUP-interleave: round ${round} — sending SIGHUP while crash-looping..."
+        kill -SIGHUP "${NGINX_PID}" 2>/dev/null || true
+        # Give the TSAN engine 3s to observe any race between store(0) and fetch_add.
+        sleep 3
+        echo "[tsan-run] SIGHUP-interleave: round ${round} — sending SIGQUIT..."
+        kill -SIGQUIT "${NGINX_PID}" 2>/dev/null || true
+        # Wait up to 20s for clean shutdown (backstop drain is 15s).
+        deadline=$(( $(date +%s) + 20 ))
+        while kill -0 "${NGINX_PID}" 2>/dev/null && (( $(date +%s) < deadline )); do
+            sleep 0.5
+        done
+        kill "${NGINX_PID}" 2>/dev/null || true
+        echo "[tsan-run] SIGHUP-interleave: round ${round} done. error.log tail:"
+        tail -5 "${TMPDIR}/logs/error.log" 2>/dev/null || echo "(none)"
+        rm -rf "${TMPDIR}"
+    done
+    echo "[tsan-run] SIGHUP-interleave: 3 rounds complete — TSAN eyes on store(0)⟷fetch_add interleaving."
+) || SIGHUP_INTERLEAVE_EXERCISE_ERRORS=$?
+echo "[tsan-run] SIGHUP-interleave exercise rc=${SIGHUP_INTERLEAVE_EXERCISE_ERRORS}"
+
+echo ""
+echo "[tsan-run] == run_chaos_dead_collector.sh under TSAN (MAX_WAIT_C=120 for TSAN overhead) =="
 DEADCOLL_RC=0
-( bash tests/integration/run_chaos_dead_collector.sh ) || DEADCOLL_RC=$?
+( MAX_WAIT_C=120 bash tests/integration/run_chaos_dead_collector.sh ) || DEADCOLL_RC=$?
 if [[ "${DEADCOLL_RC}" -ne 0 ]]; then
     echo "[tsan-run] run_chaos_dead_collector.sh: NON-ZERO exit ${DEADCOLL_RC}" >&2
 fi
@@ -298,7 +390,8 @@ for log in /tmp/ngx-otel-grpc-smoke.*/logs/error.log \
            /tmp/ngx-otel-crashloop.*/logs/error.log \
            /tmp/ngx-otel-deadcoll.*/logs/error.log \
            /tmp/ngx-otel-deadcoll-b.*/logs/error.log \
-           /tmp/ngx-otel-deadcoll-c.*/logs/error.log; do
+           /tmp/ngx-otel-deadcoll-c.*/logs/error.log \
+           /tmp/ngx-otel-sighup-interleave.*/logs/error.log; do
     if [[ -f "${log}" ]]; then
         count=$(grep -c "WARNING: ThreadSanitizer" "${log}" 2>/dev/null || true)
         if [[ "${count}" -gt 0 ]]; then

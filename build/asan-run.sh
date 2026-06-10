@@ -56,12 +56,18 @@ mkdir -p "${RUNDIR}"
 #   traces             — full span export E2E
 #   access_log         — metrics + exemplars + exception-tail export
 #
+# Chaos scripts are run separately after the main loop (they need special env
+# overrides for timeouts under ASan overhead), controlled by ASAN_CHAOS_SCRIPTS.
+#
 # run_exporter_reload_overlap.sh is intentionally NOT in the default set: its
 # export-content assertion depends on a collector endpoint that returns 404 in
 # this harness (orthogonal config, not a memory error), so it would make the
 # gate falsely red.  The reload/teardown wake path it covers is exercised by
 # run_reload.sh.  Add it back via ASAN_SCRIPTS=... once the endpoint is sorted.
 ASAN_SCRIPTS="${ASAN_SCRIPTS:-run_grpc_export.sh run_grpc_bidi_smoke.sh run_dns_dualstack.sh run_reload.sh run_traces.sh run_access_log.sh}"
+# Chaos scripts: run after the main loop with ASan-overhead-aware timeout overrides.
+# Set ASAN_CHAOS_SCRIPTS="" to skip chaos scripts (e.g. for a quick wake-path-only run).
+ASAN_CHAOS_SCRIPTS="${ASAN_CHAOS_SCRIPTS:-run_chaos_kill9.sh run_chaos_crashloop.sh run_chaos_dead_collector.sh}"
 
 log() { echo "[asan-run] $*"; }
 
@@ -146,6 +152,53 @@ for s in ${ASAN_SCRIPTS}; do
     fi
 done
 
+# ── Step 4b: Run chaos scripts with ASan-overhead-aware timeout overrides ────
+# The chaos scripts build the test-support module (NGX_OTEL_CRASH_ON_STARTUP hook)
+# and run crash-loop / dead-collector / kill-9 scenarios.  Under ASan ~5x overhead
+# the backoff sleeps are real wall-clock (unaffected), but cargo build and nginx
+# spawn overhead may take longer.  MAX_WAIT_S/MAX_WAIT_C=120s is conservative.
+CHAOS_KILL9_RC=0
+CHAOS_CRASHLOOP_RC=0
+CHAOS_DEADCOLL_RC=0
+if [[ -n "${ASAN_CHAOS_SCRIPTS}" ]]; then
+    for s in ${ASAN_CHAOS_SCRIPTS}; do
+        echo ""
+        log "=== Running ${s} under ASan (chaos) ==="
+        case "${s}" in
+            run_chaos_kill9.sh)
+                bash "tests/integration/${s}" || CHAOS_KILL9_RC=$?
+                if [[ "${CHAOS_KILL9_RC}" -ne 0 ]]; then
+                    log "${s}: NON-ZERO exit ${CHAOS_KILL9_RC} — continuing" >&2
+                    FAILED_SCRIPTS+=("${s}(rc=${CHAOS_KILL9_RC})")
+                fi
+                ;;
+            run_chaos_crashloop.sh)
+                MAX_WAIT_S=120 bash "tests/integration/${s}" || CHAOS_CRASHLOOP_RC=$?
+                if [[ "${CHAOS_CRASHLOOP_RC}" -ne 0 ]]; then
+                    log "${s}: NON-ZERO exit ${CHAOS_CRASHLOOP_RC} — continuing" >&2
+                    FAILED_SCRIPTS+=("${s}(rc=${CHAOS_CRASHLOOP_RC})")
+                fi
+                ;;
+            run_chaos_dead_collector.sh)
+                MAX_WAIT_C=120 bash "tests/integration/${s}" || CHAOS_DEADCOLL_RC=$?
+                if [[ "${CHAOS_DEADCOLL_RC}" -ne 0 ]]; then
+                    log "${s}: NON-ZERO exit ${CHAOS_DEADCOLL_RC} — continuing" >&2
+                    FAILED_SCRIPTS+=("${s}(rc=${CHAOS_DEADCOLL_RC})")
+                fi
+                ;;
+            *)
+                if bash "tests/integration/${s}"; then
+                    log "${s}: exit 0"
+                else
+                    rc=$?
+                    log "${s}: NON-ZERO exit ${rc}" >&2
+                    FAILED_SCRIPTS+=("${s}(rc=${rc})")
+                fi
+                ;;
+        esac
+    done
+fi
+
 # ── Step 5: Scan for AddressSanitizer reports ────────────────────────────────
 echo ""
 log "Scanning ${RUNDIR} for AddressSanitizer reports..."
@@ -169,5 +222,5 @@ if (( ${#FAILED_SCRIPTS[@]} > 0 )); then
     exit 2
 fi
 
-log "Zero AddressSanitizer reports across: ${ASAN_SCRIPTS}"
+log "Zero AddressSanitizer reports across: ${ASAN_SCRIPTS} ${ASAN_CHAOS_SCRIPTS}"
 log "ASan gate: PASS (no use-after-free / heap error on the exercised wake paths)."
