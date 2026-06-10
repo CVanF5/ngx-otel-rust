@@ -90,6 +90,15 @@ pub static ACCESS_LOGS_DROPPED: AtomicU64 = AtomicU64::new(0);
 /// metric is exposed even before the error-log path is wired in).
 pub static ERROR_LOGS_DROPPED: AtomicU64 = AtomicU64::new(0);
 
+/// Cumulative coalesced-count occurrences orphaned because the interval's
+/// verbatim ring push was dropped (ring full).  Incremented by
+/// `collect_log_records` once per drain cycle for each orphaned slot.
+///
+/// Unlike `ERROR_LOGS_DROPPED` (which snapshots the ring's cumulative drop
+/// counter via `store`), this is accumulated additively with `fetch_add`
+/// so it represents a true cumulative total across all drain cycles.
+pub static ERROR_LOGS_COALESCED_ORPHANED: AtomicU64 = AtomicU64::new(0);
+
 /// Cumulative logs transport send failures since exporter startup.
 pub static LOGS_SEND_FAILURES: AtomicU64 = AtomicU64::new(0);
 
@@ -282,6 +291,8 @@ impl MetricSource for SelfMetricsSource {
         let backpressure_drops = BIDI_BACKPRESSURE_DROPS.load(Ordering::Acquire) as i64;
         let access_logs_dropped = ACCESS_LOGS_DROPPED.load(Ordering::Acquire) as i64;
         let error_logs_dropped = ERROR_LOGS_DROPPED.load(Ordering::Acquire) as i64;
+        let error_logs_coalesced_orphaned =
+            ERROR_LOGS_COALESCED_ORPHANED.load(Ordering::Acquire) as i64;
         let logs_send_failures = LOGS_SEND_FAILURES.load(Ordering::Acquire) as i64;
         let traces_dropped = TRACES_DROPPED_RECORDS.load(Ordering::Acquire) as i64;
         let exporter_restarts = EXPORTER_RESTARTS.load(Ordering::Acquire) as i64;
@@ -323,6 +334,16 @@ impl MetricSource for SelfMetricsSource {
                 "Error log records dropped because the per-worker ring was full",
                 "records",
                 error_logs_dropped,
+                self.start_time_unix_nano,
+                now,
+            ),
+            monotonic_sum_metric(
+                "ngx_otel.logs.error.coalesced_orphaned_records",
+                "Error log coalesced-count occurrences orphaned because the verbatim \
+                 ring sample was dropped (ring full); a synthetic record is emitted \
+                 per orphaned slot so backends still receive the occurrence count",
+                "records",
+                error_logs_coalesced_orphaned,
                 self.start_time_unix_nano,
                 now,
             ),
@@ -1626,14 +1647,22 @@ fn collect_all_sources(amcf: &MainConfig, worker_start_ns: u64) -> Batch {
     }
 }
 
-/// Drain all worker access-log rings and assemble a [`LogsBatch`].
+/// Drain all worker access-log and error-log rings and assemble a [`LogsBatch`].
 ///
 /// Called once per export tick when `is_access_sample_enabled()` is true.
-/// Drains tail records written by `is_interesting()` requests.
-/// Does NOT drain error rings (Phase 2.3).
+/// Drains tail records written by `is_interesting()` requests (access) and
+/// error records written by the `ngx_otel_error_writer` hook (error logs).
 ///
-/// Also updates the `ACCESS_LOGS_DROPPED` self-metric by reading each ring's
-/// `drop_count()` and computing the delta vs the previous cycle.
+/// Updates `ACCESS_LOGS_DROPPED` from each ring's `drop_count()`.
+/// Updates `ERROR_LOGS_DROPPED` from the error ring's `drop_count()`.
+///
+/// **F5 — orphaned coalesced counts:** after ring drain, any entry in the
+/// coalescer `counts_vec` whose `template_hash` was NOT matched by a ring
+/// record (meaning the verbatim ring push failed — ring full) gets a
+/// synthetic `LogRecord` with `body = "(ring-full: verbatim sample dropped
+/// — occurrence count preserved)"`, `nginx.error.template_hash`, and
+/// `nginx.error.coalesced_count` attributes.  `ERROR_LOGS_COALESCED_ORPHANED`
+/// is incremented by the total orphaned occurrence count.
 fn collect_log_records(
     amcf: &MainConfig,
     logs_base: *mut u8,
@@ -1714,23 +1743,81 @@ fn collect_log_records(
             let counts_vec = unsafe { coalesce::drain_coalesce_table(coalesce_tbl) };
             // Build a lookup: key_hash → count (number of occurrences in this interval,
             // including the initial verbatim sample that was already pushed to the ring).
+            // Keep `counts_vec` alive for the F5 orphaned-count pass below.
             let counts_map: std::collections::HashMap<u64, u32> =
-                counts_vec.into_iter().map(|(hash, _sev, count)| (hash, count)).collect();
+                counts_vec.iter().map(|&(hash, _sev, count)| (hash, count)).collect();
 
             // 2. Drain error ring records for this worker.
             //    Safety: same invariants as the access ring drain above.
             let ring = unsafe { logs_error_ring(logs_base, w, cap) };
             error_dropped += ring.drop_count();
 
+            // F5: track which template_hashes are consumed by ring records so we can
+            // detect orphaned coalesced counts (whose verbatim ring push failed).
+            // template_hash lives at bytes [10..18] of each error ring record.
+            let mut consumed_hashes: std::collections::HashSet<u64> =
+                std::collections::HashSet::new();
+
             let mut record_buf: std::vec::Vec<u8> = std::vec::Vec::new();
             let mut drained = 0usize;
             while drained < MAX_ERROR_RECORDS_PER_WORKER_PER_DRAIN && ring.pop_into(&mut record_buf)
             {
+                // Track the template_hash embedded in the ring record (non-zero means
+                // this record's count was already consumed from counts_map via the
+                // join in parse_error_record).
+                if record_buf.len() >= 18 {
+                    let th = u64::from_be_bytes(
+                        // SAFETY: checked len >= 18 above; [10..18] is 8 bytes.
+                        record_buf[10..18].try_into().unwrap_or([0u8; 8]),
+                    );
+                    if th != 0 {
+                        consumed_hashes.insert(th);
+                    }
+                }
                 if let Some(lr) = parse_error_record(&record_buf, now, &counts_map) {
                     logs.push(lr);
                 }
                 record_buf.clear();
                 drained += 1;
+            }
+
+            // F5: emit a synthetic log record for every counts_vec entry whose
+            // verbatim ring push was dropped (ring full) — the template_hash was never
+            // seen in any ring record consumed above.  The synthetic record carries
+            // the coalesced_count so the backend receives the occurrence total even
+            // without the original error message body.
+            let mut orphaned_total: u64 = 0;
+            for &(hash, severity, count) in &counts_vec {
+                if count > 0 && !consumed_hashes.contains(&hash) {
+                    let (severity_number, severity_text) = nginx_to_otel(severity as u32);
+                    logs.push(LogRecord {
+                        time_unix_nano: now,
+                        observed_time_unix_nano: now,
+                        severity_number,
+                        severity_text: std::string::String::from(severity_text),
+                        body: AnyValue::String(std::string::String::from(
+                            "(ring-full: verbatim sample dropped — occurrence count preserved)",
+                        )),
+                        attributes: std::vec![
+                            KeyValue {
+                                key: "nginx.error.template_hash".into(),
+                                value: AnyValue::Int(hash as i64),
+                            },
+                            KeyValue {
+                                key: "nginx.error.coalesced_count".into(),
+                                value: AnyValue::Int(count as i64),
+                            },
+                        ],
+                        event_name: "nginx.error".into(),
+                        trace_id: std::vec::Vec::new(),
+                        span_id: std::vec::Vec::new(),
+                    });
+                    orphaned_total += count as u64;
+                }
+            }
+            if orphaned_total > 0 {
+                // Accumulate additively — orphaned counts are per-interval.
+                ERROR_LOGS_COALESCED_ORPHANED.fetch_add(orphaned_total, Ordering::Relaxed);
             }
         }
         ERROR_LOGS_DROPPED.store(error_dropped, Ordering::Relaxed);
@@ -2201,8 +2288,9 @@ mod tests {
         let metrics = src.collect();
         assert_eq!(
             metrics.len(),
-            9,
-            "SelfMetricsSource must emit 9 metrics (4 original + 3 log + 1 traces + 1 crash-loop)"
+            10,
+            "SelfMetricsSource must emit 10 metrics \
+             (4 original + 4 log + 1 traces + 1 crash-loop)"
         );
 
         let names: std::vec::Vec<&str> = metrics.iter().map(|m| m.name.as_str()).collect();
@@ -2211,9 +2299,10 @@ mod tests {
         assert!(names.contains(&"ngx_otel.send_failures"));
         assert!(names.contains(&"ngx_otel.bidi_backpressure_drops"));
         assert!(names.contains(&"ngx_otel.export_interval"));
-        // Phase 2.1 — 3 log metrics
+        // Phase 2.1 — 4 log metrics (3 original + F5 orphaned metric)
         assert!(names.contains(&"ngx_otel.logs.access.dropped_records"));
         assert!(names.contains(&"ngx_otel.logs.error.dropped_records"));
+        assert!(names.contains(&"ngx_otel.logs.error.coalesced_orphaned_records"));
         assert!(names.contains(&"ngx_otel.logs.send_failures"));
         // P3 pre-promote — traces drop metric (was written but never emitted)
         assert!(
@@ -2682,6 +2771,109 @@ mod tests {
                 "sample_emitted must be reset to false after drain"
             );
         }
+    }
+
+    /// F5 regression: orphaned coalesced count (ring-full verbatim drop) emits
+    /// a synthetic log record so the count is not silently discarded.
+    ///
+    /// Pre-fix behaviour: `collect_log_records` discards any `counts_map` entry
+    /// whose template_hash has no matching ring record → the N coalesced
+    /// occurrences are silently lost.
+    ///
+    /// This test FAILS on pre-fix code (batch.logs is empty; no synthetic record).
+    #[test]
+    fn f5_orphaned_coalesced_count_emits_synthetic_record() {
+        use crate::logs::coalesce::COALESCE_CAPACITY;
+        use crate::logs::ring::DEFAULT_LOG_RING_CAP;
+        use crate::shm::logs_coalesce_table;
+
+        let cap = DEFAULT_LOG_RING_CAP;
+        let (mut slot_buf, slot_ptr) = make_logs_slot(cap);
+        let _ = &mut slot_buf;
+
+        // Choose a template_hash that won't collide with the "no ring record" slot.
+        let template_hash: u64 = 0xdead_beef_cafe_babe;
+        let coalesced_n: u32 = 42;
+
+        // 1. Populate the coalescer table slot with count=N, but push NO ring record.
+        //    This simulates: the verbatim ring push for this template failed (ring
+        //    full), but the coalescer slot accumulated N occurrences.
+        // SAFETY: `slot_ptr` is the one-worker logs slot from `make_logs_slot`;
+        // `logs_coalesce_table(slot_ptr, 0, cap)` is the in-slot coalescer table
+        // base; `slot_idx` is masked by `COALESCE_CAPACITY - 1` (power-of-two),
+        // so `table.add(slot_idx)` is in-bounds; all writes go through atomic ops.
+        unsafe {
+            let table = logs_coalesce_table(slot_ptr, 0, cap);
+            let slot_idx = (template_hash as usize) & (COALESCE_CAPACITY - 1);
+            let slot = &*table.add(slot_idx);
+            slot.key_hash.store(template_hash, core::sync::atomic::Ordering::Relaxed);
+            slot.severity.store(4u8, core::sync::atomic::Ordering::Relaxed); // error
+            slot.count.store(coalesced_n, core::sync::atomic::Ordering::Release);
+            slot.sample_emitted.store(true, core::sync::atomic::Ordering::Release);
+        }
+        // (No ring record pushed — this is the "ring-full drop" scenario.)
+
+        // 2. Drain via collect_log_records.
+        let amcf = crate::config::MainConfig {
+            error_log_enabled: true,
+            ..crate::config::MainConfig::default()
+        };
+
+        // Reset the orphaned counter before the test drain.
+        ERROR_LOGS_COALESCED_ORPHANED.store(0, Ordering::Relaxed);
+
+        let batch = collect_log_records(&amcf, slot_ptr, 1, 0);
+
+        // 3. Pre-fix: batch.logs would be empty (orphaned count silently discarded).
+        //    Post-fix: one synthetic record is emitted carrying the orphaned count.
+        assert_eq!(
+            batch.logs.len(),
+            1,
+            "one synthetic record must be emitted for the orphaned coalesced count"
+        );
+        let rec = &batch.logs[0];
+        assert_eq!(rec.event_name, "nginx.error", "event_name must be nginx.error");
+
+        // Synthetic record must carry template_hash so backends can group by template.
+        let hash_attr = rec.attributes.iter().find(|kv| kv.key == "nginx.error.template_hash");
+        assert!(
+            hash_attr.is_some(),
+            "nginx.error.template_hash must be present on synthetic record"
+        );
+        assert_eq!(
+            hash_attr.unwrap().value,
+            crate::data_model::AnyValue::Int(template_hash as i64),
+            "template_hash must match the orphaned slot's key"
+        );
+
+        // Synthetic record must carry coalesced_count = N.
+        let count_attr = rec.attributes.iter().find(|kv| kv.key == "nginx.error.coalesced_count");
+        assert!(
+            count_attr.is_some(),
+            "nginx.error.coalesced_count must be present on synthetic record"
+        );
+        assert_eq!(
+            count_attr.unwrap().value,
+            crate::data_model::AnyValue::Int(coalesced_n as i64),
+            "coalesced_count must equal the orphaned slot count"
+        );
+
+        // Body must mention "ring-full" so the record is clearly identifiable.
+        let body_str = match &rec.body {
+            crate::data_model::AnyValue::String(s) => s.as_str(),
+            _ => "",
+        };
+        assert!(
+            body_str.contains("ring-full"),
+            "synthetic record body must contain 'ring-full'; got: {body_str:?}"
+        );
+
+        // 4. Self-metric must reflect the orphaned count total.
+        let orphaned_metric = ERROR_LOGS_COALESCED_ORPHANED.load(Ordering::Acquire);
+        assert_eq!(
+            orphaned_metric, coalesced_n as u64,
+            "ERROR_LOGS_COALESCED_ORPHANED must be incremented by the orphaned count"
+        );
     }
 
     // ── Step 2.3.4 error-rate metric tests ───────────────────────────────────

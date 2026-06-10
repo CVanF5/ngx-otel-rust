@@ -415,6 +415,7 @@ The exporter process emits its own health metrics every export interval
 | `ngx_otel.bidi_backpressure_drops` | Sum (monotonic) | `{message}` | Bidi outbound messages dropped due to channel backpressure |
 | `ngx_otel.logs.access.dropped_records` | Sum (monotonic) | `{record}` | Access log records dropped because the per-worker ring was full |
 | `ngx_otel.logs.error.dropped_records` | Sum (monotonic) | `{record}` | Error log records dropped because the per-worker ring was full |
+| `ngx_otel.logs.error.coalesced_orphaned_records` | Sum (monotonic) | `{record}` | Coalesced error-log occurrences whose verbatim ring sample was dropped (ring full); a synthetic record is emitted for each orphaned slot so the occurrence count is preserved (F5 fix). Accumulated additively across drain cycles. |
 | `ngx_otel.logs.send_failures` | Sum (monotonic) | `{failure}` | Cumulative logs transport send failures since exporter startup |
 | `ngx_otel.traces.dropped_records` | Sum (monotonic) | `{record}` | Span records dropped because the per-worker spans ring was full |
 | `ngx_otel.export_interval` | Gauge | `ms` | Configured metric export interval |
