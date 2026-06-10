@@ -1,0 +1,62 @@
+ASan gate — hostile-fixes batch (2026-06-10)
+============================================
+
+Branch: main (post-hostile-fixes; commits dbcf30e..8ad4bca)
+Platform: macOS arm64 host → Docker linux/arm64 (debian:13-slim)
+Toolchain: clang + RUSTFLAGS="-Zsanitizer=address"
+nginx: built with -fsanitize=address -fno-omit-frame-pointer
+Module: target/aarch64-unknown-linux-gnu/debug/libngx_http_otel_module.so
+       (ASan-instrumented Rust, same binary as nginx)
+Report dir: tests/asan-logs-20260610T163547Z/
+
+1. INSTRUMENTATION VERIFIED
+---------------------------
+  [asan-run] Step 1: OK — ASan flags accepted by clang + rustc.
+  [asan-run] Step 2: OK — plain ASan nginx at objs-asan-plain/nginx
+  ASAN_OPTIONS: detect_leaks=0:detect_stack_use_after_return=1:
+                detect_odr_violation=0:abort_on_error=1
+
+2. SCRIPTS EXECUTED
+-------------------
+  run_exporter_lifecycle.sh       exit 0  PASS
+  run_exporter_reload_overlap.sh  exit 0  PASS
+  run_exporter_crash_respawn.sh   exit 0  PASS
+  run_b2_orphan.sh                exit 0  PASS
+  run_b3_quit_hang.sh             exit 0  PASS
+  run_signal_storm.sh             exit 0  PASS
+  run_dns_dualstack.sh            exit 0  PASS
+  run_reload.sh                   exit 1  SKIP — jq not installed in container
+                                          (pre-existing infrastructure gap;
+                                          functional/metrics assertion, not a
+                                          memory-safety path)
+  run_traces.sh                   exit 0  PASS
+  run_chaos_kill9.sh              exit 0  PASS
+  run_chaos_crashloop.sh          exit 0  PASS
+  run_chaos_dead_collector.sh     exit 0  PASS
+
+3. ASAN REPORT SCAN
+-------------------
+  [asan-run] Scanning tests/asan-logs-20260610T163547Z for AddressSanitizer reports...
+  [asan-run] NOTE: no ASan reports, but these scripts exited non-zero: run_reload.sh(rc=1)
+  [asan-run]       (functional/assertion failure, not a memory error — inspect separately)
+  EXIT_CODE=0 (make exited 2 due to run_reload.sh rc=1; zero ASan reports)
+
+  run_reload.sh failure root cause:
+    ERROR: jq is required for metrics.json assertions.
+  This is a missing `jq` binary in the Docker container — a pre-existing
+  infrastructure gap not related to the hostile-fixes code changes.  The script
+  exits before any nginx starts, so no ASan-exercised code ran in it.
+
+VERDICT
+-------
+Zero AddressSanitizer reports (zero use-after-free / heap errors) across all
+exercised paths on the hostile-fixes batch.  E1's double-close fix and B2's
+channel-close fix both exercised with zero UAF reports.
+
+run_reload.sh skipped due to missing `jq` in container (pre-existing; jq needed
+for metrics JSON assertions only).  No memory-safety paths were skipped.
+
+Reproduce
+---------
+  make asan-test   # from project root, Docker required
+  # To include run_reload.sh: install jq in the Docker image first

@@ -1,0 +1,41 @@
+TSAN gate — hostile-fixes batch (2026-06-10)
+============================================
+
+Branch: main (post-hostile-fixes; commits dbcf30e..8ad4bca)
+Platform: macOS arm64 host → Docker linux/arm64 (debian:13-slim)
+Toolchain: clang + RUSTFLAGS="-Zsanitizer=thread"
+nginx: built with -fsanitize=thread -fno-omit-frame-pointer
+Module: target/aarch64-unknown-linux-gnu/debug/libngx_http_otel_module.so
+       (TSAN-instrumented Rust, same binary as nginx)
+
+1. INSTRUMENTATION VERIFIED
+---------------------------
+  [tsan-run] Step 1: OK — TSAN flags accepted by clang + rustc.
+  [tsan-run] Step 2: OK — plain TSAN nginx at objs-tsan-plain/nginx
+
+2. SCRIPTS EXECUTED
+-------------------
+  run_chaos_kill9.sh              exit 0  PASS
+  run_chaos_crashloop.sh          exit 0  PASS  (MAX_WAIT_S=120 for TSAN overhead)
+  SIGHUP-interleave exercise      3 rounds PASS  (F2 req 4 — SIGHUP-during-crash-loop)
+  run_chaos_dead_collector.sh     exit 0  PASS
+
+  All scenarios: B1 SIGHUP abdication, B2 orphan exit, C1 crash-loop backoff/
+  self-disable, C2 SIGHUP crash-counter reset, SIGQUIT drain, dead-collector.
+
+3. TSAN REPORT SCAN
+-------------------
+  [tsan-run] Checking for ThreadSanitizer warnings in error logs...
+  [tsan-run] Zero ThreadSanitizer warnings.  TSAN gate: PASS.
+  EXIT_CODE=0
+
+VERDICT
+-------
+Zero ThreadSanitizer warnings across all exercised code paths on the
+hostile-fixes batch (B4 daemon-on ALERT, G1 Q2 comment fix, plus all prior
+fixes from F6, F7, B1-B3 already verified).  Zero data races on new atomics
+(successor_gen abdication, DROPPED_RECORDS accounting, crash-loop shm fields).
+
+Reproduce
+---------
+  make tsan-test   # from project root, Docker required
