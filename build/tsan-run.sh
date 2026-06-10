@@ -243,17 +243,40 @@ echo "[tsan-run] === Running C2 chaos scripts under TSAN (C1 crash-counter cross
 
 echo ""
 echo "[tsan-run] == run_chaos_kill9.sh under TSAN =="
-bash tests/integration/run_chaos_kill9.sh
+# Run in a subshell so a failure here doesn't abort the whole TSAN run.
+# A real TSAN race would already have halted nginx via halt_on_error=1 and
+# been caught in the step-5 log scan below.
+KILL9_RC=0
+( bash tests/integration/run_chaos_kill9.sh ) || KILL9_RC=$?
+if [[ "${KILL9_RC}" -ne 0 ]]; then
+    echo "[tsan-run] run_chaos_kill9.sh: NON-ZERO exit ${KILL9_RC} — continuing to crash+dead_collector" >&2
+fi
 
 echo ""
 echo "[tsan-run] == run_chaos_crashloop.sh under TSAN (MAX_WAIT_S=120 for TSAN overhead) =="
 # TSAN ~10x slowdown: total backoff remains ≤ 3s (real sleep), but nginx spawn
 # and cargo build overhead may take longer.  120s budget is conservative.
-MAX_WAIT_S=120 bash tests/integration/run_chaos_crashloop.sh
+CRASHLOOP_RC=0
+( MAX_WAIT_S=120 bash tests/integration/run_chaos_crashloop.sh ) || CRASHLOOP_RC=$?
+if [[ "${CRASHLOOP_RC}" -ne 0 ]]; then
+    echo "[tsan-run] run_chaos_crashloop.sh: NON-ZERO exit ${CRASHLOOP_RC}" >&2
+fi
 
 echo ""
 echo "[tsan-run] == run_chaos_dead_collector.sh under TSAN =="
-bash tests/integration/run_chaos_dead_collector.sh
+DEADCOLL_RC=0
+( bash tests/integration/run_chaos_dead_collector.sh ) || DEADCOLL_RC=$?
+if [[ "${DEADCOLL_RC}" -ne 0 ]]; then
+    echo "[tsan-run] run_chaos_dead_collector.sh: NON-ZERO exit ${DEADCOLL_RC}" >&2
+fi
+
+# After all chaos scripts: fail the TSAN run if any of them failed.
+# The TSAN warning scan in step 5 is the definitive gate for races.
+# These functional failures indicate harness/timing issues, not TSAN races.
+if [[ "${KILL9_RC}" -ne 0 || "${CRASHLOOP_RC}" -ne 0 || "${DEADCOLL_RC}" -ne 0 ]]; then
+    echo "[tsan-run] NOTE: chaos script(s) exited non-zero (kill9=${KILL9_RC}, crashloop=${CRASHLOOP_RC}, deadcoll=${DEADCOLL_RC})"
+    echo "[tsan-run] NOTE: these are functional/timing failures — check the TSAN warning scan for actual races."
+fi
 
 # ── Step 5: Belt-and-suspenders ThreadSanitizer warning scan ─────────────────
 
@@ -293,3 +316,9 @@ if [[ "${TSAN_WARNINGS}" -gt 0 ]]; then
 fi
 
 echo "[tsan-run] Zero ThreadSanitizer warnings.  TSAN gate: PASS."
+
+# Report chaos functional failures (non-zero exits unrelated to TSAN races).
+if [[ "${KILL9_RC:-0}" -ne 0 || "${CRASHLOOP_RC:-0}" -ne 0 || "${DEADCOLL_RC:-0}" -ne 0 ]]; then
+    echo "[tsan-run] CHAOS NOTE: kill9=${KILL9_RC:-0} crashloop=${CRASHLOOP_RC:-0} deadcoll=${DEADCOLL_RC:-0} — functional/timing failure; no TSAN race." >&2
+    exit 3
+fi
