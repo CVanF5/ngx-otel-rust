@@ -45,8 +45,8 @@ extern crate std;
 use core::ptr;
 
 use nginx_sys::{
-    ngx_conf_t, ngx_cycle_t, ngx_http_module_t, ngx_int_t, ngx_module_t, ngx_uint_t,
-    NGX_HTTP_MODULE,
+    ngx_conf_t, ngx_core_conf_t, ngx_cycle_t, ngx_http_module_t, ngx_int_t, ngx_module_t,
+    ngx_uint_t, NGX_HTTP_MODULE,
 };
 use ngx::core::Status;
 use ngx::http::{add_phase_handler, HttpModule, HttpModuleLocationConf, HttpModuleMainConf};
@@ -185,6 +185,101 @@ fn spawn_exporter_for_cycle(
     Status::NGX_OK.into()
 }
 
+// ── A1: zone-sizing validation ────────────────────────────────────────────────
+
+/// Read the final `worker_processes` from the fully-parsed nginx cycle.
+///
+/// Called from `ngx_otel_init_module` (post-parse, so the value is final)
+/// and from `check_zone_sizing` to detect the hostile-ordering mismatch.
+///
+/// # Safety
+/// `cycle` must be a valid non-null `ngx_cycle_t` pointer.
+unsafe fn worker_processes_from_cycle(cycle: *const nginx_sys::ngx_cycle_t) -> Option<usize> {
+    // SAFETY: caller guarantees `cycle` is valid.
+    let cycle_ref = unsafe { &*cycle };
+    let core_idx = nginx_sys::ngx_core_module.index;
+    // SAFETY: conf_ctx is initialised by nginx; indexing by core_idx is in-bounds.
+    let raw_conf: *mut *mut *mut core::ffi::c_void = unsafe { *cycle_ref.conf_ctx.add(core_idx) };
+    let core_conf = raw_conf.cast::<ngx_core_conf_t>();
+    if core_conf.is_null() {
+        return None;
+    }
+    // SAFETY: core_conf is non-null; struct is valid at init_module time.
+    let wp = unsafe { (*core_conf).worker_processes };
+    // NGX_CONF_UNSET = -1; after a full parse the value is either set or the
+    // nginx default (1).  Treat anything < 1 as unknown = None.
+    if wp < 1 {
+        None
+    } else {
+        Some(wp as usize)
+    }
+}
+
+/// A1 — Fail-fast zone-sizing validation.
+///
+/// Compares every shm zone's registered size against what is required for the
+/// actual (post-parse, final) `worker_processes` value.  Returns `Err(())` and
+/// logs `NGX_LOG_EMERG` when any zone is undersized.
+///
+/// This catches the case where `worker_processes N;` appears **after** the
+/// `http {}` block in nginx.conf.  In that position, postconfiguration sees
+/// `NGX_CONF_UNSET` (-1) and sizes all zones for 1 worker; `init_module` then
+/// runs with the final value and catches the mismatch here before any worker
+/// forks.
+///
+/// # Safety
+/// `cycle` and `amcf` must be valid non-null pointers.
+unsafe fn check_zone_sizing(
+    cycle: *mut nginx_sys::ngx_cycle_t,
+    amcf: &crate::config::MainConfig,
+) -> Result<(), ()> {
+    // SAFETY: `cycle` is valid per the `unsafe fn` contract.
+    let actual_workers = unsafe { worker_processes_from_cycle(cycle) }.unwrap_or(1);
+
+    // Helper: compare a zone pointer's registered size against a required size.
+    let check =
+        |zone_ptr: *mut nginx_sys::ngx_shm_zone_t, required: usize, _zone_label: &str| -> bool {
+            if zone_ptr.is_null() {
+                return true; // zone not registered — nothing to check
+            }
+            // SAFETY: zone_ptr is non-null per the check above; shm.size is set at
+            // ngx_shared_memory_add time and immutable thereafter.
+            let registered = unsafe { (*zone_ptr).shm.size };
+            registered >= required
+        };
+
+    let metrics_required = crate::shm::zone_size_for(actual_workers);
+    let metrics_ok = check(amcf.shm_zone, metrics_required, "metrics");
+
+    let logs_cap = amcf.log_ring_cap();
+    let logs_required = crate::shm::logs_zone_size_for(actual_workers, logs_cap);
+    let logs_ok = check(amcf.logs_shm_zone, logs_required, "logs");
+
+    let spans_cap = crate::shm::DEFAULT_SPAN_RING_CAP;
+    let spans_required = crate::shm::spans_zone_size_for(actual_workers, spans_cap);
+    let spans_ok = check(amcf.spans_shm_zone, spans_required, "spans");
+
+    if metrics_ok && logs_ok && spans_ok {
+        return Ok(());
+    }
+
+    // At least one zone is undersized — this is the hostile-ordering case.
+    // Log EMERG and refuse to start so the operator gets a clear message
+    // instead of silent memory corruption.
+    // SAFETY: `cycle` is valid per the `unsafe fn` contract; `.log` is a
+    // non-null `ngx_log_t*` nginx initialises before calling any module hook.
+    let log = unsafe { (*cycle).log };
+    ngx::ngx_log_error!(
+        nginx_sys::NGX_LOG_EMERG,
+        log,
+        "otel: shm zones were sized for 1 worker but worker_processes={} — \
+         move the worker_processes directive BEFORE the http{{}} block and reload; \
+         refusing to start to prevent out-of-zone writes",
+        actual_workers
+    );
+    Err(())
+}
+
 // ── init_module callback ──────────────────────────────────────────────────────
 
 /// Called by nginx from `ngx_init_modules` (via `ngx_init_cycle`) — once at
@@ -230,6 +325,18 @@ extern "C" fn ngx_otel_init_module(cycle: *mut nginx_sys::ngx_cycle_t) -> nginx_
     };
     if !amcf.is_configured() {
         return Status::NGX_OK.into();
+    }
+
+    // A1 — Fail-fast: verify every shm zone was sized for the actual
+    // worker_processes count.  Catches the hostile ordering where
+    // `worker_processes N;` appears after `http{}` — postconfiguration sees
+    // NGX_CONF_UNSET and sizes for 1, then workers 1..N-1 would write past the
+    // zone end.  We refuse to start with a clear error instead.
+    //
+    // SAFETY: `cycle` is valid (verified above); `amcf` is the main conf for
+    // this cycle.
+    if unsafe { check_zone_sizing(cycle, amcf) }.is_err() {
+        return Status::NGX_ERROR.into();
     }
 
     // Detect SIGHUP reload vs initial start via old_cycle->conf_ctx.

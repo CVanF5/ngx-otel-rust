@@ -86,8 +86,35 @@ impl HttpRequestHandler for LogPhaseHandler {
         // it on the (single-threaded) request path is sound.
         let worker_id = unsafe { nginx_sys::ngx_worker };
 
+        // A1 bounds guard: if `check_zone_sizing` somehow didn't fire (e.g.
+        // the module was loaded without going through init_module), catch the
+        // out-of-range index here rather than writing past the zone end.
+        // `shm_n_workers()` derives the zone capacity from the registered zone
+        // size — zero cost: one pointer load + integer arithmetic, no alloc/lock.
+        let n_workers = amcf.shm_n_workers();
+        if worker_id >= n_workers {
+            // Hard invariant violation: zone was undersized for this worker.
+            // Log at ALERT (once per request until restart — the init_module
+            // check should have prevented this) and disable for this worker.
+            let r = request.as_ref();
+            // SAFETY: `r.connection` is a valid non-null pointer for the
+            // lifetime of the request; `(*connection).log` is the request log.
+            let log = unsafe { (*r.connection).log };
+            ngx::ngx_log_error!(
+                nginx_sys::NGX_LOG_ALERT,
+                log,
+                "otel: worker_id {} >= zone capacity {} — module disabled \
+                 for this worker; move worker_processes before http{{}}",
+                worker_id,
+                n_workers
+            );
+            return Status::NGX_OK;
+        }
+
+        debug_assert!(worker_id < n_workers, "A1: worker_id out of zone bounds");
         // Get our slot. No allocation; pointer arithmetic only.
-        // Safety: zone was sized for ≥ worker_id slots during postconfiguration.
+        // SAFETY: `worker_id < n_workers` (enforced by the bounds guard above);
+        // `n_workers` is derived from the zone size so the slot is within the zone.
         let slot = unsafe { &*worker_slots(base, worker_id) };
 
         // Use AsRef to get a typed reference to the underlying ngx_http_request_t.

@@ -784,6 +784,17 @@ pub fn zone_size_for(n_workers: usize) -> usize {
     data_offset() + n_workers * mem::size_of::<WorkerSlots>()
 }
 
+/// Number of `WorkerSlots` the metrics zone was sized for, derived from the
+/// total zone size (including the slab-pool header at offset 0).
+///
+/// Returns 0 when `zone_size <= data_offset()` (zone too small to hold any slot).
+/// The result is the CAPACITY of the zone, not necessarily the current worker count.
+#[inline]
+pub fn n_workers_from_zone_size(zone_size: usize) -> usize {
+    let slot = mem::size_of::<WorkerSlots>();
+    zone_size.saturating_sub(data_offset()) / slot
+}
+
 /// Register the shared memory zone with nginx from `postconfiguration`.
 ///
 /// Returns the `ngx_shm_zone_t` pointer on success.
@@ -1335,6 +1346,44 @@ mod tests {
         assert!(slab > 0, "slab pool offset must be positive");
         assert_eq!(zone_size_for(4), slab + 4 * mem::size_of::<WorkerSlots>());
         assert!(zone_size_for(1) >= slab + mem::size_of::<WorkerSlots>());
+    }
+
+    /// A1 — `n_workers_from_zone_size` is the exact inverse of `zone_size_for`.
+    ///
+    /// This test FAILS on the pre-fix code (before `n_workers_from_zone_size`
+    /// existed) because that function did not exist.  After the fix it must
+    /// pass to confirm the zone-capacity round-trip is correct, which is the
+    /// prerequisite for the `shm_n_workers()` bounds guard.
+    #[test]
+    fn a1_zone_capacity_round_trip() {
+        for n in [1usize, 2, 4, 8, 16, 32] {
+            let size = zone_size_for(n);
+            let recovered = n_workers_from_zone_size(size);
+            assert_eq!(
+                recovered, n,
+                "n_workers_from_zone_size(zone_size_for({n})) should equal {n}, got {recovered}"
+            );
+        }
+        // Under-sized zone (smaller than one full slot) → 0 capacity.
+        assert_eq!(
+            n_workers_from_zone_size(data_offset()),
+            0,
+            "zone with only slab header → 0 workers capacity"
+        );
+        // Zone sized for 1 but queried as if it were 4 → capacity = 1.
+        let size_1 = zone_size_for(1);
+        let cap = n_workers_from_zone_size(size_1);
+        assert_eq!(cap, 1, "zone sized for 1 worker → capacity 1");
+
+        // A1 hostile-ordering scenario: zone sized for 1 worker, actual
+        // worker_id=3.  The bounds guard `worker_id >= n_workers_from_zone_size(size)`
+        // must fire (3 >= 1).  Before the fix, no such check existed.
+        let worker_id: usize = 3;
+        assert!(
+            worker_id >= cap,
+            "worker_id {worker_id} must be >= zone capacity {cap} \
+             (bounds guard must fire for the hostile-ordering case)"
+        );
     }
 
     #[test]

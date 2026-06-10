@@ -355,6 +355,42 @@ impl Default for MainConfig {
     }
 }
 
+/// Read `worker_processes` from the nginx core conf at postconfiguration time.
+///
+/// Returns the configured worker count (`>= 1`) when the `worker_processes`
+/// directive has already been parsed, or `None` when it is still
+/// `NGX_CONF_UNSET` (= -1) — which happens when `worker_processes` appears
+/// **after** the `http {}` block in nginx.conf.
+///
+/// Callers that get `None` should fall back to a provisional value (1) and
+/// arrange for `ngx_otel_init_module` to validate the actual count later.
+///
+/// # Safety
+/// `cf` must be a valid, non-null `ngx_conf_t` at postconfiguration time.
+unsafe fn n_workers_from_cf(cf: *const ngx_conf_t) -> Option<usize> {
+    // SAFETY: caller guarantees `cf` is valid at postconfiguration time.
+    let cycle = unsafe { (*cf).cycle.as_ref() }?;
+    let core_idx = nginx_sys::ngx_core_module.index;
+    // conf_ctx is *mut *mut *mut *mut c_void; the BIT value at
+    // conf_ctx[core_idx] IS the ngx_core_conf_t*.
+    // SAFETY: nginx fills conf_ctx before postconfiguration runs.
+    let raw_conf: *mut *mut *mut core::ffi::c_void = unsafe { *cycle.conf_ctx.add(core_idx) };
+    let core_conf = raw_conf.cast::<nginx_sys::ngx_core_conf_t>();
+    if core_conf.is_null() {
+        return None;
+    }
+    // SAFETY: core_conf is non-null per above check; the struct is valid for
+    // the duration of postconfiguration.
+    let wp = unsafe { (*core_conf).worker_processes };
+    // wp == NGX_CONF_UNSET (-1 as ngx_int_t) when the directive has not been
+    // parsed yet (e.g. it appears after the http{} block).
+    if wp < 1 {
+        None
+    } else {
+        Some(wp as usize)
+    }
+}
+
 impl MainConfig {
     /// Returns `true` when `otel_exporter { endpoint ... }` was configured.
     pub fn is_configured(&self) -> bool {
@@ -634,26 +670,14 @@ impl MainConfig {
         cf: *mut ngx_conf_t,
         module: *mut ngx_module_t,
     ) -> Result<(), Status> {
-        // Determine the number of worker processes from ngx_core_conf_t.
-        // ngx_get_conf(cycle->conf_ctx, ngx_core_module) = conf_ctx[ngx_core_module.index]
-        // is a void* pointing to ngx_core_conf_t (typed as void*** in the binding).
-        // SAFETY: `cf` is the valid non-null parse context. `cf.cycle` is nginx's
-        // live cycle; `conf_ctx[core_idx]` is the populated module-conf slot for
-        // the core module (its index is in-bounds for `conf_ctx`), and the pointer
-        // it holds is the `ngx_core_conf_t*`, null-checked before deref.
-        let n_workers: usize = unsafe {
-            let cycle = (*cf).cycle.as_ref().ok_or(Status::NGX_ERROR)?;
-            let core_idx = nginx_sys::ngx_core_module.index;
-            // conf_ctx is *mut *mut *mut *mut c_void; indexing gives *mut *mut *mut c_void.
-            // The BIT value of that pointer IS the ngx_core_conf_t*.
-            let raw_conf: *mut *mut *mut core::ffi::c_void = *cycle.conf_ctx.add(core_idx);
-            let core_conf: *const nginx_sys::ngx_core_conf_t = raw_conf.cast();
-            if core_conf.is_null() {
-                1 // fallback
-            } else {
-                (*core_conf).worker_processes.max(1) as usize
-            }
-        };
+        // A1: Read worker_processes from the core conf.  When the directive
+        // appears AFTER the http{} block, `worker_processes` is still
+        // NGX_CONF_UNSET (-1) at postconfiguration time.  We use 1 as a
+        // provisional size and let `ngx_otel_init_module` catch the mismatch
+        // after the full parse is done and the value is final.
+        //
+        // SAFETY: `cf` is the valid non-null parse context at postconfiguration.
+        let n_workers: usize = unsafe { n_workers_from_cf(cf) }.unwrap_or(1);
 
         // Compute required zone size.
         let required_size = shm::zone_size_for(n_workers);
@@ -742,20 +766,9 @@ impl MainConfig {
         cf: *mut ngx_conf_t,
         module: *mut ngx_module_t,
     ) -> Result<(), Status> {
-        // SAFETY: identical to `register_shm_zone` — `cf` is valid, `cf.cycle` is
-        // the live cycle, the core module's `conf_ctx` slot is in-bounds, and the
-        // `ngx_core_conf_t*` it holds is null-checked before deref.
-        let n_workers: usize = unsafe {
-            let cycle = (*cf).cycle.as_ref().ok_or(Status::NGX_ERROR)?;
-            let core_idx = nginx_sys::ngx_core_module.index;
-            let raw_conf: *mut *mut *mut core::ffi::c_void = *cycle.conf_ctx.add(core_idx);
-            let core_conf: *const nginx_sys::ngx_core_conf_t = raw_conf.cast();
-            if core_conf.is_null() {
-                1
-            } else {
-                (*core_conf).worker_processes.max(1) as usize
-            }
-        };
+        // A1: same provisional-sizing contract as `register_shm_zone`.
+        // SAFETY: `cf` is the valid non-null parse context at postconfiguration.
+        let n_workers: usize = unsafe { n_workers_from_cf(cf) }.unwrap_or(1);
 
         let cap = self.log_ring_cap();
         let zone_size = shm::logs_zone_size_for(n_workers, cap);
@@ -797,18 +810,9 @@ impl MainConfig {
         cf: *mut ngx_conf_t,
         module: *mut ngx_module_t,
     ) -> Result<(), Status> {
-        // SAFETY: same as `register_logs_zone` — `cf` is valid, `cf.cycle` is live.
-        let n_workers: usize = unsafe {
-            let cycle = (*cf).cycle.as_ref().ok_or(Status::NGX_ERROR)?;
-            let core_idx = nginx_sys::ngx_core_module.index;
-            let raw_conf: *mut *mut *mut core::ffi::c_void = *cycle.conf_ctx.add(core_idx);
-            let core_conf: *const nginx_sys::ngx_core_conf_t = raw_conf.cast();
-            if core_conf.is_null() {
-                1
-            } else {
-                (*core_conf).worker_processes.max(1) as usize
-            }
-        };
+        // A1: same provisional-sizing contract as `register_shm_zone`.
+        // SAFETY: `cf` is the valid non-null parse context at postconfiguration.
+        let n_workers: usize = unsafe { n_workers_from_cf(cf) }.unwrap_or(1);
 
         let cap = shm::DEFAULT_SPAN_RING_CAP;
         let zone_size = shm::spans_zone_size_for(n_workers, cap);
@@ -1253,6 +1257,27 @@ impl MainConfig {
         // (slab-pool header) lie within the zone, so the offset pointer is
         // in-bounds — only formed here, not dereferenced.
         Some(unsafe { addr.cast::<u8>().add(crate::shm::data_offset()) })
+    }
+
+    /// Number of worker slots the metrics shm zone was sized for.
+    ///
+    /// Derived from the zone's registered `shm.size` — works even before workers
+    /// fork, and stays valid across reloads because the zone registration is
+    /// immutable once `ngx_shared_memory_add` returns.
+    ///
+    /// Returns 0 when the zone has not been registered yet (`shm_zone` is null).
+    ///
+    /// Used by per-request slot-index bounds guards to catch the case where
+    /// the zone was mistakenly sized for fewer workers than are actually running
+    /// (e.g., `worker_processes` appeared after `http{}` and the init_module
+    /// fail-fast was somehow bypassed).
+    pub fn shm_n_workers(&self) -> usize {
+        // SAFETY: `shm_zone` is null or the `ngx_shm_zone_t*` from
+        // `register_shm_zone`; reading `shm.size` through it is sound.
+        let Some(zone) = (unsafe { self.shm_zone.as_ref() }) else {
+            return 0;
+        };
+        crate::shm::n_workers_from_zone_size(zone.shm.size)
     }
 
     /// Returns a pointer to the `ControlShm` data in the control zone.
