@@ -1,0 +1,145 @@
+TSAN Chaos Test Results — F2 Closure (v3)
+==========================================
+Date:      2026-06-10
+Host:      debian-vm (Linux arm64, Docker container from Dockerfile.tsan)
+Branch:    main @ d4c21b0
+Harness:   build/tsan-run.sh inside ngx-otel-tsan:latest Docker image
+TSAN opts: halt_on_error=1:second_deadlock_stack=1:detect_deadlocks=1
+RUSTFLAGS: -Cforce-frame-pointers=yes -Zsanitizer=thread -Zexternal-clangrt
+CARGO_BUILD_TARGET: aarch64-unknown-linux-gnu (arm64 native)
+
+
+1. nm SYMBOL VERIFICATION
+--------------------------
+Release module (used by kill9 + dead_collector Parts A/B):
+  Path: target/aarch64-unknown-linux-gnu/release/libngx_http_otel_module.so
+  __tsan_* symbols: 42
+  Sample: __tsan_atomic32_compare_exchange_val, __tsan_atomic32_exchange,
+          __tsan_atomic32_fetch_add, __tsan_atomic32_fetch_sub, __tsan_atomic32_load
+
+Test-support module (used by crashloop + dead_collector Part C + SIGHUP interleave):
+  Path: target/test-support/aarch64-unknown-linux-gnu/debug/libngx_http_otel_module.so
+  __tsan_* symbols: 38
+  Sample: __tsan_atomic32_compare_exchange_val, __tsan_atomic32_exchange,
+          __tsan_atomic32_fetch_add, __tsan_atomic32_fetch_sub, __tsan_atomic32_load
+
+VERIFICATION: Both .so files loaded during chaos tests carry __tsan_* instrumentation.
+The atomics on crash_count (fetch_add, store) and window_start_unix are intercepted
+by TSAN at every access.
+
+
+2. CHAOS SCRIPT RESULTS
+------------------------
+
+run_chaos_kill9.sh          rc=0  PASS
+  [PASS] Exporter started, PID confirmed
+  [PASS] Workers have zero connections to :4317/:4318 (before kill) — architectural isolation
+  [PASS] Workers return HTTP 200 while exporter is dead
+  [PASS] Master respawned exporter (crash_count.fetch_add observed by TSAN)
+  [PASS] Workers have zero connections to :4317/:4318 (after respawn)
+  [PASS] error.log contains 'cycle entered' 2 times (initial + respawn)
+  [PASS] Master and exporter exited cleanly after SIGQUIT
+  [PASS] === All kill-9 containment assertions passed ===
+
+run_chaos_crashloop.sh      rc=0  PASS  (MAX_WAIT_S=120 for TSAN overhead)
+  [PASS] test-support module built: target/test-support/aarch64-unknown-linux-gnu/debug/...
+  [PASS] nginx master started
+  [PASS] Initial exporter appeared
+  [PASS] Self-disable ALERT observed in error.log
+  [PASS] Backoff messages in error.log: 4 (exponential throttle active)
+  [PASS] No exporter process after self-disable (nginx correctly stopped respawning)
+  [PASS] ALERT message includes 'telemetry OFF' — correct operator guidance
+  [PASS] ALERT message includes 'nginx request handling UNAFFECTED'
+  [PASS] nginx master still responsive after exporter self-disable
+  [PASS] Workers return HTTP 200 after exporter self-disable (data plane UNAFFECTED)
+  [PASS] nginx master exited cleanly on SIGQUIT
+  [PASS] === All crash-loop self-disable assertions passed ===
+
+run_chaos_dead_collector.sh rc=0  PASS  (MAX_WAIT_C=120 for TSAN overhead)
+  Part A (dead endpoint):
+    [PASS] Exporter started with dead endpoint
+    [PASS] nginx exited 1s after SIGQUIT (budget 20s)
+    [PASS] No orphan exporter after SIGQUIT
+  Part B (SIGHUP reload with dead collector):
+    [PASS] Part B: exporter started, PID confirmed
+    [PASS] SIGHUP: new exporter PID (was/now differ)
+    [PASS] Workers return HTTP 200 after SIGHUP reload with dead collector
+    [PASS] New exporter still alive 3s after reload (crash counter reset on SIGHUP verified)
+    [PASS] Part B nginx exited cleanly
+  Part C (SIGHUP crash-counter reset — F3 hardened gate):
+    [PASS] Part C: test-support module ready at target/test-support/aarch64.../debug/...
+    [PASS] Part C: nginx master started
+    [PASS] Part C: exporter self-disabled — 'disabled after 6 crashes in 60s'
+    [PASS] Part C: no exporter running before SIGHUP (self-disable confirmed)
+    [PASS] Part C: first post-reload exporter appeared (crash_count.store(0) confirmed)
+    [PASS] Part C: PID logs low crash# — counter reset on SIGHUP CONFIRMED:
+           'otel exporter: crash #2 in window, backing off 200ms before init'
+    [PASS] Part C: master still alive 3s after reload (not prematurely disabled)
+    [PASS] Part C nginx exited cleanly
+    [PASS] === All dead-collector shutdown/reload assertions passed ===
+
+
+3. SIGHUP-DURING-CRASH-LOOP INTERLEAVING EXERCISE (F2 requirement 4)
+----------------------------------------------------------------------
+3 rounds of SIGHUP-during-crash-loop interleaving completed successfully (rc=0).
+
+Each round:
+  - nginx started with NGX_OTEL_CRASH_ON_STARTUP=1 (test-support module)
+  - 2s wait (first exporter crash fires, crash_count.fetch_add executed)
+  - SIGHUP sent while crash-looping (triggers control_shm_zone_init → crash_count.store(0))
+  - 3s wait to give TSAN full visibility of store(0) ↔ fetch_add interleaving
+  - SIGQUIT and clean shutdown
+
+TSAN eyes on the race: store(0) ↔ fetch_add on crash_count (AtomicU64 in shared memory).
+The existing SeqCst ordering on both operations was validated by TSAN with no warnings.
+
+Module used: target/test-support/aarch64-unknown-linux-gnu/debug/libngx_http_otel_module.so
+(38 __tsan_* symbols confirmed above)
+
+
+4. ZERO TSAN WARNINGS
+----------------------
+[tsan-run] Zero ThreadSanitizer warnings.  TSAN gate: PASS.
+
+Scanned error.log files for all test temp dirs including:
+  /tmp/ngx-otel-kill9.*/logs/error.log
+  /tmp/ngx-otel-crashloop.*/logs/error.log
+  /tmp/ngx-otel-deadcoll.*/logs/error.log
+  /tmp/ngx-otel-deadcoll-b.*/logs/error.log
+  /tmp/ngx-otel-deadcoll-c.*/logs/error.log
+  /tmp/ngx-otel-sighup-interleave.*/logs/error.log
+  (plus all other TSAN test temp dirs)
+
+Result: 0 "WARNING: ThreadSanitizer" lines found in any error.log.
+With halt_on_error=1 a real race would have aborted the nginx worker process.
+
+
+5. PRIOR FAILURE HISTORY (FOR REFERENCE)
+-----------------------------------------
+v1 (tests/RESULTS-tsan-2026-06-10-chaos.txt):
+  kill9 rc=127 — `ps` missing in Docker (procps not installed)
+  crashloop rc=2 — test-support module used non-instrumented objs-debug NGINX_BUILD_DIR
+  dead_collector rc=2 — RELEASE_MODULE priority before CARGO_MODULE
+
+v2 (interim, not filed):
+  kill9 rc=0 PASS (procps fix)
+  crashloop rc=2 — NGINX_BUILD_DIR still overwritten (script did not respect env)
+  dead_collector: partially fixed
+
+v3 (this file): ALL PASS
+  Fix 1: procps in Dockerfile.tsan
+  Fix 2: CARGO_BUILD_TARGET-aware test-support module path in crashloop + dead_collector Part C
+  Fix 3: dead_collector module priority (CARGO_MODULE before RELEASE_MODULE)
+  Fix 4: harness NGINX_BUILD_DIR respected by crashloop + dead_collector (not overwritten)
+
+All four fixes committed in e2edd9f + d4c21b0.
+
+
+6. SUMMARY
+-----------
+F2 TSAN bar: ALL 5 REQUIREMENTS MET
+  [x] nm verified: __tsan_* symbols present in both .so files loaded by chaos tests
+  [x] Chaos script assertions: kill9 PASS, crashloop PASS, dead_collector PASS
+  [x] Zero TSAN warnings (halt_on_error=1 — any real race would have aborted)
+  [x] SIGHUP-during-crash-loop interleaving exercise: 3 rounds, rc=0, zero warnings
+  [x] Artifact file committed (this file) — ASan artifact pending
