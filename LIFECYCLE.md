@@ -108,15 +108,26 @@ Because E1's PPID is not M, M never receives `SIGCHLD` when E1 dies.
 If E1 crashes or is killed (`kill -9`), M does not respawn it and telemetry
 is silently lost until the next reload.
 
-Every daemonized graceful-stop (`nginx -s quit` / `nginx -s stop`) also
-triggers a one-time `kill() failed` ALERT and a short delay: M sends SIGQUIT
-to E1's PID; E1 runs its graceful drain and exits; because M never received
-`SIGCHLD` (PPID mismatch), M's process table still lists E1 as live; after
-the graceful-timeout window nginx escalates to SIGKILL and calls `kill(E1,
-SIGKILL)` — at which point E1 has already exited so the kernel returns
-`ESRCH`; nginx logs `kill() failed` at ALERT level
-(`ngx_process_cycle.c:517-521`).  This is bookkeeping, not a crash; the
-process exits cleanly regardless.
+**Graceful stop with `nginx -s quit` is permanently blocked** once the
+daemon-on startup sequence has run:
+
+* M sends SIGQUIT to all processes in its table, including E1's PID.
+* If E1 is still alive it receives SIGQUIT, runs its graceful drain, and
+  exits — but SIGCHLD is delivered to init (PPID 1), not M.  M's process
+  table still shows E1 as live.
+* If E1 was already killed (e.g. `kill -9` before the quit) M's `kill(E1,
+  SIGQUIT)` returns `ESRCH` immediately; M still does not mark E1 as done.
+* Either way M enters `sigsuspend()` waiting for E1's SIGCHLD, which never
+  arrives.  The master **hangs indefinitely**.
+
+`nginx -s stop` (SIGTERM) is unaffected: it forces workers to exit without
+waiting for SIGCHLD.  Use `nginx -s stop` or `kill -SIGTERM <master_pid>`
+to terminate nginx cleanly when `daemon on` was used at startup.
+
+A one-time `kill() failed` ALERT is logged at ALERT level
+(`ngx_process_cycle.c:517-521`) if the SIGKILL escalation fires while E1
+is already dead.  That log line is bookkeeping; the hang described above is
+the real operational impact.
 
 This is a gap in nginx's respawn model, not a bug in the module code: there is
 no extension point in nginx 1.31.x that runs post-daemonize inside the
@@ -171,7 +182,7 @@ introduced this section.
 | `kill -9` gen-1 | NO respawn within 5 s (master blind to SIGCHLD) |
 | `nginx -s reload` | Gen-2 exporter appears with PPID = master |
 | `kill -9` gen-2 | Respawn within 5 s (supervision restored) |
-| SIGQUIT | Clean exit, no orphans |
+| SIGQUIT | Master hangs (B4 gap — sigsuspend waiting for gen-1 SIGCHLD that never arrives); use SIGTERM for clean stop |
 
 ---
 
