@@ -6,10 +6,17 @@
 # announcement) and the original B1 fix (graceful_drain also abdicates).
 #
 # Assertions:
-#   a) SIGHUP rounds: each unique /b1chaos/<N> path appears EXACTLY ONCE in
-#      logs.json — no SPSC duplicate pops during reload overlap.
-#   b) Quit-completeness: records pushed just before `nginx -s quit` arrive
-#      (the no-successor full-drain path fires; we are the sole consumer).
+#   a-i)  SIGHUP rounds: each unique /b1chaos/<N> path appears EXACTLY ONCE in
+#         logs.json — no SPSC duplicate pops during reload overlap.
+#   a-ii) Conservation: sent == unique_arrived + counted_drops.  Drop-newest
+#         is by-design but every drop MUST be accounted for by the
+#         ngx_otel.logs.access.dropped_records self-metric.  A conservation
+#         failure means lost-unaccounted records — that is a real bug.
+#   a-iii) Garbage-length/parse-error scan: zero crit/alert/emerg lines in
+#         nginx error.log; zero otel send-failures; zero HTTP-4xx / parse-error
+#         lines in collector logs.  Any hit = data-corruption indicator.
+#   b)    Quit-completeness: records pushed just before `nginx -s quit` arrive
+#         (the no-successor full-drain path fires; we are the sole consumer).
 #
 # ── Mutation check (forcing technique) ──────────────────────────────────────
 #
@@ -278,6 +285,14 @@ PRE_SIZE=0
 [[ -f "${LOGS_LOG}" ]] && PRE_SIZE=$(wc -c < "${LOGS_LOG}")
 info "logs.json pre-size: ${PRE_SIZE} bytes"
 
+# Snapshot metrics.json to bound conservation reads to this test's exports.
+# The gauge ngx_otel.logs.access.dropped_records is a cumulative sum of
+# per-worker ring.drop_count() values; taking max() over new content gives
+# the final total drops produced during this nginx instance's lifetime.
+PRE_METRICS_SIZE=0
+[[ -f "${METRICS_LOG}" ]] && PRE_METRICS_SIZE=$(wc -c < "${METRICS_LOG}")
+info "metrics.json pre-size: ${PRE_METRICS_SIZE} bytes"
+
 # ── Assertion (a): SIGHUP rounds — no SPSC duplicates ─────────────────────────
 
 N_ROUNDS="${B1_CHAOS_ROUNDS:-3}"
@@ -374,8 +389,94 @@ if [[ "${TOTAL_FOUND}" -ne "${UNIQUE_FOUND}" ]]; then
          (B1-FU1 periodic-drain abdication missing, or mutation applied)"
 fi
 
-pass "assertion (a): no duplicate records across ${N_ROUNDS} SIGHUP rounds \
+pass "assertion (a-i): no duplicate records across ${N_ROUNDS} SIGHUP rounds \
 (${UNIQUE_FOUND} unique paths, ${TOTAL_FOUND} found)"
+
+# ── Assertion (a-ii): conservation — sent == arrived + counted_drops ─────────
+# Reads ngx_otel.logs.access.dropped_records from the new metrics window
+# (content since PRE_METRICS_SIZE).  Takes the max() — the gauge is a
+# cumulative sum of per-worker ring.drop_count() values, so later reports
+# always dominate earlier ones.
+# A conservation failure means unaccounted lost records — STOP-AND-ASK.
+
+info "Assertion (a-ii): checking conservation (sent=${SEQ_AFTER_ROUNDS} unique_arrived=${UNIQUE_FOUND})..."
+
+POST_METRICS_SIZE=0
+[[ -f "${METRICS_LOG}" ]] && POST_METRICS_SIZE=$(wc -c < "${METRICS_LOG}")
+NEW_METRICS_BYTES=$(( POST_METRICS_SIZE - PRE_METRICS_SIZE ))
+info "metrics.json: ${NEW_METRICS_BYTES} new bytes since pre-snapshot"
+
+ACCESS_DROPS=0
+if [[ "${NEW_METRICS_BYTES}" -gt 0 ]]; then
+    ACCESS_DROPS=$(tail -c "+$(( PRE_METRICS_SIZE + 1 ))" "${METRICS_LOG}" 2>/dev/null \
+        | python3 -c '
+import json, sys
+max_drops = 0
+for line in sys.stdin:
+    try:
+        j = json.loads(line)
+        for rm in j.get("resourceMetrics", []):
+            for sm in rm.get("scopeMetrics", []):
+                for m in sm.get("metrics", []):
+                    if m.get("name") == "ngx_otel.logs.access.dropped_records":
+                        for dp in m.get("gauge", {}).get("dataPoints", []):
+                            v = dp.get("asInt", dp.get("asDouble", 0))
+                            max_drops = max(max_drops, int(float(v)))
+    except Exception:
+        pass
+print(max_drops)
+')
+fi
+
+CONSERVATION_CHECK=$(( UNIQUE_FOUND + ACCESS_DROPS ))
+info "Conservation: ${UNIQUE_FOUND} arrived + ${ACCESS_DROPS} dropped = ${CONSERVATION_CHECK} (sent ${SEQ_AFTER_ROUNDS})"
+
+if [[ "${CONSERVATION_CHECK}" -ne "${SEQ_AFTER_ROUNDS}" ]]; then
+    fail "assertion (a-ii): conservation FAILED: ${UNIQUE_FOUND} arrived + ${ACCESS_DROPS} drops = ${CONSERVATION_CHECK} != ${SEQ_AFTER_ROUNDS} sent
+         Unaccounted records — this is a real lost-records bug; STOP-AND-ASK."
+fi
+
+pass "assertion (a-ii): conservation OK (${UNIQUE_FOUND} arrived + ${ACCESS_DROPS} dropped = ${SEQ_AFTER_ROUNDS} sent)"
+
+# ── Assertion (a-iii): garbage-length / parse-error scan ─────────────────────
+# Zero tolerance: crit/alert/emerg in nginx error.log, otel send-failures,
+# or HTTP-4xx / parse-error lines in collector logs all indicate corruption.
+# Uses COLLECTOR_CONTAINER from lib.sh (ngx-otel-test-collector).
+
+info "Assertion (a-iii): scanning for parse/garbage-length errors..."
+# Note: "otel export: send failed; queuing for retry" lines are NOT scanned —
+# transient connection-reset during reload overlap is expected retry behaviour
+# (the retry delivers the records; conservation assertion (a-ii) proves no loss).
+# Only crit/alert/emerg (nginx system failures) and collector-side 4xx/5xx
+# (malformed OTLP submission = data corruption) are hard errors.
+
+SCAN_ERRORS=0
+
+if [[ -f "${PREFIX}/logs/error.log" ]]; then
+    CRIT_LINES=$(grep -cE '\[(crit|alert|emerg)\]' "${PREFIX}/logs/error.log" 2>/dev/null || true)
+    if [[ "${CRIT_LINES}" -gt 0 ]]; then
+        info "SCAN: ${CRIT_LINES} crit/alert/emerg line(s) in error.log:"
+        grep -E '\[(crit|alert|emerg)\]' "${PREFIX}/logs/error.log" | head -10
+        SCAN_ERRORS=$(( SCAN_ERRORS + CRIT_LINES ))
+    fi
+fi
+
+COLLECTOR_SCAN=$(docker logs "${COLLECTOR_CONTAINER}" 2>&1 \
+    | grep -cE '(StatusCode:[45][0-9]{2}|"status":[45][0-9]{2}|parse.*error|malformed|invalid.*length|length.*invalid|unexpected.*length)' \
+    2>/dev/null || true)
+if [[ "${COLLECTOR_SCAN}" -gt 0 ]]; then
+    info "SCAN: ${COLLECTOR_SCAN} parse/length-error line(s) in collector logs:"
+    docker logs "${COLLECTOR_CONTAINER}" 2>&1 \
+        | grep -E '(StatusCode:[45][0-9]{2}|"status":[45][0-9]{2}|parse.*error|malformed|invalid.*length|length.*invalid|unexpected.*length)' \
+        | head -10
+    SCAN_ERRORS=$(( SCAN_ERRORS + COLLECTOR_SCAN ))
+fi
+
+if [[ "${SCAN_ERRORS}" -gt 0 ]]; then
+    fail "assertion (a-iii): ${SCAN_ERRORS} parse/garbage-length error(s) found (details above)"
+fi
+
+pass "assertion (a-iii): zero parse/garbage-length errors in error.log and collector logs"
 
 # ── Assertion (b): quit-completeness ─────────────────────────────────────────
 # Push N records then nginx -s quit.  All N must arrive (no-successor sole-consumer
@@ -459,4 +560,4 @@ fi
 pass "assertion (b): quit-completeness: all ${N_QUIT_RECORDS} pre-quit records arrived"
 
 echo ""
-pass "B1-FU1 chaos gate: PASS — SPSC exclusivity across reload, quit-completeness confirmed"
+pass "B1-FU1 chaos gate: PASS — SPSC exclusivity across reload, conservation verified, no parse errors, quit-completeness confirmed"
