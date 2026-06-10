@@ -198,69 +198,56 @@ echo "[tsan-run] Step 3.5: OK — ${TSAN_SYM_COUNT} __tsan_* symbols confirmed i
 echo "[tsan-run] Step 3.5: full path: ${NM_SO}"
 
 # ── Step 4: Run integration scripts ──────────────────────────────────────────
+#
+# Each script is run in a subshell with RC capture so that a functional test
+# failure (e.g. a timing-sensitive exemplar assertion) does not abort the run
+# before the B4/B1-chaos scripts and the TSAN warning scan (step 5) execute.
+# The TSAN gate is zero ThreadSanitizer warnings — functional assertion
+# failures are reported at the end but do not suppress the warning scan.
 
-echo ""
-echo "[tsan-run] === Running run_grpc_smoke.sh under TSAN ==="
-bash tests/integration/run_grpc_smoke.sh
+FAILED_INTEGRATION=()
 
-echo ""
-echo "[tsan-run] === Running run_grpc_bidi_smoke.sh under TSAN ==="
-bash tests/integration/run_grpc_bidi_smoke.sh
+_run_integration() {
+    local script="$1"; shift
+    local extra_env=("$@")
+    echo ""
+    echo "[tsan-run] === Running ${script} under TSAN ==="
+    local rc=0
+    ( env "${extra_env[@]}" bash "tests/integration/${script}" ) || rc=$?
+    if [[ "${rc}" -ne 0 ]]; then
+        echo "[tsan-run] ${script}: NON-ZERO exit ${rc} (functional/timing failure; TSAN warning scan is the race gate)" >&2
+        FAILED_INTEGRATION+=("${script}(rc=${rc})")
+    fi
+}
+
+_run_integration run_grpc_smoke.sh
+_run_integration run_grpc_bidi_smoke.sh
 
 echo ""
 echo "[tsan-run] === Running run_grpc_export.sh under TSAN (production gRPC export path) ==="
-# run_grpc_export.sh is a production-path test (no --features test-support).
-# It exercises the persistent GrpcTransport connection under TSAN to confirm
-# no data races on the production gRPC export loop.
-bash tests/integration/run_grpc_export.sh
+echo "# run_grpc_export.sh exercises the persistent GrpcTransport connection under TSAN"
+echo "# to confirm no data races on the production gRPC export loop."
+_run_integration run_grpc_export.sh
 
 echo ""
 echo "[tsan-run] === Running run_access_log.sh under TSAN (Phase 2.2 §6.6.1 rebalanced path) ==="
-# Exercises the new Phase 2.2 shared state under TSAN:
-#   - ExpHistogramSlot::record() — Relaxed fetch_add on exp-histogram buckets
-#   - ExemplarReservoir::write() — Relaxed stores on exemplar entry fields
-#   - route/upstream dimension writes (combo_index extended to 5 dims)
-#   - SPSC logs ring (workers write is_interesting tail records)
-#   - run_access_log.sh now sends 200 (histogram only) + 500 (ring + reservoir)
-# All new shared-state paths from RALPH_PHASE_2_2.md steps 2.2.1–2.2.5.
-bash tests/integration/run_access_log.sh
+echo "# Exercises: ExpHistogramSlot::record(), ExemplarReservoir::write(), SPSC logs ring."
+echo "# Note: FU4a exemplar timing assertion may be flaky in Docker/macOS VirtioFS"
+echo "# environments (exemplar data sync delay). Passes on debian-vm (native I/O)."
+_run_integration run_access_log.sh
+
+_run_integration run_error_log.sh
 
 echo ""
-echo "[tsan-run] === Running run_error_log.sh under TSAN (Phase 2.3 §6.6.2 error-log path) ==="
-# Exercises Phase 2.3 shared state under TSAN:
-#   - CoalesceSlot::count.fetch_add / .swap(0, AcqRel) — coalescer on writer path
-#   - WorkerSlots::error_rate_counters[].fetch_add — error-rate metric bump
-#   - SPSC error ring push (workers write verbatim samples)
-#   - drain_coalesce_table / logs_error_ring drain in exporter
-# Stage A (coalesce-on flood), Stage B (coalesce-off), Stage C (floor),
-# Stage D (DP-C config-load guard).
-bash tests/integration/run_error_log.sh
+echo "[tsan-run] === Running run_signal_storm.sh under TSAN ==="
+echo "# TSAN ~10x slowdown: 90s window (3x default 30s)."
+_run_integration run_signal_storm.sh STORM_DURATION_S=90
+
+_run_integration run_traces.sh
 
 echo ""
-echo "[tsan-run] === Running run_signal_storm.sh under TSAN (Phase 2.3 re-entrancy gate) ==="
-# THE load-bearing safety gate: busy-flag + lock-free coalescer under
-# SIGUSR1 signal delivery.  TSAN ~10x slowdown: use a 90s window (3× the
-# default 30s) so the drain cycle has time to progress under instrumentation.
-# Asserts: no crash, no panic, no torn records, drain progresses.
-STORM_DURATION_S=90 bash tests/integration/run_signal_storm.sh
-
-echo ""
-echo "[tsan-run] === Running run_traces.sh under TSAN (Phase 3 span emit→ring→drain→encode→collector) ==="
-# FU3: closes the Loop-2 gap by exercising the full spans-ring writer → drain
-# → OtlpTracesEncoder → /v1/traces path under TSAN.  Asserts that a span
-# with the expected traceId and parentSpanId (from an inbound traceparent)
-# arrives at the collector — proving the E2E path is race-free.
-bash tests/integration/run_traces.sh
-
-echo ""
-echo "[tsan-run] === Running run_dns_dualstack.sh under TSAN (transport_dns async resolver path) ==="
-# Exercises Items 2 + 3 of the transport_dns work under TSAN:
-#   - NgxConnector::connect_dns: Resolver::resolve_name (UDP event-loop path)
-#   - connect_first_reachable / pc.sockaddr+socklen wiring
-#   - IPv6 literal connect path (build_ipv6_sockaddr, AF_INET6 socklen)
-# TEST A resolves "ngx-otel-dns-test" via a local Python DNS stub → 127.0.0.1
-# (real async resolver I/O under TSAN).  TEST B connects via a v6 literal.
-bash tests/integration/run_dns_dualstack.sh
+echo "[tsan-run] === Running run_dns_dualstack.sh under TSAN ==="
+_run_integration run_dns_dualstack.sh
 
 echo ""
 echo "[tsan-run] === Running C2 chaos scripts under TSAN (C1 crash-counter cross-process atomics) ==="
@@ -483,8 +470,16 @@ fi
 
 echo "[tsan-run] Zero ThreadSanitizer warnings.  TSAN gate: PASS."
 
-# Report chaos functional failures (non-zero exits unrelated to TSAN races).
+# Report any integration + chaos functional failures (non-zero exits unrelated to TSAN races).
+OVERALL_FAILED=0
+if (( ${#FAILED_INTEGRATION[@]} > 0 )); then
+    echo "[tsan-run] INTEGRATION NOTE: these scripts had functional/timing failures: ${FAILED_INTEGRATION[*]}" >&2
+    OVERALL_FAILED=1
+fi
 if [[ "${KILL9_RC:-0}" -ne 0 || "${CRASHLOOP_RC:-0}" -ne 0 || "${DEADCOLL_RC:-0}" -ne 0 || "${B4_RC:-0}" -ne 0 || "${B1_RC:-0}" -ne 0 ]]; then
     echo "[tsan-run] CHAOS NOTE: kill9=${KILL9_RC:-0} crashloop=${CRASHLOOP_RC:-0} deadcoll=${DEADCOLL_RC:-0} b4=${B4_RC:-0} b1_chaos=${B1_RC:-0} — functional/timing failure; no TSAN race." >&2
+    OVERALL_FAILED=1
+fi
+if [[ "${OVERALL_FAILED}" -eq 1 ]]; then
     exit 3
 fi
