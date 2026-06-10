@@ -383,6 +383,28 @@ extern "C" fn ngx_otel_init_module(cycle: *mut nginx_sys::ngx_cycle_t) -> nginx_
         !old.is_null() && !(*old).conf_ctx.is_null()
     };
 
+    // B1: On reload, announce the successor BEFORE forking the new exporter.
+    // This runs in the master process, sequentially before `ngx_spawn_process`
+    // is called.  The channel message (NGX_CMD_QUIT) sent to the old exporter
+    // by the master AFTER this point provides the happens-before ordering: by
+    // the time the old exporter's channel handler fires and sets ngx_quit, the
+    // Release store below is already visible.
+    //
+    // Old exporter snapshot: `my_gen` captured at startup.
+    // `current_gen > my_gen` → reload → abdicate ring pops (new exporter owns).
+    // `current_gen == my_gen` → pure shutdown → full drain (sole consumer).
+    if is_reload {
+        if let Some(ctrl_ptr) = amcf.control_shm_ptr_mut() {
+            // SAFETY: `control_shm_ptr_mut()` returns Some only when the zone is
+            // registered and mapped; this code runs in the master process only
+            // (guarded above), so there is no concurrent write — the old exporter
+            // only reads this field after it receives NGX_CMD_QUIT (via channel),
+            // which is sent after this function returns.
+            let ctrl = unsafe { &*ctrl_ptr };
+            ctrl.successor_gen.fetch_add(1, core::sync::atomic::Ordering::Release);
+        }
+    }
+
     // Spawn the exporter for both initial start and SIGHUP reload.
     spawn_exporter_for_cycle(cycle, is_reload)
 }

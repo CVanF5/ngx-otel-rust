@@ -460,6 +460,17 @@ pub async fn export_loop(amcf: &'static MainConfig) {
     // panels and delta-conversion processors can anchor windows correctly.
     let worker_start_ns = crate::util::now_unix_nano();
 
+    // B1: Snapshot successor_gen at startup.  On QUIT, graceful_drain
+    // compares current_gen against my_gen to decide between:
+    //   current_gen > my_gen → reload → abdicate ring pops (new exporter owns)
+    //   current_gen == my_gen → shutdown → full drain (we are sole consumer)
+    // SAFETY: control_shm_ptr() returns Some only when the zone is registered
+    // and mapped; loading successor_gen is a single Acquire atomic load.
+    let my_gen: u64 = amcf
+        .control_shm_ptr()
+        .map(|p| unsafe { (*p).successor_gen.load(core::sync::atomic::Ordering::Acquire) })
+        .unwrap_or(0);
+
     // Capture the master (parent) PID once at export loop startup.
     // nginx_sys::ngx_parent is set by ngx_spawn_process to the master's PID
     // before fork, so in the exporter child it always equals the master PID.
@@ -552,6 +563,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                 amcf,
                 worker_start_ns,
                 &processor,
+                my_gen,
             )
             .await;
             EXPORT_LOOP_DONE.store(true, Ordering::Release);
@@ -833,6 +845,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                 amcf,
                 worker_start_ns,
                 &processor,
+                my_gen,
             )
             .await;
             EXPORT_LOOP_DONE.store(true, Ordering::Release);
@@ -1029,24 +1042,66 @@ struct DrainQueues<'a> {
 /// for [`EXPORT_LOOP_DONE`] before calling `process::exit`, ensuring the
 /// drain always completes.
 ///
-/// Q2 RESOLVED — option (a): old exporter races workers on SIGHUP. Dedup
-/// via `time_unix_nano` on the collector side (cumulative-counter model).
-/// Phase 2 (logs) reopens this when log-drain semantics force ordered handoff.
+/// B1 — Reload-safe graceful drain.
+///
+/// On SIGHUP reload the master announces a successor by incrementing
+/// `ControlShm::successor_gen` (with Release ordering) BEFORE forking the new
+/// exporter AND before sending `NGX_CMD_QUIT` to the old exporter.  The channel
+/// write/read provides the happens-before ordering that makes this visible.
+///
+/// When `current_gen > my_gen` (a successor is in place) this function
+/// **abdicates** log/span ring drains:
+/// - Already-popped in-process retry buffers are flushed (private memory, safe).
+/// - Final cumulative-metrics batch is sent (pure WorkerSlots reads, always safe).
+/// - Log/span ring `pop_into` calls and the coalesce-table reset are SKIPPED;
+///   the new exporter picks those up as the sole consumer.
+///
+/// When `current_gen == my_gen` (pure shutdown, no successor) the old exporter
+/// is the sole consumer and performs a full drain including ring pops.
+///
+/// **Previous Q2 comment**: the old "Q2 RESOLVED — dedup via time_unix_nano"
+/// claim was correct ONLY for cumulative metrics (the collector can dedup
+/// identical counter data points by {start_time, time} range). It was FALSE for
+/// length-prefixed log/span rings: two concurrent `pop_into` callers race on
+/// `read_offset` (Relaxed load + Release store, no CAS) and can yield garbage
+/// record lengths (up to 4 GiB on a producer wrap-around). B1 restores the
+/// SPSC invariant by making the new exporter the sole ring consumer on reload.
 async fn graceful_drain(
     transport: &mut ExportTransport,
     queues: &mut DrainQueues<'_>,
     amcf: &'static MainConfig,
     worker_start_ns: u64,
     processor: &Processor,
+    my_gen: u64,
 ) {
     let log = ngx::log::ngx_cycle_log();
     let queued = queues.metrics.len();
+
+    // B1: check whether a successor was announced (reload) or not (shutdown).
+    // SAFETY: control_shm_ptr() returns Some only when the zone is registered
+    // and mapped; loading successor_gen is a single Acquire atomic load.
+    let has_successor = amcf
+        .control_shm_ptr()
+        .map(|p| unsafe { (*p).successor_gen.load(core::sync::atomic::Ordering::Acquire) } > my_gen)
+        .unwrap_or(false);
+
     ngx::ngx_log_error!(
         NGX_LOG_NOTICE,
         log.as_ptr(),
-        "otel export: graceful drain starting ({} queued batch(es))",
-        queued
+        "otel export: graceful drain starting ({} queued batch(es), successor={})",
+        queued,
+        has_successor as u8
     );
+    if has_successor {
+        // B1: abdication path — log/span ring pops are skipped (new exporter owns).
+        // Still flush in-process retry buffers and final cumulative-metrics batch.
+        ngx::ngx_log_error!(
+            NGX_LOG_NOTICE,
+            log.as_ptr(),
+            "otel export: successor announced — abdicating log/span ring drains \
+             (new exporter is sole consumer)"
+        );
+    }
 
     // Flush metrics retry queue (one bounded attempt each, ignore errors).
     while let Some((bytes, n_pts)) = queues.metrics.pop_front() {
@@ -1155,7 +1210,8 @@ async fn graceful_drain(
     }
 
     // Final freshly-collected logs batch (access + error rings).
-    if amcf.is_access_sample_enabled() || amcf.error_log_enabled {
+    // B1: skipped on abdication — new exporter is sole consumer of the rings.
+    if !has_successor && (amcf.is_access_sample_enabled() || amcf.error_log_enabled) {
         if let Some(logs_base) = amcf.logs_shm_base() {
             // A1b: use n_active_workers (same rationale as export path).
             let n_workers = {
@@ -1245,62 +1301,65 @@ async fn graceful_drain(
     }
 
     // Final freshly-collected spans batch (Pdata pipeline, Step U2).
-    if let Some(spans_base) = amcf.spans_shm_base() {
-        // A1b: use n_active_workers (same rationale as export path).
-        let n_workers = {
-            use core::sync::atomic::Ordering;
-            let n = amcf.n_active_workers.load(Ordering::Relaxed);
-            if n > 0 {
-                n
-            } else {
-                // SAFETY: `spans_shm_base()` returned `Some`, so the spans zone is
-                // registered and mapped; `amcf.spans_shm_zone` points to a live
-                // `ngx_shm_zone_t` valid for the exporter's lifetime. The `&*`
-                // borrow does not escape this block; `shm.size` is a plain read.
-                unsafe {
-                    let zone = &*amcf.spans_shm_zone;
-                    let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
-                    spans_n_workers_from_zone(avail, DEFAULT_SPAN_RING_CAP)
+    // B1: skipped on abdication — new exporter is sole consumer of the rings.
+    if !has_successor {
+        if let Some(spans_base) = amcf.spans_shm_base() {
+            // A1b: use n_active_workers (same rationale as export path).
+            let n_workers = {
+                use core::sync::atomic::Ordering;
+                let n = amcf.n_active_workers.load(Ordering::Relaxed);
+                if n > 0 {
+                    n
+                } else {
+                    // SAFETY: `spans_shm_base()` returned `Some`, so the spans zone is
+                    // registered and mapped; `amcf.spans_shm_zone` points to a live
+                    // `ngx_shm_zone_t` valid for the exporter's lifetime. The `&*`
+                    // borrow does not escape this block; `shm.size` is a plain read.
+                    unsafe {
+                        let zone = &*amcf.spans_shm_zone;
+                        let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
+                        spans_n_workers_from_zone(avail, DEFAULT_SPAN_RING_CAP)
+                    }
                 }
-            }
-        };
-        let mut spans_pd = Pdata::Spans(collect_span_records(amcf, spans_base, n_workers));
-        processor.process(&mut spans_pd);
-        let n_spans = count_pdata_records(&spans_pd);
-        if n_spans > 0 {
-            let spans_bytes = encode_pdata(&spans_pd);
-            match with_deadline(
-                transport.send_pdata(&spans_pd, spans_bytes),
-                GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET,
-            )
-            .await
-            {
-                Ok(Ok(())) => {
-                    ngx::ngx_log_error!(
-                        NGX_LOG_NOTICE,
-                        log.as_ptr(),
-                        "otel export: drain: final spans batch sent ({} records)",
-                        n_spans
-                    );
-                }
-                Ok(Err(e)) => {
-                    ngx::ngx_log_error!(
-                        NGX_LOG_ERR,
-                        log.as_ptr(),
-                        "otel export: drain: final spans batch failed: {}",
-                        e
-                    );
-                }
-                Err(DeadlineExceeded) => {
-                    ngx::ngx_log_error!(
-                        NGX_LOG_NOTICE,
-                        log.as_ptr(),
-                        "otel export: drain: final spans batch timed out"
-                    );
+            };
+            let mut spans_pd = Pdata::Spans(collect_span_records(amcf, spans_base, n_workers));
+            processor.process(&mut spans_pd);
+            let n_spans = count_pdata_records(&spans_pd);
+            if n_spans > 0 {
+                let spans_bytes = encode_pdata(&spans_pd);
+                match with_deadline(
+                    transport.send_pdata(&spans_pd, spans_bytes),
+                    GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET,
+                )
+                .await
+                {
+                    Ok(Ok(())) => {
+                        ngx::ngx_log_error!(
+                            NGX_LOG_NOTICE,
+                            log.as_ptr(),
+                            "otel export: drain: final spans batch sent ({} records)",
+                            n_spans
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        ngx::ngx_log_error!(
+                            NGX_LOG_ERR,
+                            log.as_ptr(),
+                            "otel export: drain: final spans batch failed: {}",
+                            e
+                        );
+                    }
+                    Err(DeadlineExceeded) => {
+                        ngx::ngx_log_error!(
+                            NGX_LOG_NOTICE,
+                            log.as_ptr(),
+                            "otel export: drain: final spans batch timed out"
+                        );
+                    }
                 }
             }
         }
-    }
+    } // end `if !has_successor` for spans ring drain
 
     ngx::ngx_log_error!(NGX_LOG_NOTICE, log.as_ptr(), "otel export: graceful drain complete");
 }

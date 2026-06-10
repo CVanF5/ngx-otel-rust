@@ -71,9 +71,34 @@ pub struct ControlShm {
     /// clearing transient crash history for a long-lived healthy exporter.
     /// Zero means no window has been established yet (treat as "window expired").
     pub window_start_unix: AtomicU64,
+    /// B1 — Reload successor generation counter.
+    ///
+    /// **Written exclusively by the master** in `ngx_otel_init_module` (which
+    /// runs in the master process) via `fetch_add(1, Release)` on each SIGHUP
+    /// reload, **before** `ngx_spawn_process` forks the new exporter.  The
+    /// channel message (`NGX_CMD_QUIT`) sent to the old exporter provides the
+    /// happens-before ordering: by the time the old exporter's channel handler
+    /// fires and sets `ngx_quit`, the master's `Release` store is visible.
+    ///
+    /// **Read by the old exporter** at `ngx_quit` time.  If
+    /// `current > my_gen` (snapshot taken at startup) a successor has been
+    /// announced and the exporter abdicates mutating ring drains (log/span
+    /// `pop_into` and coalesce-table reset), handing them to the new exporter.
+    /// On pure shutdown (`current == my_gen`) the old exporter is the sole
+    /// consumer and performs a full drain.
+    ///
+    /// **Read by the new exporter** at startup to initialise its own `my_gen`
+    /// snapshot.
+    ///
+    /// On reload nginx reuses the same physical shm pages (same zone name +
+    /// size), so both old and new exporters see the same `successor_gen` value.
+    /// On USR2 binary upgrade the new master allocates fresh anon-mmap pages;
+    /// each exporter is sole consumer of its own zones (see
+    /// `ngx_master_process_cycle` in nginx's `ngx_process_cycle.c`).
+    pub successor_gen: AtomicU64,
     /// Reserved padding for forward-compatible additions.
-    /// Phase 5 payload budget: 4 × AtomicU64 = 32 bytes.
-    pub _reserved: [AtomicU64; 4],
+    /// Phase 5 payload budget: 3 × AtomicU64 = 24 bytes.
+    pub _reserved: [AtomicU64; 3],
 }
 
 impl ControlShm {
@@ -184,6 +209,7 @@ mod tests {
             0,
             "window_start_unix must start at 0"
         );
+        assert_eq!(ctrl.successor_gen.load(Ordering::Relaxed), 0, "successor_gen must start at 0");
         for (i, r) in ctrl._reserved.iter().enumerate() {
             assert_eq!(r.load(Ordering::Relaxed), 0, "_reserved[{}] must start at 0", i);
         }
@@ -196,13 +222,18 @@ mod tests {
             "version must be 1 after one increment"
         );
 
-        // crash_count, flags, and _reserved must be unaffected by the version increment.
+        // crash_count, flags, successor_gen and _reserved must be unaffected by the version increment.
         assert_eq!(ctrl.flags.load(Ordering::Relaxed), 0, "flags must be unaffected");
         assert_eq!(ctrl.crash_count.load(Ordering::Relaxed), 0, "crash_count unaffected");
         assert_eq!(
             ctrl.window_start_unix.load(Ordering::Relaxed),
             0,
             "window_start_unix unaffected"
+        );
+        assert_eq!(
+            ctrl.successor_gen.load(Ordering::Relaxed),
+            0,
+            "successor_gen must be unaffected by version increment"
         );
     }
 
@@ -229,12 +260,47 @@ mod tests {
     #[test]
     fn control_shm_struct_size() {
         // 8 × AtomicU64 (version + flags + crash_count + window_start_unix +
-        // 4 × _reserved) = 64 bytes.
+        // successor_gen + 3 × _reserved) = 64 bytes.
         assert_eq!(
             mem::size_of::<ControlShm>(),
             8 * mem::size_of::<AtomicU64>(),
             "ControlShm must be exactly 8 × AtomicU64 bytes"
         );
+    }
+
+    /// B1 regression: abdication logic is driven by `successor_gen`.
+    ///
+    /// Pre-B1 code had no `successor_gen` field at all — this test would
+    /// not compile.  Post-B1: verify the sentinel semantics that drive
+    /// `graceful_drain` abdication decisions.
+    #[test]
+    fn b1_successor_gen_abdication_logic() {
+        let buf = std::vec![0u8; mem::size_of::<ControlShm>()];
+        // SAFETY: zero-initialised buffer of exactly the right size.
+        let ctrl = unsafe { &*buf.as_ptr().cast::<ControlShm>() };
+
+        // Fresh start: my_gen = 0, current = 0 → no successor → full drain.
+        let my_gen: u64 = 0;
+        let current = ctrl.successor_gen.load(Ordering::Relaxed);
+        assert!(current <= my_gen, "no successor on fresh start");
+
+        // Reload: master increments successor_gen before QUIT.
+        ctrl.successor_gen.fetch_add(1, Ordering::Relaxed);
+        let current = ctrl.successor_gen.load(Ordering::Relaxed);
+        assert!(current > my_gen, "successor announced after reload increment");
+
+        // New exporter snapshots my_gen = 1 at startup.
+        let new_exporter_gen: u64 = ctrl.successor_gen.load(Ordering::Relaxed);
+        // Second reload: master increments again.
+        ctrl.successor_gen.fetch_add(1, Ordering::Relaxed);
+        let current2 = ctrl.successor_gen.load(Ordering::Relaxed);
+        assert!(current2 > new_exporter_gen, "successor announced on second reload");
+
+        // Pure shutdown: successor_gen stays at 2, new exporter's my_gen = 2.
+        // No further increment → equal → full drain.
+        let shutdown_gen: u64 = ctrl.successor_gen.load(Ordering::Relaxed);
+        let current3 = ctrl.successor_gen.load(Ordering::Relaxed);
+        assert!(current3 <= shutdown_gen, "no successor on pure shutdown");
     }
 
     // ── Crash-backoff decision logic (pure function tests) ────────────────────
