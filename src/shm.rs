@@ -1239,8 +1239,45 @@ pub unsafe extern "C" fn logs_shm_zone_init(
     old_data: *mut core::ffi::c_void,
 ) -> ngx_int_t {
     if !old_data.is_null() {
-        // SIGHUP: same physical pages re-mapped.  Ring offsets survive.
-        return Status::NGX_OK.into();
+        // SIGHUP: same physical pages re-mapped.  Ring offsets carry over.
+        // H2F3: On scale-up reload, new worker slots are OS-zeroed (cap==0).
+        // Stamp cap into ALL active-slot ring headers (idempotent for existing
+        // slots; required for new slots added by the worker_processes increase).
+        //
+        // SAFETY: nginx guarantees shm_zone is a valid non-null pointer (fn contract).
+        // zone.data was written by register_logs_zone to point at a ZoneInitData in
+        // amcf (nginx conf pool, outlives reload); cycle is from cf->cycle at
+        // postconfiguration; shm.addr is the mapped zone base.
+        // slot_off = w * slot_sz with w < n_active ≤ n_reserved = zone_data_bytes / slot_sz,
+        // so both ring header accesses are within the mapped zone.
+        let ret = unsafe {
+            let zone = &*shm_zone;
+            let offset = data_offset();
+            let zone_data_bytes = zone.shm.size.saturating_sub(offset);
+            let Some(zid) = zone.data.cast::<ZoneInitData>().as_ref() else {
+                return Status::NGX_OK.into();
+            };
+            let cap = zid.ring_cap;
+            let cycle = zid.cycle_addr as *const ngx_cycle_t;
+            let slot_sz = logs_slot_size(cap);
+            if slot_sz == 0 || zone_data_bytes == 0 {
+                return Status::NGX_OK.into();
+            }
+            let n_reserved = zone_data_bytes / slot_sz;
+            let n_active = wp_from_cycle(cycle).unwrap_or(n_reserved).min(n_reserved).max(1);
+            let base: *mut u8 = zone.shm.addr.cast::<u8>().add(offset);
+            for w in 0..n_active {
+                let slot_off = w * slot_sz;
+                (*base.add(slot_off).cast::<LogsWorkerRingHeader>())
+                    .cap
+                    .store(cap as u64, Ordering::Relaxed);
+                (*base.add(slot_off + ring_size_bytes(cap)).cast::<LogsWorkerRingHeader>())
+                    .cap
+                    .store(cap as u64, Ordering::Relaxed);
+            }
+            Status::NGX_OK.into()
+        };
+        return ret;
     }
 
     // SAFETY: nginx invokes this callback with a valid, non-null
@@ -1381,8 +1418,41 @@ pub unsafe extern "C" fn spans_shm_zone_init(
     old_data: *mut core::ffi::c_void,
 ) -> ngx_int_t {
     if !old_data.is_null() {
-        // SIGHUP: same physical pages re-mapped; ring offsets survive.
-        return Status::NGX_OK.into();
+        // SIGHUP: same physical pages re-mapped; ring offsets carry over.
+        // H2F3: On scale-up reload, new worker slots are OS-zeroed (cap==0).
+        // Stamp cap into ALL active-slot ring headers (idempotent for existing
+        // slots; required for new slots added by the worker_processes increase).
+        //
+        // SAFETY: nginx guarantees shm_zone is a valid non-null pointer (fn contract).
+        // zone.data was written by register_spans_zone to point at a ZoneInitData in
+        // amcf (nginx conf pool, outlives reload); cycle is from cf->cycle at
+        // postconfiguration; shm.addr is the mapped zone base.
+        // slot_off = w * slot_sz with w < n_active ≤ zone_data_bytes / slot_sz.
+        let ret = unsafe {
+            let zone = &*shm_zone;
+            let offset = data_offset();
+            let zone_data_bytes = zone.shm.size.saturating_sub(offset);
+            let Some(zid) = zone.data.cast::<ZoneInitData>().as_ref() else {
+                return Status::NGX_OK.into();
+            };
+            let cap = zid.ring_cap;
+            let cycle = zid.cycle_addr as *const ngx_cycle_t;
+            let slot_sz = spans_slot_size(cap);
+            if slot_sz == 0 || zone_data_bytes == 0 {
+                return Status::NGX_OK.into();
+            }
+            let n_reserved = zone_data_bytes / slot_sz;
+            let n_active = wp_from_cycle(cycle).unwrap_or(n_reserved).min(n_reserved).max(1);
+            let base: *mut u8 = zone.shm.addr.cast::<u8>().add(offset);
+            for w in 0..n_active {
+                let slot_off = w * slot_sz;
+                (*base.add(slot_off).cast::<LogsWorkerRingHeader>())
+                    .cap
+                    .store(cap as u64, Ordering::Relaxed);
+            }
+            Status::NGX_OK.into()
+        };
+        return ret;
     }
 
     // SAFETY: nginx calls this with a valid non-null `ngx_shm_zone_t`.
@@ -2146,5 +2216,109 @@ mod tests {
         // Keep buf alive until after join so the writer's atomic_ref is valid.
         drop(buf);
         // If we reach here without TSAN/sanitizer complaints the test passes.
+    }
+
+    /// H2F3 regression: after a SIGHUP reload that increases worker_processes,
+    /// new worker slots (which are OS-zeroed) must have cap stamped by the reload
+    /// path of logs_shm_zone_init.
+    ///
+    /// Pre-fix: the reload path returned NGX_OK immediately — cap remained 0 for
+    ///   new slots → every push from new workers returned false (dropped silently).
+    /// Post-fix: reload path stamps cap for all active slots (idempotent for
+    ///   existing slots, required for new slots).
+    ///
+    /// Fail-before proof: comment out the H2F3 reload block in logs_shm_zone_init
+    /// and this test's assertion on step (4) will fail.
+    #[test]
+    fn b1_cap_survives_reload() {
+        use crate::logs::ring::{ring_size_bytes, LogsWorkerRingHeader};
+        use nginx_sys::ngx_shm_zone_t;
+
+        const CAP: usize = 512;
+        let slot_sz = logs_slot_size(CAP);
+        let n_slots = 2usize;
+        let data_off = data_offset();
+        let zone_sz = data_off + n_slots * slot_sz;
+
+        let mut zone_mem: std::vec::Vec<u8> = std::vec![0u8; zone_sz];
+        let zone_addr = zone_mem.as_mut_ptr();
+
+        // cycle_addr=0 → wp_from_cycle returns None → n_active = n_reserved (2).
+        let zid = ZoneInitData { ring_cap: CAP, cycle_addr: 0 };
+
+        // SAFETY: ngx_shm_zone_t is repr(C); zero is valid for all fields we don't set.
+        let mut fake_zone: ngx_shm_zone_t = unsafe { core::mem::zeroed() };
+        fake_zone.data = &raw const zid as *mut core::ffi::c_void;
+        fake_zone.shm.addr = zone_addr.cast();
+        fake_zone.shm.size = zone_sz;
+
+        // ── (1) Fresh init ───────────────────────────────────────────────────────
+        // SAFETY: fake_zone is a valid ngx_shm_zone_t with shm region backing it;
+        // old_data=null triggers the fresh-init path.
+        let ret = unsafe { logs_shm_zone_init(&raw mut fake_zone, core::ptr::null_mut()) };
+        assert_eq!(ret, ngx_int_t::from(Status::NGX_OK), "fresh init must return NGX_OK");
+
+        // SAFETY: data_off < zone_sz; zone_mem is live for the whole test.
+        let base = unsafe { zone_addr.add(data_off) };
+        for w in 0..n_slots {
+            let off = w * slot_sz;
+            // SAFETY: off = w * slot_sz < n_slots * slot_sz ≤ zone_sz - data_off.
+            let access_cap = unsafe {
+                (*base.add(off).cast::<LogsWorkerRingHeader>()).cap.load(Ordering::Relaxed)
+            };
+            // SAFETY: same bounds; error header follows access ring payload.
+            let error_cap = unsafe {
+                (*base.add(off + ring_size_bytes(CAP)).cast::<LogsWorkerRingHeader>())
+                    .cap
+                    .load(Ordering::Relaxed)
+            };
+            assert_eq!(access_cap, CAP as u64, "fresh init: slot {w} access cap must be stamped");
+            assert_eq!(error_cap, CAP as u64, "fresh init: slot {w} error cap must be stamped");
+        }
+
+        // ── (2) Simulate new-worker slot (OS-zeroed, never stamped) ─────────────
+        let off1 = slot_sz;
+        // SAFETY: off1 < n_slots * slot_sz ≤ zone_sz - data_off.
+        unsafe {
+            (*base.add(off1).cast::<LogsWorkerRingHeader>()).cap.store(0, Ordering::Relaxed);
+            (*base.add(off1 + ring_size_bytes(CAP)).cast::<LogsWorkerRingHeader>())
+                .cap
+                .store(0, Ordering::Relaxed);
+        }
+        // SAFETY: same bounds as above.
+        let cap_check =
+            unsafe { (*base.add(off1).cast::<LogsWorkerRingHeader>()).cap.load(Ordering::Relaxed) };
+        assert_eq!(cap_check, 0, "sanity: slot 1 access cap must be 0 before reload");
+
+        // ── (3) Reload ───────────────────────────────────────────────────────────
+        // SAFETY: fake_zone is valid; old_data non-null triggers the reload path.
+        let ret2 = unsafe {
+            logs_shm_zone_init(&raw mut fake_zone, core::ptr::dangling_mut::<core::ffi::c_void>())
+        };
+        assert_eq!(ret2, ngx_int_t::from(Status::NGX_OK), "reload must return NGX_OK");
+
+        // ── (4) Assert slot 1 has cap stamped (the H2F3 fix) ────────────────────
+        // SAFETY: same bounds as step (2).
+        let access_cap1 =
+            unsafe { (*base.add(off1).cast::<LogsWorkerRingHeader>()).cap.load(Ordering::Relaxed) };
+        // SAFETY: same bounds.
+        let error_cap1 = unsafe {
+            (*base.add(off1 + ring_size_bytes(CAP)).cast::<LogsWorkerRingHeader>())
+                .cap
+                .load(Ordering::Relaxed)
+        };
+        assert_eq!(
+            access_cap1, CAP as u64,
+            "H2F3: reload must stamp cap on new worker slot (access ring)"
+        );
+        assert_eq!(
+            error_cap1, CAP as u64,
+            "H2F3: reload must stamp cap on new worker slot (error ring)"
+        );
+
+        // SAFETY: base points into zone_mem; slot 0 is at offset 0.
+        let access_cap0 =
+            unsafe { (*base.cast::<LogsWorkerRingHeader>()).cap.load(Ordering::Relaxed) };
+        assert_eq!(access_cap0, CAP as u64, "H2F3: reload must not corrupt slot 0 cap");
     }
 }
