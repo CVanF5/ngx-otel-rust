@@ -410,7 +410,7 @@ The exporter process emits its own health metrics every export interval
 
 | Metric | Instrument | Unit | Description |
 |---|---|---|---|
-| `ngx_otel.dropped_records` | Sum (monotonic) | `{point}` | Metric data points dropped due to a full retry buffer |
+| `ngx_otel.dropped_records` | Sum (monotonic) | `{record}` | Records from any signal (metrics, logs, spans) dropped because the per-signal retry buffer was full (oldest batch evicted) or a graceful-drain abort discarded queued batches (F6 fix: previously only metrics lane was accounted) |
 | `ngx_otel.send_failures` | Sum (monotonic) | `{failure}` | Cumulative export send failures since worker startup |
 | `ngx_otel.bidi_backpressure_drops` | Sum (monotonic) | `{message}` | Bidi outbound messages dropped due to channel backpressure |
 | `ngx_otel.logs.access.dropped_records` | Sum (monotonic) | `{record}` | Access log records dropped because the per-worker ring was full |
