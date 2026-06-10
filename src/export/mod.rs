@@ -527,6 +527,15 @@ pub async fn export_loop(amcf: &'static MainConfig) {
         .map(|p| unsafe { (*p).successor_gen.load(core::sync::atomic::Ordering::Acquire) })
         .unwrap_or(0);
 
+    // B1-FU1: One-way abdication latch for the periodic ring-pop path.
+    // Set to `true` the first time `successor_announced()` returns true;
+    // never reset.  Once abdicated the periodic drain skips log/span ring
+    // pops for the remainder of this exporter's lifetime, leaving the rings
+    // exclusively to the new (successor) exporter.
+    // Cumulative-metrics READ snapshots are NOT gated — they are pure loads,
+    // safe across the overlap window (the valid-dedup case from B1).
+    let mut periodic_abdicated = false;
+
     // Capture the master (parent) PID once at export loop startup.
     // nginx_sys::ngx_parent is set by ngx_spawn_process to the master's PID
     // before fork, so in the exporter child it always equals the master PID.
@@ -667,6 +676,21 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                 break;
             }
 
+            // B1-FU1: Check for successor before periodic ring pops.
+            // One Acquire load of successor_gen; sets the latch permanently on first
+            // abdication.  The load is on the cold path (occurs only once per drain tick;
+            // the latch short-circuits immediately after the first true result).
+            if !periodic_abdicated && successor_announced(amcf, my_gen) {
+                periodic_abdicated = true;
+                ngx::ngx_log_error!(
+                    NGX_LOG_NOTICE,
+                    log.as_ptr(),
+                    "otel export: successor announced — abdicating periodic ring pops \
+                     (my_gen={})",
+                    my_gen
+                );
+            }
+
             // ── Log drain: every sub-interval wake ──────────────────────────
             // Drain the logs retry queue first (best-effort; stop on failure).
             {
@@ -707,8 +731,9 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             }
 
             // Drain fresh log records from all workers' rings and ship them.
+            // B1-FU1: skipped on abdication — new exporter is sole consumer.
             // Gate on access_sample OR error_log — either enables the logs shm path.
-            if amcf.is_access_sample_enabled() || amcf.error_log_enabled {
+            if !periodic_abdicated && (amcf.is_access_sample_enabled() || amcf.error_log_enabled) {
                 if let Some(logs_base) = amcf.logs_shm_base() {
                     // SAFETY: `logs_shm_base()` returned `Some`, so the logs zone
                     // was registered and mapped; `amcf.logs_shm_zone` therefore
@@ -815,58 +840,62 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             }
 
             // Drain fresh span records from all workers' rings and ship them.
-            if let Some(spans_base) = amcf.spans_shm_base() {
-                // SAFETY: `spans_shm_base()` returned `Some`, so the spans zone
-                // was registered and mapped; `amcf.spans_shm_zone` therefore
-                // points to a live `ngx_shm_zone_t` valid for the exporter's
-                // lifetime. The `&*` borrow does not escape this block, and
-                // `shm.size` is a plain field read.
-                // A1b: use n_active_workers (same rationale as logs above).
-                let n_workers = {
-                    use core::sync::atomic::Ordering;
-                    let n = amcf.n_active_workers.load(Ordering::Relaxed);
-                    if n > 0 {
-                        n
-                    } else {
-                        // SAFETY: amcf.spans_shm_zone is non-null when spans_shm_base()
-                        // returned Some above; `&*` and `shm.size` read do not escape.
-                        unsafe {
-                            let zone = &*amcf.spans_shm_zone;
-                            let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
-                            spans_n_workers_from_zone(avail, DEFAULT_SPAN_RING_CAP)
+            // B1-FU1: skipped on abdication — new exporter is sole consumer.
+            if !periodic_abdicated {
+                if let Some(spans_base) = amcf.spans_shm_base() {
+                    // SAFETY: `spans_shm_base()` returned `Some`, so the spans zone
+                    // was registered and mapped; `amcf.spans_shm_zone` therefore
+                    // points to a live `ngx_shm_zone_t` valid for the exporter's
+                    // lifetime. The `&*` borrow does not escape this block, and
+                    // `shm.size` is a plain field read.
+                    // A1b: use n_active_workers (same rationale as logs above).
+                    let n_workers = {
+                        use core::sync::atomic::Ordering;
+                        let n = amcf.n_active_workers.load(Ordering::Relaxed);
+                        if n > 0 {
+                            n
+                        } else {
+                            // SAFETY: amcf.spans_shm_zone is non-null when spans_shm_base()
+                            // returned Some above; `&*` and `shm.size` read do not escape.
+                            unsafe {
+                                let zone = &*amcf.spans_shm_zone;
+                                let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
+                                spans_n_workers_from_zone(avail, DEFAULT_SPAN_RING_CAP)
+                            }
                         }
-                    }
-                };
-                // Pdata pipeline: wrap → process → encode → send (Step U2).
-                let mut spans_pd = Pdata::Spans(collect_span_records(amcf, spans_base, n_workers));
-                processor.process(&mut spans_pd);
-                let n_spans = count_pdata_records(&spans_pd);
-                if n_spans > 0 {
-                    let spans_bytes = encode_pdata(&spans_pd);
-                    match transport.send_pdata(&spans_pd, spans_bytes.clone()).await {
-                        Ok(()) => {
-                            ngx::ngx_log_error!(
-                                NGX_LOG_INFO,
-                                log.as_ptr(),
-                                "otel export: sent {} span records to collector",
-                                n_spans
-                            );
-                        }
-                        Err(ref e) => {
-                            ngx::ngx_log_error!(
-                                NGX_LOG_ERR,
-                                log.as_ptr(),
-                                "otel export: spans send failed ({}); queuing for retry",
-                                e
-                            );
-                            enqueue_with_eviction(
-                                &mut spans_retry_queue,
-                                spans_bytes,
-                                n_spans,
-                                retry_buffer_depth,
-                                log.as_ptr(),
-                            );
-                            TRACES_SEND_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    };
+                    // Pdata pipeline: wrap → process → encode → send (Step U2).
+                    let mut spans_pd =
+                        Pdata::Spans(collect_span_records(amcf, spans_base, n_workers));
+                    processor.process(&mut spans_pd);
+                    let n_spans = count_pdata_records(&spans_pd);
+                    if n_spans > 0 {
+                        let spans_bytes = encode_pdata(&spans_pd);
+                        match transport.send_pdata(&spans_pd, spans_bytes.clone()).await {
+                            Ok(()) => {
+                                ngx::ngx_log_error!(
+                                    NGX_LOG_INFO,
+                                    log.as_ptr(),
+                                    "otel export: sent {} span records to collector",
+                                    n_spans
+                                );
+                            }
+                            Err(ref e) => {
+                                ngx::ngx_log_error!(
+                                    NGX_LOG_ERR,
+                                    log.as_ptr(),
+                                    "otel export: spans send failed ({}); queuing for retry",
+                                    e
+                                );
+                                enqueue_with_eviction(
+                                    &mut spans_retry_queue,
+                                    spans_bytes,
+                                    n_spans,
+                                    retry_buffer_depth,
+                                    log.as_ptr(),
+                                );
+                                TRACES_SEND_FAILURES.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     }
                 }
@@ -1042,6 +1071,28 @@ pub async fn export_loop(amcf: &'static MainConfig) {
 
 // ── Graceful drain ────────────────────────────────────────────────────────────
 
+/// B1-FU1: Returns `true` when a successor exporter generation has been
+/// announced — `ControlShm::successor_gen > my_gen` — meaning this exporter
+/// must abdicate mutating ring pops (logs/spans).
+///
+/// Used by both the periodic drain path (see `export_loop`) and
+/// [`graceful_drain`] — one definition, two call sites, no inline copy
+/// (connascence rule: a second copy would let the two callers drift apart).
+///
+/// # Safety
+/// `control_shm_ptr()` returns `Some` only when the zone is registered and
+/// mapped; `successor_gen` is read with `Acquire` ordering.
+fn successor_announced(amcf: &MainConfig, my_gen: u64) -> bool {
+    amcf.control_shm_ptr()
+        .map(|p| {
+            // SAFETY: `control_shm_ptr()` returns `Some` only when the control
+            // shm zone is registered and mapped; the raw pointer is valid for
+            // this exporter's lifetime (cycle-pool allocated).
+            (unsafe { (*p).successor_gen.load(core::sync::atomic::Ordering::Acquire) }) > my_gen
+        })
+        .unwrap_or(false)
+}
+
 /// Retry queues for all three signal transports — metrics, logs, and spans.
 ///
 /// Bundled into a single argument to keep [`graceful_drain`]'s signature
@@ -1134,12 +1185,9 @@ async fn graceful_drain(
     let queued = queues.metrics.len();
 
     // B1: check whether a successor was announced (reload) or not (shutdown).
-    // SAFETY: control_shm_ptr() returns Some only when the zone is registered
-    // and mapped; loading successor_gen is a single Acquire atomic load.
-    let has_successor = amcf
-        .control_shm_ptr()
-        .map(|p| unsafe { (*p).successor_gen.load(core::sync::atomic::Ordering::Acquire) } > my_gen)
-        .unwrap_or(false);
+    // B1-FU1: use the shared successor_announced() check (connascence rule —
+    // one definition for both the periodic drain path and graceful_drain).
+    let has_successor = successor_announced(amcf, my_gen);
 
     ngx::ngx_log_error!(
         NGX_LOG_NOTICE,
