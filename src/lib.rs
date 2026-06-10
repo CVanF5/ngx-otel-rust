@@ -187,6 +187,53 @@ fn spawn_exporter_for_cycle(
 
 // ── A1: zone-sizing validation ────────────────────────────────────────────────
 
+/// B4 — Detect the pre-daemon context where the gen-1 exporter will be orphaned.
+///
+/// Returns `true` when ALL of:
+///   - `ccf->daemon == 1` (the `daemon on` directive — default)
+///   - `ngx_daemonized == 0` (we have NOT yet forked the daemon master;
+///     nginx sets this flag in `main()` AFTER `ngx_daemon()` returns —
+///     `nginx/src/core/nginx.c` line 354; at `init_module` time it is still 0)
+///   - `ngx_inherited == 0` (not a USR2 binary-upgrade child, where nginx
+///     sets `ngx_daemonized = 1` unconditionally — `nginx/src/core/nginx.c`
+///     line 358)
+///
+/// When this function returns `true`, `ngx_spawn_process` is about to fork E
+/// from the pre-daemon P0.  After `ngx_daemon()` forks the long-lived master M
+/// and P0 exits, E's PPID reparents to 1 (init).  M inherits the
+/// `ngx_processes[]` entry but `waitpid(-1, WNOHANG)` in M's SIGCHLD handler
+/// (`ngx_process_get_status` in `ngx_process.c`) never reaps E — only E's
+/// REAL parent (init, PID 1) receives SIGCHLD when E exits.
+/// Consequence: crash-respawn and the backoff loop are inoperative for the
+/// gen-1 exporter under `daemon on`.
+///
+/// # Safety
+/// `cycle` must be a valid non-null `ngx_cycle_t` pointer.
+unsafe fn is_pre_daemon_initial_start(cycle: *const nginx_sys::ngx_cycle_t) -> bool {
+    // Check ccf->daemon first (cheapest).
+    // SAFETY: caller guarantees `cycle` is valid and non-null.
+    let cycle_ref = unsafe { &*cycle };
+    let core_idx = nginx_sys::ngx_core_module.index;
+    // SAFETY: conf_ctx is initialised by nginx; indexing by core_idx is in-bounds.
+    let raw_conf: *mut *mut *mut core::ffi::c_void = unsafe { *cycle_ref.conf_ctx.add(core_idx) };
+    let core_conf = raw_conf.cast::<ngx_core_conf_t>();
+    if core_conf.is_null() {
+        return false;
+    }
+    // SAFETY: core_conf is non-null and valid at init_module time.
+    let daemon_flag = unsafe { (*core_conf).daemon };
+    if daemon_flag == 0 {
+        return false; // daemon off — no double-fork
+    }
+    // SAFETY: `ngx_daemonized` and `ngx_inherited` are nginx globals written
+    // by `main()` before re-entering `init_module` on SIGHUP, and never mutated
+    // concurrently.  The plain reads are race-free at init_module time.
+    let daemonized = unsafe { nginx_sys::ngx_daemonized };
+    // SAFETY: same as ngx_daemonized above — process-lifetime global, read-only here.
+    let inherited = unsafe { nginx_sys::ngx_inherited };
+    daemonized == 0 && inherited == 0
+}
+
 /// Read the final `worker_processes` from the fully-parsed nginx cycle.
 ///
 /// Called from `ngx_otel_init_module` (post-parse, so the value is final)
@@ -403,6 +450,34 @@ extern "C" fn ngx_otel_init_module(cycle: *mut nginx_sys::ngx_cycle_t) -> nginx_
             let ctrl = unsafe { &*ctrl_ptr };
             ctrl.successor_gen.fetch_add(1, core::sync::atomic::Ordering::Release);
         }
+    }
+
+    // B4 — Warn when the gen-1 exporter will be orphaned after daemonize.
+    //
+    // nginx/src/core/nginx.c call order:
+    //   line 293: ngx_init_cycle() → ngx_init_modules() → this callback
+    //   line 350: ngx_daemon() — forks M, P0 exits → exporter PPID becomes 1
+    //   line 354: ngx_daemonized = 1 — set AFTER daemon fork, in M only
+    //
+    // When is_pre_daemon_initial_start() returns true we are in P0 (the
+    // pre-daemon spawner that will exit).  After ngx_spawn_process(E) below:
+    //   - E is a child of P0; after ngx_daemon P0 exits; E's PPID → 1 (init).
+    //   - M inherits E's ngx_processes[] entry, but SIGCHLD from E goes to
+    //     init → ngx_process_get_status's waitpid(-1) in M never reaps E →
+    //     crash-respawn is dead for this generation.
+    // No fix in this loop iteration — the self-supervising wrapper (Option B)
+    // is designed and deferred post-review (LIFECYCLE.md §"Known limitation").
+    //
+    // SAFETY: `cycle` is valid (verified above).
+    if !is_reload && unsafe { is_pre_daemon_initial_start(cycle) } {
+        ngx::ngx_log_error!(
+            nginx_sys::NGX_LOG_ALERT,
+            cycle_ref.log,
+            "otel: daemon on — gen-1 exporter will be unsupervised after daemonize \
+             (PPID 1; crash-respawn unavailable for this generation). \
+             Run `nginx -s reload` once after startup to restore supervision. \
+             See LIFECYCLE.md §\"Known limitation: gen-1 exporter under daemon on\"."
+        );
     }
 
     // Spawn the exporter for both initial start and SIGHUP reload.

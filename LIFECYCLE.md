@@ -89,6 +89,82 @@ telemetry backs up in the bounded shm — observable via the same scrape endpoin
 
 ---
 
+## Known limitation: gen-1 exporter under `daemon on`
+
+### What happens
+
+With `daemon on` (the nginx production default) nginx performs a double-fork
+on startup:
+
+```
+P0 (shell child)
+  └─ forks master M
+       └─ M spawns gen-1 exporter E1 via ngx_spawn_process()
+P0 exits → M is adopted by init/systemd
+           E1 is also adopted by init/systemd (PPID → 1)
+```
+
+Because E1's PPID is not M, M never receives `SIGCHLD` when E1 dies.
+If E1 crashes or is killed (`kill -9`), M does not respawn it and telemetry
+is silently lost until the next reload.
+
+This is a gap in nginx's respawn model, not a bug in the module code: there is
+no extension point in nginx 1.31.x that runs post-daemonize inside the
+long-lived master.
+
+### Detection
+
+At `init_module` time the module checks whether `daemon on` is configured and
+the current process has not yet daemonized (`ngx_daemonized == 0 &&
+ngx_inherited == 0`).  When true it logs `NGX_LOG_ALERT`:
+
+```
+otel: daemon on — gen-1 exporter will be unsupervised after daemonize
+(PPID 1; crash-respawn unavailable for this generation).
+Run `nginx -s reload` once after startup to restore supervision.
+See LIFECYCLE.md §"Known limitation: gen-1 exporter under daemon on".
+```
+
+The ALERT appears in `error.log` during every cold start with `daemon on` until
+a reload has been performed.
+
+### Remedy
+
+Run `nginx -s reload` once after startup.  The reload causes the long-lived
+master (which is already daemonized and owns the pidfile) to spawn a fresh
+gen-2 exporter directly.  Gen-2 has PPID = master, so SIGCHLD supervision and
+crash-respawn work normally for all subsequent generations.
+
+The reload can be scripted in an init / systemd unit:
+
+```ini
+# systemd example
+ExecStartPost=/usr/sbin/nginx -s reload
+```
+
+### Deferred fix (Option B)
+
+A self-supervisor approach (exporter forks a watchdog before the double-fork
+completes, or the module uses `ngx_init_cycle` hooks) was designed but deferred
+as out-of-scope for this release.  The ALERT + reload remedy is sufficient for
+production use.  The self-supervisor design is captured in the commit that
+introduced this section.
+
+### Test
+
+`tests/integration/run_b4_daemon_on_gen1.sh` verifies:
+
+| Step | Assertion |
+|---|---|
+| Cold start with `daemon on` | ALERT present in error.log (**regression gate**) |
+| Gen-1 exporter running | PPID ≠ master (orphaned after daemonize) |
+| `kill -9` gen-1 | NO respawn within 5 s (master blind to SIGCHLD) |
+| `nginx -s reload` | Gen-2 exporter appears with PPID = master |
+| `kill -9` gen-2 | Respawn within 5 s (supervision restored) |
+| SIGQUIT | Clean exit, no orphans |
+
+---
+
 ## Chaos test matrix
 
 | Test script | Scenario | Assertions |
@@ -96,6 +172,7 @@ telemetry backs up in the bounded shm — observable via the same scrape endpoin
 | `run_chaos_kill9.sh` | `kill -9` exporter under HTTP load | workers 200; socket isolation (Linux: `/proc`); master respawns; clean SIGQUIT |
 | `run_chaos_crashloop.sh` | Repeated startup abort (test-support feature) | backoff fires; self-disable after 5; ALERT logged; master + workers unaffected |
 | `run_chaos_dead_collector.sh` | SIGQUIT/SIGHUP with unreachable collector | SIGQUIT ≤ 20 s; no orphan; reload zeroes crash counter |
+| `run_b4_daemon_on_gen1.sh` | `daemon on` gen-1 orphan + reload remedy | ALERT logged; kill-9 gen-1 → no respawn; reload → gen-2 PPID=master; kill-9 gen-2 → respawn |
 
 All three scripts pass on macOS (dev) and debian-vm (Linux, CI). Socket
 isolation is verified definitively on Linux via `/proc/<pid>/net/tcp`; on macOS

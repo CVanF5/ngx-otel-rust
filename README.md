@@ -620,6 +620,14 @@ ngx-otel-rust/
 
 ## Limitations
 
+- **Gen-1 exporter is unsupervised under `daemon on`.**  With `daemon on`
+  (the nginx production default) the gen-1 exporter is orphaned to init
+  after the daemonize double-fork; nginx cannot see its SIGCHLD and will
+  not respawn it.  Run `nginx -s reload` once after startup to restore
+  supervision (gen-2 onward is fully supervised).  The module logs an
+  `[alert]` at startup to remind you.  See
+  [LIFECYCLE.md §"Known limitation: gen-1 exporter under daemon on"](LIFECYCLE.md)
+  for the full explanation and the deferred self-supervisor design.
 - **HTTPS / TLS is not yet implemented.**  `https://` endpoints are
   rejected at config parse (`http://` and `unix:` only); both the
   OTLP/HTTP and OTLP/gRPC transports run over plaintext (h2c for gRPC).
