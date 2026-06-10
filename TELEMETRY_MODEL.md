@@ -70,6 +70,17 @@ table in `WorkerSlots` (`src/shm.rs`).
   `otel_metric_status_code_class`). Route names are the matched `location`
   name (never the raw URI), bounded `ROUTE_CAP = 64` + an `"other"` slot;
   upstream zones are bounded `UPSTREAM_CAP = 32` + `"other"` / no-upstream.
+- **SIGHUP reload behaviour (F1):** `by_route` and `by_upstream` histogram
+  slots are **zeroed on every reload** (`otel_shm_zone_init`, `shm.rs`).
+  The slot→name mapping is rebuilt from the new config on each reload
+  (new `ngx_http_core_loc_conf_t*` / `ngx_shm_zone_t*` values; any location
+  add/remove/reorder shifts the slot index).  Preserving old counts would
+  silently re-attribute them to the route/upstream that now owns that slot.
+  The zero produces a valid OTLP cumulative reset at the reload boundary —
+  `start_time_unix_nano` resets with the new exporter process, so consumers
+  already baseline on restart.  The base-series (`by method × status × protocol`)
+  and all global aggregate histograms carry over unchanged (their indices are
+  config-independent).
 - **Exemplars:** the base series attaches reservoir-sampled exemplars
   (value + `trace_id`/`span_id` + `filtered_attributes`) per combo, populated
   from the access-log sampling path (`otel_access_log_sample`).

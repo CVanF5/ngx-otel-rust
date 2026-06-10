@@ -884,13 +884,97 @@ unsafe fn wp_from_cycle(cycle: *const ngx_cycle_t) -> Option<usize> {
 ///
 /// Our WorkerSlots data lives at `data_offset()` bytes past `shm.addr`,
 /// safely beyond the slab-pool header.
+///
+/// # F1 — reload partial-zero helper
+///
+/// `route_duration_combos` and `upstream_duration_combos` are indexed by position
+/// in `route_table` / `upstream_table`, which are rebuilt on every SIGHUP reload
+/// (new `ngx_http_core_loc_conf_t*` and `ngx_shm_zone_t*` values; traversal order
+/// may differ if locations are added/removed/reordered).  Any count accumulated
+/// under the old index assignment would be re-attributed to whichever route/upstream
+/// now owns that slot number.  To prevent this, `otel_shm_zone_init` zeros ONLY
+/// these two arrays on reload.
+///
+/// Fields that CARRY OVER on reload (indices are config-stable):
+///   - `request_duration_combos` (method × status_class × protocol — no config dependency)
+///   - `request_body_bytes`, `response_body_bytes` (global aggregates)
+///   - `upstream_response_ms`, `upstream_header_ms`, `upstream_connect_ms`,
+///     `upstream_bytes_received`, `upstream_bytes_sent` (global upstream aggregates)
+///   - `exemplar_reservoir` (`combo_idx` refs `request_duration_combos` — config-stable)
+///   - `error_rate_counters` (severity class — config-stable)
+///
+/// `start_time_unix_nano` resets per-reload (export/mod.rs:487 — new exporter process
+/// calls `now_unix_nano()`), so zeroing the route/upstream slots produces a valid
+/// OTLP cumulative reset at the reload boundary.
+///
+/// Dying old workers may write a few more counts into just-zeroed slots in the seconds
+/// before they exit.  The writes are atomic (no UB); the counts vanish with the old
+/// workers and are negligible versus incoming new traffic.  Accepted.
+///
+/// # Safety
+/// `base` must point to at least `n_slots` contiguous `WorkerSlots` objects within
+/// a mapped shm zone.  `n_slots * size_of::<WorkerSlots>()` must not exceed the
+/// available zone bytes past `data_offset()`.
+unsafe fn zero_route_upstream_histograms(base: *mut u8, n_slots: usize) {
+    const ROUTE_OFF: usize = core::mem::offset_of!(WorkerSlots, route_duration_combos);
+    const ROUTE_SZ: usize = mem::size_of::<[ExpHistogramSlot; N_ROUTE_SLOTS]>();
+    const UPSTREAM_OFF: usize = core::mem::offset_of!(WorkerSlots, upstream_duration_combos);
+    const UPSTREAM_SZ: usize = mem::size_of::<[ExpHistogramSlot; N_UPSTREAM_SLOTS]>();
+    let slot_bytes = mem::size_of::<WorkerSlots>();
+    for i in 0..n_slots {
+        // SAFETY: `i < n_slots` (fn contract) → `i * slot_bytes < n_slots * slot_bytes ≤`
+        // zone bytes past data_offset() (fn contract).  ROUTE_OFF and UPSTREAM_OFF are
+        // compile-time offset_of! values within WorkerSlots (< slot_bytes); adding their
+        // respective sizes also stays within slot_bytes.  All-zeros is the valid initial
+        // state for AtomicU64, AtomicU32, and AtomicU8.
+        unsafe {
+            let slot_base: *mut u8 = base.add(i * slot_bytes);
+            ptr::write_bytes(slot_base.add(ROUTE_OFF), 0, ROUTE_SZ);
+            ptr::write_bytes(slot_base.add(UPSTREAM_OFF), 0, UPSTREAM_SZ);
+        }
+    }
+}
+
 pub unsafe extern "C" fn otel_shm_zone_init(
     shm_zone: *mut ngx_shm_zone_t,
     old_data: *mut core::ffi::c_void,
 ) -> ngx_int_t {
     if !old_data.is_null() {
         // SIGHUP reload: the same physical shm pages are re-mapped.
-        // Counter values carry over automatically; no re-initialisation needed.
+        //
+        // Most WorkerSlots fields carry over correctly (see the doc-comment on
+        // `zero_route_upstream_histograms` above for the full list).  The two
+        // exceptions are route_duration_combos and upstream_duration_combos: their
+        // slot indices come from build_route_table / build_upstream_table, which
+        // rebuilds with new clcf_ptr / shm_zone_ptr values on every reload.  Any
+        // location add/remove/reorder shifts the index, silently re-attributing old
+        // counts to a different route/upstream name in the next export.  Zero only
+        // those two arrays; leave everything else intact.
+        // SAFETY: nginx invokes this callback with a valid, non-null `ngx_shm_zone_t`
+        // (fn contract); the reference does not outlive the call.
+        let zone = unsafe { &*shm_zone };
+        let offset = data_offset();
+        if zone.shm.size <= offset {
+            return Status::NGX_OK.into();
+        }
+        // SAFETY: zone->data is either null (legacy/test) or points at a `ZoneInitData`
+        // stored in amcf (nginx conf pool, which outlives this zone-init callback).
+        let n_active = if let Some(zid) = unsafe { zone.data.cast::<ZoneInitData>().as_ref() } {
+            let cycle = zid.cycle_addr as *const ngx_cycle_t;
+            // SAFETY: cycle is non-null (set from cf->cycle at postconfiguration)
+            // and valid through otel_shm_zone_init (same ngx_init_cycle call).
+            unsafe { wp_from_cycle(cycle) }.unwrap_or(1)
+        } else {
+            1
+        };
+        let slot_bytes = mem::size_of::<WorkerSlots>();
+        let n_reserved = (zone.shm.size - offset) / slot_bytes;
+        let n_zero = n_active.min(n_reserved).max(1);
+        // SAFETY: offset == data_offset(), zone.shm.size > offset (checked above).
+        // n_zero ≤ n_reserved = (zone.shm.size - offset) / slot_bytes — fn contract met.
+        let base: *mut u8 = unsafe { zone.shm.addr.cast::<u8>().add(offset) };
+        // SAFETY: base and n_zero meet zero_route_upstream_histograms' contract (above).
+        unsafe { zero_route_upstream_histograms(base, n_zero) };
         return Status::NGX_OK.into();
     }
 
@@ -1099,8 +1183,10 @@ pub unsafe fn logs_coalesce_table(
 ///
 /// On a fresh start, zeros the slot area and sets `cap` in every ring header
 /// so that subsequent push/pop calls know the ring capacity.  On SIGHUP
-/// (`old_data` is non-null) the same physical pages are re-mapped; ring offsets
-/// carry over automatically — do NOT zero them (gotcha #6 in the plan).
+/// (`old_data` is non-null) the same physical pages are re-mapped; **log ring
+/// head/tail offsets** carry over — do NOT zero them (gotcha #6 in the plan).
+/// This is the logs-ring zone only; the metrics zone (`otel_shm_zone_init`)
+/// handles route/upstream histogram resets separately on reload.
 ///
 /// The configured `cap` is stored in `(*zone).data` as a `usize` cast to
 /// `*mut c_void` (tagged pointer pattern; safe because usize fits in a pointer
@@ -1826,5 +1912,77 @@ mod tests {
         for &default_cap in &[512 * 1024usize, 256 * 1024usize, 4096usize] {
             assert_eq!(default_cap % 8, 0, "default cap {} is already aligned", default_cap);
         }
+    }
+
+    // ── F1: reload must zero route/upstream histograms ───────────────────────
+
+    /// F1 regression: `zero_route_upstream_histograms` must zero ONLY
+    /// `route_duration_combos` and `upstream_duration_combos`, leaving all other
+    /// `WorkerSlots` fields untouched.
+    ///
+    /// Pre-fix: `otel_shm_zone_init` returned `NGX_OK` immediately on reload
+    /// without zeroing any fields.  After a reload the route/upstream tables are
+    /// rebuilt (new clcf_ptr / shm_zone_ptr values; any location add/remove/reorder
+    /// shifts the slot index).  Counts recorded pre-reload under route X ended up
+    /// attributed to whichever route now owned that index — silent misattribution.
+    ///
+    /// Post-fix: `zero_route_upstream_histograms` is called on reload for each
+    /// active WorkerSlot.  This test verifies:
+    /// 1. route_duration_combos and upstream_duration_combos are zeroed (no
+    ///    misattribution from old indices).
+    /// 2. request_duration_combos is NOT zeroed (stable method×status×protocol
+    ///    index; clearing it would lose correct data).
+    ///
+    /// Fail-before proof: without calling `zero_route_upstream_histograms`, the
+    /// route/upstream counts remain non-zero — the `assert_eq!(..., 0)` assertions
+    /// below would fail.
+    #[test]
+    fn f1_zero_route_upstream_histograms_on_reload() {
+        // Allocate a zero-initialised buffer sized for one WorkerSlots.
+        let mut buf = std::vec![0u8; mem::size_of::<WorkerSlots>()];
+        // SAFETY: `buf` is a freshly-allocated, zero-initialised `Vec<u8>` sized to
+        // exactly hold a `WorkerSlots`.  The global allocator over-aligns for the
+        // element type, and zero is the valid initial state for all atomic fields.
+        let slot = unsafe { &*buf.as_mut_ptr().cast::<WorkerSlots>() };
+
+        // Simulate pre-reload state: record traffic into route and upstream slots.
+        slot.route_duration_combos[0].record(1_000); // route index 0, pre-reload
+        slot.upstream_duration_combos[0].record(2_000); // upstream index 0, pre-reload
+        slot.request_duration_combos[0].record(3_000); // stable, must survive reload
+
+        let (_, _, _, pre_route) = slot.route_duration_combos[0].snapshot();
+        let (_, _, _, pre_up) = slot.upstream_duration_combos[0].snapshot();
+        let (_, _, _, pre_combo) = slot.request_duration_combos[0].snapshot();
+        assert!(pre_route > 0, "precondition: route count must be non-zero before reload");
+        assert!(pre_up > 0, "precondition: upstream count must be non-zero before reload");
+        assert!(pre_combo > 0, "precondition: combo count must be non-zero before reload");
+
+        // Simulate reload: call the helper that otel_shm_zone_init invokes.
+        // SAFETY: buf is aligned and sized for exactly one WorkerSlots; n_slots=1.
+        unsafe { super::zero_route_upstream_histograms(buf.as_mut_ptr(), 1) };
+
+        // Post-reload assertions.
+        let (_, _, _, post_route) = slot.route_duration_combos[0].snapshot();
+        assert_eq!(
+            post_route, 0,
+            "F1: route_duration_combos[0] must be zeroed on reload — \
+             pre-fix code leaves old counts that get re-attributed to \
+             whichever route now owns index 0 after the route_table rebuild"
+        );
+
+        let (_, _, _, post_up) = slot.upstream_duration_combos[0].snapshot();
+        assert_eq!(
+            post_up, 0,
+            "F1: upstream_duration_combos[0] must be zeroed on reload — \
+             pre-fix code leaves old counts that get re-attributed to \
+             whichever upstream now owns index 0 after the upstream_table rebuild"
+        );
+
+        // request_duration_combos must NOT be zeroed — index is config-stable.
+        let (_, _, _, post_combo) = slot.request_duration_combos[0].snapshot();
+        assert_eq!(
+            post_combo, pre_combo,
+            "F1: zero_route_upstream_histograms must NOT touch request_duration_combos"
+        );
     }
 }
