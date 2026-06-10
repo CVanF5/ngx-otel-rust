@@ -131,6 +131,26 @@ pub static MASTER_PID: AtomicI64 = AtomicI64::new(0);
 /// there is exactly one export_loop per process lifetime.
 pub(crate) static EXPORT_LOOP_DONE: AtomicBool = AtomicBool::new(false);
 
+/// RAII guard that stores `true` to [`EXPORT_LOOP_DONE`] on every exit path of
+/// [`export_loop`], including early returns on startup failures.
+///
+/// B3 fix: before this guard existed, early returns at the endpoint-parse and
+/// transport-construction paths left `EXPORT_LOOP_DONE` unset. The drain-wait
+/// loop in `otel_exporter_cycle` then blocked indefinitely inside
+/// `ngx_process_events_and_timers` (no active fds or timers → epoll/kqueue
+/// never returned) → `nginx -s quit` hung until manual SIGTERM.
+///
+/// A local `let _done_guard = ExportLoopDoneGuard;` at the top of `export_loop`
+/// ensures the flag is set whenever the future resolves, regardless of which
+/// `return` is taken.
+struct ExportLoopDoneGuard;
+
+impl Drop for ExportLoopDoneGuard {
+    fn drop(&mut self) {
+        EXPORT_LOOP_DONE.store(true, Ordering::Release);
+    }
+}
+
 /// Wall-clock budget for the graceful drain on `ngx_quit`. Each send attempt
 /// inside the drain is capped at this duration so a dead collector cannot
 /// stall exporter shutdown.
@@ -356,6 +376,12 @@ impl MetricSource for SelfMetricsSource {
 /// `EXPORT_LOOP_DONE` before calling `process::exit`.
 pub async fn export_loop(amcf: &'static MainConfig) {
     let log = ngx::log::ngx_cycle_log();
+
+    // B3: RAII guard — ensures EXPORT_LOOP_DONE is set on every exit path of
+    // this function (early return, normal return). Pre-fix early returns at
+    // the endpoint-parse and transport-construction paths left the flag unset,
+    // so the drain-wait in otel_exporter_cycle blocked indefinitely.
+    let _done_guard = ExportLoopDoneGuard;
 
     // ── Parse endpoint ────────────────────────────────────────────────────
     let endpoint_str = match core::str::from_utf8(amcf.exporter.endpoint.as_bytes()) {
