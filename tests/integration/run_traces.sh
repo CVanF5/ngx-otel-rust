@@ -26,6 +26,10 @@
 #      (cross-signal metrics→trace drill-down, exemplar→Tempo pivot).
 #   7. New data in metrics.json contains no resourceSpans payloads
 #      (FU1 clean split: spans go only to traces.json).
+#   8. D1a: `otel_trace $otel_parent_sampled` + sampled parent → span present.
+#      Pre-fix: gate always declined (SpanCtx not set before Gate 2 evaluated
+#      $otel_parent_sampled → always not_found → always falsy → zero spans).
+#   9. D1b: `otel_trace $otel_parent_sampled` + unsampled parent → no span.
 #
 # Prerequisites
 # ─────────────
@@ -68,6 +72,19 @@ FLUSH_WAIT_S=$(( METRIC_INTERVAL_S + 4 ))
 TRACEPARENT="00-a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6-f1e2d3c4b5a69788-01"
 TRACE_ID="a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"
 PARENT_SPAN_ID="f1e2d3c4b5a69788"
+
+# D1 regression: $otel_parent_sampled as the otel_trace gate value.
+# Pre-fix: SpanCtx was never set before Gate 2 evaluated — $otel_parent_sampled
+# always returned not_found (empty) → gate always declined → zero spans even for
+# sampled parents.
+# Post-fix: pre-gate SpanCtx set with inbound flags → gate reads the correct bit.
+#
+# D1_SAMPLED_TRACE_ID   — request with flags=01 → MUST produce a span (D1a).
+# D1_UNSAMPLED_TRACE_ID — request with flags=00 → MUST NOT produce a span (D1b).
+D1_SAMPLED_TRACEPARENT="00-d1aaaa00000000001111111111111111-d1aaaaaa0000ffff-01"
+D1_SAMPLED_TRACE_ID="d1aaaa00000000001111111111111111"
+D1_UNSAMPLED_TRACEPARENT="00-d1bbbb00000000002222222222222222-d1bbbbbb0000ffff-00"
+D1_UNSAMPLED_TRACE_ID="d1bbbb00000000002222222222222222"
 
 # ─── Colour helpers ──────────────────────────────────────────────────────────
 
@@ -181,6 +198,15 @@ done
 # the inbound header, making the assertion deterministic.
 info "Sending 1 GET /error with traceparent (known trace_id=${TRACE_ID})..."
 curl -sf -H "traceparent: ${TRACEPARENT}" http://127.0.0.1:9102/error >/dev/null || true
+
+# D1 regression requests: /d1_parent_sampled with otel_trace $otel_parent_sampled.
+# (a) Sampled parent: flags=01 → $otel_parent_sampled returns "1" → gate passes → span emitted.
+# (b) Unsampled parent: flags=00 → $otel_parent_sampled returns "0" → gate declines → no span.
+# Pre-fix both of these always returned not_found → gate always declined → no span.
+info "D1a: GET /d1_parent_sampled with sampled parent (flags=01) → expecting span..."
+curl -sf -H "traceparent: ${D1_SAMPLED_TRACEPARENT}" http://127.0.0.1:9102/d1_parent_sampled >/dev/null || true
+info "D1b: GET /d1_parent_sampled with unsampled parent (flags=00) → expecting NO span..."
+curl -sf -H "traceparent: ${D1_UNSAMPLED_TRACEPARENT}" http://127.0.0.1:9102/d1_parent_sampled >/dev/null || true
 
 # ─── Wait for the export interval + buffer, then stop nginx ──────────────────
 
@@ -315,6 +341,29 @@ if [[ -n "${NEW_METRICS}" ]] && echo "${NEW_METRICS}" | grep -q '"resourceSpans"
     fail "metrics.json: new data contains resourceSpans — FU1 pipeline split is broken"
 else
     pass "metrics.json: no resourceSpans in new data (FU1 split holds)"
+fi
+
+# ─── 8. D1a: sampled parent → span present ───────────────────────────────────
+# D1 regression: `otel_trace $otel_parent_sampled` with a sampled inbound
+# traceparent (flags=01) MUST produce a span.
+# Pre-fix: $otel_parent_sampled always returned not_found at Gate 2 time
+# (SpanCtx not yet set) → gate always declined → no span ever.
+# Post-fix: pre-gate SpanCtx sets flags before Gate 2 → correct behaviour.
+
+if echo "${NEW_TRACES}" | grep -q "\"${D1_SAMPLED_TRACE_ID}\""; then
+    pass "D1a: sampled parent (${D1_SAMPLED_TRACE_ID}) → span present in traces.json (otel_trace \$otel_parent_sampled works)"
+else
+    fail "D1a: sampled parent ${D1_SAMPLED_TRACE_ID} NOT in traces.json — \$otel_parent_sampled gate broken (D1 regression)"
+fi
+
+# ─── 9. D1b: unsampled parent → no span ──────────────────────────────────────
+# D1 regression: `otel_trace $otel_parent_sampled` with an unsampled inbound
+# traceparent (flags=00) MUST NOT produce a span.
+
+if echo "${NEW_TRACES}" | grep -q "\"${D1_UNSAMPLED_TRACE_ID}\""; then
+    fail "D1b: unsampled parent ${D1_UNSAMPLED_TRACE_ID} APPEARED in traces.json — should have been gated out"
+else
+    pass "D1b: unsampled parent (${D1_UNSAMPLED_TRACE_ID}) → no span in traces.json (correct: gate declined)"
 fi
 
 # ─── Summary ─────────────────────────────────────────────────────────────────

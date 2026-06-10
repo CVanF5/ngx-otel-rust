@@ -91,47 +91,38 @@ impl HttpRequestHandler for SpanStartHandler {
             // `otel_trace` not set for this location → tracing disabled here.
             return Status::NGX_DECLINED;
         }
-        // Evaluate the complex value (literal "1", nginx variable, split_clients).
-        // SAFETY: `ngx_str_t` is a plain C struct (len + data pointer); zeroing it
-        // produces a valid "empty string" representation — no invariants violated.
-        let mut cv_result: nginx_sys::ngx_str_t = unsafe { core::mem::zeroed() };
-        // SAFETY: `r_ptr` is the valid request pointer for this call; `otel_trace_cv`
-        // is a non-null complex value allocated on the nginx config pool (process
-        // lifetime); `cv_result` is a local zeroed struct, valid as output.
-        let rc =
-            unsafe { nginx_sys::ngx_http_complex_value(r_ptr, otel_trace_cv, &raw mut cv_result) };
-        if rc != nginx_sys::NGX_OK as nginx_sys::ngx_int_t {
-            return Status::NGX_DECLINED;
-        }
-        // Truthy: non-empty, not "0", not "off" (matches nginx flag semantics).
-        let cv_bytes: &[u8] = if cv_result.len == 0 || cv_result.data.is_null() {
-            b""
-        } else {
-            // SAFETY: `cv_result.data` points into pool memory; `.len` is accurate.
-            unsafe { core::slice::from_raw_parts(cv_result.data, cv_result.len) }
-        };
-        if cv_bytes.is_empty() || cv_bytes == b"0" || cv_bytes == b"off" {
-            return Status::NGX_DECLINED;
-        }
 
-        // ── Record span start time (OTel-SDK-idiomatic dual-clock, D-2) ─────
-        // Wall-clock anchor: SystemTime::now() → absolute start timestamp.
-        // Monotonic anchor: Instant::now() → elapsed at LOG gives duration,
-        //   always ≥ 0 (NTP-immune).
-        // At LOG: span_end = start_time_unix_nano + start_mono.elapsed();
-        //   http.server.request.duration = start_mono.elapsed() (same value).
-        // Result: µs precision kept, end ≥ start guaranteed, span (end−start)
-        //   == attribute (coherent), histogram NTP-exposure removed.
-        // Both reads are vDSO calls on Linux — not kernel syscalls.
-        let start_time_unix_nano: u64 = {
-            use std::time::{SystemTime, UNIX_EPOCH};
-            SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
-        };
-        let start_mono = std::time::Instant::now();
+        // Module descriptor — factored out; needed for set_module_ctx at several
+        // call sites below (pre-gate set, gate-decline clear, post-gate set).
+        // SAFETY: `ngx_http_otel_module` is the static module descriptor valid for
+        // process lifetime; `addr_of!` yields a stable pointer to it.
+        let module_ref = unsafe { &*core::ptr::addr_of!(crate::ngx_http_otel_module) };
 
-        // ── Parse inbound `traceparent` once ──────────────────────────────────
-        // Scan headers a SINGLE time here and cache on SpanCtx.
-        // The Log phase reads from SpanCtx — no second header scan.
+        // ── D1 fix: parse inbound `traceparent` BEFORE Gate 2 ────────────────
+        // `$otel_parent_sampled` reads its value from the request's SpanCtx.
+        // Gate 2 calls `ngx_http_complex_value` which evaluates whatever
+        // `otel_trace` is set to — including `$otel_parent_sampled`.  In the old
+        // ordering the traceparent parse ran AFTER the gate, so SpanCtx was never
+        // set at Gate 2 time: `$otel_parent_sampled` always returned not_found →
+        // parent-based sampling was permanently broken regardless of config.
+        //
+        // Fix: parse the inbound traceparent here (before Gate 2) and set a
+        // minimal pre-gate SpanCtx with the inbound flags so Gate 2 sees the
+        // correct `$otel_parent_sampled` value.
+        //
+        // Semantic contract:
+        //   • have_traceparent=true  → pre-gate SpanCtx.flags = inbound_flags
+        //     → `$otel_parent_sampled` = "1" if W3C sampled bit set, else "0"
+        //   • have_traceparent=false → no pre-gate SpanCtx
+        //     → `$otel_parent_sampled` = not_found (empty/falsy)
+        //     → `otel_trace $otel_parent_sampled` gate declines (correct: no parent)
+        //
+        // On gate decline: clear the pre-gate SpanCtx so `$otel_trace_id` stays
+        // empty for declined requests (same semantics as before this fix).
+        //
+        // Cost: one header scan + one pool alloc for every request at configured
+        // locations that has a traceparent header.  This is within the
+        // "bounded-when-unsampled" budget described in the module doc.
         //
         // Skip the scan for Ignore (neither read nor write) and Inject (start a
         // fresh trace, do not inherit the inbound trace context).
@@ -158,11 +149,79 @@ impl HttpRequestHandler for SpanStartHandler {
             }
         }
 
+        // Pre-gate SpanCtx: allocate and store only when we have a traceparent so
+        // Gate 2 can read `$otel_parent_sampled` from the SpanCtx.flags field.
+        // `sampled` is left false (zeroed) — the full sampling decision is made
+        // post-gate.  If Gate 2 declines, we clear this ctx before returning.
+        if have_traceparent {
+            // SAFETY: `r_ptr` is the live `ngx_http_request_t*`; `(*r_ptr).pool`
+            // is the request-scoped pool valid for the request lifetime.
+            let pool = unsafe { pool_from_request(r_ptr) };
+            let pre_ctx = alloc_span_ctx(&pool);
+            if pre_ctx.is_null() {
+                return Status::NGX_DECLINED; // OOM (extremely rare)
+            }
+            // SAFETY: `pre_ctx` is freshly pool-allocated (zeroed); we write only
+            // `flags` here; all other fields (including `sampled`) remain zero
+            // (false) until the post-gate full SpanCtx write below.
+            unsafe {
+                (*pre_ctx).flags = inbound_flags;
+            }
+            request.set_module_ctx(pre_ctx.cast::<c_void>(), module_ref);
+        }
+
+        // ── Evaluate Gate 2 ──────────────────────────────────────────────────
+        // `$otel_parent_sampled` now finds the pre-gate SpanCtx (if have_traceparent).
+        // SAFETY: `ngx_str_t` is a plain C struct (len + data pointer); zeroing it
+        // produces a valid "empty string" representation — no invariants violated.
+        let mut cv_result: nginx_sys::ngx_str_t = unsafe { core::mem::zeroed() };
+        // SAFETY: `r_ptr` is the valid request pointer for this call; `otel_trace_cv`
+        // is a non-null complex value allocated on the nginx config pool (process
+        // lifetime); `cv_result` is a local zeroed struct, valid as output.
+        let rc =
+            unsafe { nginx_sys::ngx_http_complex_value(r_ptr, otel_trace_cv, &raw mut cv_result) };
+        if rc != nginx_sys::NGX_OK as nginx_sys::ngx_int_t {
+            // Clear pre-gate SpanCtx on all decline paths to preserve "no ctx"
+            // semantics for $otel_trace_id on declined requests.
+            request.set_module_ctx(core::ptr::null_mut(), module_ref);
+            return Status::NGX_DECLINED;
+        }
+        // Truthy: non-empty, not "0", not "off" (matches nginx flag semantics).
+        let cv_bytes: &[u8] = if cv_result.len == 0 || cv_result.data.is_null() {
+            b""
+        } else {
+            // SAFETY: `cv_result.data` points into pool memory; `.len` is accurate.
+            unsafe { core::slice::from_raw_parts(cv_result.data, cv_result.len) }
+        };
+        if cv_bytes.is_empty() || cv_bytes == b"0" || cv_bytes == b"off" {
+            // Gate declined. Clear any pre-gate SpanCtx so $otel_trace_id returns
+            // empty for declined requests (same semantics as before D1 fix).
+            // set_module_ctx(null) is always safe; if no pre-gate ctx was set
+            // this is a no-op write to the ctx array slot.
+            request.set_module_ctx(core::ptr::null_mut(), module_ref);
+            return Status::NGX_DECLINED;
+        }
+
+        // Gate passed.
+
+        // ── Record span start time (OTel-SDK-idiomatic dual-clock, D-2) ─────
+        // Moved after Gate 2: avoids vDSO calls for gate-declined requests.
+        // Wall-clock anchor: SystemTime::now() → absolute start timestamp.
+        // Monotonic anchor: Instant::now() → elapsed at LOG gives duration,
+        //   always ≥ 0 (NTP-immune).
+        // At LOG: span_end = start_time_unix_nano + start_mono.elapsed();
+        //   http.server.request.duration = start_mono.elapsed() (same value).
+        // Result: µs precision kept, end ≥ start guaranteed, span (end−start)
+        //   == attribute (coherent), histogram NTP-exposure removed.
+        // Both reads are vDSO calls on Linux — not kernel syscalls.
+        let start_time_unix_nano: u64 = {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
+        };
+        let start_mono = std::time::Instant::now();
+
         // ── Worker-side sampling decision ────────────────────────────────────
-        // Ratio/head sampling is already handled by Gate 2 above: the `otel_trace`
-        // complex value (which can reference a `split_clients` variable) was
-        // evaluated there; reaching this point means the request passed the
-        // sampling check and IS supposed to produce a span.
+        // Gate 2 has passed: the request is supposed to produce a span.
         //
         // Parent flag path: inbound traceparent present → honour the W3C sampled bit.
         // Root span path:   no inbound traceparent → sample all (Gate 2 is the guard).
@@ -186,21 +245,24 @@ impl HttpRequestHandler for SpanStartHandler {
             0x01 // sampled
         };
 
-        // ── Allocate SpanCtx on the request pool ─────────────────────────────
-        // `r_ptr` was computed above (Gate 2) — reuse it here.
+        // ── Allocate full SpanCtx on the request pool ─────────────────────────
+        // This replaces the pre-gate SpanCtx if one was set.  The pre-gate
+        // allocation (have_traceparent=true path) is wasted pool memory
+        // (≈sizeof(SpanCtx) bytes) — acceptable for a bump allocator.
         // SAFETY: `r_ptr` is the live `ngx_http_request_t*` for this request;
         // `(*r_ptr).pool` is nginx's request-scoped pool, valid for the full
         // request lifetime — exactly what `pool_from_request` requires.
         let pool = unsafe { pool_from_request(r_ptr) };
         let ctx_ptr = alloc_span_ctx(&pool);
         if ctx_ptr.is_null() {
-            // OOM in the request pool — extremely rare.  Pass through without ctx.
+            // OOM in the request pool — extremely rare.  Clear pre-gate ctx and exit.
+            request.set_module_ctx(core::ptr::null_mut(), module_ref);
             return Status::NGX_DECLINED;
         }
 
         // Initialise the SpanCtx fields.
-        // SAFETY: `ctx_ptr` is freshly allocated (calloc — zeroed) from the
-        // request pool, so writing to it is sound and there are no live aliases.
+        // SAFETY: `ctx_ptr` is freshly allocated (zeroed) from the request pool,
+        // so writing to it is sound and there are no live aliases.
         // Note: `start_mono` (Instant) is Copy, and the pool-zeroed bytes are
         // overwritten by this struct assignment before any read occurs.
         unsafe {
@@ -215,14 +277,12 @@ impl HttpRequestHandler for SpanStartHandler {
             };
         }
 
-        // Store on the request via set_module_ctx.
-        // SAFETY: `ngx_http_otel_module` is the static module descriptor valid
-        // for process lifetime; `ctx_ptr` is pool-allocated and outlives the
-        // request; `set_module_ctx` writes the pointer into the request's ctx
-        // array at our module's ctx_index — no aliasing concern.
-        request.set_module_ctx(ctx_ptr.cast::<c_void>(), unsafe {
-            &*core::ptr::addr_of!(crate::ngx_http_otel_module)
-        });
+        // Store on the request via set_module_ctx (overwrites pre-gate ptr if any).
+        // SAFETY: `module_ref` is the process-lifetime module descriptor;
+        // `ctx_ptr` is pool-allocated and outlives the request;
+        // `set_module_ctx` writes the pointer into the request's ctx array at
+        // our module's ctx_index — no aliasing concern.
+        request.set_module_ctx(ctx_ptr.cast::<c_void>(), module_ref);
 
         // ── Inject outbound `traceparent` header ──────────────────────────────
         // For `inject` and `propagate` modes, push a W3C traceparent into the
