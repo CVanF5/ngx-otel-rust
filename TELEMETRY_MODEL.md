@@ -336,7 +336,7 @@ One OTel **server span** per sampled request.
 | `end_time_unix_nano` | `start_time_unix_nano + monotonic_duration_ns` (always ≥ start; NTP-immune; derived from `Instant::elapsed()` at LOG) | `src/metric_source/instrumented.rs` |
 | `trace_id` | extracted from inbound `traceparent` (propagate/extract), or freshly generated | `src/traces/ctx.rs` |
 | `span_id` | freshly generated per request | `src/traces/ctx.rs` |
-| `parent_span_id` | from inbound `traceparent` (when `extract` or `propagate`), else zero | `src/metric_source/span_start.rs` |
+| `parent_span_id` | from inbound `traceparent` (when `extract` or `propagate`), else **empty** (root span — OTLP `bytes` field empty = no parent, per proto semantics; F7 wire fix) | `src/metric_source/span_start.rs` |
 | `flags` | W3C trace flags byte (propagated from inbound header, or `0x01` for root spans) | `src/metric_source/span_start.rs` |
 | `kind` | `SERVER` | `src/traces/mod.rs` |
 | `status` | `ERROR` (5xx), else `Unset` — semconv-correct (4xx is not a server-span error) | `src/metric_source/instrumented.rs` |

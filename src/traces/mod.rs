@@ -254,7 +254,19 @@ pub fn parse_span_record(buf: &[u8], observed_ns: u64) -> Option<crate::data_mod
     pos += 16;
     let span_id = buf[pos..pos + 8].to_vec();
     pos += 8;
-    let parent_span_id = buf[pos..pos + 8].to_vec();
+    // Root spans store [0u8; 8] on the ring wire.  OTLP semantics require an
+    // **empty** parent_span_id bytes field for root spans (proto `bytes` default
+    // = empty means "no parent"); exporting [0u8;8] signals a non-existent
+    // parent to backends and breaks trace-root detection.
+    // Intended wire change (F7): root spans now export empty parent_span_id.
+    let parent_span_id = {
+        let raw = &buf[pos..pos + 8];
+        if raw == [0u8; 8] {
+            std::vec::Vec::new()
+        } else {
+            raw.to_vec()
+        }
+    };
     pos += 8;
     let flags = u32::from_be_bytes(buf[pos..pos + 4].try_into().ok()?);
     pos += 4;

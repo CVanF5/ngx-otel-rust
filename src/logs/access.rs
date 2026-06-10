@@ -308,8 +308,18 @@ pub fn parse_traceparent_full(header: &[u8]) -> Option<([u8; 16], [u8; 8], u32)>
     let hi = hex_nibble(header[53])?;
     let lo = hex_nibble(header[54])?;
     let flags = ((hi << 4) | lo) as u32;
-    // All-zero trace_id is invalid per spec
+    // Version 00 MUST NOT have trailing characters (W3C §3.3: "the implementation
+    // MUST NOT allow trailing characters after trace-flags for version 00").
+    if header.len() != 55 {
+        return None;
+    }
+    // All-zero trace-id is invalid per spec (W3C §3.3).
     if trace_id == [0u8; 16] {
+        return None;
+    }
+    // All-zero parent-id is invalid per spec (W3C §3.3: "All zeroes MUST be
+    // rejected" for parent-id).
+    if parent_span_id == [0u8; 8] {
         return None;
     }
     Some((trace_id, parent_span_id, flags))
@@ -348,12 +358,17 @@ fn decode_hex8(hex: &[u8], out: &mut [u8; 8]) -> bool {
 }
 
 /// Convert a single ASCII hex character to its nibble value (0–15).
+///
+/// Only lowercase hex is accepted.  W3C Trace Context §3.3 defines `HEXDIGLC`
+/// (`0`–`9`, `a`–`f`) as the required alphabet for all traceparent fields;
+/// uppercase letters are explicitly **not** in the grammar and MUST be
+/// rejected.  Accepting them would permit non-canonical headers that a strict
+/// downstream re-parse might reject, breaking trace correlation.
 #[inline]
 fn hex_nibble(c: u8) -> Option<u8> {
     match c {
         b'0'..=b'9' => Some(c - b'0'),
         b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
         _ => None,
     }
 }
@@ -502,6 +517,234 @@ mod tests {
         assert!(
             parse_traceparent(b"00-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-00f067aa0ba902b7-01").is_none(),
             "invalid hex → None"
+        );
+    }
+
+    /// F7 — Table-driven W3C traceparent parser: strict rejection per spec.
+    ///
+    /// Each row is (header, expected_result_is_some, description).
+    ///
+    /// W3C Trace Context §3.3 rules exercised here:
+    ///   HEXDIGLC   – lowercase hex only; uppercase MUST be rejected.
+    ///   version-00 – trailing characters after trace-flags MUST be rejected.
+    ///   parent-id  – all-zeros MUST be rejected.
+    ///   trace-id   – all-zeros MUST be rejected (already tested above, included
+    ///                here for completeness in the table).
+    ///
+    /// Regression: `hex_nibble` previously accepted `A-F`; `parse_traceparent_full`
+    /// previously accepted len > 55 and all-zero parent-id.  All three cases now
+    /// return `None`.  This test FAILS on pre-fix code for those rows.
+    #[test]
+    fn f7_traceparent_parser_strict() {
+        // The canonical valid header used as the mutation base.
+        let valid: &[u8] = b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+        struct Case {
+            header: &'static [u8],
+            expect_some: bool,
+            desc: &'static str,
+        }
+
+        let cases: &[Case] = &[
+            // ── Valid cases ───────────────────────────────────────────────────
+            Case {
+                header: b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+                expect_some: true,
+                desc: "valid canonical",
+            },
+            Case {
+                header: b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00",
+                expect_some: true,
+                desc: "valid flags=00 (unsampled)",
+            },
+            Case {
+                header: b"00-ffffffffffffffffffffffffffffffff-ffffffffffffffff-ff",
+                expect_some: true,
+                desc: "valid all-f",
+            },
+            // ── Uppercase hex — MUST reject (HEXDIGLC is lowercase only) ─────
+            Case {
+                header: b"00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01",
+                expect_some: false,
+                desc: "uppercase trace-id MUST be rejected",
+            },
+            Case {
+                header: b"00-4bf92f3577b34da6a3ce929d0e0e4736-00F067AA0BA902B7-01",
+                expect_some: false,
+                desc: "uppercase parent-id MUST be rejected",
+            },
+            Case {
+                header: b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0F",
+                expect_some: false,
+                desc: "uppercase flags MUST be rejected",
+            },
+            // ── All-zero parent-id — MUST reject (W3C §3.3) ──────────────────
+            Case {
+                header: b"00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
+                expect_some: false,
+                desc: "all-zero parent-id MUST be rejected",
+            },
+            // ── All-zero trace-id — MUST reject (W3C §3.3) ───────────────────
+            Case {
+                header: b"00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+                expect_some: false,
+                desc: "all-zero trace-id MUST be rejected",
+            },
+            // ── Version-00 trailing garbage — MUST reject (W3C §3.3) ─────────
+            Case {
+                header: b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra",
+                expect_some: false,
+                desc: "version-00 trailing garbage MUST be rejected",
+            },
+            Case {
+                header: b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01 ",
+                expect_some: false,
+                desc: "version-00 trailing space MUST be rejected",
+            },
+            // ── Non-00 version — MUST reject (we only implement version 00) ──
+            Case {
+                header: b"01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+                expect_some: false,
+                desc: "version 01 MUST be rejected",
+            },
+            Case {
+                header: b"ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+                expect_some: false,
+                desc: "version ff MUST be rejected",
+            },
+            // ── Truncated headers ─────────────────────────────────────────────
+            Case { header: b"", expect_some: false, desc: "empty MUST be rejected" },
+            Case {
+                header: b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7",
+                expect_some: false,
+                desc: "missing flags MUST be rejected",
+            },
+            Case {
+                header: b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0",
+                expect_some: false,
+                desc: "flags truncated to 1 hex digit MUST be rejected",
+            },
+            // ── Invalid hex characters ────────────────────────────────────────
+            Case {
+                header: b"00-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-00f067aa0ba902b7-01",
+                expect_some: false,
+                desc: "invalid hex in trace-id MUST be rejected",
+            },
+            Case {
+                header: b"00-4bf92f3577b34da6a3ce929d0e0e4736-zzzzzzzzzzzzzzzz-01",
+                expect_some: false,
+                desc: "invalid hex in parent-id MUST be rejected",
+            },
+        ];
+
+        // The valid base header must parse; verify the mutation baseline is correct.
+        assert!(
+            parse_traceparent_full(valid).is_some(),
+            "baseline valid header must parse — test setup error"
+        );
+
+        for case in cases {
+            let got = parse_traceparent_full(case.header);
+            let is_some = got.is_some();
+            assert_eq!(
+                is_some,
+                case.expect_some,
+                "case {:?}: expected {}, got {} — {}",
+                std::str::from_utf8(case.header).unwrap_or("<non-utf8>"),
+                if case.expect_some { "Some" } else { "None" },
+                if is_some { "Some" } else { "None" },
+                case.desc
+            );
+        }
+    }
+
+    /// F7 — Root spans export empty parent_span_id; child spans export 8 bytes.
+    ///
+    /// OTLP `Span.parent_span_id` is a `bytes` field: empty = root span,
+    /// 8 bytes = child span.  The ring wire format stores [0u8;8] for root spans;
+    /// `parse_span_record` must map that to `Vec::new()`.
+    ///
+    /// Regression: pre-fix code returned `vec![0u8;8]` for root spans,
+    /// signalling a non-existent parent to OTLP backends.
+    #[test]
+    fn f7_root_span_exports_empty_parent_span_id() {
+        use crate::data_model::{SpanKind, StatusCode};
+        use crate::traces::{emit_span_record, parse_span_record, SpanRecord};
+
+        struct VecProducer(std::sync::Mutex<std::vec::Vec<u8>>);
+        impl crate::logs::LogProducer for VecProducer {
+            fn push(&self, data: &[u8]) -> bool {
+                let mut v = self.0.lock().unwrap();
+                let len = data.len() as u32;
+                v.extend_from_slice(&len.to_be_bytes());
+                v.extend_from_slice(data);
+                true
+            }
+        }
+
+        // Root span: parent_span_id all zeros.
+        let root_rec = SpanRecord {
+            trace_id: [0xaa_u8; 16],
+            span_id: [0xbb_u8; 8],
+            parent_span_id: [0x00_u8; 8],
+            flags: 0x01,
+            start_time_unix_nano: 1_000_000_000,
+            end_time_unix_nano: 2_000_000_000,
+            status_code: StatusCode::Unset as u8,
+            kind: SpanKind::Server as u8,
+            name: b"GET /root",
+            method: b"GET",
+            http_status: 200,
+            url_path: b"/root",
+            duration_us: 1_000_000,
+            extra_attrs: &[],
+        };
+
+        // Child span: non-zero parent_span_id.
+        let child_parent: [u8; 8] = [0xcc; 8];
+        let child_rec = SpanRecord {
+            trace_id: [0xaa_u8; 16],
+            span_id: [0xdd_u8; 8],
+            parent_span_id: child_parent,
+            flags: 0x01,
+            start_time_unix_nano: 1_100_000_000,
+            end_time_unix_nano: 1_900_000_000,
+            status_code: StatusCode::Unset as u8,
+            kind: SpanKind::Server as u8,
+            name: b"GET /child",
+            method: b"GET",
+            http_status: 200,
+            url_path: b"/child",
+            duration_us: 800_000,
+            extra_attrs: &[],
+        };
+
+        let prod = VecProducer(std::sync::Mutex::new(std::vec::Vec::new()));
+
+        assert!(emit_span_record(&prod, &root_rec), "root span push must succeed");
+        assert!(emit_span_record(&prod, &child_rec), "child span push must succeed");
+
+        let raw = prod.0.lock().unwrap();
+
+        // Parse root span (first record).
+        let root_len = u32::from_be_bytes(raw[..4].try_into().unwrap()) as usize;
+        let root_span = parse_span_record(&raw[4..4 + root_len], 0).expect("root span must parse");
+        assert!(
+            root_span.parent_span_id.is_empty(),
+            "root span MUST export empty parent_span_id, got {:?}",
+            root_span.parent_span_id
+        );
+
+        // Parse child span (second record).
+        let child_off = 4 + root_len;
+        let child_len =
+            u32::from_be_bytes(raw[child_off..child_off + 4].try_into().unwrap()) as usize;
+        let child_span = parse_span_record(&raw[child_off + 4..child_off + 4 + child_len], 0)
+            .expect("child span must parse");
+        assert_eq!(
+            child_span.parent_span_id,
+            child_parent.to_vec(),
+            "child span MUST export the 8-byte parent_span_id"
         );
     }
 
