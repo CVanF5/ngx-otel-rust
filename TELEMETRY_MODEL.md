@@ -114,6 +114,16 @@ metrics only when an upstream was used (from `ngx_http_upstream_state_t`).
 | `http.server.upstream.bytes.received` | Histogram (explicit) | `By` | Cumulative |
 | `http.server.upstream.bytes.sent` | Histogram (explicit) | `By` | Cumulative |
 
+> **C1 — sentinel filtering:** nginx initialises `response_time`,
+> `connect_time`, and `header_time` in `ngx_http_upstream_state_t` to
+> `(ngx_msec_t)-1` (`ngx_http_upstream.c:1580-1582`) to mark "timing not
+> measured" (e.g., aborted upstream attempts, connection failures).  The
+> nginx log module formats this sentinel as `"-"` (`:6074`).  The three
+> upstream duration histograms skip recording when the sentinel is present;
+> failed or aborted upstream attempts therefore contribute **zero
+> observations** to those histograms.  `bytes_received` / `bytes_sent`
+> (`off_t`, zero-initialised via `ngx_pcalloc`) are not affected.
+
 ## NGINX connection / request metrics
 
 Read from nginx's `stub_status` globals each export interval

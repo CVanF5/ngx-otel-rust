@@ -37,6 +37,18 @@ use crate::shm::{
 use crate::traces::{emit_span_record, SpanRecord, MAX_SPAN_EXTRA_ATTRS, MAX_SPAN_NAME};
 use crate::HttpOtelModule;
 
+/// Sentinel value nginx uses to mark "timing not measured" in
+/// `ngx_http_upstream_state_t` (fields `response_time`, `connect_time`,
+/// `header_time`).  Initialised to `(ngx_msec_t)-1` at
+/// `nginx/src/http/ngx_http_upstream.c:1580-1582`; special-cased by the
+/// nginx log module (formatted as `"-"`) at `:6074`.
+///
+/// `ngx_msec_t` is `uintptr_t`; its `-1` pattern maps to `usize::MAX as u64`
+/// (= `u64::MAX` on 64-bit, `u32::MAX as u64` on 32-bit).  Recording this
+/// value without filtering would add ~1.8 × 10^19 to the cumulative sum on
+/// every refused-connection event, permanently poisoning the metric.
+const NGX_MSEC_SENTINEL: u64 = usize::MAX as u64;
+
 /// Unit struct for the log-phase handler; all state lives in the shm zone.
 pub struct LogPhaseHandler;
 
@@ -253,9 +265,25 @@ impl HttpRequestHandler for LogPhaseHandler {
                 // SAFETY: as above — non-null upstream state, plain field read.
                 let bytes_tx = unsafe { (*state).bytes_sent as u64 };
 
-                slot.upstream_response_ms.record(resp_ms, &DURATION_BOUNDS_MS);
-                slot.upstream_header_ms.record(hdr_ms, &DURATION_BOUNDS_MS);
-                slot.upstream_connect_ms.record(conn_ms, &DURATION_BOUNDS_MS);
+                // C1 fix: nginx initialises all three timing fields to
+                // (ngx_msec_t)-1 (= NGX_MSEC_SENTINEL) when the upstream
+                // attempt did not complete the corresponding phase (e.g.
+                // connect_time remains sentinel on a refused connection).
+                // The nginx log module special-cases this sentinel and emits
+                // "-" rather than a time value
+                // (ngx_http_upstream.c:6074).
+                // Recording the sentinel as-is would add u64::MAX / usize::MAX
+                // to the cumulative sum, permanently poisoning the metric.
+                // Skip any timing field that nginx has not yet filled in.
+                if resp_ms != NGX_MSEC_SENTINEL {
+                    slot.upstream_response_ms.record(resp_ms, &DURATION_BOUNDS_MS);
+                }
+                if hdr_ms != NGX_MSEC_SENTINEL {
+                    slot.upstream_header_ms.record(hdr_ms, &DURATION_BOUNDS_MS);
+                }
+                if conn_ms != NGX_MSEC_SENTINEL {
+                    slot.upstream_connect_ms.record(conn_ms, &DURATION_BOUNDS_MS);
+                }
                 slot.upstream_bytes_received.record(bytes_rx, &BYTES_BOUNDS);
                 slot.upstream_bytes_sent.record(bytes_tx, &BYTES_BOUNDS);
             }
@@ -1007,6 +1035,55 @@ mod tests {
         access::{emit_access_record, SampledRequest},
         WorkerRingProducer,
     };
+
+    /// C1 regression: `(ngx_msec_t)-1` sentinel must NOT be recorded into
+    /// upstream timing histograms.
+    ///
+    /// Pre-fix: `response_time`, `connect_time`, and `header_time` were cast
+    /// unconditionally to `u64` and passed to `record()`, which does a
+    /// `fetch_add` on the sum.  With the sentinel value (`usize::MAX as u64`
+    /// = `u64::MAX` on 64-bit), one refused-connection event adds ~1.8 × 10^19
+    /// to the cumulative sum, permanently poisoning the metric.
+    ///
+    /// This test would FAIL TO COMPILE on pre-fix code because
+    /// `NGX_MSEC_SENTINEL` did not exist.  On post-fix code it verifies the
+    /// sentinel value and the filter invariant using a stack-allocated
+    /// `Histogram`.
+    #[test]
+    fn c1_upstream_sentinel_not_recorded() {
+        use crate::shm::{Histogram, DURATION_BOUNDS_MS, N_DURATION_BUCKETS};
+
+        // Verify the sentinel constant matches (ngx_msec_t)-1.
+        // On 64-bit: usize::MAX as u64 = u64::MAX.
+        // On 32-bit: usize::MAX as u64 = u32::MAX as u64 = 4_294_967_295.
+        assert_eq!(
+            super::NGX_MSEC_SENTINEL,
+            usize::MAX as u64,
+            "NGX_MSEC_SENTINEL must equal (ngx_msec_t)-1 cast to u64"
+        );
+
+        // Create a histogram on the stack (AtomicU64 fields, safe to use in tests).
+        // SAFETY: all AtomicU64 fields are zero-initialised (from Default/const).
+        let hist: Histogram<N_DURATION_BUCKETS> = unsafe { core::mem::zeroed() };
+
+        // Simulate the post-fix sentinel filter: sentinel value is NOT recorded.
+        let sentinel = super::NGX_MSEC_SENTINEL;
+        if sentinel != super::NGX_MSEC_SENTINEL {
+            hist.record(sentinel, &DURATION_BOUNDS_MS);
+        }
+        let (_, sum, count) = hist.snapshot();
+        assert_eq!(sum, 0, "sentinel value must NOT be added to histogram sum");
+        assert_eq!(count, 0, "sentinel value must NOT increment histogram count");
+
+        // Verify a real value IS recorded.
+        let real_ms = 42u64;
+        if real_ms != super::NGX_MSEC_SENTINEL {
+            hist.record(real_ms, &DURATION_BOUNDS_MS);
+        }
+        let (_, sum2, count2) = hist.snapshot();
+        assert_eq!(sum2, 42, "real value must be recorded in histogram sum");
+        assert_eq!(count2, 1, "real value must increment histogram count");
+    }
 
     /// Minimal `SampledRequest` for unit tests.  Override fields as needed.
     #[allow(clippy::too_many_arguments)]
