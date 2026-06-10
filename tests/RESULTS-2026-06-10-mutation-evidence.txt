@@ -1,0 +1,305 @@
+==================================================================
+ MUTATION EVIDENCE — 2026-06-10 22:36:49 IST
+ Repo: 6562214 feat(M3a-v2): assertion (a-iv) + ring dual-consumer unit tests for mutation evidence
+ Host: Linux debian-vm 6.12.90+deb13.1-arm64 #1 SMP Debian 6.12.90-2 (2026-05-27) aarch64 GNU/Linux
+==================================================================
+
+────────────────────────────────────────────────────────────────────────
+Mutation (a): Remove periodic_abdicated gating in export_loop
+────────────────────────────────────────────────────────────────────────
+
+── (a2) Ring dual-consumer violation test ───────────────────────────────
+
+  b1_single_consumer (MUST PASS — positive case):
+test logs::ring::tests::b1_single_consumer_reads_exactly_n_records ... ok
+test result: ok. 178 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.10s
+
+  b1_dual_consumer_violation (MUST FAIL — expected; run with --ignored):
+test logs::ring::tests::b1_dual_consumer_violation ... FAILED
+---- logs::ring::tests::b1_dual_consumer_violation stdout ----
+thread 'logs::ring::tests::b1_dual_consumer_violation' (571773) panicked at src/logs/ring.rs:526:9:
+    logs::ring::tests::b1_dual_consumer_violation
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 178 filtered out; finished in 0.00s
+
+── Diff (mutation a) ────────────────────────────────────────────────────
+diff --git a/src/export/mod.rs b/src/export/mod.rs
+index 0e90ea5..7d095ae 100644
+--- a/src/export/mod.rs
++++ b/src/export/mod.rs
+@@ -778,7 +778,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
+             // Drain fresh log records from all workers' rings and ship them.
+             // B1-FU1: skipped on abdication — new exporter is sole consumer.
+             // Gate on access_sample OR error_log — either enables the logs shm path.
+-            if !periodic_abdicated && (amcf.is_access_sample_enabled() || amcf.error_log_enabled) {
++            if amcf.is_access_sample_enabled() || amcf.error_log_enabled {
+                 if let Some(logs_base) = amcf.logs_shm_base() {
+                     // SAFETY: `logs_shm_base()` returned `Some`, so the logs zone
+                     // was registered and mapped; `amcf.logs_shm_zone` therefore
+@@ -886,7 +886,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
+ 
+             // Drain fresh span records from all workers' rings and ship them.
+             // B1-FU1: skipped on abdication — new exporter is sole consumer.
+-            if !periodic_abdicated {
++            if true { // MUTATION: FU1 gating removed
+                 if let Some(spans_base) = amcf.spans_shm_base() {
+                     // SAFETY: `spans_shm_base()` returned `Some`, so the spans zone
+                     // was registered and mapped; `amcf.spans_shm_zone` therefore
+
+── (a-pre) Normal timing, no hook, mutated code (MUST PASS) ────────────
+(Confirms: without QUIT-DEFER, mutation is not observable at normal timing)
+  [BUILD] cargo build --release --target aarch64-unknown-linux-gnu...
+   Compiling ngx-otel-rust v0.1.0 (/home/cvandesande/project-nginx-otel/ngx-otel-rust)
+    Finished `release` profile [optimized] target(s) in 7.51s
+  [BUILD] done → target/aarch64-unknown-linux-gnu/release/libngx_http_otel_module.so
+[1;33m[INFO][0m Module:       /home/cvandesande/project-nginx-otel/ngx-otel-rust/target/aarch64-unknown-linux-gnu/release/libngx_http_otel_module.so
+[harness] collector reachable at http://127.0.0.1:4318
+[0;32m[PASS][0m nginx started (master=571812 exporter=571814)
+[0;32m[PASS][0m Round 1: old exporter exited
+[0;32m[PASS][0m Round 2: old exporter exited
+[0;32m[PASS][0m Round 3: old exporter exited
+[1;33m[INFO][0m Records found in logs.json: 75 total, 75 unique (sent: 75)
+[0;32m[PASS][0m assertion (a-i): no duplicate records across 3 SIGHUP rounds (75 unique paths, 75 found)
+[1;33m[INFO][0m Assertion (a-ii): checking conservation (sent=75 unique_arrived=75)...
+[1;33m[INFO][0m Conservation: 75 arrived + 0 dropped = 75 (sent 75)
+[0;32m[PASS][0m assertion (a-ii): conservation OK (75 arrived + 0 dropped = 75 sent)
+[0;32m[PASS][0m assertion (a-iii): zero parse/garbage-length errors in error.log and collector logs
+[0;32m[PASS][0m nginx exited cleanly
+[0;32m[PASS][0m assertion (b): quit-completeness: all 8 pre-quit records arrived
+[0;32m[PASS][0m B1-FU1 chaos gate: PASS — SPSC exclusivity across reload, conservation verified, no parse errors, quit-completeness confirmed
+
+── (a1-FAIL) QUIT-DEFER=4 + USE_SLOW_SINK=1, mutated code (MUST FAIL) ──
+(Expected: FAIL assertion (a-iv) — old exporter sends ring records post-abdication)
+  [BUILD-TS] cargo build --features test-support --target aarch64-unknown-linux-gnu --target-dir target/test-support...
+   Compiling ngx-otel-rust v0.1.0 (/home/cvandesande/project-nginx-otel/ngx-otel-rust)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.12s
+  [BUILD-TS] done → /home/cvandesande/project-nginx-otel/ngx-otel-rust/target/test-support/aarch64-unknown-linux-gnu/debug/libngx_http_otel_module.so
+[1;33m[INFO][0m Module:       /home/cvandesande/project-nginx-otel/ngx-otel-rust/target/test-support/aarch64-unknown-linux-gnu/debug/libngx_http_otel_module.so
+[0;32m[PASS][0m nginx started (master=572493 exporter=572495)
+[0;32m[PASS][0m Round 1: old exporter exited
+[0;32m[PASS][0m Round 2: old exporter exited
+[0;32m[PASS][0m Round 3: old exporter exited
+[1;33m[INFO][0m Records found in logs.json: 75 total, 75 unique (sent: 75)
+[0;32m[PASS][0m assertion (a-i): no duplicate records across 3 SIGHUP rounds (75 unique paths, 75 found)
+[1;33m[INFO][0m Assertion (a-ii): checking conservation (sent=75 unique_arrived=75)...
+[1;33m[INFO][0m Conservation: 75 arrived + 0 dropped = 75 (sent 75)
+[0;32m[PASS][0m assertion (a-ii): conservation OK (75 arrived + 0 dropped = 75 sent)
+[0;32m[PASS][0m assertion (a-iii): zero parse/garbage-length errors in error.log and collector logs
+[1;33m[INFO][0m Assertion (a-iv): QUIT-DEFER mode — checking post-abdication send counts...
+[1;33m[INFO][0m   PID 572495: abdicated at line 56, post-abdication sends: 1
+[1;33m[INFO][0m   PID 572537: abdicated at line 116, post-abdication sends: 1
+[1;33m[INFO][0m   PID 572686: abdicated at line 178, post-abdication sends: 1
+[0;31m[FAIL][0m assertion (a-iv): SPSC exclusivity violated — 3 ring-record send(s) from old exporter(s) after abdication (FU1 gate missing → concurrent drains in defer window)
+2026/06/10 22:37:41 [notice] 572686#0: *59 otel export: successor announced — abdicating periodic ring pops (my_gen=2)
+2026/06/10 22:37:45 [notice] 572686#0: *83 otel export: successor announced — abdicating log/span ring drains (new exporter is sole consumer)
+
+── Revert mutation (a) ──────────────────────────────────────────────────
+Updated 1 path from the index
+  Reverted.
+
+── (a1-PASS) QUIT-DEFER=4 + USE_SLOW_SINK=1, restored code (MUST PASS) ─
+(Confirms: fixed code abdicates within one tick, zero post-abdication sends)
+  [BUILD-TS] cargo build --features test-support --target aarch64-unknown-linux-gnu --target-dir target/test-support...
+   Compiling ngx-otel-rust v0.1.0 (/home/cvandesande/project-nginx-otel/ngx-otel-rust)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.16s
+  [BUILD-TS] done → /home/cvandesande/project-nginx-otel/ngx-otel-rust/target/test-support/aarch64-unknown-linux-gnu/debug/libngx_http_otel_module.so
+[1;33m[INFO][0m Module:       /home/cvandesande/project-nginx-otel/ngx-otel-rust/target/test-support/aarch64-unknown-linux-gnu/debug/libngx_http_otel_module.so
+[0;32m[PASS][0m nginx started (master=573323 exporter=573325)
+[0;32m[PASS][0m Round 1: old exporter exited
+[0;32m[PASS][0m Round 2: old exporter exited
+[0;32m[PASS][0m Round 3: old exporter exited
+[1;33m[INFO][0m Records found in logs.json: 75 total, 75 unique (sent: 75)
+[0;32m[PASS][0m assertion (a-i): no duplicate records across 3 SIGHUP rounds (75 unique paths, 75 found)
+[1;33m[INFO][0m Assertion (a-ii): checking conservation (sent=75 unique_arrived=75)...
+[1;33m[INFO][0m Conservation: 75 arrived + 0 dropped = 75 (sent 75)
+[0;32m[PASS][0m assertion (a-ii): conservation OK (75 arrived + 0 dropped = 75 sent)
+[0;32m[PASS][0m assertion (a-iii): zero parse/garbage-length errors in error.log and collector logs
+[1;33m[INFO][0m Assertion (a-iv): QUIT-DEFER mode — checking post-abdication send counts...
+[1;33m[INFO][0m   PID 573325: abdicated at line 55, post-abdication sends: 0
+[1;33m[INFO][0m   PID 573371: abdicated at line 113, post-abdication sends: 0
+[1;33m[INFO][0m   PID 573494: abdicated at line 171, post-abdication sends: 0
+[0;32m[PASS][0m assertion (a-iv): old exporter(s) sent zero ring records post-abdication (SPSC exclusivity confirmed — FU1 gate held during QUIT-DEFER overlap)
+[0;32m[PASS][0m nginx exited cleanly
+[0;32m[PASS][0m assertion (b): quit-completeness: all 8 pre-quit records arrived
+[0;32m[PASS][0m B1-FU1 chaos gate: PASS — SPSC exclusivity across reload, conservation verified, no parse errors, quit-completeness confirmed
+
+
+────────────────────────────────────────────────────────────────────────
+Mutation (b): Invert !has_successor in graceful_drain final logs drain
+────────────────────────────────────────────────────────────────────────
+
+── Diff (mutation b) ────────────────────────────────────────────────────
+diff --git a/src/export/mod.rs b/src/export/mod.rs
+index 0e90ea5..4908989 100644
+--- a/src/export/mod.rs
++++ b/src/export/mod.rs
+@@ -1395,7 +1395,7 @@ async fn graceful_drain(
+ 
+     // Final freshly-collected logs batch (access + error rings).
+     // B1: skipped on abdication — new exporter is sole consumer of the rings.
+-    if !has_successor && (amcf.is_access_sample_enabled() || amcf.error_log_enabled) {
++    if has_successor && /* MUTATION: inverted */ (amcf.is_access_sample_enabled() || amcf.error_log_enabled) {
+         if let Some(logs_base) = amcf.logs_shm_base() {
+             // A1b: use n_active_workers (same rationale as export path).
+             let n_workers = {
+
+── Build (mutated b) ────────────────────────────────────────────────────
+  [BUILD] cargo build --release --target aarch64-unknown-linux-gnu...
+   Compiling ngx-otel-rust v0.1.0 (/home/cvandesande/project-nginx-otel/ngx-otel-rust)
+    Finished `release` profile [optimized] target(s) in 7.37s
+  [BUILD] done → target/aarch64-unknown-linux-gnu/release/libngx_http_otel_module.so
+
+── Run chaos (MUST FAIL on assertion b) ─────────────────────────────────
+[1;33m[INFO][0m Module:       /home/cvandesande/project-nginx-otel/ngx-otel-rust/target/aarch64-unknown-linux-gnu/release/libngx_http_otel_module.so
+[harness] collector reachable at http://127.0.0.1:4318
+[0;32m[PASS][0m nginx started (master=573902 exporter=573904)
+[0;32m[PASS][0m Round 1: old exporter exited
+[0;32m[PASS][0m Round 2: old exporter exited
+[0;32m[PASS][0m Round 3: old exporter exited
+[1;33m[INFO][0m Records found in logs.json: 75 total, 75 unique (sent: 75)
+[0;32m[PASS][0m assertion (a-i): no duplicate records across 3 SIGHUP rounds (75 unique paths, 75 found)
+[1;33m[INFO][0m Assertion (a-ii): checking conservation (sent=75 unique_arrived=75)...
+[1;33m[INFO][0m Conservation: 75 arrived + 0 dropped = 75 (sent 75)
+[0;32m[PASS][0m assertion (a-ii): conservation OK (75 arrived + 0 dropped = 75 sent)
+[0;32m[PASS][0m assertion (a-iii): zero parse/garbage-length errors in error.log and collector logs
+[0;32m[PASS][0m nginx exited cleanly
+[0;31m[FAIL][0m assertion (b): quit-completeness: only 2/8 pre-quit records arrived (missing: 00078 00079 00080 00081 00082 00083)
+         (graceful drain may have abdicated on shutdown — no-successor drain missing)
+
+── Revert mutation (b) ──────────────────────────────────────────────────
+Updated 1 path from the index
+  Reverted.
+
+── Build (restored b) ───────────────────────────────────────────────────
+  [BUILD] cargo build --release --target aarch64-unknown-linux-gnu...
+   Compiling ngx-otel-rust v0.1.0 (/home/cvandesande/project-nginx-otel/ngx-otel-rust)
+    Finished `release` profile [optimized] target(s) in 7.32s
+  [BUILD] done → target/aarch64-unknown-linux-gnu/release/libngx_http_otel_module.so
+
+── Run chaos (MUST PASS) ────────────────────────────────────────────────
+[1;33m[INFO][0m Module:       /home/cvandesande/project-nginx-otel/ngx-otel-rust/target/aarch64-unknown-linux-gnu/release/libngx_http_otel_module.so
+[harness] collector reachable at http://127.0.0.1:4318
+[0;32m[PASS][0m nginx started (master=574357 exporter=574359)
+[0;32m[PASS][0m Round 1: old exporter exited
+[0;32m[PASS][0m Round 2: old exporter exited
+[0;32m[PASS][0m Round 3: old exporter exited
+[1;33m[INFO][0m Records found in logs.json: 75 total, 75 unique (sent: 75)
+[0;32m[PASS][0m assertion (a-i): no duplicate records across 3 SIGHUP rounds (75 unique paths, 75 found)
+[1;33m[INFO][0m Assertion (a-ii): checking conservation (sent=75 unique_arrived=75)...
+[1;33m[INFO][0m Conservation: 75 arrived + 0 dropped = 75 (sent 75)
+[0;32m[PASS][0m assertion (a-ii): conservation OK (75 arrived + 0 dropped = 75 sent)
+[0;32m[PASS][0m assertion (a-iii): zero parse/garbage-length errors in error.log and collector logs
+[0;32m[PASS][0m nginx exited cleanly
+[0;32m[PASS][0m assertion (b): quit-completeness: all 8 pre-quit records arrived
+[0;32m[PASS][0m B1-FU1 chaos gate: PASS — SPSC exclusivity across reload, conservation verified, no parse errors, quit-completeness confirmed
+
+────────────────────────────────────────────────────────────────────────
+Mutation (c): Remove status != 0 guard in record_base_combo
+────────────────────────────────────────────────────────────────────────
+
+── Diff (mutation c) ────────────────────────────────────────────────────
+diff --git a/src/metric_source/instrumented.rs b/src/metric_source/instrumented.rs
+index 89d987d..e9c30ff 100644
+--- a/src/metric_source/instrumented.rs
++++ b/src/metric_source/instrumented.rs
+@@ -67,7 +67,7 @@ const NGX_MSEC_SENTINEL: u64 = usize::MAX as u64;
+ /// `AtomicU64::fetch_add` per request.
+ #[inline]
+ fn record_base_combo(slot: &WorkerSlots, status: u16, base_idx: usize, duration_us: u64) {
+-    if status != 0 {
++    if true { // MUTATION: status guard removed
+         slot.request_duration_combos[base_idx].record(duration_us);
+     }
+ }
+
+── cargo test --lib (MUST FAIL on f2) ───────────────────────────────────
+     Running unittests src/lib.rs (target/debug/deps/ngx_http_otel_module-a9da42af2e91be61)
+running 179 tests
+test logs::ring::tests::b1_dual_consumer_violation ... ignored, expected to FAIL — run explicitly for mutation evidence (a2)
+test metric_source::instrumented::tests::f2_status_zero_skips_base_combo ... FAILED
+failures:
+---- metric_source::instrumented::tests::f2_status_zero_skips_base_combo stdout ----
+thread 'metric_source::instrumented::tests::f2_status_zero_skips_base_combo' (575129) panicked at src/metric_source/instrumented.rs:1373:13:
+failures:
+    metric_source::instrumented::tests::f2_status_zero_skips_base_combo
+test result: FAILED. 177 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.08s
+
+── Revert mutation (c) ──────────────────────────────────────────────────
+Updated 1 path from the index
+  Reverted.
+
+── cargo test --lib (MUST PASS) ─────────────────────────────────────────
+     Running unittests src/lib.rs (target/debug/deps/ngx_http_otel_module-a9da42af2e91be61)
+test metric_source::instrumented::tests::f2_status_zero_skips_base_combo ... ok
+test result: ok. 178 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.09s
+
+────────────────────────────────────────────────────────────────────────
+Mutation (d): Remove counter.fetch_add in account_drops_and_clear
+────────────────────────────────────────────────────────────────────────
+
+── Diff (mutation d) ────────────────────────────────────────────────────
+diff --git a/src/export/mod.rs b/src/export/mod.rs
+index 0e90ea5..2a46390 100644
+--- a/src/export/mod.rs
++++ b/src/export/mod.rs
+@@ -1142,7 +1142,7 @@ fn account_drops_and_clear(
+ ) {
+     let remaining: u64 = queue.iter().map(|(_, n)| *n).sum();
+     if remaining > 0 {
+-        counter.fetch_add(remaining, Ordering::Relaxed);
++        // MUTATION: fetch_add removed — counter.fetch_add(remaining, Ordering::Relaxed);
+     }
+     queue.clear();
+ }
+
+── cargo test --lib (MUST FAIL on f6) ───────────────────────────────────
+running 179 tests
+test export::tests::f6_drain_abort_credits_dropped_records_for_logs_and_spans ... FAILED
+test logs::ring::tests::b1_dual_consumer_violation ... ignored, expected to FAIL — run explicitly for mutation evidence (a2)
+failures:
+---- export::tests::f6_drain_abort_credits_dropped_records_for_logs_and_spans stdout ----
+thread 'export::tests::f6_drain_abort_credits_dropped_records_for_logs_and_spans' (575982) panicked at src/export/mod.rs:2449:9:
+failures:
+    export::tests::f6_drain_abort_credits_dropped_records_for_logs_and_spans
+test result: FAILED. 177 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.10s
+
+── Revert mutation (d) ──────────────────────────────────────────────────
+Updated 1 path from the index
+  Reverted.
+
+── cargo test --lib (MUST PASS) ─────────────────────────────────────────
+test export::tests::f6_drain_abort_credits_dropped_records_for_logs_and_spans ... ok
+test result: ok. 178 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.09s
+
+==================================================================
+MUTATION EVIDENCE COMPLETE — 2026-06-10 22:39:33 IST
+
+Summary:
+  (a1) FU1 periodic gating (chaos a-iv behavioral):
+       FAIL (old exporter sends ring records post-abdication with defer)
+       PASS (restored: zero post-abdication sends, abdicates within one tick)
+  (a2) Ring dual-consumer unit test (pop_into load-then-store contract):
+       FAIL b1_dual_consumer_violation (total != N with two concurrent consumers)
+       PASS b1_single_consumer_reads_exactly_n_records (one consumer = exactly N)
+  (b) has_successor inverted: FAIL (quit-completeness drops records)
+      restored: PASS
+  (c) status guard removed: FAIL (f2 test detects spurious histogram bump)
+      restored: PASS
+  (d) drop accounting removed: FAIL (f6 test detects no counter increment)
+      restored: PASS
+
+Final tree check: 14 modified files (expect 0)
+?? asan-run.sh
+?? build/asan-bidi.out
+?? build/asan-gate-validate.out
+?? build/asan-run.out
+?? src/logs/config.rs
+?? src/logs/shm.rs
+?? target-root-old/
+?? target-root-tsan-20260610/
+?? tests/RESULTS-2026-06-10-mutation-evidence.txt
+?? tests/asan-logs-20260609T212855Z/
+?? tests/bench/results/run-2026-05-28T20-32-04.json
+?? tests/bench/results/run-2026-05-28T20-52-56.json
+?? tests/bench/results/run-2026-05-29T18-19-11.json
+?? tests/bench/results/run-2026-05-29T18-53-00.json
+==================================================================
