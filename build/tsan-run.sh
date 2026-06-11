@@ -46,6 +46,9 @@ cd /work/ngx-otel-rust
 
 # ── Provenance header (embedded in artifact by the F2 bar) ───────────────────
 # Emit the git commit hash and run date so the artifact is self-provable.
+# Inside Docker the container runs as root; the bind-mounted project dir is
+# owned by the host user → git "dubious ownership" check.  Mark it safe.
+git config --global --add safe.directory /work/ngx-otel-rust
 GIT_COMMIT="$(git -C /work/ngx-otel-rust rev-parse HEAD)"
 RUN_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "[tsan-run] PROVENANCE: GIT_COMMIT=${GIT_COMMIT} DATE=${RUN_DATE}"

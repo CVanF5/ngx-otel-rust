@@ -47,9 +47,12 @@ mkdir -p "${RUNDIR}"
 
 # ── Provenance header (embedded in artifact by the F2 bar) ───────────────────
 # Emit the git commit hash and run date so the artifact is self-provable.
+# Inside Docker the container runs as root; the bind-mounted project dir is
+# owned by the host user → git "dubious ownership" check.  Mark it safe.
+log() { echo "[asan-run] $*"; }
+git config --global --add safe.directory "${CRATE}"
 GIT_COMMIT="$(git -C "${CRATE}" rev-parse HEAD)"
 RUN_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-log() { echo "[asan-run] $*"; }
 log "PROVENANCE: GIT_COMMIT=${GIT_COMMIT} DATE=${RUN_DATE}"
 
 # Wake-path-relevant scripts (override via ASAN_SCRIPTS):
