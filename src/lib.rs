@@ -805,6 +805,33 @@ extern "C" fn ngx_otel_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
         }
     }
 
+    // ── H3F2: eager, fallible trace-DRBG seed (off the request path) ─────────
+    //
+    // Seed this worker's ChaCha20 trace-ID DRBG here, at worker init, so the
+    // single `getrandom(2)` syscall happens off the per-request hot path.  On a
+    // persistent OS-RNG failure (e.g. seccomp denying getrandom) we MUST NOT
+    // panic — a panic in the `extern "C"` REWRITE handler aborts the worker and
+    // every respawn re-aborts on its first traced request (a crash loop).
+    // Instead `eager_seed_drbg()` sets a worker-local tracing-disabled flag and
+    // returns Err; we log ONE `NGX_LOG_EMERG` line and keep serving traffic
+    // (span-start treats the flag as unsampled — no spans, no weak IDs).  Run
+    // in worker processes only; master/exporter never trace.
+    if matches!(crate::exporter::ngx_process(), crate::exporter::NgxProcess::Worker(_)) {
+        if let Err(e) = crate::traces::ctx::eager_seed_drbg() {
+            // SAFETY: `cycle` is the non-null, valid cycle nginx passes into
+            // `init_process`; `(*cycle).log` is the worker's log handle, copied
+            // out (not retained).  The EMERG line is emitted at most once per
+            // worker because `eager_seed_drbg` is called exactly once here.
+            let log = unsafe { (*cycle).log };
+            ngx::ngx_log_error!(
+                nginx_sys::NGX_LOG_EMERG,
+                log,
+                "otel: trace-ID DRBG seeding failed ({e}); OS RNG unavailable — \
+                 tracing DISABLED for this worker (traffic unaffected, no spans emitted)"
+            );
+        }
+    }
+
     // ── Phase 1.2 Item 1: in-worker gRPC viability harness ──────────────────
     //
     // Only compiled when the `test-support` feature is enabled.  When set,

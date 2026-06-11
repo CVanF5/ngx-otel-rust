@@ -227,10 +227,20 @@ pub unsafe fn pool_from_request(r: *mut ngx_http_request_t) -> Pool {
 // DRBG: cryptographically-unpredictable IDs, zero per-request syscalls.
 //
 // Design (OTel-SDK-idiomatic):
-//   - Seeded ONCE per worker thread (#[cold]) from `getrandom::fill()` (one
-//     OS-entropy syscall per worker at the first trace request).
+//   - Seeded EAGERLY in worker `init_process` (off the request path) via the
+//     fallible `eager_seed_drbg()` — one OS-entropy syscall per worker at
+//     worker init, not on the first traced request.
 //   - Thereafter: pure ChaCha20 block operations, no syscall per request.
 //   - Thread-local `Cell<Option<ChaCha20Rng>>` (infallible take/set access).
+//
+// H3F2 — non-panicking OS-RNG failure handling:
+//   A persistent OS-RNG failure (e.g. seccomp denying `getrandom(2)`) must NOT
+//   panic inside the `extern "C"` REWRITE handler — that aborts the worker and
+//   every respawn aborts on its first traced request (a crash loop).  Instead,
+//   on seed failure we set a worker-local "tracing-disabled" flag.  Span-start
+//   reads the flag and treats the request as unsampled (serve traffic, emit no
+//   span).  We never fall back to weak/predictable IDs.  The lazy path is kept
+//   as a fallback but is likewise non-panicking (sets the same flag on failure).
 
 use std::cell::Cell;
 
@@ -239,40 +249,123 @@ use rand_core::{Rng, SeedableRng};
 
 thread_local! {
     static DRBG: Cell<Option<ChaCha20Rng>> = const { Cell::new(None) };
+
+    /// Worker-local "tracing disabled because OS-RNG seeding failed" flag.
+    ///
+    /// Set (once) when `getrandom` fails at seed time.  When set, span-start
+    /// treats every request as unsampled — no span IDs are generated, so no
+    /// weak/predictable IDs ever reach the wire.  Metrics and logs are
+    /// unaffected (they do not consult this flag).
+    static TRACING_DISABLED: Cell<bool> = const { Cell::new(false) };
+}
+
+// Worker-local failure-injection switch for the seed path.
+//
+// Only compiled with `#[cfg(any(test, feature = "test-support"))]` — in
+// production the seed path carries zero injection cost.  When set, the next
+// `try_seed_drbg()` returns `Err` as if `getrandom` failed, exercising the
+// non-panicking degrade path without an actual seccomp sandbox.
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static INJECT_SEED_FAILURE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Test-support: arm/disarm the seed-failure injection for this worker thread.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn set_inject_seed_failure(on: bool) {
+    INJECT_SEED_FAILURE.with(|c| c.set(on));
+}
+
+/// Returns `true` if OS-RNG seeding failed for this worker and tracing is
+/// therefore disabled (every request unsampled).  One `Cell` load + branch.
+#[inline]
+pub(crate) fn tracing_disabled() -> bool {
+    TRACING_DISABLED.with(Cell::get)
+}
+
+/// Eagerly seed this worker's DRBG from OS entropy.
+///
+/// Called once per worker in `init_process` — OFF the request path.  Returns
+/// `Ok(())` on success; on the FIRST failure it sets the worker-local
+/// tracing-disabled flag and returns `Err` so the caller logs a single
+/// `NGX_LOG_EMERG` line.  Idempotent and EMERG-once: if seeding already
+/// succeeded, or tracing is already disabled from a prior failure, this is a
+/// no-op `Ok` (no second Err → no duplicate EMERG line even if called again).
+#[cold]
+pub(crate) fn eager_seed_drbg() -> Result<(), getrandom::Error> {
+    // EMERG-once: a prior failure already flipped the flag and logged; do not
+    // re-attempt or re-signal.
+    if tracing_disabled() {
+        return Ok(());
+    }
+    DRBG.with(|c| {
+        if let Some(rng) = c.take() {
+            // Already seeded this worker (re-entry / test re-arm): keep it.
+            c.set(Some(rng));
+            return Ok(());
+        }
+        match try_seed_drbg() {
+            Ok(rng) => {
+                c.set(Some(rng));
+                Ok(())
+            }
+            Err(e) => {
+                TRACING_DISABLED.with(|d| d.set(true));
+                Err(e)
+            }
+        }
+    })
 }
 
 /// Return the next pseudo-random `u64` from the per-thread ChaCha20 DRBG.
 ///
-/// Seeds itself on first call in each worker thread from OS entropy (one
-/// `getrandom` syscall, #[cold]).  All subsequent calls are pure ChaCha20
-/// block operations — lock-free, no syscall.
+/// In production the DRBG is eagerly seeded in `init_process`, so this is a
+/// pure ChaCha20 word extraction — lock-free, no syscall.  As a fallback (e.g.
+/// a thread that skipped eager seeding), it seeds lazily.  On seed failure it
+/// sets the tracing-disabled flag and returns 0 (callers must consult
+/// `tracing_disabled()` before relying on generated IDs — span-start does).
 ///
 /// **Hot-path note:** TLS lookup + ChaCha20 word extraction — effectively
 /// free relative to the request path.
 #[inline]
 pub(crate) fn drbg64() -> u64 {
-    DRBG.with(|c| {
-        let mut rng = c.take().unwrap_or_else(seed_drbg);
-        let val = rng.next_u64();
-        c.set(Some(rng));
-        val
+    DRBG.with(|c| match c.take() {
+        Some(mut rng) => {
+            let val = rng.next_u64();
+            c.set(Some(rng));
+            val
+        }
+        None => match try_seed_drbg() {
+            Ok(mut rng) => {
+                let val = rng.next_u64();
+                c.set(Some(rng));
+                val
+            }
+            Err(_) => {
+                TRACING_DISABLED.with(|d| d.set(true));
+                0
+            }
+        },
     })
 }
 
-/// One-time per-thread DRBG seed from OS entropy.
+/// One-time per-thread DRBG seed from OS entropy (fallible).
 ///
-/// Called #[cold] at most once per worker thread (lazily on the first
-/// trace/span ID request).  `getrandom::fill` uses the OS CSPRNG
-/// (getrandom(2) on Linux, arc4random_buf on macOS) — never a filesystem
-/// read, never blocks after boot.
-///
-/// Panics if the OS RNG is unavailable (hardware fault / FIPS failure);
-/// this is a catastrophic condition, not a recoverable error.
+/// `getrandom::fill` uses the OS CSPRNG (getrandom(2) on Linux,
+/// arc4random_buf on macOS) — never a filesystem read, never blocks after
+/// boot.  Returns `Err` if the OS RNG is unavailable (hardware fault / FIPS
+/// failure / seccomp denial) instead of panicking, so an `extern "C"` caller
+/// never aborts the worker.
 #[cold]
-fn seed_drbg() -> ChaCha20Rng {
+fn try_seed_drbg() -> Result<ChaCha20Rng, getrandom::Error> {
+    #[cfg(any(test, feature = "test-support"))]
+    if INJECT_SEED_FAILURE.with(Cell::get) {
+        // Simulate a persistent OS-RNG failure without a real seccomp sandbox.
+        return Err(getrandom::Error::UNSUPPORTED);
+    }
     let mut seed = [0u8; 32];
-    getrandom::fill(&mut seed).expect("getrandom::fill failed — OS RNG unavailable");
-    ChaCha20Rng::from_seed(seed)
+    getrandom::fill(&mut seed)?;
+    Ok(ChaCha20Rng::from_seed(seed))
 }
 
 // ── ID generation ─────────────────────────────────────────────────────────────
@@ -313,6 +406,71 @@ pub(crate) fn gen_span_id() -> [u8; 8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// H3F2 — under injected OS-RNG seed failure, the eager seed path must NOT
+    /// panic; it must set the worker-local tracing-disabled flag and return Err.
+    ///
+    /// Each assertion runs on a freshly-spawned thread so the `thread_local!`
+    /// DRBG / flag / injection state is isolated (the test runner reuses
+    /// threads across tests otherwise).
+    #[test]
+    fn h3f2_eager_seed_failure_no_panic_sets_flag() {
+        let outcome = std::thread::spawn(|| {
+            // Arm the injection BEFORE seeding.
+            set_inject_seed_failure(true);
+            // (a) no panic: eager_seed_drbg returns Err rather than aborting.
+            let res = std::panic::catch_unwind(eager_seed_drbg);
+            assert!(res.is_ok(), "eager_seed_drbg must not panic on RNG failure");
+            let seed_result = res.unwrap();
+            assert!(seed_result.is_err(), "eager_seed_drbg must return Err on RNG failure");
+            // Flag set → span-start will treat every request as unsampled.
+            assert!(tracing_disabled(), "tracing must be disabled after seed failure");
+            // (c, ID side) drbg64 stays non-panicking and returns 0 (the
+            // sentinel span-start checks `tracing_disabled()` to avoid).
+            let v = std::panic::catch_unwind(drbg64);
+            assert!(v.is_ok(), "drbg64 must not panic when seeding fails");
+            assert_eq!(v.unwrap(), 0, "drbg64 returns 0 when unseeded under failure");
+        })
+        .join();
+        assert!(outcome.is_ok(), "test thread must not panic");
+    }
+
+    /// H3F2 — EMERG-once: the failing seed returns `Err` only on the FIRST
+    /// call; a subsequent call returns `Ok` (flag already set) so the caller
+    /// emits exactly one `NGX_LOG_EMERG` line per worker.
+    #[test]
+    fn h3f2_seed_failure_emits_err_exactly_once() {
+        std::thread::spawn(|| {
+            set_inject_seed_failure(true);
+            assert!(
+                eager_seed_drbg().is_err(),
+                "first seed attempt must report failure (logs EMERG)"
+            );
+            // Even with the injection still armed, the flag short-circuits:
+            assert!(
+                eager_seed_drbg().is_ok(),
+                "second call must NOT re-report (no duplicate EMERG)"
+            );
+            assert!(eager_seed_drbg().is_ok(), "third call must NOT re-report either");
+            assert!(tracing_disabled(), "flag stays set");
+        })
+        .join()
+        .expect("test thread must not panic");
+    }
+
+    /// H3F2 — the happy path: with no injected failure, eager seeding succeeds,
+    /// tracing stays enabled, and the DRBG yields non-zero values.
+    #[test]
+    fn h3f2_eager_seed_success_enables_tracing() {
+        std::thread::spawn(|| {
+            set_inject_seed_failure(false);
+            assert!(eager_seed_drbg().is_ok(), "eager_seed_drbg must succeed normally");
+            assert!(!tracing_disabled(), "tracing must remain enabled on success");
+            assert_ne!(drbg64(), 0, "seeded DRBG must yield non-zero");
+        })
+        .join()
+        .expect("test thread must not panic");
+    }
 
     /// PRNG should produce non-zero values.
     #[test]

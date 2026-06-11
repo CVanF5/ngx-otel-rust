@@ -258,6 +258,19 @@ impl HttpRequestHandler for SpanStartHandler {
         };
         let start_mono = std::time::Instant::now();
 
+        // ── H3F2: OS-RNG seed failed → tracing disabled for this worker ──────
+        // If `getrandom` failed at worker init (e.g. seccomp denial), the
+        // worker-local DRBG is unseeded and `drbg64()` returns 0; calling
+        // `gen_trace_id`/`gen_span_id` here would spin forever rerolling for a
+        // non-zero value.  Degrade exactly like a gate-declined request: clear
+        // any pre-gate SpanCtx (so `$otel_trace_id` is empty) and return
+        // NGX_DECLINED — the request is served, no span is emitted, and we never
+        // produce weak/predictable IDs.  One `Cell` load + branch on this path.
+        if crate::traces::ctx::tracing_disabled() {
+            request.set_module_ctx(core::ptr::null_mut(), module_ref);
+            return Status::NGX_DECLINED;
+        }
+
         // ── Worker-side sampling decision ────────────────────────────────────
         // Gate 2 has passed: the request is supposed to produce a span.
         //
