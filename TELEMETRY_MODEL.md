@@ -65,16 +65,24 @@ signal:
   deduplication key. If a batch is retried after the collector already
   ingested it, the collector receives and stores duplicate records. Operators
   relying on exact-once log or trace counts should configure their collector
-  pipeline with a deduplication processor (e.g. the OTel Collector's
-  `deduplicate` or a backend-native dedup on `trace_id`/`span_id`).
+  pipeline with a deduplication processor or backend-native dedup on
+  `trace_id`/`span_id`.
 
-HTTP 4xx responses are treated as **permanent rejections** and the batch is
-dropped rather than retried (`is_permanent_rejection`,
-`src/export/mod.rs`). The retry queue is bounded: when full, the oldest
-batch is evicted and counted in `ngx_otel.dropped_records`
-(`enqueue_with_eviction`, `src/export/mod.rs`). A planned evolution to
-status-aware retry with partial-success handling and back-off is described in
-`DELIVERY_OUTCOME_DESIGN.md`.
+HTTP 4xx responses are **not retried indefinitely**: a fresh-send failure on
+any error (including 4xx) enqueues the batch in the per-signal retry queue
+(`enqueue_with_eviction`, `src/export/mod.rs`); the subsequent retry-drain
+then calls `is_permanent_rejection` (`src/export/mod.rs`) and drops the
+batch on a 4xx result rather than re-queuing it further. In practice a 4xx
+batch is exported at most twice before being discarded. The retry queue is
+bounded: when full, the oldest batch is evicted and counted in
+`ngx_otel.dropped_records`. Note that producer-side ring drops —
+`ngx_otel.logs.access.dropped_records`, `ngx_otel.logs.error.dropped_records`,
+and `ngx_otel.traces.dropped_records` (see the self-observability table
+below) — are a separate, upstream drop class that occurs before any batch
+reaches the exporter retry buffer. A planned evolution to a status-aware
+retry policy that distinguishes permanent from transient failures per
+protocol, with partial-success handling and back-off, is a deferred
+improvement not yet implemented.
 
 ---
 
