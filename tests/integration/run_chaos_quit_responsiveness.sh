@@ -132,6 +132,32 @@ else
     echo "ERROR: module not found. Run 'make build-release' first." >&2; exit 1
 fi
 
+# ─── H3F9(h): artifact-freshness guard ───────────────────────────────────────
+# The chaos test LOADS an existing cdylib but does NOT build it; a mutation
+# cycle once silently ran against a STALE artifact (edit a src file, forget to
+# rebuild → the test exercised the old binary).  Refuse to run if the loaded
+# module is older than any tracked source input.  `find -newer` is portable
+# across GNU/BSD; `-print -quit` stops at the first newer file.
+assert_module_fresh() {
+    local module="$1"
+    [[ -f "${module}" ]] || return 0
+    local newer
+    newer=$(find \
+        "${CRATE_DIR}/src" \
+        "${CRATE_DIR}/Cargo.toml" \
+        "${CRATE_DIR}/Cargo.lock" \
+        "${CRATE_DIR}/build.rs" \
+        -type f -newer "${module}" -print -quit 2>/dev/null || true)
+    if [[ -n "${newer}" ]]; then
+        echo "ERROR: loaded module is STALE — a source input is newer than the cdylib:" >&2
+        echo "         module: ${module}" >&2
+        echo "         newer:  ${newer}" >&2
+        echo "       Rebuild before running: 'make build-release' (or 'cargo build --release')." >&2
+        exit 1
+    fi
+}
+assert_module_fresh "${MODULE_PATH}"
+
 GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
 pass()  { echo -e "${GREEN}[PASS]${NC} $*"; }
 fail()  { echo -e "${RED}[FAIL]${NC} $*" >&2; exit 2; }
