@@ -2139,8 +2139,9 @@ mod tests {
         // ── (1) Populate stale counts in slot 1 (above the new active count) ─────
         // SAFETY: zone_mem is live; slot 1 starts at data_off + slot_bytes.
         let base = unsafe { zone_addr.add(data_off) };
-        let slot1 =
-            unsafe { &*(base.add(slot_bytes) as *const WorkerSlots) };
+        // SAFETY: zone_mem reserves n_reserved (≥2) full WorkerSlots starting at
+        // data_off, so base + slot_bytes is in-bounds and properly aligned.
+        let slot1 = unsafe { &*(base.add(slot_bytes) as *const WorkerSlots) };
         slot1.route_duration_combos[0].record(5_000); // stale pre-reload count
         slot1.upstream_duration_combos[0].record(7_000); // stale pre-reload count
 
@@ -2153,10 +2154,7 @@ mod tests {
         // SAFETY: fake_zone is a valid ngx_shm_zone_t with shm backing; old_data
         // non-null triggers the reload path.
         let ret = unsafe {
-            otel_shm_zone_init(
-                &raw mut fake_zone,
-                core::ptr::dangling_mut::<core::ffi::c_void>(),
-            )
+            otel_shm_zone_init(&raw mut fake_zone, core::ptr::dangling_mut::<core::ffi::c_void>())
         };
         assert_eq!(ret, ngx_int_t::from(Status::NGX_OK), "reload must return NGX_OK");
 

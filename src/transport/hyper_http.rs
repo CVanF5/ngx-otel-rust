@@ -89,7 +89,11 @@ const SPIN_IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub(crate) enum ParsedEndpoint {
-    Http { host: std::string::String, port: u16, path: std::string::String },
+    Http {
+        host: std::string::String,
+        port: u16,
+        path: std::string::String,
+    },
     Unix {
         // Used by SpinConnector (test) and will be used by NgxConnector when
         // Unix-socket support lands (Phase 1.2).
