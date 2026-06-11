@@ -14,7 +14,6 @@
 
 pub mod grpc;
 pub mod hyper_http;
-pub mod sync_http;
 
 use thiserror::Error;
 

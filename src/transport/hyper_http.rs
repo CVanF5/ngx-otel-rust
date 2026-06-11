@@ -90,7 +90,13 @@ const SPIN_IO_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone)]
 pub(crate) enum ParsedEndpoint {
     Http { host: std::string::String, port: u16, path: std::string::String },
-    Unix { socket_path: std::string::String, http_path: std::string::String },
+    Unix {
+        // Used by SpinConnector (test) and will be used by NgxConnector when
+        // Unix-socket support lands (Phase 1.2).
+        #[allow(dead_code)]
+        socket_path: std::string::String,
+        http_path: std::string::String,
+    },
 }
 
 impl ParsedEndpoint {
@@ -1012,8 +1018,6 @@ impl Connector for NgxConnector {
                 // Strip IPv6 bracket notation ("[::1]" → "::1") before parsing.
                 // `ParsedEndpoint::parse` stores the bracket form for IPv6 URLs
                 // such as `http://[::1]:4317/`, so we must strip here.
-                // Uses the shared `strip_v6_brackets` helper so the sync path
-                // (sync_http.rs) can't drift from this logic.
                 let host_str = strip_v6_brackets(host.as_str());
 
                 // Branch on address family.  DNS names fall through to the
