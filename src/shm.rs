@@ -988,8 +988,15 @@ pub unsafe extern "C" fn otel_shm_zone_init(
         // slot indices come from build_route_table / build_upstream_table, which
         // rebuilds with new clcf_ptr / shm_zone_ptr values on every reload.  Any
         // location add/remove/reorder shifts the index, silently re-attributing old
-        // counts to a different route/upstream name in the next export.  Zero only
-        // those two arrays; leave everything else intact.
+        // counts to a different route/upstream name in the next export.
+        //
+        // H3F4: zero ALL reserved slots, not just the new active count.  On a
+        // scale-down reload (e.g. worker_processes 4→1) the old higher-numbered
+        // slots retain counts recorded under the OLD route-index assignment.  The
+        // exporter always sums all reserved slots, so those stale counts get
+        // attributed to whichever route now owns that index — silent misattribution.
+        // Zeroing all reserved slots is safe: they are already atomic (H2F2) and the
+        // memory is already mapped (same physical shm pages), so no new page faults.
         // SAFETY: nginx invokes this callback with a valid, non-null `ngx_shm_zone_t`
         // (fn contract); the reference does not outlive the call.
         let zone = unsafe { &*shm_zone };
@@ -997,24 +1004,15 @@ pub unsafe extern "C" fn otel_shm_zone_init(
         if zone.shm.size <= offset {
             return Status::NGX_OK.into();
         }
-        // SAFETY: zone->data is either null (legacy/test) or points at a `ZoneInitData`
-        // stored in amcf (nginx conf pool, which outlives this zone-init callback).
-        let n_active = if let Some(zid) = unsafe { zone.data.cast::<ZoneInitData>().as_ref() } {
-            let cycle = zid.cycle_addr as *const ngx_cycle_t;
-            // SAFETY: cycle is non-null (set from cf->cycle at postconfiguration)
-            // and valid through otel_shm_zone_init (same ngx_init_cycle call).
-            unsafe { wp_from_cycle(cycle) }.unwrap_or(1)
-        } else {
-            1
-        };
         let slot_bytes = mem::size_of::<WorkerSlots>();
+        // n_reserved may be 0 if the zone is too small for even one slot;
+        // zero_route_upstream_histograms(_, 0) is a safe no-op.
         let n_reserved = (zone.shm.size - offset) / slot_bytes;
-        let n_zero = n_active.min(n_reserved).max(1);
         // SAFETY: offset == data_offset(), zone.shm.size > offset (checked above).
-        // n_zero ≤ n_reserved = (zone.shm.size - offset) / slot_bytes — fn contract met.
+        // n_reserved = (zone.shm.size - offset) / slot_bytes — fn contract met.
         let base: *mut u8 = unsafe { zone.shm.addr.cast::<u8>().add(offset) };
-        // SAFETY: base and n_zero meet zero_route_upstream_histograms' contract (above).
-        unsafe { zero_route_upstream_histograms(base, n_zero) };
+        // SAFETY: base and n_reserved meet zero_route_upstream_histograms' contract.
+        unsafe { zero_route_upstream_histograms(base, n_reserved) };
         return Status::NGX_OK.into();
     }
 
@@ -2093,6 +2091,88 @@ mod tests {
         assert_eq!(
             post_combo, pre_combo,
             "F1: zero_route_upstream_histograms must NOT touch request_duration_combos"
+        );
+    }
+
+    // ── H3F4: scale-down reload must zero ALL reserved slots ────────────────
+
+    /// H3F4 regression: on a scale-down SIGHUP reload (worker_processes 2→1),
+    /// slot indices above the new active count must be zeroed.
+    ///
+    /// Pre-fix: `otel_shm_zone_init` called `zero_route_upstream_histograms`
+    /// with `n_zero = n_active.min(n_reserved).max(1)` — only the NEW active
+    /// worker count.  On scale-down the higher-numbered slots retained counts
+    /// recorded under the OLD route-index assignment.  The exporter sums ALL
+    /// reserved slots, so those stale counts were attributed to whichever route
+    /// now owns that index — silent misattribution.
+    ///
+    /// Post-fix: `n_zero = n_reserved`, zeroing all reserved slots on reload.
+    ///
+    /// Fail-before proof: restore `n_active.min(n_reserved).max(1)` in
+    /// `otel_shm_zone_init` — the assertion on slot 1 below will fail because
+    /// its route/upstream counts are never zeroed.
+    #[test]
+    fn h3f4_scale_down_reload_zeros_all_reserved_slots() {
+        use nginx_sys::ngx_shm_zone_t;
+
+        // Two reserved slots (n_reserved=2).  cycle_addr=0 → wp_from_cycle
+        // returns None → old code used unwrap_or(1) → n_active=1 → only slot 0
+        // would be zeroed.  Slot 1 is the "stale higher-numbered slot" from a
+        // scale-down scenario.
+        let slot_bytes = mem::size_of::<WorkerSlots>();
+        let n_slots = 2usize;
+        let data_off = data_offset();
+        let zone_sz = data_off + n_slots * slot_bytes;
+
+        let mut zone_mem: std::vec::Vec<u8> = std::vec![0u8; zone_sz];
+        let zone_addr = zone_mem.as_mut_ptr();
+
+        // cycle_addr=0 → wp_from_cycle returns None → old code: n_active=1.
+        let zid = ZoneInitData { ring_cap: 0, cycle_addr: 0 };
+
+        // SAFETY: ngx_shm_zone_t is repr(C); zero is valid for all fields we don't set.
+        let mut fake_zone: ngx_shm_zone_t = unsafe { core::mem::zeroed() };
+        fake_zone.data = &raw const zid as *mut core::ffi::c_void;
+        fake_zone.shm.addr = zone_addr.cast();
+        fake_zone.shm.size = zone_sz;
+
+        // ── (1) Populate stale counts in slot 1 (above the new active count) ─────
+        // SAFETY: zone_mem is live; slot 1 starts at data_off + slot_bytes.
+        let base = unsafe { zone_addr.add(data_off) };
+        let slot1 =
+            unsafe { &*(base.add(slot_bytes) as *const WorkerSlots) };
+        slot1.route_duration_combos[0].record(5_000); // stale pre-reload count
+        slot1.upstream_duration_combos[0].record(7_000); // stale pre-reload count
+
+        let (_, _, _, pre_route) = slot1.route_duration_combos[0].snapshot();
+        let (_, _, _, pre_up) = slot1.upstream_duration_combos[0].snapshot();
+        assert!(pre_route > 0, "precondition: slot 1 route count must be non-zero before reload");
+        assert!(pre_up > 0, "precondition: slot 1 upstream count must be non-zero before reload");
+
+        // ── (2) Simulate scale-down reload (old_data non-null) ───────────────────
+        // SAFETY: fake_zone is a valid ngx_shm_zone_t with shm backing; old_data
+        // non-null triggers the reload path.
+        let ret = unsafe {
+            otel_shm_zone_init(
+                &raw mut fake_zone,
+                core::ptr::dangling_mut::<core::ffi::c_void>(),
+            )
+        };
+        assert_eq!(ret, ngx_int_t::from(Status::NGX_OK), "reload must return NGX_OK");
+
+        // ── (3) Slot 1 must be zeroed by H3F4 fix ────────────────────────────────
+        let (_, _, _, post_route) = slot1.route_duration_combos[0].snapshot();
+        assert_eq!(
+            post_route, 0,
+            "H3F4: slot 1 route_duration_combos[0] must be zeroed on scale-down reload — \
+             pre-fix code only zeros n_active slots, leaving stale counts in slot 1 \
+             that get misattributed to the new route owning index 0"
+        );
+        let (_, _, _, post_up) = slot1.upstream_duration_combos[0].snapshot();
+        assert_eq!(
+            post_up, 0,
+            "H3F4: slot 1 upstream_duration_combos[0] must be zeroed on scale-down reload — \
+             pre-fix code only zeros n_active slots, leaving stale counts in slot 1"
         );
     }
 
