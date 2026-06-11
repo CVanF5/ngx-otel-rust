@@ -73,6 +73,7 @@ pub(crate) mod exporter;
 pub(crate) mod logs;
 mod metric_source;
 pub(crate) mod processor;
+pub(crate) mod shim;
 mod shm;
 pub(crate) mod traces;
 pub mod transport;
@@ -617,7 +618,18 @@ unsafe extern "C" fn otel_var_get_trace_id(
     // SAFETY: `ngx_http_otel_module` is a `static` module descriptor valid for
     // the full process lifetime; `addr_of!` yields a valid pointer.
     let module = unsafe { &*::core::ptr::addr_of!(ngx_http_otel_module) };
-    let ctx: Option<&SpanCtx> = request.get_module_ctx(module);
+    // H3F1: recover the SpanCtx from the pool-cleanup anchor when the module-ctx
+    // slot was cleared by an internal redirect (recovery walks only on NULL slot
+    // + r->internal/filter_finalize; otherwise this is a single pointer load).
+    let ctx: Option<&SpanCtx> = match request.get_module_ctx::<SpanCtx>(module) {
+        Some(c) => Some(c),
+        // SAFETY: `r` is the live request pointer nginx passed; `module` is the
+        // process-lifetime descriptor; the recovered pointer (if non-null) is a
+        // pool-anchored SpanCtx valid for the request lifetime.
+        None => unsafe {
+            crate::traces::ctx::recover_span_ctx(r, module, ::core::ptr::null_mut()).as_ref()
+        },
+    };
 
     // SAFETY: `v` is the non-null `ngx_variable_value_t*` nginx supplies.
     let vv = unsafe { &mut *v };
@@ -670,7 +682,17 @@ unsafe extern "C" fn otel_var_get_parent_sampled(
     // SAFETY: `ngx_http_otel_module` is a `static` module descriptor valid for
     // the full process lifetime; `addr_of!` yields a valid pointer.
     let module = unsafe { &*::core::ptr::addr_of!(ngx_http_otel_module) };
-    let ctx: Option<&SpanCtx> = request.get_module_ctx(module);
+    // H3F1: recover the SpanCtx from the pool-cleanup anchor when the module-ctx
+    // slot was cleared by an internal redirect (see otel_var_get_trace_id).
+    let ctx: Option<&SpanCtx> = match request.get_module_ctx::<SpanCtx>(module) {
+        Some(c) => Some(c),
+        // SAFETY: `r` is the live request pointer nginx passed; `module` is the
+        // process-lifetime descriptor; the recovered pointer (if non-null) is a
+        // pool-anchored SpanCtx valid for the request lifetime.
+        None => unsafe {
+            crate::traces::ctx::recover_span_ctx(r, module, ::core::ptr::null_mut()).as_ref()
+        },
+    };
 
     // SAFETY: `v` is the non-null `ngx_variable_value_t*` nginx supplies.
     let vv = unsafe { &mut *v };

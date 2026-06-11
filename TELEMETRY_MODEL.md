@@ -437,6 +437,25 @@ Standard OTel HTTP semconv attributes recorded on every span:
   (defaults: `/healthz`, `/readyz`, `/livez`, `/ping`, `/metrics`). Configured via the
   exporter `processor` block (independent of sampling).
 
+### One span per request (internal redirects & subrequests)
+
+Mirrors the C++ `nginx-otel` module's redirect-safe design (H3F1):
+
+- **Internal redirects** (`error_page`, `try_files`, named locations) re-run the
+  REWRITE phase with `r->internal` set and the per-request module-ctx array
+  zeroed by nginx. The span-start handler **early-returns on `r->internal`** (so
+  it does not start a second span or re-decide sampling), and the original
+  `SpanCtx` is **recovered at LOG** from a pool-cleanup anchor that survives the
+  redirect. Result: **exactly one span per request**, carrying pass-1's parent
+  linkage and timing — the span SURVIVES the redirect.
+- **Subrequests** also set `r->internal`, so they do **not** get their own span
+  (deliberate, upstream-mirrored semantic). A subrequest's work is attributed to
+  the parent request's span.
+- **Outbound `traceparent` injection** (`inject` / `propagate`) **updates an
+  existing inbound `traceparent` in place** rather than appending — so the
+  upstream receives **exactly one** `traceparent` (carrying our trace/span IDs),
+  never a stale-plus-fresh duplicate.
+
 ### Hot-path budget
 
 - **Zero cost when disabled:** `otel_trace` absent on a location ⇒ REWRITE handler

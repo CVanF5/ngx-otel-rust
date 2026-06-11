@@ -15,8 +15,70 @@ fn main() {
         println!("cargo::rustc-link-arg=dynamic_lookup");
     }
 
+    // Compile the module-side bitfield shim (H3F1) against the real nginx headers.
+    compile_bitfield_shim();
+
     // Compile proto files for OTLP encoding (used in Step 7)
     compile_protos();
+}
+
+/// Compile `src/shim/ngx_otel_bitfield_shim.c` — module-side C accessors for
+/// `ngx_http_request_t` bitfields that rust-bindgen reads at the wrong bit
+/// offset (allocation-unit-sharing bug; see the file header and
+/// `BINDGEN_BITFIELD_ISSUE_DRAFT.md`).
+///
+/// The shim is compiled by *our* build against the *same* nginx headers and
+/// `-D` defines nginx-sys used to build nginx, so the layout it sees is
+/// byte-identical to nginx's own — correct by construction.
+///
+/// Include paths and defines are taken from the `DEP_NGINX_INCLUDE` /
+/// `DEP_NGINX_BUILD_DIR` / `DEP_NGINX_CFLAGS` environment variables that
+/// nginx-sys exports to its dependents (via `links = "nginx"` +
+/// `cargo::metadata=include=…` / `=build_dir=…` / `=cflags=…`), so we do not
+/// re-derive them.  `DEP_NGINX_INCLUDE` is an `env::join_paths` list (OS path
+/// separator); `DEP_NGINX_CFLAGS` is a space-separated `-Dname[=value]` list.
+fn compile_bitfield_shim() {
+    println!("cargo::rerun-if-changed=src/shim/ngx_otel_bitfield_shim.c");
+    println!("cargo::rerun-if-env-changed=DEP_NGINX_INCLUDE");
+    println!("cargo::rerun-if-env-changed=DEP_NGINX_BUILD_DIR");
+    println!("cargo::rerun-if-env-changed=DEP_NGINX_CFLAGS");
+
+    let mut build = cc::Build::new();
+    build.file("src/shim/ngx_otel_bitfield_shim.c");
+
+    // Include dirs from nginx-sys (src/core, src/event, src/os/unix, src/http,
+    // src/http/modules, …) plus the build/objs dir (ngx_auto_config.h /
+    // ngx_auto_headers.h).
+    if let Some(include) = env::var_os("DEP_NGINX_INCLUDE") {
+        for path in env::split_paths(&include) {
+            build.include(path);
+        }
+    }
+    // The objs build dir holds ngx_auto_config.h / ngx_auto_headers.h, which
+    // ngx_config.h includes.  It is normally already in DEP_NGINX_INCLUDE, but
+    // add it explicitly so the shim compiles even if it is not.
+    if let Some(build_dir) = env::var_os("DEP_NGINX_BUILD_DIR") {
+        build.include(build_dir);
+    }
+
+    // The same `-D` defines nginx-sys used (feature gates that affect the
+    // ngx_http_request_t layout, e.g. NGX_HTTP_V2/V3, SSL).
+    if let Ok(cflags) = env::var("DEP_NGINX_CFLAGS") {
+        for def in cflags.split_whitespace() {
+            if let Some(d) = def.strip_prefix("-D") {
+                match d.split_once('=') {
+                    Some((name, value)) => {
+                        build.define(name, Some(value));
+                    }
+                    None => {
+                        build.define(d, None);
+                    }
+                }
+            }
+        }
+    }
+
+    build.compile("ngx_otel_bitfield_shim");
 }
 
 /// Generates `ngx_os`, `ngx_feature` and nginx version cfg values.

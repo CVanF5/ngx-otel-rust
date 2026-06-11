@@ -590,6 +590,7 @@ name = "ngx-otel-rust"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "cc",
  "futures-channel",
  "getrandom",
  "http",

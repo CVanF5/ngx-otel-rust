@@ -59,6 +59,43 @@ impl HttpRequestHandler for SpanStartHandler {
     /// `SpanCtx` with `sampled=false` and stores it.  LOG reads it and skips
     /// ring work.  The pool alloc is a bump pointer — effectively free.
     fn handler(request: &mut Request) -> Status {
+        // ── Gate 0: internal-redirect / subrequest guard (H3F1) ───────────────
+        // Mirrors the C++ module's REWRITE early-return
+        // (`nginx-otel/src/http_module.cpp:356-361`): "don't let internal
+        // redirects override the sampling decision".  nginx re-runs the REWRITE
+        // phase after an internal redirect (`error_page`, `try_files`, named
+        // location) and for subrequests, both of which set `r->internal`.  If we
+        // re-entered span-start here we would generate a *second* span (and a
+        // fresh sampling decision) for what is one logical request.  Returning
+        // NGX_DECLINED before any span-start work yields exactly ONE span per
+        // request, with pass-1's parent + timing intact (recovered at LOG via
+        // `recover_span_ctx`).
+        //
+        // NOTE: `r->internal` is also set for subrequests, so this guard means
+        // subrequests do NOT get their own span — a deliberate, upstream-mirrored
+        // semantic (the C++ module behaves identically).
+        //
+        // Read via the C shim, NOT the bindgen `internal()` accessor: bindgen
+        // mis-lays-out this struct's bitfields and reads `internal` 2 bits low
+        // (see `crate::shim` / `BINDGEN_BITFIELD_ISSUE_DRAFT.md`).
+        //
+        // Ordering: we check `internal` BEFORE the config/location gates,
+        // mirroring the C++ module (`http_module.cpp:356-361`, which checks
+        // `r->internal` first).  The cost is one extern call + branch per request
+        // — but it is NOT a zero-cost-when-disabled regression: an unconfigured
+        // location never registers this handler at all (see
+        // `lib.rs::postconfiguration`), so the shim call only runs when tracing
+        // is in play.  Keeping the C++ ordering preserves the redirect semantics
+        // (an internal redirect must not re-enter span-start regardless of how
+        // the location gates would evaluate on pass 2).
+        //
+        // Cost: one extern (C-shim) call + branch on the hot path.
+        let r_const = request.as_ref() as *const nginx_sys::ngx_http_request_t;
+        // SAFETY: `r_const` is the live request pointer borrowed from `request`.
+        if unsafe { crate::shim::r_internal(r_const) } != 0 {
+            return Status::NGX_DECLINED;
+        }
+
         // ── Gate 1: module not configured → zero cost ────────────────────────
         // NGX_DECLINED passes to the next handler in the REWRITE phase (correct
         // passthrough).  NGX_OK in the REWRITE phase re-enters the phase checker
@@ -316,14 +353,37 @@ fn hex_encode_into_slice(src: &[u8], dst: &mut [u8]) {
     }
 }
 
-/// Injects a W3C `traceparent` header into `r->headers_in.headers` so that
-/// nginx proxy modules forward it to the upstream.
+/// Injects (or *updates in place*) a W3C `traceparent` header in
+/// `r->headers_in.headers` so that nginx proxy modules forward it to the
+/// upstream.
 ///
-/// The 55-byte value string and the 11-byte key string are allocated on the
-/// request pool (lifetime = request).
+/// **H3F1 — update-don't-append (mirrors the C++ `setHeader`,
+/// `nginx-otel/src/http_module.cpp:278-307`):** an inbound request may already
+/// carry a `traceparent` (the common case under `propagate`).  The pre-H3F1 code
+/// always pushed a *new* entry, leaving the inbound header in place — so the
+/// upstream received TWO `traceparent` headers (the stale inbound one and our
+/// freshly-minted one), and the downstream span linkage was ambiguous.  This
+/// function now finds the existing `traceparent` and overwrites its value in
+/// place; it pushes a new entry only when none is present.  Result: exactly one
+/// outbound `traceparent`, carrying our trace_id / span_id.
 ///
-/// On pool-allocation failure the function silently returns — tracing
-/// continues; only the inject step is skipped.
+/// The 55-byte value string (always version-00, fixed length) is allocated on the
+/// request pool.  When updating in place, if the existing value buffer is exactly
+/// 55 bytes we overwrite it directly; otherwise we re-point the entry at a fresh
+/// pool allocation (the C++ module re-points unconditionally — we keep the
+/// in-place write as a cheap fast path).
+///
+/// **hash-consistency (`updateRequestHeader`) finding:** the C++ module calls
+/// `updateRequestHeader` to keep nginx's typed `headers_in` fields consistent
+/// after mutating a header.  That step is a NO-OP for `traceparent`: it is NOT a
+/// member of nginx's `ngx_http_headers_in[]` hash table (verified — `traceparent`
+/// does not appear in `src/http/ngx_http_request.c`), so the `headers_in_hash`
+/// lookup returns NULL and the C++ path returns `NGX_OK` without doing anything.
+/// We therefore intentionally do NOT mirror that call.  Setting `entry->hash` to
+/// a non-zero value is sufficient for the proxy module's generic header copy.
+///
+/// On pool-allocation failure the function silently returns — tracing continues;
+/// only the inject step is skipped.
 ///
 /// # Safety
 /// `r` must be a valid, non-null `*mut ngx_http_request_t`.
@@ -336,11 +396,56 @@ unsafe fn inject_traceparent_header(
     // SAFETY: caller guarantees `r` is valid; `(*r).pool` is the request pool.
     let pool = unsafe { (*r).pool };
 
+    // Build the 55-byte value: "00-{32hex trace_id}-{16hex span_id}-{flags}".
+    let mut value: [u8; 55] = [0u8; 55];
+    value[0] = b'0';
+    value[1] = b'0';
+    value[2] = b'-';
+    hex_encode_into_slice(trace_id, &mut value[3..35]);
+    value[35] = b'-';
+    hex_encode_into_slice(span_id, &mut value[36..52]);
+    value[52] = b'-';
+    value[53] = b'0';
+    value[54] = if sampled { b'1' } else { b'0' };
+
+    // ── Find an existing `traceparent` in headers_in (mirrors C++ findHeader) ──
+    // SAFETY: `r` is valid; we walk the inbound headers list parts. The list is
+    // initialised by nginx in `ngx_http_process_request_headers`.
+    let existing = unsafe { find_header_in(&raw mut (*r).headers_in.headers, b"traceparent") };
+
+    if !existing.is_null() {
+        // ── Update in place ───────────────────────────────────────────────────
+        // SAFETY: `existing` points to a live `ngx_table_elt_t` in headers_in.
+        unsafe {
+            let dst = if (*existing).value.len == 55 && !(*existing).value.data.is_null() {
+                // Fast path: same length → overwrite the existing value buffer.
+                (*existing).value.data
+            } else {
+                // Length differs → allocate a fresh 55-byte value on the pool.
+                let buf = nginx_sys::ngx_pnalloc(pool, 55) as *mut u8;
+                if buf.is_null() {
+                    return; // OOM — leave the inbound header untouched.
+                }
+                (*existing).value.data = buf;
+                (*existing).value.len = 55;
+                buf
+            };
+            core::ptr::copy_nonoverlapping(value.as_ptr(), dst, 55);
+            // Keep the entry "active" — non-zero hash. (No headers_in_hash entry
+            // for traceparent, so updateRequestHeader would be a no-op; see doc.)
+            if (*existing).hash == 0 {
+                (*existing).hash = 1;
+            }
+        }
+        return;
+    }
+
+    // ── Absent → push a new entry (mirrors C++ ngx_list_push branch) ──────────
     // Allocate key ("traceparent", 11 bytes) and value (55 bytes) on pool.
     // SAFETY: `pool` is a valid nginx pool pointer.
     let key_buf = unsafe { nginx_sys::ngx_pcalloc(pool, 11) } as *mut u8;
     // SAFETY: same pool.
-    let val_buf = unsafe { nginx_sys::ngx_pcalloc(pool, 55) } as *mut u8;
+    let val_buf = unsafe { nginx_sys::ngx_pnalloc(pool, 55) } as *mut u8;
     if key_buf.is_null() || val_buf.is_null() {
         return;
     }
@@ -348,19 +453,8 @@ unsafe fn inject_traceparent_header(
     // Write the header name (all lowercase — nginx convention).
     // SAFETY: `key_buf` is a valid 11-byte allocation; source is 'static.
     unsafe { core::ptr::copy_nonoverlapping(b"traceparent".as_ptr(), key_buf, 11) };
-
-    // Build value: "00-{32hex trace_id}-{16hex span_id}-{flags}"  (55 bytes)
     // SAFETY: `val_buf` is a valid 55-byte allocation.
-    let s = unsafe { core::slice::from_raw_parts_mut(val_buf, 55) };
-    s[0] = b'0';
-    s[1] = b'0';
-    s[2] = b'-';
-    hex_encode_into_slice(trace_id, &mut s[3..35]);
-    s[35] = b'-';
-    hex_encode_into_slice(span_id, &mut s[36..52]);
-    s[52] = b'-';
-    s[53] = b'0';
-    s[54] = if sampled { b'1' } else { b'0' };
+    unsafe { core::ptr::copy_nonoverlapping(value.as_ptr(), val_buf, 55) };
 
     // Push a new entry onto the headers_in list.
     // SAFETY: `(*r).headers_in.headers` is the valid inbound headers list; nginx
@@ -380,6 +474,50 @@ unsafe fn inject_traceparent_header(
         (*entry).value.len = 55;
         (*entry).lowcase_key = key_buf; // already lowercase
     }
+}
+
+/// Finds a header by lowercase name in an `ngx_list_t` of `ngx_table_elt_t`
+/// (e.g. `r->headers_in.headers`), returning a pointer to the live entry or
+/// `null_mut()` if absent.
+///
+/// Mirrors the C++ module's `findHeader` (`nginx-otel/src/http_module.cpp:231-257`)
+/// but matches on the lowercase key bytes directly (case-insensitive) rather than
+/// pre-hashing, since the only caller passes a small literal name.
+///
+/// # Safety
+/// `list` must be a valid, non-null `*mut ngx_list_t` whose elements are
+/// `ngx_table_elt_t`.
+unsafe fn find_header_in(
+    list: *mut nginx_sys::ngx_list_t,
+    name: &[u8],
+) -> *mut nginx_sys::ngx_table_elt_t {
+    // SAFETY: walking the ngx_list_t parts; each part's `elts`/`nelts`/`next`
+    // are valid for the request lifetime.
+    unsafe {
+        let mut part = &raw mut (*list).part;
+        let mut elts = (*part).elts as *mut nginx_sys::ngx_table_elt_t;
+        let mut i: nginx_sys::ngx_uint_t = 0;
+        loop {
+            if i >= (*part).nelts {
+                if (*part).next.is_null() {
+                    break;
+                }
+                part = (*part).next;
+                elts = (*part).elts as *mut nginx_sys::ngx_table_elt_t;
+                i = 0;
+            }
+            let e = elts.add(i as usize);
+            // Active header (hash != 0), matching key length and (case-insensitive) bytes.
+            if (*e).hash != 0 && (*e).key.len as usize == name.len() && !(*e).key.data.is_null() {
+                let key = core::slice::from_raw_parts((*e).key.data, name.len());
+                if key.eq_ignore_ascii_case(name) {
+                    return e;
+                }
+            }
+            i += 1;
+        }
+    }
+    core::ptr::null_mut()
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -439,6 +577,99 @@ mod tests {
         let sid = gen_span_id();
         assert_ne!(tid, [0u8; 16]);
         assert_ne!(sid, [0u8; 8]);
+    }
+
+    // ── H3F1: update-vs-append decision (find_header_in) ─────────────────────
+    //
+    // These tests fabricate a single-part `ngx_list_t` of `ngx_table_elt_t` on
+    // the Rust heap (both are `#[repr(C)]` POD structs) and exercise the
+    // find-then-update/push *decision*.  They do NOT touch a real nginx pool —
+    // the FFI list mutation (`ngx_list_push`) is covered by the integration test
+    // (run_traces.sh's single-traceparent assertion); here we prove the
+    // find/length logic that decides update-in-place vs push.
+
+    /// Build a heap-backed single-part `ngx_list_t` from a vector of (key,value)
+    /// byte pairs.  Returns the boxed list and keeps the backing storage alive in
+    /// the returned `Vec`s so the test owns all memory.
+    fn make_list(
+        entries: &[(&[u8], &[u8])],
+    ) -> (
+        std::boxed::Box<nginx_sys::ngx_list_t>,
+        std::vec::Vec<nginx_sys::ngx_table_elt_t>,
+        std::vec::Vec<std::vec::Vec<u8>>,
+    ) {
+        let mut keep: std::vec::Vec<std::vec::Vec<u8>> = std::vec::Vec::new();
+        let mut elts: std::vec::Vec<nginx_sys::ngx_table_elt_t> = std::vec::Vec::new();
+        for (k, v) in entries {
+            let mut kb = k.to_vec();
+            let mut vb = v.to_vec();
+            // SAFETY: zeroed table_elt is a valid empty header.
+            let mut e: nginx_sys::ngx_table_elt_t = unsafe { core::mem::zeroed() };
+            e.hash = 1;
+            e.key.len = kb.len();
+            e.key.data = kb.as_mut_ptr();
+            e.lowcase_key = kb.as_mut_ptr();
+            e.value.len = vb.len();
+            e.value.data = vb.as_mut_ptr();
+            elts.push(e);
+            keep.push(kb);
+            keep.push(vb);
+        }
+        // SAFETY: a zeroed ngx_list_t is a valid empty list (POD struct);
+        // we fill the single part below before any read.
+        let zeroed_list: nginx_sys::ngx_list_t = unsafe { core::mem::zeroed() };
+        let mut list: std::boxed::Box<nginx_sys::ngx_list_t> = std::boxed::Box::new(zeroed_list);
+        list.part.elts = elts.as_mut_ptr().cast::<core::ffi::c_void>();
+        list.part.nelts = elts.len();
+        list.part.next = core::ptr::null_mut();
+        list.size = core::mem::size_of::<nginx_sys::ngx_table_elt_t>();
+        (list, elts, keep)
+    }
+
+    /// find_header_in: returns the matching entry (case-insensitive) when present.
+    #[test]
+    fn find_header_present_updates_in_place() {
+        let (mut list, _elts, _keep) =
+            make_list(&[(b"host", b"example.com"), (b"traceparent", b"old-value")]);
+        // SAFETY: `list` is a valid fabricated ngx_list_t for this test.
+        let found = unsafe { find_header_in(&raw mut *list, b"traceparent") };
+        assert!(!found.is_null(), "existing traceparent must be found");
+        // SAFETY: `found` points into our `_elts` backing storage.
+        unsafe {
+            let v = core::slice::from_raw_parts((*found).value.data, (*found).value.len);
+            assert_eq!(v, b"old-value", "found entry must be the existing traceparent");
+        }
+        // Decision: present → UPDATE in place → entry count stays the same (2).
+        assert_eq!(list.part.nelts, 2, "update path must not change the entry count");
+    }
+
+    /// find_header_in: case-insensitive match (mixed-case key).
+    #[test]
+    fn find_header_case_insensitive() {
+        let (mut list, _elts, _keep) = make_list(&[(b"TraceParent", b"v")]);
+        // SAFETY: valid fabricated list.
+        let found = unsafe { find_header_in(&raw mut *list, b"traceparent") };
+        assert!(!found.is_null(), "match must be case-insensitive");
+    }
+
+    /// find_header_in: returns null when absent → caller takes the PUSH path.
+    #[test]
+    fn find_header_absent_takes_push_path() {
+        let (mut list, _elts, _keep) = make_list(&[(b"host", b"example.com")]);
+        // SAFETY: valid fabricated list.
+        let found = unsafe { find_header_in(&raw mut *list, b"traceparent") };
+        assert!(found.is_null(), "absent traceparent must return null (push path)");
+    }
+
+    /// find_header_in: skips inactive (hash==0) entries.
+    #[test]
+    fn find_header_skips_inactive() {
+        let (mut list, mut elts, _keep) = make_list(&[(b"traceparent", b"v")]);
+        elts[0].hash = 0; // mark inactive
+        list.part.elts = elts.as_mut_ptr().cast::<core::ffi::c_void>();
+        // SAFETY: valid fabricated list.
+        let found = unsafe { find_header_in(&raw mut *list, b"traceparent") };
+        assert!(found.is_null(), "inactive (hash==0) entry must be skipped");
     }
 
     /// Child span path: trace_id from parent, new span_id generated.

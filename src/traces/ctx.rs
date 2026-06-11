@@ -76,18 +76,137 @@ pub struct SpanCtx {
     pub sampled: bool,
 }
 
-// ── Pool allocator ────────────────────────────────────────────────────────────
+// ── Pool allocator + redirect-safe cleanup anchor (H3F1) ───────────────────────
 
-/// Allocate a `SpanCtx` on the nginx request pool and return a raw pointer.
+/// No-op cleanup handler that serves as the *findable anchor* for the request's
+/// `SpanCtx` (H3F1, mirroring the C++ module's `cleanupOtelCtx`,
+/// `nginx-otel/src/http_module.cpp:191-193`).
 ///
-/// Callers should store the pointer via `request.set_module_ctx(ptr.cast(), module)`.
+/// nginx zeroes the whole per-request module-ctx array on an internal redirect
+/// (`ngx_http_internal_redirect` / `ngx_http_named_location`, both call
+/// `ngx_memzero(r->ctx, …)` — verified `src/http/ngx_http_core_module.c:2614`
+/// and `:2688`), which would orphan the `SpanCtx` pointer stored via
+/// `set_module_ctx`.  By allocating the `SpanCtx` as the payload of a
+/// `ngx_pool_cleanup_add` node, the node survives the redirect (it lives on the
+/// pool's cleanup list, not the ctx array) and `recover_span_ctx` can walk the
+/// list to re-install the pointer post-redirect.
+///
+/// # Drop-safety
+/// `SpanCtx` is `Copy` (all fields are plain arrays/scalars plus `std::time::Instant`,
+/// which is `Copy` on all supported platforms) — i.e. trivially destructible with
+/// no `Drop` side-effects.  A no-op handler is therefore correct: there is nothing
+/// to run at pool teardown, and the pool reclaims the bump-allocated bytes wholesale.
+/// (If `SpanCtx` ever gains a non-`Copy`, `Drop`-relevant field, this handler must
+/// run `ptr::drop_in_place` — guarded by the `Copy` assertion in the unit tests.)
+///
+/// # Safety
+/// nginx calls this with the `data` pointer of the cleanup node at pool teardown.
+unsafe extern "C" fn cleanup_span_ctx(_data: *mut core::ffi::c_void) {
+    // Intentionally empty: SpanCtx is Copy / trivially destructible.
+}
+
+/// The cleanup-handler function-pointer type (matches `ngx_pool_cleanup_pt`'s
+/// inner type), used for the `fn_addr_eq` identity comparison in
+/// [`recover_span_ctx`].
+type NgxCleanupPt = unsafe extern "C" fn(*mut core::ffi::c_void);
+
+/// Allocate a `SpanCtx` as the payload of a pool-cleanup node and return a
+/// pointer to that (zeroed) payload.
+///
+/// The cleanup node (handler = [`cleanup_span_ctx`]) is the redirect-survivable
+/// anchor; the returned pointer is what callers store via
+/// `request.set_module_ctx(ptr.cast(), module)`.  Mirrors the C++ module's
+/// `createOtelCtx` (`nginx-otel/src/http_module.cpp:214-229`).
+///
 /// Returns `null_mut()` on OOM (pool bump failure — extremely rare in practice).
 ///
 /// # Safety
 /// `pool` must point to the nginx request pool that outlives this call.
 #[inline]
 pub fn alloc_span_ctx(pool: &Pool) -> *mut SpanCtx {
-    pool.calloc_type::<SpanCtx>()
+    // SAFETY: `pool.as_ptr()` yields the live request pool pointer; requesting
+    // `size_of::<SpanCtx>()` extra payload bytes hands us a node whose `data`
+    // field points to zeroed (ngx_pcalloc'd) storage of exactly that size.
+    let cln =
+        unsafe { nginx_sys::ngx_pool_cleanup_add(pool.as_ptr(), core::mem::size_of::<SpanCtx>()) };
+    if cln.is_null() {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: `cln` is a freshly-returned, exclusively-owned cleanup node; we set
+    // its handler to the anchor and zero its payload.  `ngx_pool_cleanup_add`
+    // allocates the payload with `ngx_palloc` (NOT zeroed), so we must zero it
+    // here to preserve the previous `calloc`-based contract that callers writing
+    // only some fields (e.g. the pre-gate ctx, which sets only `flags`) rely on.
+    unsafe {
+        (*cln).handler = Some(cleanup_span_ctx);
+        let ctx = (*cln).data.cast::<SpanCtx>();
+        core::ptr::write_bytes(ctx, 0u8, 1);
+        ctx
+    }
+}
+
+/// Recover the request's `SpanCtx` after an internal redirect cleared the module
+/// ctx array, mirroring the C++ module's `getOtelCtx`
+/// (`nginx-otel/src/http_module.cpp:195-212`).
+///
+/// Returns the current ctx pointer if the module-ctx slot is non-NULL.  Otherwise,
+/// **only** when the slot is NULL **and** the request is a redirect/filter-finalize
+/// continuation (`r->internal || r->filter_finalize`), walks the pool cleanup list
+/// for the [`cleanup_span_ctx`] anchor, re-installs the recovered pointer via
+/// `set_module_ctx`, and returns it.  Returns NULL if no anchor is found.
+///
+/// # Hot-path note
+/// The cleanup-list walk runs **only** on the NULL-slot + redirect branch — i.e.
+/// post-redirect/filter-finalize.  On the normal (non-redirect) request path the
+/// slot is non-NULL and this is a single pointer load + branch.
+///
+/// # Safety
+/// `r` must be a valid, non-null `ngx_http_request_t`; `module` must be the
+/// process-lifetime module descriptor; `slot` is the current value of the
+/// module-ctx slot (i.e. `get_module_ctx_ptr`).
+#[inline]
+pub unsafe fn recover_span_ctx(
+    r: *mut ngx_http_request_t,
+    module: &nginx_sys::ngx_module_t,
+    slot: *mut SpanCtx,
+) -> *mut SpanCtx {
+    if !slot.is_null() {
+        return slot;
+    }
+    // Read `internal` / `filter_finalize` via the C shim, NOT the bindgen
+    // `*_raw` accessors: bindgen mis-lays-out this struct's bitfields and reads
+    // both flags 2 bits low (see `crate::shim` / `BINDGEN_BITFIELD_ISSUE_DRAFT.md`).
+    // SAFETY: `r` is a valid request pointer; the shim only reads the `internal`
+    // / `filter_finalize` bitfields through nginx's own header layout.
+    let is_redirect =
+        unsafe { crate::shim::r_internal(r) != 0 || crate::shim::r_filter_finalize(r) != 0 };
+    if !is_redirect {
+        return core::ptr::null_mut();
+    }
+    // Walk the pool cleanup list for our anchor handler.
+    // SAFETY: `(*r).pool` is the request pool; `.cleanup` is the head of the
+    // cleanup list (possibly NULL); each node's `handler`/`data`/`next` are valid.
+    unsafe {
+        let mut cln = (*(*r).pool).cleanup;
+        while !cln.is_null() {
+            // Identity-compare the handler pointer against our anchor.  This is
+            // the same mechanism the C++ module uses (`cln->handler ==
+            // cleanupOtelCtx`); `fn_addr_eq` is the sanctioned API for it.  The
+            // anchor is a single symbol within this cdylib, so the address is
+            // stable across all cleanup nodes we created this run.
+            if (*cln)
+                .handler
+                .is_some_and(|h| core::ptr::fn_addr_eq(h, cleanup_span_ctx as NgxCleanupPt))
+            {
+                let ctx = (*cln).data.cast::<SpanCtx>();
+                // Re-install into the (zeroed) module-ctx slot.
+                *(*r).ctx.add(module.ctx_index) = ctx.cast::<core::ffi::c_void>();
+                return ctx;
+            }
+            cln = (*cln).next;
+        }
+    }
+    core::ptr::null_mut()
 }
 
 /// Reconstruct a Pool view from the request's pool pointer.

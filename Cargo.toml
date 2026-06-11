@@ -63,6 +63,12 @@ tonic-prost = { version = "0.14", default-features = false }
 tower-service = "0.3"
 
 [build-dependencies]
+# cc: compiles the module-side bitfield shim (src/shim/ngx_otel_bitfield_shim.c)
+# against the real nginx headers — H3F1 works around a rust-bindgen bitfield
+# mis-layout (allocation-unit-sharing; see BINDGEN_BITFIELD_ISSUE_DRAFT.md).
+# Already in the tree transitively via nginx-sys; listed here as a direct
+# build-dependency to drive cc::Build from build.rs. No new crate added.
+cc = "1.2"
 tonic-prost-build = { version = "0.14", default-features = false }
 
 [features]

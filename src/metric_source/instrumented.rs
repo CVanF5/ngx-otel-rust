@@ -164,14 +164,31 @@ impl HttpRequestHandler for LogPhaseHandler {
         //   (2) trace correlation on the access tail log / exemplar (Phase 2.2 below).
         //   (3) span record emission when sampled (S2 block below).
         let span_ctx: Option<&crate::traces::ctx::SpanCtx> = {
-            use crate::traces::ctx::SpanCtx;
+            use crate::traces::ctx::{recover_span_ctx, SpanCtx};
             // SAFETY: `ngx_http_otel_module` is a valid static module descriptor;
             // `get_module_ctx` reads the request ctx array at our module's index and
             // returns a valid reference only when non-null (set by `SpanStartHandler`
             // from a pool-allocated `SpanCtx` that lives for the full request lifetime).
-            request.get_module_ctx::<SpanCtx>(unsafe {
-                &*core::ptr::addr_of!(crate::ngx_http_otel_module)
-            })
+            let module = unsafe { &*core::ptr::addr_of!(crate::ngx_http_otel_module) };
+            let slot = request.get_module_ctx::<SpanCtx>(module);
+            // H3F1: the LOG phase can run AFTER an internal redirect (error_page /
+            // try_files), where nginx has zeroed the module-ctx array.  Recover the
+            // SpanCtx from the pool-cleanup anchor so the LOG phase sees pass-1's
+            // span (one span per request).  The recovery walk runs ONLY when the
+            // slot is NULL && r->internal/filter_finalize — i.e. post-redirect.
+            match slot {
+                Some(c) => Some(c),
+                None => {
+                    let r = request.as_ref() as *const _ as *mut nginx_sys::ngx_http_request_t;
+                    // SAFETY: `r` is the live request pointer; `module` is the
+                    // process-lifetime descriptor; the NULL slot is passed in.
+                    let recovered = unsafe { recover_span_ctx(r, module, core::ptr::null_mut()) };
+                    // SAFETY: `recovered` is either NULL or a pointer into the
+                    // request pool (the cleanup-anchored SpanCtx), valid for the
+                    // request lifetime.
+                    unsafe { recovered.as_ref() }
+                }
+            }
         };
 
         // ── request duration in MICROSECONDS ─────────────────────────────────
