@@ -150,6 +150,35 @@ export NGINX_BUILD_DIR="${PLAIN_OBJS}"
 echo "[tsan-run] TSAN nginx:  ${NGINX_BINARY}"
 echo "[tsan-run] RUSTFLAGS:   ${RUSTFLAGS}"
 
+# ── Step 3.4: f_shm_atomic_zero unit test under TSAN ─────────────────────────
+#
+# FU3 gap: integration scripts exercise nginx-as-process but never ran the
+# f_shm_atomic_zero unit test under TSAN.  That test spawns a concurrent
+# fetch_add writer while zero_route_upstream_histograms (H2F2's fix) runs —
+# meaningful ONLY when TSAN observes both threads.  A macOS pass is inert;
+# the TSAN run is the real evidence.
+#
+# Standalone test binaries link their OWN TSAN runtime (libclang_rt.tsan from
+# libclang-rt-dev); drop -Zexternal-clangrt which is only correct for cdylibs
+# loaded into an already-TSAN-instrumented nginx process.
+echo "[tsan-run] Step 3.4: Running f_shm_atomic_zero unit test under TSAN..."
+(
+    export RUSTFLAGS="-Cforce-frame-pointers=yes -Zsanitizer=thread"
+    cd /work/ngx-otel-rust
+    NGINX_SOURCE_DIR=/work/nginx \
+    NGINX_BUILD_DIR="${PLAIN_OBJS}" \
+    cargo test --lib -- f_shm_atomic_zero --nocapture 2>&1
+) | tee /tmp/tsan-unit-f_shm_atomic_zero.log
+if grep -q "f_shm_atomic_zero.*ok\|test.*f_shm_atomic_zero.*PASSED\|PASSED.*f_shm_atomic_zero" /tmp/tsan-unit-f_shm_atomic_zero.log; then
+    echo "[tsan-run] Step 3.4: f_shm_atomic_zero ... PASSED under TSAN — OK"
+elif grep -q "FAILED\|error\[E\|^error" /tmp/tsan-unit-f_shm_atomic_zero.log; then
+    echo "[tsan-run] FAIL: f_shm_atomic_zero failed under TSAN — aborting run" >&2
+    cat /tmp/tsan-unit-f_shm_atomic_zero.log >&2
+    exit 1
+else
+    echo "[tsan-run] Step 3.4: f_shm_atomic_zero output captured (see log above)"
+fi
+
 # ── Step 3.5: nm-verification — confirm __tsan_* symbols in the cdylib ───────
 #
 # FU4: the previous TSAN artifact contained only a "Step 1 OK" compile-sanity
