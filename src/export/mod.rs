@@ -173,6 +173,34 @@ impl Drop for ExportLoopDoneGuard {
 /// stall exporter shutdown.
 const GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET: Duration = Duration::from_secs(2);
 
+/// H3F3: Per-attempt wall-clock budget for every *periodic* (non-drain) send —
+/// fresh metrics/logs/spans batches and their retry-queue drains.
+///
+/// Why this is needed: periodic sends were previously awaited bare. The only
+/// backstop is the transport's read timer (`DEFAULT_READ_TIMEOUT_MS` = 60 s),
+/// and that only covers connect + read — a `poll_write` that returns `NGX_AGAIN`
+/// against a collector whose receive window has stalled arms NO timer, so a
+/// write can hang unbounded. Even within the 60 s read backstop, a single
+/// export wake chains several sends (3 retry drains + up to 3 fresh sends), so
+/// one wake could stall for minutes, and shutdown flags are only polled
+/// *between* wakes — `nginx -s quit` would block for that whole time.
+///
+/// Value choice (15 s): it must be ≤ the 60 s read backstop (so it is the
+/// effective cap, not a no-op) yet comfortably larger than a healthy send's
+/// latency so a momentarily slow-but-live collector is not falsely treated as
+/// failed (a healthy OTLP POST completes in well under a second). It is
+/// deliberately *much* larger than the 250 ms `SHUTDOWN_POLL_INTERVAL` drain
+/// tick and independent of `otel_metric_interval` (which gates how often a wake
+/// occurs, not how long one send may take): the budget bounds a single hung
+/// send, while the inter-send flag checks added in `export_loop` bound how many
+/// such sends a quit can wait behind within one wake. Worst-case quit latency
+/// is therefore one in-flight send's remaining budget (< 15 s), not minutes.
+/// On expiry the batch takes the EXISTING transient-failure path (retry-queue
+/// enqueue with eviction + failure-counter bump + ERR log) — no new semantics,
+/// no wire-byte change (the in-flight future is dropped, cancelling the
+/// connection via `Drop`, exactly as a transport error would unwind).
+const PERIODIC_SEND_BUDGET: Duration = Duration::from_secs(15);
+
 /// Maximum slice of the export interval that may pass between `ngx_quit`
 /// polls. Chunked sleep ensures shutdown is responsive even with a long
 /// configured `otel_metric_interval` — we never wait more than this between
@@ -273,6 +301,19 @@ enum ShutdownKind {
     None,
     Exiting,
     Terminate,
+}
+
+/// H3F3: True if the master has signalled shutdown (`ngx_quit` graceful or
+/// `ngx_terminate` immediate). Checked BETWEEN consecutive periodic sends within
+/// a single export wake so that a quit arriving mid-wake is honoured promptly
+/// rather than waiting for every remaining (possibly deadline-bounded) send to
+/// finish. Worst case a quit waits behind only the one send currently in flight.
+#[inline]
+fn shutdown_requested() -> bool {
+    // SAFETY: `ngx_quit` / `ngx_terminate` are nginx-owned `sig_atomic_t`
+    // globals, set on the master signal path and read here in the
+    // single-threaded exporter process; plain reads are well-defined.
+    unsafe { nginx_sys::ngx_quit != 0 || nginx_sys::ngx_terminate != 0 }
 }
 
 // ── Self-metrics source ──────────────────────────────────────────────────────
@@ -741,6 +782,23 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                 }
             }
 
+            // H3F3: whether a QUIT-DEFER overlap window is currently active.
+            // When active (test-support only), shutdown is being deliberately
+            // deferred to keep ring drains alive during a successor overlap, so
+            // the inter-send shutdown short-circuits below must NOT fire — they
+            // would skip exactly the drains the defer window exists to run.
+            // Always false in production builds (no defer mechanism compiled in).
+            let defer_active: bool = {
+                #[cfg(feature = "test-support")]
+                {
+                    quit_defer_ticks > 0
+                }
+                #[cfg(not(feature = "test-support"))]
+                {
+                    false
+                }
+            };
+
             // B1-FU1: Check for successor before periodic ring pops.
             // One Acquire load of successor_gen; sets the latch permanently on first
             // abdication.  The load is on the cold path (occurs only once per drain tick;
@@ -767,6 +825,22 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                 &mut LogsRetry(&mut transport),
             )
             .await;
+
+            // H3F3: inter-send shutdown check — a quit/terminate that arrived
+            // while the logs-retry drain above was in flight is honoured now,
+            // before chaining further (deadline-bounded) sends in this same tick.
+            // Break out of the chunked sleep so the post-loop shutdown handling
+            // (graceful drain on quit, immediate return on terminate) runs.
+            if shutdown_requested() && !defer_active {
+                // SAFETY: nginx-owned `sig_atomic_t` global, read in the
+                // single-threaded exporter process — a plain read is well-defined.
+                shutdown_during_sleep = if unsafe { nginx_sys::ngx_terminate } != 0 {
+                    ShutdownKind::Terminate
+                } else {
+                    ShutdownKind::Exiting
+                };
+                break;
+            }
 
             // Drain fresh log records from all workers' rings and ship them.
             // B1-FU1: skipped on abdication — new exporter is sole consumer.
@@ -808,8 +882,15 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                     let n_logs = count_pdata_records(&logs_pd);
                     if n_logs > 0 {
                         let logs_bytes = encode_pdata(&logs_pd);
-                        match transport.send_pdata(&logs_pd, logs_bytes.clone()).await {
-                            Ok(()) => {
+                        // H3F3: cap at PERIODIC_SEND_BUDGET; deadline expiry is a
+                        // transient failure taking the identical enqueue/counter/ERR path.
+                        match with_deadline(
+                            transport.send_pdata(&logs_pd, logs_bytes.clone()),
+                            PERIODIC_SEND_BUDGET,
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {
                                 ngx::ngx_log_error!(
                                     NGX_LOG_INFO,
                                     log.as_ptr(),
@@ -817,7 +898,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                                     n_logs
                                 );
                             }
-                            Err(ref e) => {
+                            Ok(Err(ref e)) => {
                                 ngx::ngx_log_error!(
                                     NGX_LOG_ERR,
                                     log.as_ptr(),
@@ -833,9 +914,36 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                                 );
                                 LOGS_SEND_FAILURES.fetch_add(1, Ordering::Relaxed);
                             }
+                            Err(DeadlineExceeded) => {
+                                ngx::ngx_log_error!(
+                                    NGX_LOG_ERR,
+                                    log.as_ptr(),
+                                    "otel export: logs send timed out after {:?}; queuing for retry",
+                                    PERIODIC_SEND_BUDGET
+                                );
+                                enqueue_with_eviction(
+                                    &mut logs_retry_queue,
+                                    logs_bytes,
+                                    n_logs,
+                                    retry_buffer_depth,
+                                    log.as_ptr(),
+                                );
+                                LOGS_SEND_FAILURES.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     }
                 }
+            }
+
+            // H3F3: inter-send shutdown check before the span lane (see logs lane).
+            if shutdown_requested() && !defer_active {
+                // SAFETY: nginx-owned `sig_atomic_t` global; single-threaded read.
+                shutdown_during_sleep = if unsafe { nginx_sys::ngx_terminate } != 0 {
+                    ShutdownKind::Terminate
+                } else {
+                    ShutdownKind::Exiting
+                };
+                break;
             }
 
             // ── Span drain: every sub-interval wake ─────────────────────────
@@ -849,6 +957,17 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                 &mut SpansRetry(&mut transport),
             )
             .await;
+
+            // H3F3: inter-send shutdown check before the fresh-span send.
+            if shutdown_requested() && !defer_active {
+                // SAFETY: nginx-owned `sig_atomic_t` global; single-threaded read.
+                shutdown_during_sleep = if unsafe { nginx_sys::ngx_terminate } != 0 {
+                    ShutdownKind::Terminate
+                } else {
+                    ShutdownKind::Exiting
+                };
+                break;
+            }
 
             // Drain fresh span records from all workers' rings and ship them.
             // B1-FU1: skipped on abdication — new exporter is sole consumer.
@@ -882,8 +1001,15 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                     let n_spans = count_pdata_records(&spans_pd);
                     if n_spans > 0 {
                         let spans_bytes = encode_pdata(&spans_pd);
-                        match transport.send_pdata(&spans_pd, spans_bytes.clone()).await {
-                            Ok(()) => {
+                        // H3F3: cap at PERIODIC_SEND_BUDGET; deadline expiry is a
+                        // transient failure taking the identical enqueue/counter/ERR path.
+                        match with_deadline(
+                            transport.send_pdata(&spans_pd, spans_bytes.clone()),
+                            PERIODIC_SEND_BUDGET,
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {
                                 ngx::ngx_log_error!(
                                     NGX_LOG_INFO,
                                     log.as_ptr(),
@@ -891,12 +1017,28 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                                     n_spans
                                 );
                             }
-                            Err(ref e) => {
+                            Ok(Err(ref e)) => {
                                 ngx::ngx_log_error!(
                                     NGX_LOG_ERR,
                                     log.as_ptr(),
                                     "otel export: spans send failed ({}); queuing for retry",
                                     e
+                                );
+                                enqueue_with_eviction(
+                                    &mut spans_retry_queue,
+                                    spans_bytes,
+                                    n_spans,
+                                    retry_buffer_depth,
+                                    log.as_ptr(),
+                                );
+                                TRACES_SEND_FAILURES.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(DeadlineExceeded) => {
+                                ngx::ngx_log_error!(
+                                    NGX_LOG_ERR,
+                                    log.as_ptr(),
+                                    "otel export: spans send timed out after {:?}; queuing for retry",
+                                    PERIODIC_SEND_BUDGET
                                 );
                                 enqueue_with_eviction(
                                     &mut spans_retry_queue,
@@ -1018,6 +1160,26 @@ pub async fn export_loop(amcf: &'static MainConfig) {
         )
         .await;
 
+        // H3F3: inter-send shutdown check between the metrics retry drain and the
+        // fresh-metrics send. A quit/terminate arriving while the (deadline-bounded)
+        // retry drain was in flight loops back to the top of the outer loop, which
+        // immediately runs graceful_drain (quit) or returns (terminate) rather than
+        // chaining the fresh-metrics send first. Skipped during a QUIT-DEFER window
+        // so the overlap-window drains complete (test-support only; never in prod).
+        let metrics_defer_active: bool = {
+            #[cfg(feature = "test-support")]
+            {
+                quit_defer_ticks > 0
+            }
+            #[cfg(not(feature = "test-support"))]
+            {
+                false
+            }
+        };
+        if shutdown_requested() && !metrics_defer_active {
+            continue;
+        }
+
         // ── Collect fresh metrics from all sources ────────────────────────
         // Pdata pipeline: wrap → process → encode → send (Step U2).
         let mut metrics_pd = Pdata::Metrics(collect_all_sources(amcf, worker_start_ns));
@@ -1027,8 +1189,15 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             let bytes = encode_pdata(&metrics_pd);
 
             // ── Send the fresh batch ──────────────────────────────────────
-            match transport.send_pdata(&metrics_pd, bytes.clone()).await {
-                Ok(()) => {
+            // H3F3: cap at PERIODIC_SEND_BUDGET; deadline expiry is a transient
+            // failure taking the identical enqueue/counter/ERR path.
+            match with_deadline(
+                transport.send_pdata(&metrics_pd, bytes.clone()),
+                PERIODIC_SEND_BUDGET,
+            )
+            .await
+            {
+                Ok(Ok(())) => {
                     ngx::ngx_log_error!(
                         NGX_LOG_INFO,
                         log.as_ptr(),
@@ -1036,12 +1205,28 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                         n_pts
                     );
                 }
-                Err(ref e) => {
+                Ok(Err(ref e)) => {
                     ngx::ngx_log_error!(
                         NGX_LOG_ERR,
                         log.as_ptr(),
                         "otel export: send failed ({}); queuing for retry",
                         e
+                    );
+                    enqueue_with_eviction(
+                        &mut retry_queue,
+                        bytes,
+                        n_pts,
+                        retry_buffer_depth,
+                        log.as_ptr(),
+                    );
+                    SEND_FAILURES.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(DeadlineExceeded) => {
+                    ngx::ngx_log_error!(
+                        NGX_LOG_ERR,
+                        log.as_ptr(),
+                        "otel export: send timed out after {:?}; queuing for retry",
+                        PERIODIC_SEND_BUDGET
                     );
                     enqueue_with_eviction(
                         &mut retry_queue,
@@ -1493,17 +1678,22 @@ async fn graceful_drain(
 struct DeadlineExceeded;
 
 pin_project! {
-    /// Races an inner future against an [`ngx::async_::Sleep`]. Whichever
-    /// resolves first wins. No allocation, no `select!` machinery.
-    struct WithDeadline<F> {
+    /// Races an inner future against a timer future. Whichever resolves first
+    /// wins. No allocation, no `select!` machinery.
+    ///
+    /// Generic over the timer type `T` so that production passes
+    /// [`ngx::async_::Sleep`] (driven by the NGINX event loop) while unit tests
+    /// can inject a deterministic, runtime-free timer (e.g. ready-on-first-poll)
+    /// to exercise the deadline-expiry arm without a real wall-clock wait.
+    struct WithDeadline<F, T> {
         #[pin]
         fut: F,
         #[pin]
-        timer: ngx::async_::Sleep,
+        timer: T,
     }
 }
 
-impl<F: Future> Future for WithDeadline<F> {
+impl<F: Future, T: Future<Output = ()>> Future for WithDeadline<F, T> {
     type Output = Result<F::Output, DeadlineExceeded>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -1521,7 +1711,7 @@ impl<F: Future> Future for WithDeadline<F> {
 /// Wraps `fut` so it resolves at most after `timeout`. On timeout the inner
 /// future is dropped — for a hyper send this means the in-flight connection
 /// future is cancelled cleanly via [`Drop`].
-fn with_deadline<F: Future>(fut: F, timeout: Duration) -> WithDeadline<F> {
+fn with_deadline<F: Future>(fut: F, timeout: Duration) -> WithDeadline<F, ngx::async_::Sleep> {
     WithDeadline { fut, timer: ngx::async_::sleep(timeout) }
 }
 
@@ -1641,6 +1831,44 @@ async fn drain_retry_queue_once<S: RetrySend>(
     signal: &'static str,
     sender: &mut S,
 ) {
+    // Production timer: the NGINX-event-loop-driven sleep. Factored as a
+    // closure so the inner generic helper can also be driven by a deterministic
+    // runtime-free timer in unit tests (see `f_h3f3_periodic_send_deadline`).
+    drain_retry_queue_once_with_timer(
+        queue,
+        retry_buffer_depth,
+        log,
+        failure_counter,
+        signal,
+        sender,
+        || ngx::async_::sleep(PERIODIC_SEND_BUDGET),
+    )
+    .await;
+}
+
+/// Inner generic body of [`drain_retry_queue_once`], parameterised over the
+/// per-send deadline timer so unit tests can inject a deterministic timer.
+///
+/// `mk_timer` produces a fresh timer future for each send attempt; the send is
+/// raced against it via [`with_deadline`]/[`WithDeadline`]. Production supplies
+/// `|| ngx::async_::sleep(PERIODIC_SEND_BUDGET)`.
+///
+/// # Safety
+/// `log` must point to a valid `ngx_log_t` or be `null_mut()` (all log calls
+/// are null-guarded).
+async fn drain_retry_queue_once_with_timer<S, Mk, T>(
+    queue: &mut VecDeque<(std::vec::Vec<u8>, u64)>,
+    retry_buffer_depth: usize,
+    log: *mut nginx_sys::ngx_log_t,
+    failure_counter: &AtomicU64,
+    signal: &'static str,
+    sender: &mut S,
+    mut mk_timer: Mk,
+) where
+    S: RetrySend,
+    Mk: FnMut() -> T,
+    T: Future<Output = ()>,
+{
     let mut snapshot = core::mem::take(queue);
     let mut drain_failed = false;
     while let Some((bytes, n)) = snapshot.pop_front() {
@@ -1648,9 +1876,14 @@ async fn drain_retry_queue_once<S: RetrySend>(
             enqueue_with_eviction(queue, bytes, n, retry_buffer_depth, log);
             continue;
         }
-        match sender.send_batch(bytes.clone()).await {
-            Ok(()) => {}
-            Err(ref e) => {
+        // H3F3: cap each retry send at PERIODIC_SEND_BUDGET. A deadline expiry
+        // (hung collector) is a TRANSIENT failure — identical path to a transport
+        // error: bump the failure counter, ERR-log, re-enqueue, and stop draining
+        // for the rest of this pass (the transport is likely wedged).
+        let send = WithDeadline { fut: sender.send_batch(bytes.clone()), timer: mk_timer() };
+        match send.await {
+            Ok(Ok(())) => {}
+            Ok(Err(ref e)) => {
                 failure_counter.fetch_add(1, Ordering::Relaxed);
                 if is_permanent_rejection(e) {
                     if !log.is_null() {
@@ -1672,6 +1905,20 @@ async fn drain_retry_queue_once<S: RetrySend>(
                         "otel export: {} retry send failed ({}); re-queuing",
                         signal,
                         e
+                    );
+                }
+                enqueue_with_eviction(queue, bytes, n, retry_buffer_depth, log);
+                drain_failed = true;
+            }
+            Err(DeadlineExceeded) => {
+                failure_counter.fetch_add(1, Ordering::Relaxed);
+                if !log.is_null() {
+                    ngx::ngx_log_error!(
+                        NGX_LOG_ERR,
+                        log,
+                        "otel export: {} retry send timed out after {:?}; re-queuing",
+                        signal,
+                        PERIODIC_SEND_BUDGET
                     );
                 }
                 enqueue_with_eviction(queue, bytes, n, retry_buffer_depth, log);
@@ -3297,13 +3544,18 @@ mod tests {
         let failure_counter = AtomicU64::new(0);
         // Removing is_permanent_rejection's guard classifies 413 as transient
         // → batch is re-queued → queue.len() == 1 → assertion FAILS.
-        super::drain_retry_queue_once(
+        // H3F3: use the `_with_timer` form with a never-firing timer so the
+        // mock's immediate error wins the deadline race — this exercises the
+        // identical drain logic while avoiding the real `ngx::async_::sleep`
+        // (which derefs the nginx cycle log, null in unit tests).
+        super::drain_retry_queue_once_with_timer(
             &mut queue,
             16,
             core::ptr::null_mut(),
             &failure_counter,
             "test",
             &mut MockAlwaysErr(413),
+            || NeverTimer,
         )
         .await;
 
@@ -3324,13 +3576,14 @@ mod tests {
         queue2.push_back((std::vec![1u8], 7));
 
         let failure_counter2 = AtomicU64::new(0);
-        super::drain_retry_queue_once(
+        super::drain_retry_queue_once_with_timer(
             &mut queue2,
             16,
             core::ptr::null_mut(),
             &failure_counter2,
             "test",
             &mut MockAlwaysErr(503),
+            || NeverTimer,
         )
         .await;
 
@@ -3339,6 +3592,150 @@ mod tests {
             failure_counter2.load(Ordering::Relaxed),
             1,
             "H2F4: failure_counter must be bumped on transient error"
+        );
+    }
+
+    // ── H3F3 periodic-send deadline ───────────────────────────────────────────
+
+    /// A `RetrySend` whose send NEVER resolves — models a collector that
+    /// accepts the connection but never responds (the hung-collector case the
+    /// `PERIODIC_SEND_BUDGET` deadline exists to bound).
+    struct MockNeverResolve;
+    impl super::RetrySend for MockNeverResolve {
+        fn send_batch(
+            &mut self,
+            _bytes: std::vec::Vec<u8>,
+        ) -> impl core::future::Future<Output = Result<(), crate::transport::TransportError>>
+        {
+            // A future that is always `Poll::Pending` and never wakes.
+            core::future::poll_fn(|_cx| {
+                core::task::Poll::<Result<(), crate::transport::TransportError>>::Pending
+            })
+        }
+    }
+
+    /// Runtime-free timer that NEVER fires — `Poll::Pending` forever. Used when
+    /// the mock send resolves on its own (e.g. an immediate error), so the
+    /// deadline must lose the race. Avoids the real `ngx::async_::sleep`, which
+    /// derefs the nginx cycle log (null in unit tests).
+    struct NeverTimer;
+    impl core::future::Future for NeverTimer {
+        type Output = ();
+        fn poll(
+            self: core::pin::Pin<&mut Self>,
+            _cx: &mut core::task::Context<'_>,
+        ) -> core::task::Poll<()> {
+            core::task::Poll::Pending
+        }
+    }
+
+    /// Deterministic, runtime-free deadline timer: `Ready(())` on the first poll.
+    /// Substitutes for `ngx::async_::sleep` so the test exercises the
+    /// deadline-expiry arm without a real wall-clock wait or an nginx event loop.
+    struct ReadyTimer;
+    impl core::future::Future for ReadyTimer {
+        type Output = ();
+        fn poll(
+            self: core::pin::Pin<&mut Self>,
+            _cx: &mut core::task::Context<'_>,
+        ) -> core::task::Poll<()> {
+            core::task::Poll::Ready(())
+        }
+    }
+
+    /// Bounded-poll executor: drives `fut` for at most `max_polls` polls,
+    /// returning its output. Panics if the future has not completed by then.
+    ///
+    /// This is the DETERMINISM mechanism for the mutation cycle. With the
+    /// production deadline wrap in place, `WithDeadline { fut: never, timer:
+    /// ReadyTimer }` resolves to `Err(DeadlineExceeded)` on the FIRST poll, so
+    /// the whole drain pass completes in a couple of polls. If the deadline wrap
+    /// is removed (mutation), the inner send is the never-resolving future, which
+    /// returns `Pending` forever — the poll budget is exhausted and this PANICS,
+    /// failing the test deterministically (no timing, no flake).
+    fn block_on_bounded<F: core::future::Future>(fut: F, max_polls: u32) -> F::Output {
+        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        unsafe fn clone(_: *const ()) -> RawWaker {
+            RawWaker::new(core::ptr::null(), &VTABLE)
+        }
+        unsafe fn noop(_: *const ()) {}
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+        // SAFETY: the no-op vtable's clone/wake/drop never dereference the data
+        // pointer (all are no-ops or rebuild a null-data RawWaker), so a null
+        // data pointer is sound — the standard test-waker pattern.
+        let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = core::pin::pin!(fut);
+        for _ in 0..max_polls {
+            if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+                return v;
+            }
+        }
+        panic!(
+            "H3F3: future did not complete within {max_polls} polls — the \
+             periodic send was awaited without a deadline (a hung collector \
+             would block the export loop, and thus `nginx -s quit`, indefinitely)"
+        );
+    }
+
+    /// H3F3 mutation-evidence: a periodic (retry-drain) send to a hung collector
+    /// must be bounded by `PERIODIC_SEND_BUDGET` and the batch must land back in
+    /// the retry queue with the failure counter bumped — i.e. a deadline expiry
+    /// takes the EXACT transient-failure path.
+    ///
+    /// Drives the production `drain_retry_queue_once_with_timer` (the shared
+    /// helper behind all three lanes' retry drains) with a never-resolving
+    /// sender and the deterministic `ReadyTimer` standing in for the real
+    /// `ngx::async_::sleep(PERIODIC_SEND_BUDGET)`.
+    ///
+    /// MUTATION: in `drain_retry_queue_once_with_timer`, replace
+    ///   `let send = WithDeadline { fut: sender.send_batch(bytes.clone()), timer: mk_timer() };`
+    ///   `match send.await {`
+    /// with a bare
+    ///   `match sender.send_batch(bytes.clone()).await {`
+    /// (dropping the deadline wrap) → the never-resolving send returns `Pending`
+    /// forever → `block_on_bounded` exhausts its poll budget → PANIC → test FAILS.
+    /// Restore the wrap → the `ReadyTimer` fires first → `Err(DeadlineExceeded)`
+    /// → enqueue path runs → test PASSES.
+    #[test]
+    fn f_h3f3_periodic_send_deadline() {
+        let mut queue: VecDeque<(std::vec::Vec<u8>, u64)> = VecDeque::new();
+        queue.push_back((std::vec![1u8, 2u8, 3u8], 9));
+
+        let failure_counter = AtomicU64::new(0);
+
+        // Bound: a single batch takes ~2 polls (WithDeadline poll → timer Ready;
+        // plus the helper's surrounding awaits). 64 is generous head-room while
+        // still tiny vs. the "never completes" mutation. The deadline arm fires
+        // on the FIRST poll of WithDeadline, so completion is poll-count-bounded
+        // and clock-independent.
+        block_on_bounded(
+            super::drain_retry_queue_once_with_timer(
+                &mut queue,
+                16,
+                core::ptr::null_mut(),
+                &failure_counter,
+                "test",
+                &mut MockNeverResolve,
+                || ReadyTimer,
+            ),
+            64,
+        );
+
+        assert_eq!(
+            queue.len(),
+            1,
+            "H3F3: a deadline-expired (hung-collector) batch must be re-queued for retry"
+        );
+        assert_eq!(
+            queue.front().map(|(_, n)| *n),
+            Some(9),
+            "H3F3: the re-queued batch must preserve its record count"
+        );
+        assert_eq!(
+            failure_counter.load(Ordering::Relaxed),
+            1,
+            "H3F3: a deadline expiry must bump the failure counter (transient-failure path)"
         );
     }
 }
