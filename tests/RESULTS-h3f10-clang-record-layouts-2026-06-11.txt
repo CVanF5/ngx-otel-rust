@@ -1,0 +1,181 @@
+H3F10 — bindgen bitfield-accessor audit: authoritative C record-layout evidence
+================================================================================
+
+PROVENANCE
+  audited repo HEAD  : aa9606b76e9e05a76c2b6ea17e334105c62ea753
+                       (the H3F10 tip these layouts were probed against; this
+                       evidence file lands in the follow-up commit on top of it.)
+  date               : 2026-06-11
+  host               : debian-vm (aarch64 / arm64; Linux 6.12 Debian 13)
+  compiler           : Debian clang version 19.1.7
+  method             : clang -Xclang -fdump-record-layouts in CODEGEN mode
+                       (-c -emit-llvm, NOT -fsyntax-only — the anonymous-typedef
+                       record ngx_variable_value_t is only emitted under codegen).
+  nginx headers      : project-nginx-otel/nginx/src/{core,event,event/quic,
+                       os/unix,http,http/modules,http/v2,http/v3}
+                       + ngx-otel-rust/objs-release (ngx_auto_config.h /
+                       ngx_auto_headers.h — the same configure output the module
+                       links against, so the layout matches the shipped ABI).
+  bindgen reference  : target/release/build/nginx-sys-*/out/bindings.rs.
+                       The "bindgen unit-bit" columns below are _bitfield_1-unit-
+                       LOCAL offsets (the coordinate space bindgen accessors use).
+
+  reproduce (probe.c references sizeof(ngx_http_request_t/ngx_event_t/ngx_buf_t)
+  plus a function dereferencing ngx_variable_value_t->{len,valid,...}):
+    clang-19 \
+      -I nginx/src/core -I nginx/src/event -I nginx/src/event/quic \
+      -I nginx/src/os/unix -I nginx/src/http -I nginx/src/http/modules \
+      -I nginx/src/http/v2 -I nginx/src/http/v3 \
+      -I ngx-otel-rust/objs-release \
+      -c -emit-llvm -o /dev/null -Xclang -fdump-record-layouts probe.c
+
+ENUMERATION METHOD (independent re-derivation, not inherited from the reviewer)
+  1. Extracted every bitfield-accessor method name (getters, setters, and *_raw
+     forms) from bindings.rs by capturing each `pub (unsafe) fn NAME` whose body
+     references `_bitfield_1` -> 1246 names.
+  2. Intersected against src/ via the method-call form `.NAME(` plus the free/
+     static form `NAME_raw(`.
+  3. Dropped stdlib-colliding names whose receivers are NOT nginx structs --
+     each verified by reading the call site: Vec/slice .len(); Atomic
+     .store()/.count(); Cell .set(); hyper Request .uri(); Read/Write/Close
+     .read()/.write()/.flush()/.close(); Mutex .lock(); and doc-comment-only
+     .set_cancelable()/.set_nonblocking().
+  4. Resolved the receiver TYPE of every surviving site.
+  Result: 4 nginx structs are reached through a bindgen bitfield accessor in
+  src/. No `*_raw` call site exists (the two `_raw` tokens in src/shim/mod.rs are
+  doc comments). No fully-qualified `Type::accessor(ptr)` call site exists.
+
+================================================================================
+STRUCT 1 — ngx_http_request_s        VERDICT: BROKEN at/after uri_changes
+================================================================================
+Call sites (all routed through the C shim, NOT bindgen accessors):
+  src/metric_source/span_start.rs  r_internal           (production)
+  src/traces/ctx.rs                r_internal, r_filter_finalize (production)
+  src/lib.rs:1133                  r_header_only         (test/test-support
+                                   otel_status content handler; shimmed by H3F10)
+
+clang record layout (struct-absolute byte:bit-range):
+           0 | struct ngx_http_request_s
+        1200 |   in_port_t port
+   1202:0-15 |   unsigned int count
+    1208:0-3 |   unsigned int uri_changes
+    1212:0-0 |   unsigned int header_only
+    1212:6-6 |   unsigned int internal
+    1213:0-0 |   unsigned int filter_finalize
+             | [sizeof=1408, align=8]
+
+Trigger PRESENT: `in_port_t port` (byte 1200, a non-bitfield unsigned short)
+shares the leading 4-byte allocation unit with the first bitfield `count`
+(1202:0-15). The C ABI pads in struct-absolute coordinates; bindgen re-packs
+into a fresh unit-local `_bitfield_1` and ignores the 16 bits `port` consumes,
+so every accessor at/after uri_changes lands 2 bits low.
+  field            real unit-bit (clang)   bindgen unit-bit   delta
+  header_only      80   (1212:0)           78                 +2  BROKEN
+  internal         86   (1212:6)           84                 +2  BROKEN
+  filter_finalize  88   (1213:0)           86                 +2  BROKEN
+  (unit base = `count` at byte 1202; e.g. header_only 1212:0 -> (1212-1202)*8 = 80)
+=> MUST use the shim. Done (r_internal / r_filter_finalize in H3F1;
+   r_header_only in H3F10).
+
+================================================================================
+STRUCT 2 — ngx_event_s               VERDICT: SAFE (left on bindgen accessors)
+================================================================================
+Call sites:
+  src/transport/hyper_http.rs:434(x2),506  .timedout()
+  src/transport/hyper_http.rs:538           .active()
+  src/transport/hyper_http.rs:540           .timer_set()
+  src/exporter/mod.rs:515                    .timer_set()  <-- reviewer-found;
+                                            covered by this same verdict.
+
+clang record layout:
+           0 | struct ngx_event_s
+           0 |   void * data
+       8:0-0 |   unsigned int write
+       8:1-1 |   unsigned int accept
+       8:3-3 |   unsigned int active
+       9:2-2 |   unsigned int timedout
+       9:3-3 |   unsigned int timer_set
+             | [sizeof=96, align=8]
+
+Trigger ABSENT: `void *data` fully fills bytes 0-7; the bitfield region begins
+container-aligned at byte 8 (`write` 8:0) with NO non-bitfield member sharing
+that leading unit.
+  field        clang unit-local (from byte 8)   bindgen unit-bit   delta
+  active       3   (8:3)                         3                  0  SAFE
+  timedout     10  (9:2)                         10                 0  SAFE
+  timer_set    11  (9:3)                         11                 0  SAFE
+=> bit-exact. No shim required. (exporter/mod.rs:515 reads a stack ngx_event_t
+   `backstop_ev.timer_set()`; same struct, same verdict.)
+
+================================================================================
+STRUCT 3 — ngx_variable_value_t      VERDICT: SAFE (SETTERS; bitfield is member 0)
+================================================================================
+Call sites (production variable handlers, registered unconditionally at
+  src/lib.rs:533 / 546):
+  src/lib.rs:644,650-653,657   otel_var_get_trace_id:
+      set_not_found, set_valid, set_no_cacheable, set_len
+  src/lib.rs:708-711,715       otel_var_get_parent_sampled:
+      set_valid, set_no_cacheable, set_not_found, set_len
+  (SETTERS — the accessor class the original H3F10 sweep had not considered.)
+
+clang record layout:
+           0 | ngx_variable_value_t
+      0:0-27 |   unsigned int len
+       3:4-4 |   unsigned int valid
+       3:5-5 |   unsigned int no_cacheable
+       3:6-6 |   unsigned int not_found
+       3:7-7 |   unsigned int escape
+           8 |   u_char * data
+             | [sizeof=16, align=8]
+
+Trigger ABSENT: `_bitfield_1` is the FIRST member (the C struct opens with the
+bitfields; `u_char *data` follows at byte 8). No non-bitfield member shares the
+leading allocation unit, so bindgen's unit-local packing coincides with the C ABI.
+  field          clang unit-local       bindgen unit-bit   delta
+  len            0   (0:0, width 28)     0  (width 28)      0  SAFE
+  valid          28  (3:4)               28                 0  SAFE
+  no_cacheable   29  (3:5)               29                 0  SAFE
+  not_found      30  (3:6)               30                 0  SAFE
+  escape         31  (3:7)               31                 0  SAFE
+=> bit-exact. The setters write the correct bits. No shim required.
+
+================================================================================
+STRUCT 4 — ngx_buf_s                 VERDICT: SAFE (test-gated; clean bitfield region)
+================================================================================
+Call sites:
+  src/lib.rs:1145  buf.set_last_buf(true)       (ngx-rust Buffer wrapper over
+  src/lib.rs:1146  buf.set_last_in_chain(true)   ngx_buf_t; otel_status content
+                                                 handler, cfg(test/test-support))
+
+clang record layout:
+           0 | struct ngx_buf_s
+           0 |   u_char * pos
+          64 |   ngx_buf_t * shadow
+       72:0-0 |   unsigned int temporary
+       72:1-1 |   unsigned int memory
+       72:7-7 |   unsigned int last_buf
+       73:0-0 |   unsigned int last_in_chain
+       73:1-1 |   unsigned int last_shadow
+          76 |   int num
+             | [sizeof=80, align=8]
+
+Trigger ABSENT: the bitfield region begins at byte 72, immediately after the
+pointer `shadow` (bytes 64-71); no non-bitfield member shares its leading unit.
+  field          clang unit-local (from byte 72)  bindgen unit-bit   delta
+  last_buf       7   (72:7)                        7                  0  SAFE
+  last_in_chain  8   (73:0)                        8                  0  SAFE
+=> bit-exact. No shim required.
+
+================================================================================
+SUMMARY
+  Bindgen bitfield-accessor sites in src/ (production + test): 4 nginx structs.
+    ngx_http_request_s    BROKEN  -> shimmed (r_internal / r_filter_finalize /
+                                    r_header_only).
+    ngx_event_s           SAFE    -> bindgen accessors (incl. exporter/mod.rs:515).
+    ngx_variable_value_t  SAFE    -> bindgen SETTERS (lib.rs trace_id /
+                                    parent_sampled variable handlers).
+    ngx_buf_s             SAFE    -> bindgen setters (test-gated).
+  Only ngx_http_request_s carries the allocation-unit-sharing trigger (a
+  non-bitfield member co-resident in the bitfield's leading allocation unit);
+  the other three open their bitfield region on a clean aligned boundary and
+  match the C ABI bit-for-bit, getters and setters alike.
