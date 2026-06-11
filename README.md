@@ -251,9 +251,9 @@ design proposal to integrate. In brief:
   histogram, recorded in microseconds, decomposed three ways — a base series
   keyed on method, status class, and protocol; a per-`http.route` series; and
   a per-`nginx.upstream.zone` series. Plus request, response, and upstream
-  byte and timing histograms; the nginx `stub_status` counters and gauges;
-  and a `ngx_otel.error_log.events` error-rate counter. Cumulative
-  temporality.
+  byte and timing histograms; the nginx `stub_status` counters and gauges
+  (see note below); and a `ngx_otel.error_log.events` error-rate counter.
+  Cumulative temporality.
 - **Logs — access** (`otel_access_log_sample <n>`): metrics-primary, plus
   reservoir-sampled **exemplars** (trace-linked) and a **thin exception tail** of
   `LogRecord`s for status ≥ 4xx / latency outliers. Not a per-request log.
@@ -385,6 +385,23 @@ Produces:
 - `objs-<flavor>/nginx` — a fresh NGINX binary linked against this
   module.  Used by the integration tests.
 - `objs-<flavor>/ngx_http_otel_module.so` — the loadable module.
+
+> **`--with-http_stub_status_module` and the `nginx.connections.*` /
+> `nginx.requests.total` metrics.** Those seven series read nginx's internal
+> `ngx_stat_*` globals, which only exist when nginx is built with
+> `--with-http_stub_status_module` (the default build above includes it).
+> Two consequences if your nginx differs:
+>
+> - **Module built against a nginx *without* the flag** — the stub_status
+>   metric source is compiled out and not registered; the seven series are
+>   **absent** from the export (not present-as-zero), and the exporter logs a
+>   one-shot `[warn]` at startup naming the missing flag. Every other signal
+>   works normally.
+> - **A stub-enabled module loaded into a *no-flag* nginx** — this combination
+>   is rejected at config-test time: `nginx -t` fails with
+>   `[emerg] dlopen() ... undefined symbol: ngx_stat_<...>` because the
+>   `ngx_stat_*` symbols the module references are not present in that nginx.
+>   Build the module against headers from the same nginx you will load it into.
 
 Internals: `make build` invokes
 `./auto/configure --add-dynamic-module=$(CURDIR) --with-compat --with-http_stub_status_module`

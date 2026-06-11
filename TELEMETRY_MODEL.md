@@ -195,6 +195,14 @@ Read from nginx's `stub_status` globals each export interval
 (active/reading/writing/waiting) is emitted as OTLP **Gauge** metrics; the
 cumulative counters (accepted/handled/requests) as monotonic **Sum** metrics.
 
+> **Build-flag requirement.** These seven series exist **only** when nginx is
+> built with `--with-http_stub_status_module` (which defines `NGX_STAT_STUB`,
+> the source of the `ngx_stat_*` globals these metrics read). When the module is
+> compiled against a nginx that lacks the flag, the source is not registered and
+> these series are **absent** from the export (not present-as-zero); the exporter
+> logs a one-shot `[warn]` at startup naming the missing flag. All other signals
+> are unaffected.
+
 | Name | Instrument | Unit (UCUM) | Temporality | Stability |
 |---|---|---|---|---|
 | `nginx.requests.total` | Counter (Sum, monotonic) | `{request}` | Cumulative | experimental |

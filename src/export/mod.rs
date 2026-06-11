@@ -54,6 +54,7 @@ use crate::encoder::{OtlpHttpEncoder, OtlpLogsEncoder, OtlpTracesEncoder};
 use crate::logs::coalesce;
 use crate::logs::severity::nginx_to_otel;
 use crate::metric_source::instrumented::InstrumentedSource;
+#[cfg(ngx_feature = "stat_stub")]
 use crate::metric_source::stub_status::StubStatusSource;
 use crate::metric_source::MetricSource;
 use crate::processor::Processor;
@@ -664,6 +665,22 @@ pub async fn export_loop(amcf: &'static MainConfig) {
         protocol_str,
         amcf.interval_ms(),
         retry_buffer_depth
+    );
+
+    // H3F7 option A: in a no-flag build (nginx without --with-http_stub_status_module,
+    // so `NGX_STAT_STUB` undefined → no `ngx_feature = "stat_stub"`) the stub_status
+    // MetricSource is not registered in `collect_all_sources`. Emit a single
+    // degraded-feature notice naming the missing flag and the affected series so the
+    // operator understands why `nginx.connections.*` / `nginx.requests.total` are
+    // absent. WARN (not ERR): the module otherwise works; this is a degraded feature,
+    // not a failure. One-shot at startup, matching the lifecycle-line convention.
+    #[cfg(not(ngx_feature = "stat_stub"))]
+    ngx::ngx_log_error!(
+        NGX_LOG_WARN,
+        log.as_ptr(),
+        "otel export: stub_status metrics disabled: nginx built without \
+         --with-http_stub_status_module; nginx.connections.* and \
+         nginx.requests.total will not be exported"
     );
 
     loop {
@@ -2029,6 +2046,14 @@ fn collect_all_sources(amcf: &MainConfig, worker_start_ns: u64) -> Batch {
     let mut metrics = std::vec::Vec::new();
 
     // 1. NGINX connection / request counters (stub_status equivalents).
+    //    Only registered when nginx was built with `--with-http_stub_status_module`
+    //    (i.e. `NGX_STAT_STUB` is defined → `ngx_feature = "stat_stub"`, set by
+    //    `build.rs::detect_stat_stub`). In a no-flag build the `ngx_stat_*` symbols
+    //    do not exist and the source would only ever yield permanent zeros, so we
+    //    skip registration entirely (H3F7 option A) — the 7 series become ABSENT
+    //    rather than zero. The operator is told why via a one-shot WARN at export
+    //    loop startup (see `export_loop`).
+    #[cfg(ngx_feature = "stat_stub")]
     metrics.extend(StubStatusSource.collect());
 
     // 2. Per-worker shm histograms (http.server.request.duration, etc.).
@@ -2935,6 +2960,37 @@ mod tests {
             AnyValue::String(std::format!("{}", test_pid)),
             "service.instance.id value must equal the master PID (logs)"
         );
+    }
+
+    /// H3F7 option A — inverse of `stub_status::tests::stub_status_produces_seven_metrics`.
+    /// In a no-flag build (nginx without `--with-http_stub_status_module`, so
+    /// `NGX_STAT_STUB` undefined → no `ngx_feature = "stat_stub"`), the stub_status
+    /// `MetricSource` is not registered in `collect_all_sources`, so none of its 7
+    /// series are emitted. We assert they are ABSENT from the real collection path —
+    /// proving the permanently-zero series are gone, not present-as-zero. This test
+    /// only compiles/runs in a no-stub build (e.g. debian-vm scenario-B config).
+    #[cfg(not(ngx_feature = "stat_stub"))]
+    #[test]
+    fn collect_all_sources_omits_stub_status_without_stat_stub() {
+        let amcf = crate::config::MainConfig::default();
+        let batch = collect_all_sources(&amcf, 0);
+
+        let stub_names = [
+            "nginx.connections.accepted",
+            "nginx.connections.handled",
+            "nginx.requests.total",
+            "nginx.connections.active",
+            "nginx.connections.reading",
+            "nginx.connections.writing",
+            "nginx.connections.waiting",
+        ];
+        for m in &batch.metrics {
+            assert!(
+                !stub_names.contains(&m.name.as_str()),
+                "stub_status series {} must be ABSENT in a no-stat_stub build",
+                m.name
+            );
+        }
     }
 
     /// (d) An operator-supplied `service.instance.id` is NOT overridden.

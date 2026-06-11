@@ -12,6 +12,12 @@
 pub mod instrumented;
 pub mod location_conf;
 pub mod span_start;
+// H3F7 option A: in a no-flag nginx build (`NGX_STAT_STUB` undefined →
+// no `ngx_feature = "stat_stub"`) the stub_status source is never registered or
+// collected (see `export::collect_all_sources`), so its items are dead code.
+// We keep the module compiled (type/API coherence) but suppress the dead-code
+// warnings that would otherwise fire only in that build config.
+#[cfg_attr(not(ngx_feature = "stat_stub"), allow(dead_code))]
 pub mod stub_status;
 
 use crate::data_model::Metric;

@@ -8,6 +8,9 @@
 //!
 //! Requires nginx built with `--with-http_stub_status_module` (`NGX_STAT_STUB`).
 
+// Only used by the stat_stub variant of `read_stats` (atomic loads); in a
+// no-flag build that variant is cfg'd out, so the import would be unused.
+#[cfg(ngx_feature = "stat_stub")]
 use core::sync::atomic::Ordering;
 
 use crate::data_model::{AggregationTemporality, HistogramData, Metric, MetricData};
@@ -199,7 +202,13 @@ fn scalar_histogram(
 
 // ─── tests ──────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+// In a stub-enabled build (`--with-http_stub_status_module` → NGX_STAT_STUB →
+// `ngx_feature = "stat_stub"`) the source is registered and yields all 7 series.
+// See `collect_all_sources_omits_stub_status_without_stat_stub` in `export` for the
+// inverse (no-flag build): the source is NOT registered, so the 7 series are ABSENT.
+// The whole module is gated on `stat_stub` because its sole test exercises the
+// stub-enabled path; the no-stub inverse is asserted at the registration site.
+#[cfg(all(test, ngx_feature = "stat_stub"))]
 mod tests {
     use super::*;
     use crate::data_model::MetricData;
