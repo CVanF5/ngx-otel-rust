@@ -2321,4 +2321,101 @@ mod tests {
             unsafe { (*base.cast::<LogsWorkerRingHeader>()).cap.load(Ordering::Relaxed) };
         assert_eq!(access_cap0, CAP as u64, "H2F3: reload must not corrupt slot 0 cap");
     }
+
+    /// H2F3 regression: spans_shm_zone_init must stamp `cap` into new-worker
+    /// slots on SIGHUP reload (scale-up path).
+    ///
+    /// Each spans slot contains ONE `LogsWorkerRingHeader` at slot base
+    /// (spans_slot_size = ring_size_bytes; no separate error ring).
+    /// Also asserts read_offset / write_offset are untouched by the reload
+    /// path (reload stamps cap only; offsets survive from the old generation).
+    ///
+    /// Fail-before proof: comment out the H2F3 reload block in spans_shm_zone_init
+    /// and this test's assertion on step (4) will fail.
+    #[test]
+    fn b1_spans_cap_survives_reload() {
+        use crate::logs::ring::LogsWorkerRingHeader;
+        use nginx_sys::ngx_shm_zone_t;
+
+        const CAP: usize = 512;
+        let slot_sz = spans_slot_size(CAP);
+        let n_slots = 2usize;
+        let data_off = data_offset();
+        let zone_sz = data_off + n_slots * slot_sz;
+
+        let mut zone_mem: std::vec::Vec<u8> = std::vec![0u8; zone_sz];
+        let zone_addr = zone_mem.as_mut_ptr();
+
+        // cycle_addr=0 → wp_from_cycle returns None → n_active = n_reserved (2).
+        let zid = ZoneInitData { ring_cap: CAP, cycle_addr: 0 };
+
+        // SAFETY: ngx_shm_zone_t is repr(C); zero is valid for all fields we don't set.
+        let mut fake_zone: ngx_shm_zone_t = unsafe { core::mem::zeroed() };
+        fake_zone.data = &raw const zid as *mut core::ffi::c_void;
+        fake_zone.shm.addr = zone_addr.cast();
+        fake_zone.shm.size = zone_sz;
+
+        // ── (1) Fresh init ───────────────────────────────────────────────────────
+        // SAFETY: fake_zone is a valid ngx_shm_zone_t with shm region backing it;
+        // old_data=null triggers the fresh-init path.
+        let ret = unsafe { spans_shm_zone_init(&raw mut fake_zone, core::ptr::null_mut()) };
+        assert_eq!(ret, ngx_int_t::from(Status::NGX_OK), "fresh init must return NGX_OK");
+
+        // SAFETY: data_off < zone_sz; zone_mem is live for the whole test.
+        let base = unsafe { zone_addr.add(data_off) };
+        for w in 0..n_slots {
+            let off = w * slot_sz;
+            // SAFETY: off = w * slot_sz < n_slots * slot_sz ≤ zone_sz - data_off.
+            let cap = unsafe {
+                (*base.add(off).cast::<LogsWorkerRingHeader>()).cap.load(Ordering::Relaxed)
+            };
+            assert_eq!(cap, CAP as u64, "fresh init: slot {w} cap must be stamped");
+        }
+
+        // ── (2) Simulate new-worker slot (OS-zeroed, never stamped) ─────────────
+        let off1 = slot_sz; // byte offset of slot 1 from base
+                            // SAFETY: off1 = slot_sz < n_slots * slot_sz ≤ zone_sz - data_off.
+        unsafe {
+            let hdr1 = base.add(off1).cast::<LogsWorkerRingHeader>();
+            (*hdr1).cap.store(0, Ordering::Relaxed);
+            // read_offset and write_offset are already 0 (zero-init); set
+            // explicitly to make the initial state unambiguous.
+            (*hdr1).read_offset.store(0, Ordering::Relaxed);
+            (*hdr1).write_offset.store(0, Ordering::Relaxed);
+        }
+        // SAFETY: off1 = slot_sz < n_slots * slot_sz ≤ zone_sz - data_off.
+        let cap_check =
+            unsafe { (*base.add(off1).cast::<LogsWorkerRingHeader>()).cap.load(Ordering::Relaxed) };
+        assert_eq!(cap_check, 0, "sanity: slot 1 cap must be 0 before reload");
+
+        // ── (3) Reload ───────────────────────────────────────────────────────────
+        // SAFETY: fake_zone is valid; old_data non-null triggers the reload path.
+        let ret2 = unsafe {
+            spans_shm_zone_init(&raw mut fake_zone, core::ptr::dangling_mut::<core::ffi::c_void>())
+        };
+        assert_eq!(ret2, ngx_int_t::from(Status::NGX_OK), "reload must return NGX_OK");
+
+        // ── (4) Assert slot 1 has cap stamped (the H2F3 fix) ────────────────────
+        // SAFETY: same bounds as step (2).
+        let cap1 =
+            unsafe { (*base.add(off1).cast::<LogsWorkerRingHeader>()).cap.load(Ordering::Relaxed) };
+        assert_eq!(cap1, CAP as u64, "H2F3: spans reload must stamp cap on new worker slot");
+
+        // ── (5) Assert read_offset / write_offset untouched ─────────────────────
+        // The reload path stamps cap only; offsets survive from the old generation.
+        // SAFETY: same bounds as step (2).
+        let ro = unsafe {
+            (*base.add(off1).cast::<LogsWorkerRingHeader>()).read_offset.load(Ordering::Relaxed)
+        };
+        // SAFETY: same bounds as step (2).
+        let wo = unsafe {
+            (*base.add(off1).cast::<LogsWorkerRingHeader>()).write_offset.load(Ordering::Relaxed)
+        };
+        assert_eq!(ro, 0, "H2F3: spans reload must not touch read_offset");
+        assert_eq!(wo, 0, "H2F3: spans reload must not touch write_offset");
+
+        // SAFETY: base points into zone_mem; slot 0 header is at offset 0.
+        let cap0 = unsafe { (*base.cast::<LogsWorkerRingHeader>()).cap.load(Ordering::Relaxed) };
+        assert_eq!(cap0, CAP as u64, "H2F3: reload must not corrupt slot 0 cap");
+    }
 }
