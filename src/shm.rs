@@ -2176,6 +2176,14 @@ mod tests {
     /// a particular value is observed after the race (the race outcome is intentionally
     /// "stale counts vanish with old workers", which is accepted).
     ///
+    /// **TSAN-guard caveat (FU5):** This test is inert on non-sanitizer builds.
+    /// `AtomicU64::store` makes no runtime assertion without `-Zsanitizer=thread`;
+    /// the test will pass on macOS / release / debug builds whether the H2F2 fix
+    /// is present or not.  A green macOS run is NOT race coverage.
+    /// The real evidence lives in `tests/RESULTS-tsan-2026-06-11-h2fu.txt`
+    /// (commit 841827c): the test passes under TSAN with 42 `__tsan_*` symbols
+    /// loaded and zero ThreadSanitizer warnings in the full make-tsan-test run.
+    ///
     /// Guarded by #[cfg(not(miri))] because Miri is single-threaded and would deadlock.
     #[test]
     #[cfg(not(miri))]
