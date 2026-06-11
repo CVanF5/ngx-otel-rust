@@ -269,11 +269,16 @@ fi
 # internal redirect.  `add_header ... always` emits the header even with an
 # empty value, so we assert the header value is empty (not that the header is
 # absent).
+# NOTE: nginx omits an `add_header ... always` whose value is empty, so when
+# $otel_trace_id is empty (the CORRECT, fixed case) the header is ABSENT.  An
+# absent header therefore means EMPTY trace-id (pass).  The `|| true` guards
+# keep `set -e`/pipefail from aborting on grep's no-match exit code.
 DECLINE_TID=""
 if [[ -f "${DECLINE_HDRS}" ]]; then
     # Extract the header value (strip name, CR, surrounding whitespace).
-    DECLINE_TID=$(grep -i '^X-Otel-Trace-Id:' "${DECLINE_HDRS}" \
-        | sed -e 's/^[^:]*:[[:space:]]*//' -e 's/[[:space:]]*$//' | tr -d '\r')
+    # grep no-match → empty (absent header == empty trace-id == pass).
+    DECLINE_TID=$( { grep -i '^X-Otel-Trace-Id:' "${DECLINE_HDRS}" || true; } \
+        | sed -e 's/^[^:]*:[[:space:]]*//' -e 's/[[:space:]]*$//' | tr -d '\r' )
 fi
 if [[ -z "${DECLINE_TID}" ]]; then
     pass "(c) declined+redirected request → \$otel_trace_id is EMPTY (no stale pre-gate ctx recovered)"
