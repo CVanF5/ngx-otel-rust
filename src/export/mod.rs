@@ -758,52 +758,15 @@ pub async fn export_loop(amcf: &'static MainConfig) {
 
             // ── Log drain: every sub-interval wake ──────────────────────────
             // Drain the logs retry queue first (best-effort; stop on failure).
-            {
-                let mut logs_queue_snap = core::mem::take(&mut logs_retry_queue);
-                let mut logs_retry_failed = false;
-                while let Some((bytes, n_logs)) = logs_queue_snap.pop_front() {
-                    if logs_retry_failed {
-                        enqueue_with_eviction(
-                            &mut logs_retry_queue,
-                            bytes,
-                            n_logs,
-                            retry_buffer_depth,
-                            log.as_ptr(),
-                        );
-                        continue;
-                    }
-                    match transport.send_logs(bytes.clone()).await {
-                        Ok(()) => {}
-                        Err(ref e) => {
-                            LOGS_SEND_FAILURES.fetch_add(1, Ordering::Relaxed);
-                            if is_permanent_rejection(e) {
-                                ngx::ngx_log_error!(
-                                    NGX_LOG_ERR,
-                                    log.as_ptr(),
-                                    "otel export: dropping logs batch — permanent rejection ({})",
-                                    e
-                                );
-                                logs_retry_failed = true;
-                                continue;
-                            }
-                            ngx::ngx_log_error!(
-                                NGX_LOG_ERR,
-                                log.as_ptr(),
-                                "otel export: logs retry send failed ({}); re-queuing",
-                                e
-                            );
-                            enqueue_with_eviction(
-                                &mut logs_retry_queue,
-                                bytes,
-                                n_logs,
-                                retry_buffer_depth,
-                                log.as_ptr(),
-                            );
-                            logs_retry_failed = true;
-                        }
-                    }
-                }
-            }
+            drain_retry_queue_once(
+                &mut logs_retry_queue,
+                retry_buffer_depth,
+                log.as_ptr(),
+                &LOGS_SEND_FAILURES,
+                "logs",
+                &mut LogsRetry(&mut transport),
+            )
+            .await;
 
             // Drain fresh log records from all workers' rings and ship them.
             // B1-FU1: skipped on abdication — new exporter is sole consumer.
@@ -877,52 +840,15 @@ pub async fn export_loop(amcf: &'static MainConfig) {
 
             // ── Span drain: every sub-interval wake ─────────────────────────
             // Drain the spans retry queue first (best-effort; stop on failure).
-            {
-                let mut spans_queue_snap = core::mem::take(&mut spans_retry_queue);
-                let mut spans_retry_failed = false;
-                while let Some((bytes, n_spans)) = spans_queue_snap.pop_front() {
-                    if spans_retry_failed {
-                        enqueue_with_eviction(
-                            &mut spans_retry_queue,
-                            bytes,
-                            n_spans,
-                            retry_buffer_depth,
-                            log.as_ptr(),
-                        );
-                        continue;
-                    }
-                    match transport.send_traces(bytes.clone()).await {
-                        Ok(()) => {}
-                        Err(ref e) => {
-                            TRACES_SEND_FAILURES.fetch_add(1, Ordering::Relaxed);
-                            if is_permanent_rejection(e) {
-                                ngx::ngx_log_error!(
-                                    NGX_LOG_ERR,
-                                    log.as_ptr(),
-                                    "otel export: dropping spans batch — permanent rejection ({})",
-                                    e
-                                );
-                                spans_retry_failed = true;
-                                continue;
-                            }
-                            ngx::ngx_log_error!(
-                                NGX_LOG_ERR,
-                                log.as_ptr(),
-                                "otel export: spans retry send failed ({}); re-queuing",
-                                e
-                            );
-                            enqueue_with_eviction(
-                                &mut spans_retry_queue,
-                                bytes,
-                                n_spans,
-                                retry_buffer_depth,
-                                log.as_ptr(),
-                            );
-                            spans_retry_failed = true;
-                        }
-                    }
-                }
-            }
+            drain_retry_queue_once(
+                &mut spans_retry_queue,
+                retry_buffer_depth,
+                log.as_ptr(),
+                &TRACES_SEND_FAILURES,
+                "spans",
+                &mut SpansRetry(&mut transport),
+            )
+            .await;
 
             // Drain fresh span records from all workers' rings and ship them.
             // B1-FU1: skipped on abdication — new exporter is sole consumer.
@@ -1079,58 +1005,18 @@ pub async fn export_loop(amcf: &'static MainConfig) {
 
         // ── Drain retry queue before collecting fresh data ────────────────
         // Stop draining as soon as a send fails — transport may still be down.
-        let mut queue_snapshot = core::mem::take(&mut retry_queue);
-        let mut drain_failed = false;
-        while let Some((bytes, n_pts)) = queue_snapshot.pop_front() {
-            if drain_failed {
-                // Transport is down; re-enqueue remaining items without sending.
-                enqueue_with_eviction(
-                    &mut retry_queue,
-                    bytes,
-                    n_pts,
-                    retry_buffer_depth,
-                    log.as_ptr(),
-                );
-                continue;
-            }
-            match transport.send(bytes.clone()).await {
-                Ok(()) => {
-                    ngx::ngx_log_error!(
-                        NGX_LOG_INFO,
-                        log.as_ptr(),
-                        "otel export: queued batch ({} pts) sent successfully",
-                        n_pts
-                    );
-                }
-                Err(ref e) => {
-                    SEND_FAILURES.fetch_add(1, Ordering::Relaxed);
-                    if is_permanent_rejection(e) {
-                        ngx::ngx_log_error!(
-                            NGX_LOG_ERR,
-                            log.as_ptr(),
-                            "otel export: dropping metrics batch — permanent rejection ({})",
-                            e
-                        );
-                        drain_failed = true;
-                        continue;
-                    }
-                    ngx::ngx_log_error!(
-                        NGX_LOG_ERR,
-                        log.as_ptr(),
-                        "otel export: retry send failed ({}); re-queuing",
-                        e
-                    );
-                    enqueue_with_eviction(
-                        &mut retry_queue,
-                        bytes,
-                        n_pts,
-                        retry_buffer_depth,
-                        log.as_ptr(),
-                    );
-                    drain_failed = true;
-                }
-            }
-        }
+        // Note: the per-retry-success INFO log ("queued batch sent successfully")
+        // previously emitted only by this lane is intentionally omitted in the
+        // shared helper — it was operational noise absent from the logs/spans lanes.
+        drain_retry_queue_once(
+            &mut retry_queue,
+            retry_buffer_depth,
+            log.as_ptr(),
+            &SEND_FAILURES,
+            "metrics",
+            &mut MetricsRetry(&mut transport),
+        )
+        .await;
 
         // ── Collect fresh metrics from all sources ────────────────────────
         // Pdata pipeline: wrap → process → encode → send (Step U2).
@@ -1681,6 +1567,118 @@ fn enqueue_with_eviction(
 #[inline]
 fn is_permanent_rejection(e: &crate::transport::TransportError) -> bool {
     matches!(e, crate::transport::TransportError::HttpStatus { code, .. } if *code >= 400 && *code < 500)
+}
+
+// ── Retry-drain abstraction ───────────────────────────────────────────────────
+// `RetrySend` is a minimal send-one-batch trait used exclusively by
+// `drain_retry_queue_once`.  The trait exists to make the helper testable
+// (test code supplies `MockAlwaysErr` instead of a real transport) while
+// keeping the production path zero-overhead — each impl is monomorphised away.
+//
+// The three production wrappers and the test mock are the only implementations.
+// Do NOT generalise this trait to cover other send paths.
+
+trait RetrySend {
+    async fn send_batch(
+        &mut self,
+        bytes: std::vec::Vec<u8>,
+    ) -> Result<(), crate::transport::TransportError>;
+}
+
+/// Logs retry sender — wraps `ExportTransport::send_logs`.
+struct LogsRetry<'t>(&'t mut ExportTransport);
+impl RetrySend for LogsRetry<'_> {
+    async fn send_batch(
+        &mut self,
+        bytes: std::vec::Vec<u8>,
+    ) -> Result<(), crate::transport::TransportError> {
+        self.0.send_logs(bytes).await
+    }
+}
+
+/// Spans retry sender — wraps `ExportTransport::send_traces`.
+struct SpansRetry<'t>(&'t mut ExportTransport);
+impl RetrySend for SpansRetry<'_> {
+    async fn send_batch(
+        &mut self,
+        bytes: std::vec::Vec<u8>,
+    ) -> Result<(), crate::transport::TransportError> {
+        self.0.send_traces(bytes).await
+    }
+}
+
+/// Metrics retry sender — wraps `ExportTransport::send`.
+struct MetricsRetry<'t>(&'t mut ExportTransport);
+impl RetrySend for MetricsRetry<'_> {
+    async fn send_batch(
+        &mut self,
+        bytes: std::vec::Vec<u8>,
+    ) -> Result<(), crate::transport::TransportError> {
+        self.0.send(bytes).await
+    }
+}
+
+/// Per-batch retry-drain helper shared by all three signal lanes.
+///
+/// Drains `queue` by attempting to send each batch via `sender.send_batch`.
+/// On permanent 4xx rejection: drops the batch, bumps `failure_counter`, ERR-logs.
+/// On transient error: re-enqueues (bounded by `retry_buffer_depth`), ERR-logs,
+/// and stops attempting sends for the rest of this drain pass.
+///
+/// Called by:
+///   logs lane    — src/export/mod.rs (logs retry drain, `&LOGS_SEND_FAILURES`)
+///   spans lane   — src/export/mod.rs (spans retry drain, `&TRACES_SEND_FAILURES`)
+///   metrics lane — src/export/mod.rs (metrics retry drain, `&SEND_FAILURES`)
+///
+/// # Safety
+/// `log` must point to a valid `ngx_log_t` or be `null_mut()`.  All log calls
+/// are guarded; passing `null_mut()` silently omits output (used in tests).
+async fn drain_retry_queue_once<S: RetrySend>(
+    queue: &mut VecDeque<(std::vec::Vec<u8>, u64)>,
+    retry_buffer_depth: usize,
+    log: *mut nginx_sys::ngx_log_t,
+    failure_counter: &AtomicU64,
+    signal: &'static str,
+    sender: &mut S,
+) {
+    let mut snapshot = core::mem::take(queue);
+    let mut drain_failed = false;
+    while let Some((bytes, n)) = snapshot.pop_front() {
+        if drain_failed {
+            enqueue_with_eviction(queue, bytes, n, retry_buffer_depth, log);
+            continue;
+        }
+        match sender.send_batch(bytes.clone()).await {
+            Ok(()) => {}
+            Err(ref e) => {
+                failure_counter.fetch_add(1, Ordering::Relaxed);
+                if is_permanent_rejection(e) {
+                    if !log.is_null() {
+                        ngx::ngx_log_error!(
+                            NGX_LOG_ERR,
+                            log,
+                            "otel export: dropping {} batch — permanent rejection ({})",
+                            signal,
+                            e
+                        );
+                    }
+                    drain_failed = true;
+                    continue;
+                }
+                if !log.is_null() {
+                    ngx::ngx_log_error!(
+                        NGX_LOG_ERR,
+                        log,
+                        "otel export: {} retry send failed ({}); re-queuing",
+                        signal,
+                        e
+                    );
+                }
+                enqueue_with_eviction(queue, bytes, n, retry_buffer_depth, log);
+                drain_failed = true;
+            }
+        }
+    }
 }
 
 /// Count the total number of data points across all metrics in a batch.
@@ -3262,116 +3260,85 @@ mod tests {
     }
 
     /// H2F4 regression: a permanently-rejected batch (4xx HTTP status) must be
-    /// dropped from the retry queue, not re-queued.
-    ///
-    /// Pre-fix: the Err arm always called enqueue_with_eviction → the 4xx batch
-    ///   re-entered the queue, was popped first on the next tick, failed again,
-    ///   set drain_failed=true, and blocked all valid batches behind it forever.
-    /// Post-fix: is_permanent_rejection() detects 4xx and skips re-queuing.
-    ///
-    /// Fail-before proof: change `if is_permanent_rejection(e)` in the metrics
-    /// retry drain to `if false` and this test fails (queue not empty).
-    #[test]
-    fn f_retry_drops_permanent_4xx() {
-        use crate::transport::TransportError;
-
-        // Simulate the metrics retry drain loop with a 413 response.
-        let mut retry_queue: VecDeque<(std::vec::Vec<u8>, u64)> = VecDeque::new();
-        retry_queue.push_back((std::vec![1u8, 2u8, 3u8], 42));
-
-        let poison =
-            TransportError::HttpStatus { code: 413, message: "Request Entity Too Large".into() };
-
-        // Simulate one drain pass (no actual transport — replicate the loop logic).
-        let retry_buffer_depth = 16;
-        let mut queue_snapshot = core::mem::take(&mut retry_queue);
-        let mut drain_failed = false;
-        while let Some((bytes, n_pts)) = queue_snapshot.pop_front() {
-            if drain_failed {
-                super::enqueue_with_eviction(
-                    &mut retry_queue,
-                    bytes,
-                    n_pts,
-                    retry_buffer_depth,
-                    core::ptr::null_mut(),
-                );
-                continue;
-            }
-            // Simulate the transport returning 413.
-            let result: Result<(), TransportError> = Err(TransportError::HttpStatus {
-                code: 413,
-                message: "Request Entity Too Large".into(),
-            });
-            match result {
-                Ok(()) => {}
-                Err(ref e) => {
-                    if super::is_permanent_rejection(e) {
-                        // Drop — do NOT re-enqueue.
-                        drain_failed = true;
-                        continue;
-                    }
-                    super::enqueue_with_eviction(
-                        &mut retry_queue,
-                        bytes,
-                        n_pts,
-                        retry_buffer_depth,
-                        core::ptr::null_mut(),
-                    );
-                    drain_failed = true;
-                }
-            }
+    /// Mock `RetrySend` that always returns an HTTP error with a fixed status code.
+    /// Used exclusively to drive `drain_retry_queue_once` in unit tests without
+    /// a real nginx transport.
+    struct MockAlwaysErr(u16);
+    impl super::RetrySend for MockAlwaysErr {
+        async fn send_batch(
+            &mut self,
+            _bytes: std::vec::Vec<u8>,
+        ) -> Result<(), crate::transport::TransportError> {
+            Err(crate::transport::TransportError::HttpStatus {
+                code: self.0,
+                message: "mock".into(),
+            })
         }
-        drop(poison); // silence unused-variable warning
+    }
+
+    /// Drives the production `drain_retry_queue_once` helper (the shared path
+    /// called by all three export lanes — logs, spans, metrics) with an injected
+    /// mock sender (`MockAlwaysErr`).  Neutering the `is_permanent_rejection`
+    /// guard inside the helper makes this test fail.
+    ///
+    /// Pre-fix shape (HOLLOW — fixed in FU1): the test re-implemented the drain
+    /// loop inline and never called production code; the reviewer removed all
+    /// three production guard blocks and the test STILL PASSED.  This test calls
+    /// the production helper directly — the test cannot pass if the guard is gone.
+    ///
+    /// Mutation-evidence bar (FU1): neuter `drain_retry_queue_once`'s 4xx-drop
+    /// branch (classify everything transient) → this test FAILS → restore → PASSES.
+    #[tokio::test]
+    async fn f_retry_drops_permanent_4xx() {
+        // ── 413 case: permanent rejection → dropped, not re-queued, counter bumped ──
+        let mut queue: VecDeque<(std::vec::Vec<u8>, u64)> = VecDeque::new();
+        queue.push_back((std::vec![1u8, 2u8, 3u8], 42));
+
+        let failure_counter = AtomicU64::new(0);
+        // Removing is_permanent_rejection's guard classifies 413 as transient
+        // → batch is re-queued → queue.len() == 1 → assertion FAILS.
+        super::drain_retry_queue_once(
+            &mut queue,
+            16,
+            core::ptr::null_mut(),
+            &failure_counter,
+            "test",
+            &mut MockAlwaysErr(413),
+        )
+        .await;
 
         assert!(
-            retry_queue.is_empty(),
+            queue.is_empty(),
             "H2F4: 413-rejected batch must be dropped, not re-queued; \
              queue depth = {}",
-            retry_queue.len()
+            queue.len()
+        );
+        assert_eq!(
+            failure_counter.load(Ordering::Relaxed),
+            1,
+            "H2F4: failure_counter must be bumped on permanent rejection"
         );
 
-        // Also verify that a transient 503 IS re-queued (not silently dropped).
-        let mut retry_queue2: VecDeque<(std::vec::Vec<u8>, u64)> = VecDeque::new();
-        retry_queue2.push_back((std::vec![1u8], 7));
-        let mut snap2 = core::mem::take(&mut retry_queue2);
-        let mut failed2 = false;
-        while let Some((bytes, n)) = snap2.pop_front() {
-            if failed2 {
-                super::enqueue_with_eviction(
-                    &mut retry_queue2,
-                    bytes,
-                    n,
-                    16,
-                    core::ptr::null_mut(),
-                );
-                continue;
-            }
-            let result: Result<(), TransportError> = Err(TransportError::HttpStatus {
-                code: 503,
-                message: "Service Unavailable".into(),
-            });
-            match result {
-                Ok(()) => {}
-                Err(ref e) => {
-                    if super::is_permanent_rejection(e) {
-                        failed2 = true;
-                        continue;
-                    }
-                    super::enqueue_with_eviction(
-                        &mut retry_queue2,
-                        bytes,
-                        n,
-                        16,
-                        core::ptr::null_mut(),
-                    );
-                    failed2 = true;
-                }
-            }
-        }
+        // ── 503 case: transient error → re-queued ─────────────────────────────────
+        let mut queue2: VecDeque<(std::vec::Vec<u8>, u64)> = VecDeque::new();
+        queue2.push_back((std::vec![1u8], 7));
+
+        let failure_counter2 = AtomicU64::new(0);
+        super::drain_retry_queue_once(
+            &mut queue2,
+            16,
+            core::ptr::null_mut(),
+            &failure_counter2,
+            "test",
+            &mut MockAlwaysErr(503),
+        )
+        .await;
+
+        assert_eq!(queue2.len(), 1, "H2F4 boundary: 503 is transient — batch must be re-queued");
         assert_eq!(
-            retry_queue2.len(),
+            failure_counter2.load(Ordering::Relaxed),
             1,
-            "H2F4 boundary: 503 is transient — batch must be re-queued"
+            "H2F4: failure_counter must be bumped on transient error"
         );
     }
 }
