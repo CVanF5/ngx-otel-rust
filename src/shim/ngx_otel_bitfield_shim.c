@@ -22,6 +22,7 @@
  *
  *   - `internal`        true layout = bit 86; bindgen accessor reads bit 84.
  *   - `filter_finalize` (and every later bitfield) is likewise 2 bits low.
+ *   - `header_only`     true layout = bit 80; bindgen accessor reads bit 78.
  *
  * Because bindgen's accessors silently read adjacent bits, the Rust-side reads
  * of these flags are WRONG on every platform — verified against gcc-14 DWARF
@@ -53,6 +54,26 @@
  * accessor, which will be 2 bits low.  Bitfields BEFORE `uri_changes` are
  * unaffected.  (Item H3F10 audits the remaining call-sites and extends this
  * shim accordingly; this file currently covers H3F1's needs only.)
+ *
+ * H3F10 AUDIT (2026-06-11)
+ * ------------------------
+ * Every bindgen bitfield-accessor read across src/ production code was
+ * enumerated and classified against authoritative DWARF
+ * (DW_AT_data_bit_offset / pahole) on debian-vm:
+ *
+ *   - `ngx_http_request_t` — BROKEN at/after `uri_changes` (this bug).
+ *       Production/test reads routed through this shim: `r_internal`,
+ *       `r_filter_finalize`, `r_header_only`.
+ *   - `ngx_event_t` (`.timedout()`, `.active()`, `.timer_set()` in
+ *       src/transport/hyper_http.rs) — SAFE: the bitfield unit begins on its
+ *       own 4-byte-aligned offset right after the leading `void *data`
+ *       pointer; NO non-bitfield member shares the leading allocation unit,
+ *       all fields are single-bit and live in the first 32-bit container, so
+ *       the no-straddle trigger does not exist.  Verified bit-exact vs DWARF.
+ *       Left on the bindgen accessors.
+ *
+ * See the audit table in the H3F10 commit message for the full struct ->
+ * verdict -> evidence record.
  */
 
 #include <ngx_config.h>
@@ -77,4 +98,15 @@ unsigned
 ngx_otel_shim_r_filter_finalize(const ngx_http_request_t *r)
 {
     return (unsigned) r->filter_finalize;
+}
+
+/*
+ * Return r->header_only (0 or 1).  `header_only` lives after `uri_changes`
+ * (true layout bit 80; bindgen reads bit 78), so it MUST go through this shim.
+ * Used by the otel_status_endpoint content handler to skip the body on HEAD.
+ */
+unsigned
+ngx_otel_shim_r_header_only(const ngx_http_request_t *r)
+{
+    return (unsigned) r->header_only;
 }

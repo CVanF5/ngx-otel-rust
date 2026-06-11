@@ -1128,9 +1128,10 @@ pub(crate) unsafe extern "C" fn otel_status_content_handler(
         return rc;
     }
     // HEAD requests need no body.
-    // SAFETY: `r` is the valid request; `header_only()` reads a bitfield accessor on
-    // the live request struct.
-    if unsafe { (*r).header_only() } != 0 {
+    // SAFETY: `r` is the valid request; `header_only` lives after `uri_changes`
+    // in `ngx_http_request_t`, so the bindgen accessor reads 2 bits low — route
+    // through the C shim, which reads nginx's own layout (H3F10).
+    if unsafe { crate::shim::r_header_only(r) } != 0 {
         return nginx_sys::NGX_OK as nginx_sys::ngx_int_t;
     }
 
