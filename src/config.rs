@@ -1505,11 +1505,22 @@ extern "C" fn cmd_exporter_set_trusted_cert(
     NGX_CONF_OK
 }
 
+/// Returns `true` when `value` contains a scheme+authority marker (`://`),
+/// meaning the per-signal endpoint directive includes a host/port component
+/// that would be silently stripped at export time.
+///
+/// Pure predicate — testable without an nginx config context.
+/// Called by `warn_if_has_authority` (below) and its unit test
+/// `h2f5_per_signal_endpoint_host_detection`.
+pub(crate) fn has_authority(value: &[u8]) -> bool {
+    value.windows(3).any(|w| w == b"://")
+}
+
 /// Emit a WARN if the per-signal endpoint value includes a scheme or authority
 /// (i.e. contains `://`).  Only the path component is used at export time;
 /// the host/port from the base `endpoint` directive is preserved.
 fn warn_if_has_authority(cf: *mut ngx_conf_t, signal: &str, value: &[u8]) {
-    if value.windows(3).any(|w| w == b"://") {
+    if has_authority(value) {
         ngx_conf_log_error!(
             NGX_LOG_WARN,
             cf,
@@ -2913,24 +2924,27 @@ mod tests {
     /// H2F5 regression: per-signal endpoint directives that include a scheme/host
     /// must emit a WARN (not silently misroute telemetry to the wrong collector).
     ///
-    /// Tests the host-detection predicate used by warn_if_has_authority().
-    /// Pre-fix: no warning was emitted; the host was silently stripped.
-    /// Post-fix: any value containing "://" is flagged.
+    /// Calls the production `has_authority` predicate directly.  Neutering that
+    /// predicate (replacing `value.windows(3).any(…)` with `false`) makes every
+    /// `assert!` below fail.
     ///
-    /// Fail-before proof: the warn_if_has_authority() call did not exist before
-    /// the fix; these assertions capture the expected detection behaviour.
+    /// Pre-fix shape (HOLLOW — fixed in FU2): the test defined its own local
+    /// `fn has_authority` (identical copy of the inline predicate in
+    /// `warn_if_has_authority`).  The reviewer replaced the production predicate
+    /// with `if false` and the test STILL PASSED because it was calling its own
+    /// copy.  This test calls `super::has_authority` — the single production
+    /// definition — so it cannot pass if the predicate is neutered.
+    ///
+    /// Mutation-evidence bar (FU2): replace `value.windows(3).any(…)` in
+    /// `has_authority` with `false` → this test FAILS → restore → PASSES.
     #[test]
     fn h2f5_per_signal_endpoint_host_detection() {
-        fn has_authority(value: &[u8]) -> bool {
-            value.windows(3).any(|w| w == b"://")
-        }
-
-        // Values with a scheme/host — should warn.
+        // Values with a scheme/host — production predicate must detect these.
         assert!(has_authority(b"http://other:4318/v1/metrics"));
         assert!(has_authority(b"https://collector.example.com/v1/logs"));
         assert!(has_authority(b"http://[::1]:4318/v1/traces"));
 
-        // Path-only values — no warning.
+        // Path-only values — production predicate must pass these through.
         assert!(!has_authority(b"/v1/metrics"));
         assert!(!has_authority(b"/opentelemetry/api/v1/logs"));
         assert!(!has_authority(b"v1/traces"));
