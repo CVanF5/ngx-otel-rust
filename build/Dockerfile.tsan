@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y \
     ca-certificates perl git netcat-openbsd lsof \
     procps \
     python3-minimal \
+    jq \
     && rm -rf /var/lib/apt/lists/*
 # libpcre2-dev:      required by nginx's HTTP rewrite module (default-enabled).
 # zlib1g-dev:        required by nginx's HTTP gzip module (default-enabled).
