@@ -2,28 +2,51 @@
 # tests/integration/run_chaos_quit_responsiveness.sh
 #   — H3F3 chaos gate: h3f3_quit_responsiveness
 #
-# The H3F3 bug: periodic exporter sends (fresh metrics/logs/spans + retry-queue
-# drains) were awaited BARE. The only backstop was the transport read timer
-# (DEFAULT_READ_TIMEOUT_MS = 60 s), and that covers only connect + read — a
-# poll_write that returns NGX_AGAIN against a stalled collector arms NO timer, so
-# a write can hang unbounded. Either way, a single export wake chains several
-# sends and shutdown flags are polled only BETWEEN wakes, so `nginx -s quit`
-# behind a hung-but-connected collector could block for a minute or more.
+# PREMISE CORRECTED (H3F3 follow-up): the original "blocks quit for minutes"
+# framing was FALSE. The pre-existing GRACEFUL_DRAIN_BACKSTOP (15 s,
+# src/exporter/mod.rs) already bounds SIGQUIT-to-exit independently of the
+# PERIODIC_SEND_BUDGET wrap, so a hung send never blocks quit for "a minute or
+# more" — the backstop caps it. Because that backstop and PERIODIC_SEND_BUDGET
+# are both 15 s, a pure quit-latency ceiling does NOT discriminate the fix: it
+# passes whether or not the periodic wrap is present (the original gate's
+# defect — it went green against the parent commit with the fix entirely
+# absent).
+#
+# The TRUE justification for the PERIODIC_SEND_BUDGET wrap, and what this gate
+# now verifies:
+#   1. Bound each INDIVIDUAL hung periodic send so its batch lands back in the
+#      retry queue within the wake (retry-queue accuracy + in-wake
+#      responsiveness) — rather than the whole wake stalling on the transport
+#      read timer (DEFAULT_READ_TIMEOUT_MS = 60 s) for connect+read paths.
+#   2. Close the UNBOUNDED write-stall gap: a poll_write returning NGX_AGAIN
+#      against a stalled collector arms NO timer, so without the wrap a write
+#      can hang with no ceiling at all (the read timer never covers it).
+#
+# DISCRIMINATING ASSERTION (the part the original gate missed). The
+# PERIODIC_SEND_BUDGET deadline emits a DISTINCTIVE ERR line when it fires on a
+# periodic send:
+#     "otel export: ... send timed out after 15s; queuing for retry"
+# This line is produced ONLY by the with_deadline() wrap on the periodic send
+# path. With the wrap absent/neutralized, the periodic send awaits BARE and this
+# line is NEVER emitted (the send blocks on the 60 s read timer / unbounded
+# write, then the backstop tears the exporter down at quit). So we let the
+# exporter sit on the hung collector longer than PERIODIC_SEND_BUDGET and assert
+# the signature appears — this FAILS on the unwrapped build and PASSES on the
+# fixed build. Verified both polarities in the H3F3 follow-up (mutation: the
+# deadline wrap removed → signature absent → this gate fails).
 #
 # This differs from run_chaos_dead_collector.sh, which uses a black-hole port
 # with NO listener (connect fails fast with ECONNREFUSED — never exercises the
 # stall). Here the collector ACCEPTS the TCP connection and then NEVER RESPONDS
-# (a Python socket that accepts and sleeps), so the exporter's send genuinely
-# hangs in connect-complete/write/read — exactly the path PERIODIC_SEND_BUDGET
-# (15 s, src/export/mod.rs) now bounds.
+# (a Python socket that accepts and sleeps), so the exporter's periodic send
+# genuinely hangs in connect-complete/write/read — exactly the path
+# PERIODIC_SEND_BUDGET (15 s, src/export/mod.rs) now bounds.
 #
-# Assertion (HARD CEILING): with the exporter mid-send to the never-responding
-# collector, SIGQUIT to the master causes nginx to fully exit within
-#   PERIODIC_SEND_BUDGET (15 s, the one in-flight send) +
-#   a few graceful-drain attempts (GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET = 2 s each) +
-#   margin  ==>  hard ceiling 25 s.
-# Pre-fix, the same scenario blocks on the 60 s read timer (or unbounded on the
-# write path), so a 25 s ceiling cleanly separates fixed from unfixed.
+# SECONDARY assertion (HARD CEILING, kept as a backstop sanity check, NOT the
+# discriminator): with the exporter mid-send to the never-responding collector,
+# SIGQUIT to the master causes nginx to fully exit within the
+# GRACEFUL_DRAIN_BACKSTOP (15 s) + a few graceful-drain attempts
+# (GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET = 2 s each) + margin ==> ceiling 25 s.
 # Also asserts no orphan exporter/worker/master remains.
 #
 # Exit codes: 0 = pass, 1 = preflight error, 2 = assertion failed.
@@ -39,6 +62,21 @@ HANG_ENDPOINT="http://127.0.0.1:${HANG_PORT}"
 
 # Hard ceiling for the SIGQUIT-to-exit latency (seconds).
 QUIT_CEILING="${QUIT_CEILING:-25}"
+
+# PERIODIC_SEND_BUDGET (src/export/mod.rs) is 15s. The periodic send to the
+# hung collector must hang for the full budget before the deadline fires and
+# emits the distinctive ERR signature. We wait the budget + margin so the
+# signature is guaranteed to have landed in error.log before we assert on it.
+DEADLINE_BUDGET_SECS="${DEADLINE_BUDGET_SECS:-15}"
+SIGNATURE_WAIT="${SIGNATURE_WAIT:-22}"
+
+# The DISCRIMINATING signature: emitted ONLY by the with_deadline() wrap on a
+# periodic send. Absent on the unwrapped (bug-present) build. Matches all three
+# periodic lanes — metrics ("send timed out after ...; queuing for retry"),
+# logs ("logs send timed out ..."), spans ("spans send timed out ...") — and the
+# retry-drain lane ("... retry send timed out after ...; re-queuing"). With the
+# wrap absent the periodic send awaits bare and NONE of these lines is emitted.
+DEADLINE_SIGNATURE='otel export: .*send timed out after .*; (queuing for retry|re-queuing)'
 
 NGINX_CONF_BODY="
 daemon off;
@@ -112,6 +150,7 @@ info "nginx binary:  ${NGINX_BINARY}"
 info "Module:        ${MODULE_PATH}"
 info "Hang endpoint: ${HANG_ENDPOINT} (accepts, never responds)"
 info "Quit ceiling:  ${QUIT_CEILING}s"
+info "Deadline wait: ${SIGNATURE_WAIT}s (PERIODIC_SEND_BUDGET ${DEADLINE_BUDGET_SECS}s + margin)"
 
 exporter_pid() {
     local master_pid="${1:-}"
@@ -189,10 +228,39 @@ fi
 wait_for 5 "exporter to appear" "[[ -n \"\$(exporter_pid ${NGINX_PID})\" ]]"
 pass "Exporter started against the hung collector"
 
-# Let the export loop run several 1s intervals so it is actively attempting
-# sends (and accumulating a retry queue) against the hung collector.
-info "Waiting 4s for the export loop to engage the hung collector..."
-sleep 4
+ERROR_LOG="${PREFIX}/logs/error.log"
+
+# ─── DISCRIMINATING ASSERTION: periodic-send deadline signature ─────────────
+# Let the periodic send hang on the collector for longer than
+# PERIODIC_SEND_BUDGET (15s) so the deadline fires and emits its distinctive
+# ERR line. On the FIXED build the signature appears; on the unwrapped
+# (bug-present) build the send awaits bare and the line never appears — so this
+# is the half the original ceiling-only gate missed.
+info "Waiting up to ${SIGNATURE_WAIT}s for the periodic-send deadline (${DEADLINE_BUDGET_SECS}s budget) to fire..."
+SIG_DEADLINE=$(( $(date +%s) + SIGNATURE_WAIT ))
+SIGNATURE_SEEN=0
+while (( $(date +%s) < SIG_DEADLINE )); do
+    if grep -Eq "${DEADLINE_SIGNATURE}" "${ERROR_LOG}" 2>/dev/null; then
+        SIGNATURE_SEEN=1
+        break
+    fi
+    # Bail early if nginx died unexpectedly during the wait.
+    if ! kill -0 "${NGINX_PID}" 2>/dev/null; then
+        fail "nginx master exited unexpectedly before the deadline signature appeared"
+    fi
+    sleep 0.5
+done
+
+if (( SIGNATURE_SEEN == 1 )); then
+    SIG_LINE="$(grep -E "${DEADLINE_SIGNATURE}" "${ERROR_LOG}" 2>/dev/null | head -1)"
+    pass "h3f3_periodic_deadline: PERIODIC_SEND_BUDGET signature observed during the chaos run"
+    info "  signature: ${SIG_LINE}"
+else
+    # This is the assertion the unwrapped build trips: without the deadline wrap
+    # the periodic send hangs on the 60s read timer / unbounded write and the
+    # "send timed out after ...; queuing for retry" line is never emitted.
+    fail "h3f3_periodic_deadline: PERIODIC_SEND_BUDGET signature NOT observed within ${SIGNATURE_WAIT}s (deadline wrap absent or neutralized — periodic send was awaited bare)"
+fi
 
 # ─── SIGQUIT and time the shutdown ──────────────────────────────────────────
 QUIT_START="$(date +%s.%N)"
@@ -226,4 +294,4 @@ kill "${HANG_PID}" 2>/dev/null || true
 HANG_PID=""
 
 echo ""
-pass "=== h3f3_quit_responsiveness: PASSED (quit latency ${QUIT_ELAPSED}s <= ${QUIT_CEILING}s) ==="
+pass "=== h3f3_quit_responsiveness: PASSED (deadline signature observed; quit latency ${QUIT_ELAPSED}s <= ${QUIT_CEILING}s) ==="
