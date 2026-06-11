@@ -44,6 +44,12 @@ set -euo pipefail
 
 cd /work/ngx-otel-rust
 
+# ── Provenance header (embedded in artifact by the F2 bar) ───────────────────
+# Emit the git commit hash and run date so the artifact is self-provable.
+GIT_COMMIT="$(git -C /work/ngx-otel-rust rev-parse HEAD)"
+RUN_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "[tsan-run] PROVENANCE: GIT_COMMIT=${GIT_COMMIT} DATE=${RUN_DATE}"
+
 TSAN_OBJS=/work/ngx-otel-rust/objs-tsan
 PLAIN_OBJS=/work/ngx-otel-rust/objs-tsan-plain
 
@@ -449,11 +455,24 @@ if [[ "${B1_RC}" -ne 0 ]]; then
     echo "[tsan-run] run_b1_spsc_reload_chaos.sh: NON-ZERO exit ${B1_RC}" >&2
 fi
 
+# H3F3 gate: run_chaos_quit_responsiveness.sh — discriminating periodic-send
+# deadline assertion (the h3f3_quit_responsiveness / h3f3_periodic_deadline
+# PASS lines required by the Final Gate).  Wall-clock timing (PERIODIC_SEND_BUDGET
+# is 15s real-time; TSAN's ~10x slowdown affects CPU but not wall-clock timers),
+# so the default SIGNATURE_WAIT=22s / QUIT_CEILING=25s are sufficient.
+echo ""
+echo "[tsan-run] == run_chaos_quit_responsiveness.sh under TSAN (H3F3 discriminating gate) =="
+QUITRESP_RC=0
+( bash tests/integration/run_chaos_quit_responsiveness.sh ) || QUITRESP_RC=$?
+if [[ "${QUITRESP_RC}" -ne 0 ]]; then
+    echo "[tsan-run] run_chaos_quit_responsiveness.sh: NON-ZERO exit ${QUITRESP_RC}" >&2
+fi
+
 # After all chaos scripts: fail the TSAN run if any of them failed.
 # The TSAN warning scan in step 5 is the definitive gate for races.
 # These functional failures indicate harness/timing issues, not TSAN races.
-if [[ "${KILL9_RC}" -ne 0 || "${CRASHLOOP_RC}" -ne 0 || "${DEADCOLL_RC}" -ne 0 || "${B4_RC}" -ne 0 || "${B1_RC}" -ne 0 ]]; then
-    echo "[tsan-run] NOTE: chaos/lifecycle script(s) exited non-zero (kill9=${KILL9_RC}, crashloop=${CRASHLOOP_RC}, deadcoll=${DEADCOLL_RC}, b4=${B4_RC}, b1_chaos=${B1_RC})"
+if [[ "${KILL9_RC}" -ne 0 || "${CRASHLOOP_RC}" -ne 0 || "${DEADCOLL_RC}" -ne 0 || "${B4_RC}" -ne 0 || "${B1_RC}" -ne 0 || "${QUITRESP_RC}" -ne 0 ]]; then
+    echo "[tsan-run] NOTE: chaos/lifecycle script(s) exited non-zero (kill9=${KILL9_RC}, crashloop=${CRASHLOOP_RC}, deadcoll=${DEADCOLL_RC}, b4=${B4_RC}, b1_chaos=${B1_RC}, quitresp=${QUITRESP_RC})"
     echo "[tsan-run] NOTE: these are functional/timing failures — check the TSAN warning scan for actual races."
 fi
 
@@ -480,7 +499,8 @@ for log in /tmp/ngx-otel-grpc-smoke.*/logs/error.log \
            /tmp/ngx-otel-deadcoll-c.*/logs/error.log \
            /tmp/ngx-otel-sighup-interleave.*/logs/error.log \
            /tmp/ngx-otel-b4-daemon.*/logs/error.log \
-           /tmp/ngx-otel-b1chaos.*/logs/error.log; do
+           /tmp/ngx-otel-b1chaos.*/logs/error.log \
+           /tmp/ngx-otel-quitresp.*/logs/error.log; do
     if [[ -f "${log}" ]]; then
         count=$(grep -c "WARNING: ThreadSanitizer" "${log}" 2>/dev/null || true)
         if [[ "${count}" -gt 0 ]]; then
@@ -505,8 +525,8 @@ if (( ${#FAILED_INTEGRATION[@]} > 0 )); then
     echo "[tsan-run] INTEGRATION NOTE: these scripts had functional/timing failures: ${FAILED_INTEGRATION[*]}" >&2
     OVERALL_FAILED=1
 fi
-if [[ "${KILL9_RC:-0}" -ne 0 || "${CRASHLOOP_RC:-0}" -ne 0 || "${DEADCOLL_RC:-0}" -ne 0 || "${B4_RC:-0}" -ne 0 || "${B1_RC:-0}" -ne 0 ]]; then
-    echo "[tsan-run] CHAOS NOTE: kill9=${KILL9_RC:-0} crashloop=${CRASHLOOP_RC:-0} deadcoll=${DEADCOLL_RC:-0} b4=${B4_RC:-0} b1_chaos=${B1_RC:-0} — functional/timing failure; no TSAN race." >&2
+if [[ "${KILL9_RC:-0}" -ne 0 || "${CRASHLOOP_RC:-0}" -ne 0 || "${DEADCOLL_RC:-0}" -ne 0 || "${B4_RC:-0}" -ne 0 || "${B1_RC:-0}" -ne 0 || "${QUITRESP_RC:-0}" -ne 0 ]]; then
+    echo "[tsan-run] CHAOS NOTE: kill9=${KILL9_RC:-0} crashloop=${CRASHLOOP_RC:-0} deadcoll=${DEADCOLL_RC:-0} b4=${B4_RC:-0} b1_chaos=${B1_RC:-0} quitresp=${QUITRESP_RC:-0} — functional/timing failure; no TSAN race." >&2
     OVERALL_FAILED=1
 fi
 if [[ "${OVERALL_FAILED}" -eq 1 ]]; then

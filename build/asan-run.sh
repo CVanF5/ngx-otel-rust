@@ -45,6 +45,13 @@ PLAIN_OBJS="${CRATE}/objs-asan-plain"
 RUNDIR="${ASAN_RUNDIR:-${CRATE}/tests/asan-logs-$(date -u +%Y%m%dT%H%M%SZ)}"
 mkdir -p "${RUNDIR}"
 
+# ── Provenance header (embedded in artifact by the F2 bar) ───────────────────
+# Emit the git commit hash and run date so the artifact is self-provable.
+GIT_COMMIT="$(git -C "${CRATE}" rev-parse HEAD)"
+RUN_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+log() { echo "[asan-run] $*"; }
+log "PROVENANCE: GIT_COMMIT=${GIT_COMMIT} DATE=${RUN_DATE}"
+
 # Wake-path-relevant scripts (override via ASAN_SCRIPTS):
 #   grpc_export        — production hyper/h2 persistent export (Sleep timer + h2 wake)
 #   grpc_bidi_smoke    — h2 bidi-stream connection lifecycle (honors ECHO_BINARY;
@@ -69,9 +76,9 @@ ASAN_SCRIPTS="${ASAN_SCRIPTS:-run_grpc_export.sh run_grpc_bidi_smoke.sh run_dns_
 # Set ASAN_CHAOS_SCRIPTS="" to skip chaos scripts (e.g. for a quick wake-path-only run).
 # FU4: run_b4_daemon_on_gen1.sh and run_b1_spsc_reload_chaos.sh added; both were
 # absent from the prior ASan artifact.
-ASAN_CHAOS_SCRIPTS="${ASAN_CHAOS_SCRIPTS:-run_chaos_kill9.sh run_chaos_crashloop.sh run_chaos_dead_collector.sh run_b4_daemon_on_gen1.sh run_b1_spsc_reload_chaos.sh}"
-
-log() { echo "[asan-run] $*"; }
+# H3F3 gate: run_chaos_quit_responsiveness.sh added (discriminating periodic-send
+# deadline assertion; required by the Final Gate F2 bar).
+ASAN_CHAOS_SCRIPTS="${ASAN_CHAOS_SCRIPTS:-run_chaos_kill9.sh run_chaos_crashloop.sh run_chaos_dead_collector.sh run_b4_daemon_on_gen1.sh run_b1_spsc_reload_chaos.sh run_chaos_quit_responsiveness.sh}"
 
 cd "${CRATE}"
 
@@ -249,6 +256,18 @@ if [[ -n "${ASAN_CHAOS_SCRIPTS}" ]]; then
                 if [[ "${B1_RC}" -ne 0 ]]; then
                     log "${s}: NON-ZERO exit ${B1_RC} — continuing" >&2
                     FAILED_SCRIPTS+=("${s}(rc=${B1_RC})")
+                fi
+                ;;
+            run_chaos_quit_responsiveness.sh)
+                # H3F3 gate: discriminating periodic-send deadline assertion.
+                # Wall-clock timers (PERIODIC_SEND_BUDGET = 15s real-time) are
+                # unaffected by ASan ~5x CPU overhead, so default
+                # SIGNATURE_WAIT=22s / QUIT_CEILING=25s are sufficient.
+                QUITRESP_RC=0
+                bash "tests/integration/${s}" || QUITRESP_RC=$?
+                if [[ "${QUITRESP_RC}" -ne 0 ]]; then
+                    log "${s}: NON-ZERO exit ${QUITRESP_RC} — continuing" >&2
+                    FAILED_SCRIPTS+=("${s}(rc=${QUITRESP_RC})")
                 fi
                 ;;
             *)

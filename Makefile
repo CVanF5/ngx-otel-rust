@@ -212,6 +212,9 @@ tsan-test: collector-up
 	    -v "$(CURDIR)":/work/ngx-otel-rust \
 	    -v "$(CURDIR)/../nginx":/work/nginx \
 	    -v "$(CURDIR)/../ngx-rust":/work/ngx-rust \
+	    -v ngx-otel-tsan-target:/work/ngx-otel-rust/target \
+	    -v ngx-otel-tsan-objs:/work/ngx-otel-rust/objs-tsan \
+	    -v ngx-otel-tsan-objs-plain:/work/ngx-otel-rust/objs-tsan-plain \
 	    ngx-otel-tsan:latest \
 	    bash /work/ngx-otel-rust/build/tsan-run.sh
 
