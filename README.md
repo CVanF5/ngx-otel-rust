@@ -627,6 +627,11 @@ ngx-otel-rust/
 
 ## Limitations
 
+- **At-least-once delivery on retry.**  A send failure after the collector
+  already ingested a batch causes that batch to be re-sent.  Metrics are
+  effectively idempotent (cumulative snapshots); log and span duplicates are
+  possible and require collector-side dedup.  See [Delivery semantics in
+  `TELEMETRY_MODEL.md`](TELEMETRY_MODEL.md#delivery-semantics).
 - **Gen-1 exporter is unsupervised under `daemon on`.**  With `daemon on`
   (the nginx production default) the gen-1 exporter is orphaned to init
   after the daemonize double-fork; nginx cannot see its SIGCHLD and will

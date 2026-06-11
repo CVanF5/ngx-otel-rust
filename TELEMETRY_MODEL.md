@@ -42,6 +42,40 @@ as cumulative running totals (workers bump; the exporter snapshots without
 resetting) and are emitted **Cumulative** with a fixed
 `start_time_unix_nano`, matching the `nginx.*` counters.
 
+## Delivery semantics
+
+The exporter provides **at-least-once delivery per signal per retry**. When a
+send fails — network error, connection reset, or an HTTP 5xx / gRPC non-OK
+response — the encoded batch is placed into a bounded per-signal retry queue
+(`retry_queue` / `logs_retry_queue` / `spans_retry_queue`,
+`src/export/mod.rs`) and retried in a later drain cycle. If the collector
+received and processed the first attempt but the response was lost in transit,
+the retry delivers the same batch a second time: there is no idempotency key
+or dedup token in the OTLP payload. The practical consequence differs by
+signal:
+
+- **Metrics** — all instruments are exported as cumulative snapshots with a
+  fixed `start_time_unix_nano` (`src/metric_source/instrumented.rs`,
+  `src/metric_source/stub_status.rs`; `AggregationTemporality::Cumulative`
+  throughout). A duplicate delivery is the same snapshot over the same
+  `[start_time, time)` window. OTel-aware collectors and backends can detect
+  and discard these by comparing the `{start_time_unix_nano, time_unix_nano}`
+  pair, making metric re-sends effectively idempotent at the backend.
+- **Logs and spans** — individual `LogRecord`s and spans carry no
+  deduplication key. If a batch is retried after the collector already
+  ingested it, the collector receives and stores duplicate records. Operators
+  relying on exact-once log or trace counts should configure their collector
+  pipeline with a deduplication processor (e.g. the OTel Collector's
+  `deduplicate` or a backend-native dedup on `trace_id`/`span_id`).
+
+HTTP 4xx responses are treated as **permanent rejections** and the batch is
+dropped rather than retried (`is_permanent_rejection`,
+`src/export/mod.rs`). The retry queue is bounded: when full, the oldest
+batch is evicted and counted in `ngx_otel.dropped_records`
+(`enqueue_with_eviction`, `src/export/mod.rs`). A planned evolution to
+status-aware retry with partial-success handling and back-off is described in
+`DELIVERY_OUTCOME_DESIGN.md`.
+
 ---
 
 ## HTTP server request duration (exponential histogram, µs)
