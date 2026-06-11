@@ -39,8 +39,10 @@
 // byte offsets cast to `usize` on every push/pop, and stub_status treats
 // `ngx_atomic_t` (c_ulong) as `u64`. Both assumptions break silently on
 // 32-bit targets (usize truncation after 4 GiB; c_ulong == u32 != u64).
-// Enforced below by the compile_error! guard.
-#[cfg(target_pointer_width = "32")]
+// Enforced below by the compile_error! guard. The cfg rejects ALL non-64-bit
+// targets (16-bit, 32-bit, or any exotic width), not merely the 32-bit case,
+// since the u64 assumptions only hold on a 64-bit pointer/atomic width.
+#[cfg(not(target_pointer_width = "64"))]
 compile_error!(
     "ngx-otel-rust requires a 64-bit target: 64-bit atomics are assumed \
      throughout (shm rings, stub_status)."
