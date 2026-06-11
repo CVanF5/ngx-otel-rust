@@ -55,68 +55,75 @@ Confluence proposal (link below) for the full phase plan.
 
 ## Architecture
 
-<!-- The diagram is a waterfall: requests enter top-left, telemetry exits bottom-right.
-     The two tinted bands ARE the architecture thesis — a hot path that does constant
-     lock-free work on every request, and a cold path (one dedicated process) that does
-     all wire-format work per interval, with shared memory as the only coupling between
-     them.  Plane colours: user traffic = black (thick), telemetry = #648FFF (blue),
-     control = #FFB000 (amber, dashed — the feedback half is Phase 5).
-     Cylinders = shared memory.  LAYOUT NOTES (hard-won): the exporter pipeline is ONE
-     node because mermaid ignores a subgraph's `direction` when any internal node has
-     an external edge, and cluster-level edges don't constrain dagre's ranking; the
-     flags edges point downstream (workers READ the control shm) so the macro flow
-     ranks correctly; no pure-white fills (clashes on dark backgrounds). -->
+<!-- The diagram is a pipeline read left to right: requests enter on the left,
+     telemetry exits on the right.  The two large rounded nodes ARE the architecture
+     thesis — a hot path doing constant lock-free work on every request, and a cold
+     path (one dedicated process) doing all wire-format work per interval, with shared
+     memory (cylinders) as the only coupling between them.  Temperature colours: hot
+     path = warm red (#e8590c — red-leaning on purpose, so it can't be confused with
+     the amber control plane), cold path = blue.  The two lanes between them
+     carry the two planes: telemetry (top, blue #648FFF) and control (bottom, amber
+     #FFB000, dashed — the feedback half is Phase 5); user traffic is black (thick).
+     LAYOUT NOTES (hard-won): hot/cold are NODES, not subgraphs — a band around a
+     single node renders as clutter, and mermaid ignores a subgraph's `direction`
+     when any internal node has an external edge; the flags edges point downstream
+     (workers READ the control shm) so dagre ranks the macro flow correctly; NO
+     `%%{init}%%` directive — third-party renderers (Zed's native preview, Typora)
+     ignore or choke on it and it's deprecated upstream, so node text lines are
+     kept short enough to fit mermaid's DEFAULT auto-wrap width (~200px) instead
+     (it wraps regardless of <br/> breaks); no pure-white fills (clashes on dark
+     backgrounds).  Zed's preview OVERRIDES all classDef colours with its editor
+     theme's accents (`!important` CSS injection, by design — see zed
+     crates/mermaid_render) — judge layout in Zed, but judge colours on
+     GitHub/kroki. -->
 ```mermaid
-flowchart TB
-    Client(["HTTP clients"]):::ext
+flowchart LR
+    Client(["HTTP<br/>clients"]):::ext
 
-    subgraph NGINX["NGINX — one instance"]
-        direction TB
-        subgraph Hot["Hot path — every request"]
-            Workers["Workers ×N — serve traffic<br/>REWRITE: span starts ·<br/>traceparent parsed once<br/>LOG: bump histograms ·<br/>exemplars · tail · span end<br/>lock-free · no syscalls"]:::data
-        end
-        SHM[("shared memory — the only coupling<br/>per-worker slots + rings ×N<br/>drop-newest when full · counted")]:::tel
+    subgraph NGINX
+        direction LR
+        Workers("<b>Hot path — workers ×N</b><br/>serve traffic · each request<br/>Read & raw bytes copy"):::data
+        SHM[("per-worker shared memory<br/>slots · rings ×N<br/>")]:::tel
         Ctl[("control shm<br/>flags · heartbeat")]:::ctl
-        subgraph Cold["Cold path — per interval"]
-            Exp["<b>nginx: otel exporter</b><br/>dedicated child process · owns all egress<br/>drain → process → encode → transport"]:::tel
-        end
+        Exp("<b>Cold path — otel</b><br/>dedicated worker<br/>read shm → encode<br/> → export<br/>"):::telbig
     end
 
-    Coll(["OTel collector"]):::ext
+    Coll(["OTel<br/>collector"]):::ext
 
     Client ==>|"requests"| Workers
-    Workers -->|"atomic bumps + bounded memcpy"| SHM
-    Workers -.->|"reads flags · 1 relaxed load/req"| Ctl
-    SHM -->|"drained on interval"| Exp
-    Ctl -. "flags published by exporter" .- Exp
-    Exp -->|"OTLP/HTTP · OTLP/gRPC<br/>(OTAP at Phase 5)"| Coll
-    Coll -.->|"control feedback · Phase 5"| Exp
+    Workers -->|"atomic bumps<br/>bounded memcpy"| SHM
+    Workers -.->|"1 relaxed load/req"| Ctl
+    SHM -->|"drain"| Exp
+    Ctl -. "publishes flags" .- Exp
+    Exp -->|"OTLP/HTTP · gRPC"| Coll
+    Coll -.->|"feedback · Phase 5"| Exp
 
-    classDef data fill:#e8e8e8,stroke:#333333,stroke-width:2px,color:#000000;
+    classDef data fill:#ffe3e0,stroke:#e8590c,stroke-width:2px,color:#000000;
     classDef tel fill:#d0e2ff,stroke:#648FFF,stroke-width:2px,color:#000000;
+    classDef telbig fill:#e4edff,stroke:#648FFF,stroke-width:2px,color:#000000;
     classDef ctl fill:#ffe8cc,stroke:#FFB000,stroke-width:2px,color:#000000;
     classDef ext fill:#ececec,stroke:#333333,stroke-width:2px,color:#000000;
 
-    style Hot fill:#f5f5f5,stroke:#999999,stroke-width:1px,color:#000000;
-    style Cold fill:#e4edff,stroke:#648FFF,stroke-width:1px,color:#000000;
-    style NGINX fill:transparent,stroke:#888888,stroke-width:2px;
+    style NGINX fill:transparent,stroke:#999999,stroke-width:1.5px;
 
     linkStyle 1,3,5 stroke:#648FFF,stroke-width:2px;
     linkStyle 0 stroke:#000000,stroke-width:3px;
     linkStyle 2,4,6 stroke:#FFB000,stroke-width:2px;
 ```
 
-*Read it top to bottom: requests enter at the top, telemetry leaves at the
-bottom. The two tinted bands are the design thesis — the **hot path** (grey)
+*Read it left to right: requests enter on the left, telemetry leaves on the
+right. The two large nodes are the design thesis — the **hot path** (warm red)
 does constant, lock-free work on every request and never serialises; the
 **cold path** (blue) is one dedicated process, spawned and respawned by the
 nginx master, that does all wire-format work once per interval. Shared memory
 (cylinders) is the only thing the two share: workers hold zero collector
 sockets, and when a ring fills, telemetry drops — counted — while traffic is
-untouched. Edge colours: **user traffic** black (thick) · **telemetry** blue
-`#648FFF` · **control** amber `#FFB000`, dashed — the exporter publishes flags
-that workers read with one relaxed atomic load per request; the collector-side
-feedback half of that loop is Phase 5.*
+untouched. On the hot path, REWRITE starts the span and parses any inbound
+`traceparent` once; LOG bumps histograms and writes exemplars, tail records,
+and the span end. Edge colours: **user traffic** black (thick) · **telemetry**
+blue `#648FFF` · **control** amber `#FFB000`, dashed — the exporter publishes
+flags that workers read with one relaxed atomic load per request; the
+collector-side feedback half of that loop (and OTAP transport) is Phase 5.*
 
 Instrumented metrics live in per-worker shared-memory counter slots.  A
 Log-phase handler increments them atomically, and each worker writes only
