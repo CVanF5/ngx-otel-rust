@@ -145,6 +145,38 @@ pub fn alloc_span_ctx(pool: &Pool) -> *mut SpanCtx {
     }
 }
 
+/// Allocate a `SpanCtx` as a PLAIN zeroed pool allocation, with NO pool-cleanup
+/// anchor — i.e. it is NOT redirect-survivable and `recover_span_ctx` will never
+/// re-install it after a redirect clears the module-ctx slot.
+///
+/// Used for the PRE-GATE `SpanCtx` (H3F9(f)): that ctx exists only so Gate 2's
+/// `$otel_parent_sampled` complex-value read can see the inbound flags WITHIN the
+/// same span-start handler pass.  It must never outlive a decline.  If the
+/// pre-gate path registered the cleanup anchor (as [`alloc_span_ctx`] does), a
+/// Gate-2-DECLINED request that then internally redirects would have
+/// `recover_span_ctx` walk the cleanup list, find the orphaned pre-gate anchor,
+/// and re-install the stale ctx — making `$otel_trace_id` return non-empty for a
+/// declined request.  A plain alloc has no anchor, so a declined request leaves
+/// nothing for `recover_span_ctx` to find.  The final POST-GATE [`alloc_span_ctx`]
+/// (only reached when the gate PASSES) still registers the anchor, preserving the
+/// H3F1 redirect-survival semantics for spans that are actually emitted.
+///
+/// Returns `null_mut()` on OOM (pool bump failure — extremely rare).
+///
+/// # Safety
+/// `pool` must point to the nginx request pool that outlives this call.
+#[inline]
+pub fn alloc_span_ctx_plain(pool: &Pool) -> *mut SpanCtx {
+    // SAFETY: `pool.as_ptr()` yields the live request pool pointer; `ngx_pcalloc`
+    // returns a pointer to zeroed storage of exactly `size_of::<SpanCtx>()` bytes
+    // valid for the request lifetime (or null on OOM).
+    let ctx = unsafe { nginx_sys::ngx_pcalloc(pool.as_ptr(), core::mem::size_of::<SpanCtx>()) }
+        .cast::<SpanCtx>();
+    // ngx_pcalloc already zeroes; the cast is to a freshly-zeroed SpanCtx (which is
+    // a valid all-zero bit pattern). No cleanup anchor is registered.
+    ctx
+}
+
 /// Recover the request's `SpanCtx` after an internal redirect cleared the module
 /// ctx array, mirroring the C++ module's `getOtelCtx`
 /// (`nginx-otel/src/http_module.cpp:195-212`).

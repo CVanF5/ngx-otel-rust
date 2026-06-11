@@ -37,7 +37,9 @@ use ngx::http::{
 };
 
 use crate::metric_source::location_conf::{LocationConf, TraceContextMode};
-use crate::traces::ctx::{alloc_span_ctx, gen_span_id, gen_trace_id, pool_from_request, SpanCtx};
+use crate::traces::ctx::{
+    alloc_span_ctx, alloc_span_ctx_plain, gen_span_id, gen_trace_id, pool_from_request, SpanCtx,
+};
 use crate::HttpOtelModule;
 
 /// Unit struct for the REWRITE-phase span-start handler.
@@ -191,11 +193,20 @@ impl HttpRequestHandler for SpanStartHandler {
         // Gate 2 can read `$otel_parent_sampled` from the SpanCtx.flags field.
         // `sampled` is left false (zeroed) — the full sampling decision is made
         // post-gate.  If Gate 2 declines, we clear this ctx before returning.
+        //
+        // H3F9(f): use `alloc_span_ctx_plain` (NO cleanup anchor) here, NOT
+        // `alloc_span_ctx`.  The pre-gate ctx only needs to live for Gate 2's
+        // `$otel_parent_sampled` read within this handler pass; it must NOT be
+        // redirect-survivable.  If it registered the cleanup anchor, a
+        // Gate-2-declined request that then internally redirects would have
+        // `recover_span_ctx` re-install this stale pre-gate ctx, making
+        // `$otel_trace_id` non-empty for a declined request.  Only the final
+        // post-gate alloc (gate-PASS path) registers the anchor.
         if have_traceparent {
             // SAFETY: `r_ptr` is the live `ngx_http_request_t*`; `(*r_ptr).pool`
             // is the request-scoped pool valid for the request lifetime.
             let pool = unsafe { pool_from_request(r_ptr) };
-            let pre_ctx = alloc_span_ctx(&pool);
+            let pre_ctx = alloc_span_ctx_plain(&pool);
             if pre_ctx.is_null() {
                 return Status::NGX_DECLINED; // OOM (extremely rare)
             }

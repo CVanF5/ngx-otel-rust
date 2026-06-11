@@ -137,6 +137,15 @@ curl -sf -H "traceparent: ${PROXY_TRACEPARENT}" http://127.0.0.1:9103/proxy >/de
 info "(b) GET /redir with inbound traceparent (error_page → /recover)..."
 curl -s -H "traceparent: ${REDIR_TRACEPARENT}" http://127.0.0.1:9103/redir >/dev/null || true
 
+# ─── Test (c) [H3F9(f)]: DECLINED + redirected → $otel_trace_id must be empty ─
+# Inbound traceparent (so the pre-gate SpanCtx is allocated) but Gate 2 declines
+# (otel_trace = empty header), then an internal redirect.  Capture the
+# X-Otel-Trace-Id response header emitted by /decline_recover.
+info "(c) GET /decline_redir with inbound traceparent (declined → internal redirect)..."
+DECLINE_HDRS="${PREFIX}/decline_resp_headers.txt"
+curl -s -D "${DECLINE_HDRS}" -H "traceparent: ${REDIR_TRACEPARENT}" \
+    http://127.0.0.1:9103/decline_redir >/dev/null || true
+
 info "Waiting ${FLUSH_WAIT_S}s for the exporter to flush..."
 sleep "${FLUSH_WAIT_S}"
 
@@ -222,10 +231,54 @@ else
 fi
 
 # ─── (b2) Span's parentSpanId is the genuine inbound parent ──────────────────
-if echo "${NEW_TRACES}" | grep -q "\"${REDIR_PARENT_SPAN_ID}\""; then
-    pass "(b) span parentSpanId=${REDIR_PARENT_SPAN_ID} is the genuine inbound parent (not self/phantom)"
+# H3F9(g): STRUCTURED field check (mirrors (b1)'s python) instead of a
+# grep-anywhere for the dddd… string.  A bare `grep "dddd…"` would also match
+# the id appearing in ANY other JSON field (traceId, spanId, an attribute
+# value, …) — it cannot prove the id is specifically the parentSpanId.  Walk
+# the spans for the REDIR_TRACE_ID and confirm at least one has
+# parentSpanId == REDIR_PARENT_SPAN_ID.
+REDIR_PARENT_MATCH=$(echo "${NEW_TRACES}" | python3 -c '
+import sys, json
+tid = sys.argv[1]
+want_parent = sys.argv[2]
+hit = 0
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        d = json.loads(line)
+    except Exception:
+        continue
+    for rs in d.get("resourceSpans", []):
+        for ss in rs.get("scopeSpans", []):
+            for sp in ss.get("spans", []):
+                if sp.get("traceId") == tid and sp.get("parentSpanId") == want_parent:
+                    hit = 1
+print(hit)
+' "${REDIR_TRACE_ID}" "${REDIR_PARENT_SPAN_ID}")
+if [[ "${REDIR_PARENT_MATCH}" == "1" ]]; then
+    pass "(b) span parentSpanId field == ${REDIR_PARENT_SPAN_ID} (genuine inbound parent, structured check)"
 else
-    fail "(b) parentSpanId ${REDIR_PARENT_SPAN_ID} NOT found — span lost its parent across redirect"
+    fail "(b) no span for trace ${REDIR_TRACE_ID} has parentSpanId field == ${REDIR_PARENT_SPAN_ID} — span lost its parent across redirect (or id only appears in a non-parentSpanId field)"
+fi
+
+# ─── (c) [H3F9(f)] DECLINED + redirected request → $otel_trace_id EMPTY ──────
+# The X-Otel-Trace-Id response header from /decline_recover must be empty:
+# a Gate-2-declined request must NOT recover a stale pre-gate SpanCtx after an
+# internal redirect.  `add_header ... always` emits the header even with an
+# empty value, so we assert the header value is empty (not that the header is
+# absent).
+DECLINE_TID=""
+if [[ -f "${DECLINE_HDRS}" ]]; then
+    # Extract the header value (strip name, CR, surrounding whitespace).
+    DECLINE_TID=$(grep -i '^X-Otel-Trace-Id:' "${DECLINE_HDRS}" \
+        | sed -e 's/^[^:]*:[[:space:]]*//' -e 's/[[:space:]]*$//' | tr -d '\r')
+fi
+if [[ -z "${DECLINE_TID}" ]]; then
+    pass "(c) declined+redirected request → \$otel_trace_id is EMPTY (no stale pre-gate ctx recovered)"
+else
+    fail "(c) declined+redirected request leaked \$otel_trace_id='${DECLINE_TID}' — stale pre-gate cleanup anchor recovered (H3F9(f) regression)"
 fi
 
 echo ""
