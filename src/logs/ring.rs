@@ -162,6 +162,8 @@ impl LogsWorkerRing {
 
         let base = self.payload_ptr();
         let len_bytes = (record_len as u32).to_be_bytes();
+        // `write_off as usize`: safe on 64-bit targets (usize == u64); 32-bit
+        // targets are rejected by the compile_error! guard in lib.rs.
         write_wrap(base, cap, write_off as usize, &len_bytes);
         write_wrap(base, cap, write_off as usize + 4, record);
 
@@ -192,6 +194,8 @@ impl LogsWorkerRing {
 
         let base = self.payload_ptr();
         let mut len_buf = [0u8; 4];
+        // `read_off as usize`: safe on 64-bit targets (usize == u64); 32-bit
+        // targets are rejected by the compile_error! guard in lib.rs.
         read_wrap(base, cap, read_off as usize, &mut len_buf);
         let record_len = u32::from_be_bytes(len_buf) as usize;
 

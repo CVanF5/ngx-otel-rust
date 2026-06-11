@@ -99,9 +99,10 @@ unsafe fn read_stats() -> (u64, u64, u64, u64, u64, u64, u64) {
         ($ptr:expr) => {
             // ngx_stat_* is a *mut ngx_atomic_t (= *mut c_ulong).
             // We treat the underlying memory as an AtomicU64.
-            // TODO(portability): ngx_atomic_t is c_ulong-wide. This alias is correct
-            // on 64-bit Linux/macOS where c_ulong == u64, but breaks on 32-bit
-            // platforms where c_ulong == u32. Revisit before declaring v1.0 portable.
+            // ngx_atomic_t is c_ulong-wide. This alias is correct on 64-bit
+            // Linux/macOS where c_ulong == u64, but would break on 32-bit platforms
+            // where c_ulong == u32. 32-bit targets are rejected at compile time by
+            // the compile_error! guard in lib.rs.
             // SAFETY: `$ptr` is one of nginx's `ngx_stat_*` globals (a non-null
             // `*mut ngx_atomic_t`), allocated and zero-initialised by nginx at
             // startup before any worker runs (the `read_stats` fn contract requires

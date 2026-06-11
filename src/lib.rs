@@ -35,6 +35,17 @@
 //! proves this claim statistically.
 
 #![no_std]
+// Require a 64-bit target: the shm rings use monotonically-increasing u64
+// byte offsets cast to `usize` on every push/pop, and stub_status treats
+// `ngx_atomic_t` (c_ulong) as `u64`. Both assumptions break silently on
+// 32-bit targets (usize truncation after 4 GiB; c_ulong == u32 != u64).
+// Enforced below by the compile_error! guard.
+#[cfg(target_pointer_width = "32")]
+compile_error!(
+    "ngx-otel-rust requires a 64-bit target: 64-bit atomics are assumed \
+     throughout (shm rings, stub_status)."
+);
+
 // Pull all `std` macros (format!, vec!, assert!, etc.) into global scope.
 // The crate is no_std but links to std, so this is safe — it only affects
 // name resolution, not the binary.  Required because generated tonic client
