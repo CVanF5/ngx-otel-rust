@@ -2464,10 +2464,13 @@ mod tests {
         unsafe {
             let hdr1 = base.add(off1).cast::<LogsWorkerRingHeader>();
             (*hdr1).cap.store(0, Ordering::Relaxed);
-            // read_offset and write_offset are already 0 (zero-init); set
-            // explicitly to make the initial state unambiguous.
-            (*hdr1).read_offset.store(0, Ordering::Relaxed);
-            (*hdr1).write_offset.store(0, Ordering::Relaxed);
+            // Set NON-ZERO sentinel offsets so step (5) can detect a re-zeroing
+            // regression: the reload path must stamp cap only and leave the
+            // surviving-generation offsets untouched. Asserting `== 0` after
+            // setting `0` could not catch a stray offset store in the reload
+            // path; asserting these sentinels are PRESERVED can.
+            (*hdr1).read_offset.store(7, Ordering::Relaxed);
+            (*hdr1).write_offset.store(13, Ordering::Relaxed);
         }
         // SAFETY: off1 = slot_sz < n_slots * slot_sz ≤ zone_sz - data_off.
         let cap_check =
@@ -2487,8 +2490,10 @@ mod tests {
             unsafe { (*base.add(off1).cast::<LogsWorkerRingHeader>()).cap.load(Ordering::Relaxed) };
         assert_eq!(cap1, CAP as u64, "H2F3: spans reload must stamp cap on new worker slot");
 
-        // ── (5) Assert read_offset / write_offset untouched ─────────────────────
-        // The reload path stamps cap only; offsets survive from the old generation.
+        // ── (5) Assert read_offset / write_offset PRESERVED ─────────────────────
+        // The reload path stamps cap only; offsets survive from the old
+        // generation. Step (2) seeded non-zero sentinels (7/13); a stray offset
+        // store in the reload path would clobber them — assert they are preserved.
         // SAFETY: same bounds as step (2).
         let ro = unsafe {
             (*base.add(off1).cast::<LogsWorkerRingHeader>()).read_offset.load(Ordering::Relaxed)
@@ -2497,8 +2502,8 @@ mod tests {
         let wo = unsafe {
             (*base.add(off1).cast::<LogsWorkerRingHeader>()).write_offset.load(Ordering::Relaxed)
         };
-        assert_eq!(ro, 0, "H2F3: spans reload must not touch read_offset");
-        assert_eq!(wo, 0, "H2F3: spans reload must not touch write_offset");
+        assert_eq!(ro, 7, "H2F3: spans reload must not touch read_offset (sentinel preserved)");
+        assert_eq!(wo, 13, "H2F3: spans reload must not touch write_offset (sentinel preserved)");
 
         // SAFETY: base points into zone_mem; slot 0 header is at offset 0.
         let cap0 = unsafe { (*base.cast::<LogsWorkerRingHeader>()).cap.load(Ordering::Relaxed) };

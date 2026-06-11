@@ -443,6 +443,30 @@ impl MetricSource for SelfMetricsSource {
 /// Takes `&'static MainConfig` because the loop task outlives the spawn call;
 /// NGINX allocates MainConfig from the cycle pool which has exporter lifetime.
 ///
+/// H2F5: decide which per-signal endpoint directives are silently ignored under
+/// gRPC transport (path routing is not applicable to gRPC). Returns the signal
+/// names (in metrics/logs/traces order) whose endpoint field is non-empty — the
+/// caller logs one WARN per returned name. Extracted so the predicate is unit-
+/// testable without a live exporter loop (the production `export_loop` calls this
+/// exact function; see `grpc_ignored_endpoint_names_predicate`).
+fn grpc_ignored_endpoint_names(
+    metrics: &nginx_sys::ngx_str_t,
+    logs: &nginx_sys::ngx_str_t,
+    traces: &nginx_sys::ngx_str_t,
+) -> std::vec::Vec<&'static str> {
+    let mut names = std::vec::Vec::new();
+    if !metrics.is_empty() {
+        names.push("metrics");
+    }
+    if !logs.is_empty() {
+        names.push("logs");
+    }
+    if !traces.is_empty() {
+        names.push("traces");
+    }
+    names
+}
+
 /// When `ngx_quit` is detected, runs [`graceful_drain`], sets
 /// [`EXPORT_LOOP_DONE`], and returns. The exporter cycle polls
 /// `EXPORT_LOOP_DONE` before calling `process::exit`.
@@ -537,20 +561,19 @@ pub async fn export_loop(amcf: &'static MainConfig) {
     // ignored.  Warn once at exporter startup so the operator knows the config
     // has no effect.
     if let ExportTransport::Grpc(_) = transport {
-        let warn_if_set = |field: &nginx_sys::ngx_str_t, name: &str| {
-            if !field.is_empty() {
-                ngx::ngx_log_error!(
-                    NGX_LOG_WARN,
-                    log.as_ptr(),
-                    "otel export: {}_endpoint ignored under grpc transport \
-                     (path routing is not applicable)",
-                    name
-                );
-            }
-        };
-        warn_if_set(&amcf.exporter.metrics_endpoint, "metrics");
-        warn_if_set(&amcf.exporter.logs_endpoint, "logs");
-        warn_if_set(&amcf.exporter.traces_endpoint, "traces");
+        for name in grpc_ignored_endpoint_names(
+            &amcf.exporter.metrics_endpoint,
+            &amcf.exporter.logs_endpoint,
+            &amcf.exporter.traces_endpoint,
+        ) {
+            ngx::ngx_log_error!(
+                NGX_LOG_WARN,
+                log.as_ptr(),
+                "otel export: {}_endpoint ignored under grpc transport \
+                 (path routing is not applicable)",
+                name
+            );
+        }
     }
     if let ExportTransport::Http(ref mut t) = transport {
         let me = &amcf.exporter.metrics_endpoint;
@@ -2993,6 +3016,51 @@ mod tests {
         }
     }
 
+    /// H2F5: the gRPC per-signal-endpoint warn predicate (the PRODUCTION
+    /// `grpc_ignored_endpoint_names` fn that `export_loop` calls) returns exactly
+    /// the names whose endpoint field is non-empty, in metrics/logs/traces order.
+    /// Mutation evidence (commit msg): break the predicate (e.g. invert one
+    /// `!field.is_empty()` to `field.is_empty()`) → this test FAILS → restore → PASSES.
+    #[test]
+    fn grpc_ignored_endpoint_names_predicate() {
+        use nginx_sys::ngx_str_t;
+
+        // Construct ngx_str_t values: empty == { len: 0, data: null }; set ==
+        // pointing at a static byte string. Safety: bytes are 'static; the
+        // ngx_str_t values only live for this test and the fn only reads `len`.
+        let set_bytes = b"/v1/custom";
+        let set = || ngx_str_t { len: set_bytes.len(), data: set_bytes.as_ptr().cast_mut() };
+        let empty = || ngx_str_t { len: 0, data: core::ptr::null_mut() };
+
+        // All empty → no warnings.
+        assert_eq!(
+            super::grpc_ignored_endpoint_names(&empty(), &empty(), &empty()),
+            std::vec::Vec::<&str>::new(),
+            "no endpoint set → no warning"
+        );
+
+        // Only logs set → exactly "logs".
+        assert_eq!(
+            super::grpc_ignored_endpoint_names(&empty(), &set(), &empty()),
+            std::vec!["logs"],
+            "only logs_endpoint set → warn for logs only"
+        );
+
+        // All set → all three, in metrics/logs/traces order.
+        assert_eq!(
+            super::grpc_ignored_endpoint_names(&set(), &set(), &set()),
+            std::vec!["metrics", "logs", "traces"],
+            "all set → warn for all three in order"
+        );
+
+        // metrics + traces set, logs empty → preserves order, skips logs.
+        assert_eq!(
+            super::grpc_ignored_endpoint_names(&set(), &empty(), &set()),
+            std::vec!["metrics", "traces"],
+            "metrics+traces set, logs empty → warn for metrics, traces"
+        );
+    }
+
     /// (d) An operator-supplied `service.instance.id` is NOT overridden.
     #[test]
     fn operator_service_instance_id_is_not_overridden() {
@@ -3562,7 +3630,6 @@ mod tests {
         }
     }
 
-    /// H2F4 regression: a permanently-rejected batch (4xx HTTP status) must be
     /// Mock `RetrySend` that always returns an HTTP error with a fixed status code.
     /// Used exclusively to drive `drain_retry_queue_once` in unit tests without
     /// a real nginx transport.

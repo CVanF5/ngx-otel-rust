@@ -615,9 +615,8 @@ ngx-otel-rust/
 │   ├── metric_source/     # MetricSource trait + StubStatusSource + InstrumentedSource
 │   ├── encoder/           # Encoder trait + OTLP/HTTP protobuf encoder
 │   ├── transport/         # Transport trait; hyper_http.rs (OTLP/HTTP async),
-│   │                      # sync_http.rs (exit_process flush), grpc/ (OTLP/gRPC unary
-│   │                      # production transport + bidi smoke harnesses on a
-│   │                      # runtime-less h2 executor)
+│   │                      # grpc/ (OTLP/gRPC unary production transport + bidi
+│   │                      # smoke harnesses on a runtime-less h2 executor)
 │   ├── exporter/          # dedicated "nginx: otel exporter" process: control_shm
 │   │                      # (flags + heartbeat), worker->exporter channel, supervisor
 │   └── export/            # export loop, graceful drain, retry buffer,
