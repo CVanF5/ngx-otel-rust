@@ -1,0 +1,44 @@
+C3 executed mutation-cycle evidence — ServingCertSource registration disable
+Date: 2026-06-12  Host: debian-vm (Linux build/verification platform)
+GIT_COMMIT (HEAD at time of run): f53bbdf7b918c462964b8b03bcfdac5e0c5136bc
+
+Mutation: src/export/mod.rs line 2140 commented out:
+  -    metrics.extend(ServingCertSource { certs: &amcf.cert_table }.collect());
+  +    // MUTATION-C3: metrics.extend(ServingCertSource { certs: &amcf.cert_table }.collect());
+Rebuild command (both halves): NGINX_SOURCE_DIR=$HOME/project-nginx-otel/nginx NGINX_BUILD_DIR=$HOME/project-nginx-otel/ngx-otel-rust/objs-release cargo build --release
+Test command (both halves): NGINX_BINARY=$PWD/objs-release/nginx tests/integration/run_c3_cert_metrics.sh
+Module artifact: target/release/libngx_http_otel_module.so
+
+================ HALF 1: MUTATED (must FAIL) ================
+Baseline (pre-mutation) module:
+  sha256: dcf99f623ef1cc8bb45d2071362c718649407e3a4eac46f9ba8be712afe4539d
+  mtime:  2026-06-12 13:41:27.294485293 +0100
+Mutated module (rebuilt, rc=0, hash CHANGED from baseline):
+  sha256: daae5bd83da1ed0434b80f52ca05439e31d5090314ad8a6dab0cd50b45db1054
+  mtime:  2026-06-12 13:49:07.223732176 +0100
+Integration run: rc=2 (FAILED as required). FAIL lines:
+  [FAIL] (1) cert a not_after: expected ngx_otel.tls.certificate.not_after=1893456000 for /tmp/ngx-otel-c3-cert.EinIYd/certs/a.crt, got ''
+
+================ HALF 2: RESTORED (must PASS) ================
+Restore: git checkout -- src/export/mod.rs (tree clean); rebuild rc=0.
+Restored module (hash DIFFERS from mutated; identical to baseline — deterministic build):
+  sha256: dcf99f623ef1cc8bb45d2071362c718649407e3a4eac46f9ba8be712afe4539d
+  mtime:  2026-06-12 13:50:11.602907812 +0100
+Integration run: rc=0 (PASSED). Assertion lines:
+  [PASS] (1) cert a not_after: ngx_otel.tls.certificate.not_after = 1893456000 exact (every flush)
+  [PASS] (1) cert a not_before: ngx_otel.tls.certificate.not_before = 1781268634 exact (every flush)
+  [PASS] (1) dual rsa not_after: ngx_otel.tls.certificate.not_after = 1924992000 exact (every flush)
+  [PASS] (1) dual ecdsa not_after: ngx_otel.tls.certificate.not_after = 1956528000 exact (every flush)
+  [PASS] (2) time_to_expiration 112187361 ≈ not_after − now (112187360, |Δ|=1s ≤ 300s)
+  [PASS] (3) dual RSA+ECDSA block: 2 series per metric in a single flush
+  [PASS] (4) attribute set EXACTLY the 7 scope-guard keys on all 45 points
+  [PASS] (6) reload: swapped cert exported (not_after=2051222400, CN=cert-a2.example.test on the same point)
+  [PASS] (5) Agent name nginx.certificate.time_to_expiration ABSENT from collector output
+  [PASS] (7) no-ssl binary: export proven (export_interval present), cert series ABSENT
+  [PASS] C3 cert-metrics integration: ALL assertions passed (1)-(7)
+
+Conclusion: removing the ServingCertSource registration makes all three
+ngx_otel.tls.certificate.* series vanish at the collector and the C3
+integration script fails immediately at assertion (1); restoring the
+registration returns the full (1)-(7) PASS set. The test is sensitive to
+the registration line; the mutation cycle was EXECUTED, not narrated.
