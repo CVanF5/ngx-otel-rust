@@ -1,0 +1,127 @@
+B4-FU2 heartbeat-stale detection — EXECUTED mutation cycle
+==========================================================
+Date:        2026-06-12
+Host:        debian-vm (Linux verification platform)
+Local HEAD at run time (git rev-parse HEAD, embedded from the run logs):
+             95e8554479e814934d58731f1cebcc800bd32706
+Test:        tests/integration/run_b4_heartbeat_stale.sh (both polarities)
+Artifact under test: target/release/libngx_http_otel_module.so
+             (loaded via load_module by ~/objs-release/nginx; rebuilt with
+             cargo build --release --features test-support DIRECTLY before
+             each half; mtime + sha256 recorded below, and the two halves
+             hash DIFFERENTLY — the test demonstrably loaded each build)
+
+Mutation:    invert the core staleness predicate in src/liveness.rs:89
+             heartbeat_is_stale: '... > HEARTBEAT_STALE_THRESHOLD_MS'
+                              -> '... <= HEARTBEAT_STALE_THRESHOLD_MS'
+             Effect: a FRESH beat reads as stale (saturation polarity must
+             false-alert -> A3 FAIL) and a stale beat reads as fresh
+             (death polarity would never alert).
+
+Note on MUT-RC/RESTORE-RC lines: $? was expanded by the outer launch shell
+(quoting artifact), so those lines always read 0. The authoritative
+evidence is the [PASS]/[FAIL] assertion lines and the presence/absence of
+the final ALL-assertions-passed line.
+
+──────────────────────────────────────────────────────────────────────
+HALF 1 — MUTATED BUILD → TEST FAILS (full log, colors stripped)
+──────────────────────────────────────────────────────────────────────
+=== MUTATION HALF: invert heartbeat_is_stale predicate ===
+95e8554479e814934d58731f1cebcc800bd32706
+89:    last_beat_msec != 0 && now_msec.saturating_sub(last_beat_msec) <= HEARTBEAT_STALE_THRESHOLD_MS
+warning: `ngx-otel-rust` (lib) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 8.19s
+--- artifact under test ---
+mtime=2026-06-12 10:08:23.993372427 +0100 size=2437960
+75d257a942dfdcb30593c04788da593f741571cc569c3e91a7b645de2ca442f4  target/release/libngx_http_otel_module.so
+[INFO] nginx binary: /home/cvandesande/objs-release/nginx
+[INFO] Building release module with --features test-support...
+warning: `ngx-otel-rust` (lib) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.03s
+[INFO] Module: /home/cvandesande/project-nginx-otel/ngx-otel-rust/target/release/libngx_http_otel_module.so
+[INFO] === Phase A: saturation polarity (exporter alive, ring saturated) ===
+[PASS] A1: heartbeat advances while alive (236759735 → 236761736)
+[INFO] A2: driving 404 bursts for 12s (60/burst against a 1k ring)...
+[PASS] A2: ring-full drops occurred while exporter alive (access_dropped 0 → 496)
+2026/06/12 10:08:30 [alert] 1112614#0: *22 otel exporter heartbeat stale (no beat for >5000ms); telemetry suspended; nginx -s reload restores while logging request, client: 127.0.0.1, server: , request: "GET /missing HTTP/1.1", host: "127.0.0.1:9221"
+[FAIL] A3: 1 false-positive alert(s) while the exporter was alive
+MUT-RC=0
+MUT-DONE
+
+──────────────────────────────────────────────────────────────────────
+HALF 2 — RESTORED BUILD → TEST PASSES (+ heartbeat regression)
+──────────────────────────────────────────────────────────────────────
+=== RESTORE HALF: git checkout src/liveness.rs ===
+?? .claude/
+?? tests/asan-logs-20260609T212855Z/
+?? tests/bench/results/run-2026-05-28T20-32-04.json
+?? tests/bench/results/run-2026-05-28T20-52-56.json
+?? tests/bench/results/run-2026-05-29T18-19-11.json
+?? tests/bench/results/run-2026-05-29T18-53-00.json
+95e8554479e814934d58731f1cebcc800bd32706
+89:    last_beat_msec != 0 && now_msec.saturating_sub(last_beat_msec) > HEARTBEAT_STALE_THRESHOLD_MS
+warning: `ngx-otel-rust` (lib) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 8.12s
+--- artifact under test ---
+mtime=2026-06-12 10:09:40.968946328 +0100 size=2437960
+fd00a89af7c828274072a216fc38dba3728f181c232f21797863b87e72b76d7d  target/release/libngx_http_otel_module.so
+[INFO] nginx binary: /home/cvandesande/objs-release/nginx
+[INFO] Building release module with --features test-support...
+warning: `ngx-otel-rust` (lib) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.03s
+[INFO] Module: /home/cvandesande/project-nginx-otel/ngx-otel-rust/target/release/libngx_http_otel_module.so
+[INFO] === Phase A: saturation polarity (exporter alive, ring saturated) ===
+[PASS] A1: heartbeat advances while alive (236836695 → 236838697)
+[INFO] A2: driving 404 bursts for 12s (60/burst against a 1k ring)...
+[PASS] A2: ring-full drops occurred while exporter alive (access_dropped 0 → 499)
+[PASS] A3: ZERO heartbeat-stale alerts under saturation (drops=499)
+[INFO] === Phase B: death polarity (daemon on, gen-1 exporter, kill -9) ===
+[INFO] Master PID: 1114391
+[PASS] B1: gen-1 exporter PID=1114390 beating (236847533 → 236849535)
+[INFO] B2: kill -9 exporter PID 1114390 (no reload)...
+[PASS] B2: exporter dead, no respawn, heartbeat frozen at 236849535
+[INFO] B3: waiting 3s for staleness threshold...
+[PASS] B3: ALERT within 0s of drop traffic (8s after kill): *21 otel exporter heartbeat stale (no beat for >5000ms); telemetry suspended; nginx -s reload restores while logging request, client: 127.0.0.1, server: , request: "GET /missing HTTP/1.1", host: "127.0.0.1:9222"
+[INFO] B4: continuing drop traffic for 8s (latch check)...
+[PASS] B4: exactly ONE alert after sustained post-death drops (latched; worker_processes=1)
+[INFO] B5: nginx -s reload (remedy from the alert text)...
+[INFO] B5: driving drop traffic for 10s against the live gen-2...
+[PASS] B5: reload restored telemetry; re-armed latch did NOT false-fire (still 1 alert)
+
+[PASS] ALL B4 heartbeat-stale assertions passed (saturation: 0 alerts; death: 1 latched alert; reload remedy clean)
+RESTORE-RC=0
+=== HEARTBEAT REGRESSION ===
+[INFO] nginx binary: /home/cvandesande/objs-release/nginx
+[INFO] Building release module with --features test-support...
+warning: function `set_inject_seed_failure` is never used
+   --> src/traces/ctx.rs:307:15
+    |
+307 | pub(crate) fn set_inject_seed_failure(on: bool) {
+    |               ^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `ngx-otel-rust` (lib) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.04s
+[INFO] Module built: /home/cvandesande/project-nginx-otel/ngx-otel-rust/target/release/libngx_http_otel_module.so
+[INFO] nginx started (PID 1116359)
+[INFO] Reading V_INITIAL from http://127.0.0.1:9201/otel_status...
+[INFO] V_INITIAL = 2
+[INFO] Sleeping 5s (metric_interval=1s, expect ≥4 heartbeats)...
+[INFO] Reading V_AFTER from http://127.0.0.1:9201/otel_status...
+[INFO] V_AFTER  = 6
+[PASS] Heartbeat incremented: V_INITIAL=2 → V_AFTER=6 (delta=4)
+[PASS] Production .so does NOT contain 'otel_status_endpoint' (cfg gate holds)
+
+[PASS] === Heartbeat integration test passed ===
+HB-RC=0
+RESTORE-DONE
+
+Summary
+-------
+Mutated  sha256: 75d257a942dfdcb30593c04788da593f741571cc569c3e91a7b645de2ca442f4 (mtime 10:08:23)
+Restored sha256: fd00a89af7c828274072a216fc38dba3728f181c232f21797863b87e72b76d7d (mtime 10:09:40)
+Mutated:  A1 PASS, A2 PASS (496 drops), A3 FAIL — 1 false-positive ALERT while alive.
+Restored: A1-A3, B1-B5 ALL PASS (499 drops alive/0 alerts; kill -9 -> beats frozen ->
+          1 latched ALERT 8s after kill; latch holds under sustained drops; reload
+          remedy resumes beats with no false fire) + run_exporter_heartbeat.sh PASS.
