@@ -149,6 +149,44 @@ See LIFECYCLE.md §"Known limitation: gen-1 exporter under daemon on".
 The ALERT appears in `error.log` during every cold start with `daemon on` until
 a reload has been performed.
 
+### Runtime detection: heartbeat-stale ALERT (B4 follow-up 2)
+
+The startup ALERT above warns about the *possibility*; a second, runtime
+detector reports the *event* — a silent exporter death (the unsupervised gen-1
+dying, an exporter wedged by `SIGSTOP`, or a crash-loop self-disable) — through
+the only channel that still works when the exporter is dead: the worker error
+log.
+
+Mechanism (`src/liveness.rs`):
+
+* The exporter stamps its monotonic clock (`ngx_current_msec`,
+  `CLOCK_MONOTONIC` basis) into the control shm zone
+  (`ControlShm::last_beat_msec`) every **1 s**, from a dedicated self-rearming
+  `ngx_event_t` timer that is independent of drain/send progress — a stalled
+  send to a blackholed collector does not delay beats.
+* Workers check the beat **only on the ring-full drop path** (span or
+  access-tail push returning "full" — an already-counted symptom path). There
+  is no per-request check and zero added cost in healthy operation.
+* The drop is the trigger, the heartbeat is the verdict: drops with a fresh
+  beat are normal saturation (the exporter keeps exporting
+  `*.dropped_records`) and never alert. Only a beat older than **5 s**
+  (5 beat periods — derived from the beat period, not from
+  `otel_metric_interval`) produces:
+
+```
+[alert] ... otel exporter heartbeat stale (no beat for >5000ms);
+telemetry suspended; nginx -s reload restores
+```
+
+* The ALERT is **latched: one line per worker per exporter generation**.
+  A SIGHUP reload starts a new generation (and a fresh, supervised exporter),
+  which re-arms the latch.
+
+Note: detection requires drop traffic on a ring (spans enabled or
+`otel_access_log_sample` set, plus requests that push records). A fully idle
+nginx with a dead exporter stays silent until telemetry pressure appears —
+by design, the check lives on the symptom path only.
+
 ### Remedy
 
 Run `nginx -s reload` once after startup.  The reload causes the long-lived
@@ -194,6 +232,7 @@ introduced this section.
 | `run_chaos_crashloop.sh` | Repeated startup abort (test-support feature) | backoff fires; self-disable after 5; ALERT logged; master + workers unaffected |
 | `run_chaos_dead_collector.sh` | SIGQUIT/SIGHUP with unreachable collector | SIGQUIT ≤ 20 s; no orphan; reload zeroes crash counter |
 | `run_b4_daemon_on_gen1.sh` | `daemon on` gen-1 orphan + reload remedy | ALERT logged; kill-9 gen-1 → no respawn; reload → gen-2 PPID=master; kill-9 gen-2 → respawn |
+| `run_b4_heartbeat_stale.sh` | Heartbeat-stale alert, both polarities | alive+saturated (drops verified) → 0 alerts; daemon-on gen-1 kill-9 → beats freeze → exactly 1 latched ALERT; reload remedy → beats resume, no false fire |
 
 All three scripts pass on macOS (dev) and debian-vm (Linux, CI). Socket
 isolation is verified definitively on Linux via `/proc/<pid>/net/tcp`; on macOS
