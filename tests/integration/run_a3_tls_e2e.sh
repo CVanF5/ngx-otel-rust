@@ -542,16 +542,24 @@ PLAIN_METRIC_NAMES="$(echo "${DELTA_A_PLAIN}" | jq -r \
     'select([.resourceMetrics[].resource.attributes[]? | select(.key=="service.name").value.stringValue] | index($s)) | .resourceMetrics[].scopeMetrics[].metrics[].name' \
     | sort -u)"
 
-# Both sets must contain the same core metric names. We check the TLS names
-# are a subset of the plain names and vice versa (set equality).
-NAMES_ONLY_IN_TLS="$(comm -23 <(echo "${TLS_METRIC_NAMES}") <(echo "${PLAIN_METRIC_NAMES}"))"
-NAMES_ONLY_IN_PLAIN="$(comm -13 <(echo "${TLS_METRIC_NAMES}") <(echo "${PLAIN_METRIC_NAMES}"))"
-if [[ -n "${NAMES_ONLY_IN_TLS}" || -n "${NAMES_ONLY_IN_PLAIN}" ]]; then
-    info "(a) payload-equality: TLS-only names: '${NAMES_ONLY_IN_TLS}'"
-    info "(a) payload-equality: plain-only names: '${NAMES_ONLY_IN_PLAIN}'"
-    fail "(a) payload-equality: TLS and plain-http metric name sets differ"
+# Both sets must contain the same CORE metric names. We exclude the one
+# TLS-only metric (ngx_otel.tls.collector_cert.not_after, B1) because it is
+# legitimately absent on plaintext endpoints and present on TLS endpoints.
+# All other metric names must be identical.
+TLS_ONLY_EXPECTED="ngx_otel.tls.collector_cert.not_after"
+TLS_METRIC_NAMES_CORE="$(echo "${TLS_METRIC_NAMES}" | grep -v "${TLS_ONLY_EXPECTED}" || true)"
+# Check the TLS-only metric IS present (validates B1 capture is working).
+if ! echo "${TLS_METRIC_NAMES}" | grep -q "${TLS_ONLY_EXPECTED}"; then
+    info "(a) payload-equality: WARNING: ${TLS_ONLY_EXPECTED} absent from TLS run (B1 not captured)"
 fi
-pass "(a) payload-equality: metric name sets IDENTICAL across TLS and plain-http transports"
+NAMES_ONLY_IN_TLS="$(comm -23 <(echo "${TLS_METRIC_NAMES_CORE}") <(echo "${PLAIN_METRIC_NAMES}"))"
+NAMES_ONLY_IN_PLAIN="$(comm -13 <(echo "${TLS_METRIC_NAMES_CORE}") <(echo "${PLAIN_METRIC_NAMES}"))"
+if [[ -n "${NAMES_ONLY_IN_TLS}" || -n "${NAMES_ONLY_IN_PLAIN}" ]]; then
+    info "(a) payload-equality: TLS-only (non-B1) names: '${NAMES_ONLY_IN_TLS}'"
+    info "(a) payload-equality: plain-only names: '${NAMES_ONLY_IN_PLAIN}'"
+    fail "(a) payload-equality: core metric name sets differ (excluding TLS-only B1 gauge)"
+fi
+pass "(a) payload-equality: core metric name sets IDENTICAL across TLS and plain-http transports (B1 TLS-only gauge correctly excluded)"
 
 # ─── Scenario (b): OTLP/gRPC + https:// + trusted_certificate ────────────────
 

@@ -1,0 +1,29 @@
+B1 Collector-Cert Gauge — Mutation Evidence
+==============================================
+Date: 2026-06-12T19:38:38Z
+Platform: macOS (darwin aarch64, make unittest)
+GIT_COMMIT: 61579e7494f720e2316689d54227d5767be25087
+
+Mutation target: src/transport/tls.rs, poll_handshake B1 capture block.
+Test: transport::tls::tests::successful_handshake_captures_cert_not_after
+
+── BREAK ──────────────────────────────────────────────────────────────────────
+Mutation applied: replaced SSL_get1_peer_certificate(self.ssl) call with a
+null pointer (null_mut()), so the if !cert.is_null() block never executes and
+COLLECTOR_CERT_NOT_AFTER stays at 0 after the handshake.
+
+Result:
+  test transport::tls::tests::successful_handshake_captures_cert_not_after ... FAILED
+  thread panicked at src/transport/tls_tests.rs:541:5 (assert_ne! on 0)
+  test result: FAILED. 246 passed; 1 failed; 1 ignored
+
+── RESTORE ────────────────────────────────────────────────────────────────────
+Mutation reverted: SSL_get1_peer_certificate(self.ssl) restored.
+
+Result:
+  test transport::tls::tests::successful_handshake_captures_cert_not_after ... ok
+  test result: ok. 247 passed; 0 failed; 1 ignored
+
+── VERDICT ────────────────────────────────────────────────────────────────────
+Both halves executed. The test catches the mutation (real fail→pass confirmed).
+Mutation evidence is VALID per the F2 bar (executed, not narrated).
