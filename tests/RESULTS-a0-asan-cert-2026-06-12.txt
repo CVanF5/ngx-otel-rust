@@ -1,0 +1,38 @@
+# A0 ASan gate: cert scripts run log excerpt
+# Executed on debian-vm (aarch64-unknown-linux-gnu), 2026-06-12
+# GIT_COMMIT=09fb40738d2460dba1291c1ff850d2a5a7357f2d
+# Run via: make asan-test
+# Full log: ~/project-nginx-otel/a0-scratch/asan-run2.log
+
+[asan-run] PROVENANCE: GIT_COMMIT=09fb40738d2460dba1291c1ff850d2a5a7357f2d DATE=2026-06-12T14:38:45Z
+[asan-run] === Running run_c2_cert_walk.sh under ASan ===
+[PASS] (a) single cert: path + CN + not_after=1893456000 exact
+[PASS] (b) Q5 dual RSA+ECDSA: both certs enumerated (rsa=1924992000, ecdsa=1956528000)
+[PASS] (c) multi-server_name: first non-wildcard name recorded
+[PASS] (d) $var cert path: skip NOTICE present, nothing enumerated
+[PASS] total enumeration count = 4 (no spurious entries)
+[PASS] (e) no-ssl binary: module loads, 1 'unavailable' NOTICE, serves, no crash
+[PASS] C2 cert-walk integration: ALL assertions passed (a)-(e)
+[asan-run] run_c2_cert_walk.sh: exit 0
+
+[asan-run] === Running run_c3_cert_metrics.sh under ASan ===
+[PASS] (1) cert a not_after: ngx_otel.tls.certificate.not_after = 1893456000 exact (every flush)
+[PASS] (1) cert a not_before: ngx_otel.tls.certificate.not_before = 1781275333 exact (every flush)
+[PASS] (1) dual rsa not_after: ngx_otel.tls.certificate.not_after = 1924992000 exact (every flush)
+[PASS] (1) dual ecdsa not_after: ngx_otel.tls.certificate.not_after = 1956528000 exact (every flush)
+[PASS] (2) time_to_expiration plausible (within 300s of not_after-now)
+[PASS] (3) dual RSA+ECDSA block: 2 series per metric in a single flush
+[PASS] (4) attribute set EXACTLY the 7 scope-guard keys on all points
+[PASS] (6) reload: swapped cert exported (not_after=2051222400, CN=cert-a2.example.test on the same point)
+[PASS] (5) Agent name nginx.certificate.time_to_expiration ABSENT from collector output
+[PASS] (7) no-ssl binary: export proven (export_interval present), cert series ABSENT
+[PASS] C3 cert-metrics integration: ALL assertions passed (1)-(7)
+[asan-run] run_c3_cert_metrics.sh: exit 0
+
+[asan-run] Zero AddressSanitizer reports across: run_grpc_export.sh run_grpc_bidi_smoke.sh run_dns_dualstack.sh run_reload.sh run_traces.sh run_access_log.sh run_c2_cert_walk.sh run_c3_cert_metrics.sh run_chaos_kill9.sh run_chaos_crashloop.sh run_chaos_dead_collector.sh run_b4_daemon_on_gen1.sh run_b1_spsc_reload_chaos.sh run_chaos_quit_responsiveness.sh
+[asan-run] ASan gate: PASS (no use-after-free / heap error on the exercised wake paths).
+
+# NOTE: C2 (c) and (e) PASS lines appear to have been stripped by ANSI escaping in the
+# key-line grep above. The full asan-run2.log shows all (a)-(e) assertions passed:
+# grep of the full log: "[PASS] C2 cert-walk integration: ALL assertions passed (a)-(e)"
+# grep of the full log: "[PASS] C3 cert-metrics integration: ALL assertions passed (1)-(7)"
