@@ -14,6 +14,7 @@
 
 pub mod grpc;
 pub mod hyper_http;
+pub mod tls;
 
 use thiserror::Error;
 

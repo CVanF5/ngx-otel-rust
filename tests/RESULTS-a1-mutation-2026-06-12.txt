@@ -1,0 +1,43 @@
+A1 mutation cycle — verify-mode wiring (insecure -> always SSL_VERIFY_NONE)
+GIT_COMMIT (A1 commit): daedbaa30af7fd3d5b93afcfd4807605aa6b8f55
+Platform: macOS (aarch64-apple-darwin), system OpenSSL 3.6.2
+Date: 2026-06-12
+Target test: transport::tls::tests::bad_ca_handshake_fails
+Hypothesis: forcing SSL_VERIFY_NONE unconditionally => bad-CA handshake
+            no longer fails => the test that asserts failure must FAIL.
+
+========================================================================
+HALF 1 — MUTANT (broken: 'if self.insecure' -> 'if true')
+========================================================================
+     Running unittests src/lib.rs (target/debug/deps/ngx_http_otel_module-97f79c35b7cd26a6)
+
+running 1 test
+test transport::tls::tests::bad_ca_handshake_fails ... FAILED
+
+failures:
+
+---- transport::tls::tests::bad_ca_handshake_fails stdout ----
+
+thread 'transport::tls::tests::bad_ca_handshake_fails' (64903411) panicked at src/transport/tls_tests.rs:398:5:
+handshake against an untrusted server cert MUST fail (got Ok): verification not enforced
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    transport::tls::tests::bad_ca_handshake_fails
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 226 filtered out; finished in 0.30s
+
+error: test failed, to rerun pass `--lib`
+     Running unittests src/lib.rs (target/debug/deps/ngx_http_otel_module-97f79c35b7cd26a6)
+
+running 6 tests
+test transport::tls::tests::build_ctx_variants ... ok
+test transport::tls::tests::hostname_mismatch_fails ... ok
+test transport::tls::tests::handshake_ok_and_roundtrip ... ok
+test transport::tls::tests::insecure_skips_verification ... ok
+test transport::tls::tests::drop_mid_handshake_is_clean ... ok
+test transport::tls::tests::bad_ca_handshake_fails ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 221 filtered out; finished in 0.31s
+
