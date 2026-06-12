@@ -306,5 +306,6 @@ asan-test: collector-up
 	    -v ngx-otel-asan-target:/work/ngx-otel-rust/target \
 	    -v ngx-otel-asan-objs-sanitize:/work/ngx-otel-rust/objs-sanitize \
 	    -v ngx-otel-asan-objs-plain:/work/ngx-otel-rust/objs-asan-plain \
+	    -v ngx-otel-asan-objs-nossl:/work/ngx-otel-rust/objs-asan-nossl \
 	    ngx-otel-sanitize:latest \
 	    bash /work/ngx-otel-rust/build/asan-run.sh

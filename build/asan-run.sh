@@ -117,6 +117,41 @@ make -f "${PLAIN_OBJS}/Makefile" binary
 cd "${CRATE}"
 log "Step 2: OK — plain ASan nginx at ${PLAIN_OBJS}/nginx"
 
+# ── Step 2.6: Build no-ssl ASan nginx for C2/C3 cert-script (e)/(7) sub-scenario ─
+# run_c2_cert_walk.sh (e) and run_c3_cert_metrics.sh (7) load the ASan-instrumented
+# module into a nginx built WITHOUT --with-http_ssl_module to verify the module
+# still loads and emits the "cert metrics unavailable" NOTICE gracefully.
+#
+# The ASan-instrumented module contains __asan_* symbol references that require
+# the ASan runtime to already be linked into the host nginx.  A non-ASan nginx
+# binary therefore cannot load the ASan module (undefined __asan_*).  Solution:
+# build a second ASan-instrumented nginx WITHOUT --with-http_ssl_module; then
+# both the host nginx and the module are instrumented (ASan runtime present) and
+# the load_module succeeds.  The no-ssl semantics (cert walk unavailable) are
+# preserved because --with-http_ssl_module is absent from this build.
+NOSSL_ASAN_OBJS="${CRATE}/objs-asan-nossl"
+log "Step 2.6: Building no-ssl ASan nginx (for C2/C3 cert-script sub-scenario)..."
+mkdir -p "${NOSSL_ASAN_OBJS}"
+cd "${NGINX_SRC}"
+[[ -f Makefile ]] && cp -f Makefile Makefile.asan-nossl-bak
+
+auto/configure \
+    --with-compat \
+    --with-http_stub_status_module \
+    --with-cc=clang \
+    --with-cc-opt="-O1 -fsanitize=address -fno-omit-frame-pointer -DNGX_DEBUG_PALLOC=1 -DNGX_SUPPRESS_WARN=1" \
+    --with-ld-opt="-fsanitize=address" \
+    --with-debug \
+    --builddir="${NOSSL_ASAN_OBJS}"
+
+rm -f "${NGINX_SRC}/Makefile"
+[[ -f "${NGINX_SRC}/Makefile.asan-nossl-bak" ]] && mv -f "${NGINX_SRC}/Makefile.asan-nossl-bak" "${NGINX_SRC}/Makefile"
+
+make -f "${NOSSL_ASAN_OBJS}/Makefile" binary
+cd "${CRATE}"
+log "Step 2.6: OK — no-ssl ASan nginx at ${NOSSL_ASAN_OBJS}/nginx"
+export NO_SSL_NGINX_BINARY="${NOSSL_ASAN_OBJS}/nginx"
+
 # ── Step 2.5: Pre-build bidi_echo_server example WITHOUT ASan ─────────────────
 log "Step 2.5: Pre-building bidi_echo_server example (no ASan)..."
 (
