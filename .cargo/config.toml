@@ -1,0 +1,16 @@
+# Local dev convenience: supplies the nginx paths that the Makefile normally
+# injects, so editor rust-analyzer (`cargo check`) works without going through
+# `make`. Paths are config-relative (resolved from this crate root) and mirror
+# the Makefile defaults, so they work on any machine using the standard layout:
+#   - sibling nginx source checkout at ../nginx
+#   - debug build output at ./objs-debug  (run `make` once to populate it)
+#
+# `[env]` does NOT override vars already in the environment, so CLI builds via
+# `make` (debug/release/asan/tsan) still set their own NGINX_BUILD_DIR and win.
+#
+# Flavor-mismatch guard: build.rs enforces that the cargo profile and the nginx
+# tree flavor agree (release profile + --with-debug tree → hard error). See the
+# "Build-flavor guard" section in README.md for the remedy and escape hatch.
+[env]
+NGINX_SOURCE_DIR = { value = "../nginx", relative = true }
+NGINX_BUILD_DIR  = { value = "objs-debug", relative = true }
