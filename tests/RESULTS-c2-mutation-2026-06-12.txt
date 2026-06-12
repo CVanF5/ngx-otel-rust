@@ -1,0 +1,39 @@
+C2 mutation-cycle evidence — executed 2026-06-12T10:38:53Z
+GIT_COMMIT=6cdcd429dbba1c256e13aef2c64f56f639954938
+Host: Darwin 25.5.0 arm64 (macOS unit-test platform)
+
+MUTATION: src/cert_table.rs asn1_time_to_unix epoch math days*86400 -> days*3600 (days->hours)
+
+488:    Some(i64::from(days) * 3_600 + i64::from(secs))
+--- HALF 1: mutated, direct cargo rebuild + test run ---
+thread 'cert_table::tests::asn1_utctime_pre_2000' (57065773) panicked at src/cert_table.rs:676:9:
+assertion `left == right` failed
+  left: 38131200
+ right: 915148800
+
+
+failures:
+    cert_table::tests::asn1_generalizedtime_2050
+    cert_table::tests::asn1_generalizedtime_post_2050
+    cert_table::tests::asn1_utctime_high_window_year_49_is_2049
+    cert_table::tests::asn1_utctime_low_window_year_50_is_1950
+    cert_table::tests::asn1_utctime_pre_2000
+
+test result: FAILED. 11 passed; 5 failed; 0 ignored; 0 measured; 200 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`
+cargo test exit=101
+half-1 test binary: target/debug/deps/ngx_http_otel_module-97f79c35b7cd26a6
+half-1 mtime: Jun 12 11:39:46 2026  size: 11495784
+half-1 sha256: fdefeb2cb117f56a8a0c58869be1fee768d072ccf18c1835ab49b68f270369ce
+
+--- HALF 2: restored (git diff clean), direct cargo rebuild + test run ---
+restore check: 1 occurrence(s) of 86_400, git diff clean
+test cert_table::tests::cn_present ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 200 filtered out; finished in 0.01s
+
+cargo test exit=0
+half-2 test binary: target/debug/deps/ngx_http_otel_module-97f79c35b7cd26a6
+half-2 mtime: Jun 12 11:40:17 2026  size: 11495784
+half-2 sha256: fd06930508531875f66943a3df20cc1b77b1e40e665be92de6975359420decb8
