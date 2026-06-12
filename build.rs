@@ -151,7 +151,17 @@ fn check_build_flavor() {
         Ok(s) => s,
         Err(_) => return,
     };
-    let nginx_tree_is_debug = contents.contains("NGX_DEBUG");
+    // Match a genuine `#define NGX_DEBUG 1` (whitespace-tolerant), NOT a bare
+    // substring: a non-debug tree's `ngx_auto_config.h` can still mention
+    // `NGX_DEBUG` in an `#ifndef NGX_DEBUG` guard, which `contains("NGX_DEBUG")`
+    // would wrongly flag as a debug tree (the A0.5 false-positive that aborted
+    // `make test` on debian-vm). Only the actual define indicates `--with-debug`.
+    let nginx_tree_is_debug = contents.lines().any(|line| {
+        let mut toks = line.split_whitespace();
+        toks.next() == Some("#define")
+            && toks.next() == Some("NGX_DEBUG")
+            && toks.next() == Some("1")
+    });
 
     if is_release && nginx_tree_is_debug {
         // Hard error: release cargo profile + debug nginx tree = bad cache.
