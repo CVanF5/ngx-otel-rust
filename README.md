@@ -281,6 +281,13 @@ design proposal to integrate. In brief:
   `time_to_expiration` goes negative after expiry. Absent entirely when nginx
   lacks the ssl module or no `ssl_certificate` is configured. See
   `TELEMETRY_MODEL.md` § "Serving-certificate metrics".
+- **Collector-certificate gauge** (TLS endpoints only):
+  `ngx_otel.tls.collector_cert.not_after` — one Gauge (`s`, int64 epoch) for
+  the `notAfter` of the certificate the OTLP collector presents during TLS
+  handshake. Attribute: `server.address` = collector hostname. **Absent** for
+  plaintext endpoints or before the first successful handshake. Useful for
+  alerting when the collector's own certificate is about to expire. See
+  `TELEMETRY_MODEL.md` § "Collector-certificate gauge".
 
 A ready-made Grafana dashboard is provided at
 [`test-harness/demo/grafana/dashboards/ngx-otel-rust-overview.json`](test-harness/demo/grafana/dashboards/ngx-otel-rust-overview.json).

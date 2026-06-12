@@ -627,6 +627,50 @@ expose.
 - **Leaf certificates only**: intermediate/chain certificates in the
   configured bundle are not enumerated (deferred).
 
+---
+
+## Collector-certificate gauge (`ngx_otel.tls.collector_cert.not_after`)
+
+One int64 Gauge for the TLS certificate the **collector** (OTLP endpoint)
+presents during the handshake (`src/transport/tls.rs`, B1). Emitted by the
+exporter process every export interval once a successful TLS handshake has
+been completed.
+
+**Absent until first successful TLS handshake** (absent-not-zero):
+- Plaintext (`http://`) endpoints: metric name does not appear.
+- Pre-handshake (TLS configured but not yet connected): metric name does not appear.
+- After a successful handshake: one data point, stable per exporter generation
+  (the collector certificate does not change mid-connection).
+
+| Metric | Instrument | Unit | Description |
+|---|---|---|---|
+| `ngx_otel.tls.collector_cert.not_after` | Gauge (int64) | `s` | Collector certificate `notAfter` as Unix epoch seconds |
+
+### Attributes
+
+| Attribute | Value | Source |
+|---|---|---|
+| `server.address` | collector hostname from the configured `otel_exporter` endpoint (e.g. `otel-collector.example.com`) | `src/export/mod.rs` |
+
+### Implementation
+
+- Captured in `TlsNgxConnIo::poll_handshake` via `SSL_get1_peer_certificate`
+  (owned reference; freed after reading with `X509_free`).
+- Epoch conversion reuses `cert_table::asn1_time_to_unix` — the same helper
+  used by `ServingCertSource` — so there is no duplicated epoch math.
+- Written to `COLLECTOR_CERT_NOT_AFTER: AtomicI64` (process-global, initial
+  value 0 = absent); read by `collect_all_sources` at each export interval.
+- Single-threaded exporter: `Relaxed` ordering is sound (no concurrent writers).
+
+### Use case
+
+Alert when the collector's own certificate is about to expire (e.g.
+`time() - ngx_otel.tls.collector_cert.not_after < 30d`). Particularly useful
+in mTLS deployments where the collector certificate is managed separately from
+the nginx serving certificates.
+
+---
+
 ## Dashboard
 
 A reference Grafana dashboard is committed at
