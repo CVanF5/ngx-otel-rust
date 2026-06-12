@@ -128,6 +128,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# ── Leftover cleanup ───────────────────────────────────────────────────────────
+# Phase B identifies the exporter by proctitle, so stray test-sandbox nginx
+# (conf under /tmp/ngx-*) and orphaned exporters from earlier runs must go.
+pgrep -f "[n]ginx: master process.*/tmp/ngx-" | xargs -r kill -KILL 2>/dev/null || true
+pgrep -f "[n]ginx: otel exporter" | xargs -r kill -KILL 2>/dev/null || true
+sleep 1
+[[ -z "$(exporter_pid)" ]] || fail "Preflight: stray otel exporter (PID $(exporter_pid)) survived cleanup"
+
 # ═══ Phase A — saturation polarity: alive + saturated → ZERO alerts ═══════════
 
 info "=== Phase A: saturation polarity (exporter alive, ring saturated) ==="
@@ -184,9 +192,8 @@ NGINX_A_PID=""
 # ═══ Phase B — death polarity: silent kill -9 → ONE latched alert ═════════════
 
 info "=== Phase B: death polarity (daemon on, gen-1 exporter, kill -9) ==="
-if [[ -n "$(exporter_pid)" ]]; then
-    fail "Phase B preflight: stray otel exporter (PID $(exporter_pid)) — clean up leftover nginx first"
-fi
+# Phase A teardown is graceful; give its exporter a moment, then verify clean.
+wait_for 10 "no exporter left from Phase A" "[[ -z \"\$(exporter_pid)\" ]]"
 PREFIX_B="$(mktemp -d /tmp/ngx-b4-hb-dead.XXXXXX)"
 mkdir -p "${PREFIX_B}/logs" "${PREFIX_B}/client_body_temp"
 sed -e "s|@MODULE_PATH@|${MODULE_PATH}|g" -e "s|@PREFIX@|${PREFIX_B}|g" \
