@@ -655,11 +655,19 @@ already set in the environment, so Makefile targets and CI always win.
 make check             # rustfmt + clippy (zero warnings required)
 make unittest          # cargo test --lib  (debug profile, objs-debug tree)
 make unittest-release  # cargo test --release --lib  (release profile, objs-release tree)
-make test              # bash integration suite (needs a running OTel collector)
+make test              # bash integration suite (pins BUILD=release; see note below)
 ```
 
 `make unittest-release` requires `make build-release` to have been run first
 (to populate `objs-release/`).
+
+`make test` always pins `BUILD=release` so the nginx binary, `NGINX_BUILD_DIR`, and the
+cargo `--release` artifact are all from the same release pairing (production-identical).
+For a debug-pairing integration run (e.g. to exercise nginx debug assertions), use
+`BUILD=debug make test` — but note this writes a release-profile `nginx-sys` artifact
+to `target/release` built against the debug nginx tree, which poisons the cache for the
+next `make build-release`; run `cargo clean` before `make build-release` afterward (the
+build-flavor guard will flag the mismatch if you forget).
 
 ### Build-flavor guard
 

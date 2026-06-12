@@ -156,6 +156,33 @@ unittest-release: ## Run unit-tests in release profile (objs-release tree; requi
 # Phase A test target: invoke our existing bash integration scripts via the
 # nginx binary we just built (TEST_NGINX_BINARY). Phase B replaces this with
 # `prove -I $(NGINX_TESTS_DIR)/lib t/`.
+#
+# test and full-test pin BUILD=release so the nginx binary, NGINX_BUILD_DIR,
+# and the cargo --release artifact are all from the same release pairing.
+# This prevents the A0.5 flavor-mismatch guard from firing and avoids
+# poisoning target/release with a debug-tree build.
+#
+# Mechanism: sub-make ($(MAKE) BUILD=release) rather than target-specific
+# variables, because target-specific vars cannot change which
+# build/build-$(BUILD).mk is included (includes are parsed before any target
+# runs).  Sub-make reruns make from scratch with BUILD=release in the
+# environment, so the correct include file and NGINX_BUILD_DIR are used.
+#
+# If the user explicitly passes BUILD=... on the command line (e.g.
+# `BUILD=debug make test` for a debug-pairing debug run), that value is
+# respected: $(origin BUILD) = "command line" distinguishes an explicit user
+# override from the default "file" value, and we skip the sub-make.
+# NOTE: debug-pairing integration runs (`BUILD=debug make test`) write a
+# release-profile nginx-sys artifact to target/release built against the
+# debug nginx tree; run `cargo clean` before `make build-release` afterward
+# (the A0.5 guard will flag the mismatch if you forget).
+ifneq ($(origin BUILD),command line)
+test: ## Run the integration test suite (pins BUILD=release; use BUILD=debug make test for a debug-pairing run)
+	$(MAKE) BUILD=release test
+
+full-test: ## Run module + nginx integration suites (Phase B; pins BUILD=release)
+	$(MAKE) BUILD=release full-test
+else
 test: $(TEST_PREREQ) ## Run the integration test suite
 	@for t in $(TESTS); do \
 		echo "==> $$t"; \
@@ -164,6 +191,7 @@ test: $(TEST_PREREQ) ## Run the integration test suite
 
 # Phase B will fill this in. For now it's an alias for `test`.
 full-test: test ## Run module + nginx integration suites (Phase B)
+endif
 
 clean: ## Cleanup everything
 	rm -rf $(NGINX_BUILD_DIR)
