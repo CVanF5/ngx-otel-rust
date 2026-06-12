@@ -1645,6 +1645,111 @@
               }
             ]
           }
+        },
+        {
+          "id": 57,
+          "type": "table",
+          "title": "Collector Certificate \u2014 Time to Expiration (ngx_otel.tls.collector_cert.not_after)",
+          "description": "The TLS certificate the OTLP collector presents during the handshake (B1 gauge: ngx_otel.tls.collector_cert.not_after, epoch s). Absent until the first successful TLS handshake; one row per collector endpoint. Countdown = not_after \u2212 now. Thresholds: red < 7d, orange < 30d.",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "gridPos": {
+            "h": 6,
+            "w": 24,
+            "x": 0,
+            "y": 140
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "refId": "A",
+              "expr": "ngx_otel_tls_collector_cert_not_after{service_name=\"$service\"} - time()",
+              "instant": true,
+              "format": "table"
+            }
+          ],
+          "transformations": [
+            {
+              "id": "organize",
+              "options": {
+                "excludeByName": {
+                  "Time": true,
+                  "__name__": true,
+                  "job": true,
+                  "instance": true,
+                  "service_name": true,
+                  "service_instance_id": true
+                },
+                "indexByName": {
+                  "server_address": 0,
+                  "Value": 1
+                },
+                "renameByName": {
+                  "server_address": "Collector endpoint",
+                  "Value": "Time to expiration"
+                }
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "red",
+                    "value": null
+                  },
+                  {
+                    "color": "orange",
+                    "value": 604800
+                  },
+                  {
+                    "color": "green",
+                    "value": 2592000
+                  }
+                ]
+              },
+              "color": {
+                "mode": "thresholds"
+              },
+              "unit": "s"
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "Time to expiration"
+                },
+                "properties": [
+                  {
+                    "id": "unit",
+                    "value": "s"
+                  },
+                  {
+                    "id": "custom.cellOptions",
+                    "value": {
+                      "type": "color-background"
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "showHeader": true,
+            "sortBy": [
+              {
+                "displayName": "Time to expiration",
+                "desc": false
+              }
+            ]
+          }
         }
       ]
     },

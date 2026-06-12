@@ -292,6 +292,25 @@ design proposal to integrate. In brief:
 A ready-made Grafana dashboard is provided at
 [`test-harness/demo/grafana/dashboards/ngx-otel-rust-overview.json`](test-harness/demo/grafana/dashboards/ngx-otel-rust-overview.json).
 
+### Demo: TLS end-to-end
+
+`test-harness/demo/run-demo.sh up` starts the full stack with TLS enabled by
+default (`DEMO_TLS=1`).  At startup the script mints a per-run self-signed CA
+(`demo-ca.crt`) and a collector server certificate signed by that CA with an IP
+SAN of `127.0.0.1`; the OTLP collector container loads the cert and requires TLS
+on both gRPC (port 14317) and HTTP (port 14318) receivers.  The nginx exporter is
+configured with `trusted_certificate <demo-ca.crt>` and `endpoint
+https://127.0.0.1:14317`, so every export batch is encrypted and the
+collector's certificate is verified by the demo CA (exercising the IP-literal
+verification path — `X509_VERIFY_PARAM_set1_ip_asc` — rather than the DNS-name
+path).
+
+The fail-closed behaviour is demonstrable: run `./run-demo.sh down`, then start
+nginx manually pointing `trusted_certificate` at a wrong CA file — the exporter
+will produce send-failure alerts in `error.log` and deliver no data.  Restoring
+the correct CA (via SIGHUP or restart) brings telemetry flowing again.  Use
+`DEMO_TLS=0 ./run-demo.sh up` for the plaintext (`http://`) profile.
+
 ## Getting Started
 
 ### Requirements

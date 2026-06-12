@@ -1,0 +1,135 @@
+A4 — Demo TLS Story: Verification Evidence
+==========================================
+Date: 2026-06-12
+Platform: macOS (darwin arm64)
+GIT_COMMIT: (stamped after commit below)
+
+SAN/branch note:
+  The demo collector cert carries IP SAN: 127.0.0.1 (the address nginx uses to
+  reach the Docker collector). Verification exercises the IP-literal branch:
+  X509_VERIFY_PARAM_set1_ip_asc (NOT the DNS-name set1_host branch). This is
+  explicitly called out in the spec ("mind the IP-SAN branch, it's a good live
+  demo of it").
+
+── CERT GENERATION ──────────────────────────────────────────────────────────────
+
+Demo CA (self-signed, 90d): demo-ca.crt
+  Subject: CN=demo-otel-ca
+
+Collector cert (CA-signed, 90d): collector.crt
+  Subject: CN=127.0.0.1
+  X509v3 Subject Alternative Name: IP Address:127.0.0.1
+  Verification: openssl verify -CAfile demo-ca.crt collector.crt → OK
+
+Serving certs (unchanged from fa4997c):
+  short.crt: notAfter=Jun 12 21:44:32 2026 GMT (~1h via openssl@3 -not_after)
+  long.crt:  90d
+
+── TLS FLOWING (Half: demo up with correct CA) ──────────────────────────────────
+
+Collector config: TLS on gRPC:4317 + HTTP:4318 (cert: /etc/otelcol/collector.crt)
+nginx conf: endpoint https://127.0.0.1:14317; trusted_certificate <demo-ca.crt>;
+
+error.log snippet (startup):
+  [notice] 78059#0: otel exporter: cycle entered, pid=78059, parent=78051,
+           endpoint=https://127.0.0.1:14317
+  [notice] 78059#0: otel export: export loop started, endpoint=https://127.0.0.1:14317,
+           protocol=otlp_grpc, interval=2000ms, retry_depth=4
+
+Plaintext probe rejected (fail-closed verification):
+  curl http://127.0.0.1:14318/v1/metrics → "Client sent an HTTP request to an HTTPS server."
+
+Collector received data (TLS handshake succeeded, data flowing):
+  2026-06-12T20:44:36.685Z info Metrics resource metrics=1, metrics=31, data points=47
+  (continuous 2s batches; no send_failures in Prometheus: value=0)
+
+send_failures metric: 0 (zero TLS handshake failures with correct CA)
+
+── DRILL-DOWN VERIFICATION ──────────────────────────────────────────────────────
+
+Metrics (Prometheus):
+  http_server_request_duration: 8 series (native histogram, multiple method/status combos)
+  ngx_otel_send_failures: 2 series (value=0)
+  ngx_otel_tls_certificate_time_to_expiration: 4 series (2 workers × 2 certs)
+    demo-short.local: ~3200s remaining
+    demo-long.local: ~7775600s remaining
+
+Tempo traces:
+  /api/search?limit=3 → 3 traces: GET /, GET /api/ (rootServiceName=nginx-otel)
+  inspectedTraces=28816
+
+Loki logs:
+  /loki/api/v1/query_range?query={service_name="nginx-otel"} → 3 streams, entries present
+
+── CERT PANEL RENDER CHECK ──────────────────────────────────────────────────────
+
+Panel 54 (Serving Certificates):
+  Prometheus query: ngx_otel_tls_certificate_time_to_expiration{service_name="nginx-otel"}
+  Result: 4 series found (render confirmed — sane values)
+
+Panel 57 (Collector Certificate, new in A4):
+  Prometheus query: ngx_otel_tls_collector_cert_not_after{service_name="nginx-otel"} - time()
+  Result: 0 series (empty — see macOS limitation note below)
+  Panel JSON verified in Grafana API (/api/dashboards/uid/ngx-otel-rust-overview → id=57 present)
+  Dashboard JSON validates: python3 -m json.tool → valid
+
+macOS limitation (OBSERVATION, NOT A BUG IN THE DEMO CODE):
+  The B1 gauge (ngx_otel.tls.collector_cert.not_after) does not appear in the
+  macOS demo run. COLLECTOR_CERT_NOT_AFTER atomic stays at 0 despite TLS handshakes
+  succeeding (data flows). Root cause: not yet diagnosed in this session; B1 unit
+  test (successful_handshake_captures_cert_not_after) PASSES on macOS per the A0.5
+  and B1 review. The B1 integration test (run_b1_collector_cert_gauge.sh) is
+  Linux-only (GNU date -d dependency). The panel JSON, PromQL expression, and
+  transformation are correct; the metric will appear when B1 atomic is emitted.
+  This is an out-of-scope STOP item (see STOP items below).
+
+── FAIL-CLOSED TEST (MUTATION EQUIVALENT) ───────────────────────────────────────
+
+Half 1 — wrong CA: trusted_certificate points to wrong-ca.crt (not signed by demo CA)
+  nginx restarted with nginx-badca.conf
+  error.log immediately shows:
+    [error] otel export: send failed (connection failed: gRPC h2 handshake failed:
+            connection error); queuing for retry
+    [error] otel export: retry buffer full, dropped N records
+    [error] otel export: logs send failed (...); queuing for retry
+    [error] otel export: spans send failed (...); queuing for retry
+  NO data delivered to collector during this period.
+
+Half 2 — restore correct CA:
+  nginx restarted with nginx.conf (correct demo-ca.crt)
+  error.log shows clean startup:
+    [notice] otel exporter: cycle entered, endpoint=https://127.0.0.1:14317
+    [notice] otel export: export loop started, endpoint=https://127.0.0.1:14317,
+             protocol=otlp_grpc, interval=2000ms, retry_depth=4
+  Collector receives data again (serving cert metrics visible in collector logs)
+
+Both halves EXECUTED on the running demo stack. Fail-closed behaviour confirmed.
+
+── PLAINTEXT PROFILE ────────────────────────────────────────────────────────────
+
+DEMO_TLS=0 path verified by code inspection:
+  gen_collector_config copies otel-collector-demo.yaml unchanged (no TLS blocks)
+  nginx conf uses endpoint http://127.0.0.1:14317 (no trusted_certificate)
+  Docker compose volume: ${DEMO_COLLECTOR_DIR} still mounted as /etc/otelcol
+
+Full stack test with DEMO_TLS=0 not executed in this session (demo was brought up
+with DEMO_TLS=1 only). Code path is straightforward and verified by inspection.
+
+── STOP ITEMS ────────────────────────────────────────────────────────────────────
+
+STOP 1: B1 gauge (ngx_otel.tls.collector_cert.not_after) not emitting on macOS demo.
+  The COLLECTOR_CERT_NOT_AFTER atomic stays 0 despite successful TLS connections.
+  Unit test passes on macOS. Integration test is Linux-only.
+  Possible cause: COLLECTOR_CERT_NOT_AFTER static in dylib vs nginx master/worker
+  fork semantics on macOS — or an SSL_get1_peer_certificate edge case in the h2
+  gRPC TLS path on macOS. Investigation deferred; B1 review confirmed it works on
+  Linux. Dashboard panel 57 is correct; will render when B1 works on macOS.
+
+OUT-OF-SCOPE OBSERVATIONS:
+  The otel-collector-demo.yaml static file is now superseded by the runtime-generated
+  collector/config.yaml. The static file is kept for reference and as the plaintext
+  template source. If DEMO_COLLECTOR_DIR is not exported (e.g. manual docker compose),
+  the placeholder path /tmp/ngx-otel-demo-placeholder will fail. This is acceptable
+  for a demo-only stack.
+
+── GIT_COMMIT: (stamped after commit) ───────────────────────────────────────────

@@ -1,8 +1,9 @@
 # nginx-demo.conf.template — demo server for the Grafana visualisation stack.
 #
-# run-demo.sh substitutes:
-#   @MODULE_PATH@  — absolute path to the built module (.so / .dylib)
-#   @PREFIX@       — absolute path to the per-run sandbox prefix
+# run-demo.sh substitutes template variables at startup and writes the result
+# to .run/nginx.conf. Variables: MODULE_PATH (module .so/.dylib), PREFIX (run
+# sandbox), OTEL_ENDPOINT (https:// TLS or http:// plaintext), TRUSTED_CA_LINE
+# (trusted_certificate directive when DEMO_TLS=1, empty string otherwise).
 #
 # Shape:
 #   :9400  front server, instrumented + exporting OTLP to the demo collector
@@ -26,9 +27,15 @@ events {
 
 http {
     otel_exporter {
-        # gRPC receiver: http://host:port (no /v1/metrics path).
-        # The demo stack's collector listens on gRPC at host port 14317.
-        endpoint http://127.0.0.1:14317;
+        # gRPC receiver: host port 14317 (no /v1/metrics path for gRPC).
+        # @OTEL_ENDPOINT@ is https://127.0.0.1:14317 (TLS, default) or
+        # http://127.0.0.1:14317 (plaintext, DEMO_TLS=0).
+        endpoint @OTEL_ENDPOINT@;
+        # trusted_certificate is set to the demo CA path when DEMO_TLS=1.
+        # The demo CA is minted per-run; it signed the collector's server cert.
+        # The collector cert carries an IP SAN for 127.0.0.1, exercising the
+        # IP-literal verification branch (X509_VERIFY_PARAM_set1_ip_asc).
+@TRUSTED_CA_LINE@
     }
     otel_service_name nginx-otel;
     otel_metric_interval 2s;

@@ -26,7 +26,11 @@ services:
     container_name: ngx-otel-demo-collector
     command: ["--config=/etc/otelcol/config.yaml"]
     volumes:
-      - ./otel-collector-demo.yaml:/etc/otelcol/config.yaml:ro
+      # run-demo.sh generates ${PREFIX}/collector/ at startup:
+      #   config.yaml  — full collector config (TLS or plaintext, per DEMO_TLS)
+      #   collector.crt / collector.key  — server cert+key (DEMO_TLS=1 only)
+      # DEMO_COLLECTOR_DIR is exported by run-demo.sh before docker compose up.
+      - ${DEMO_COLLECTOR_DIR:-/tmp/ngx-otel-demo-placeholder}:/etc/otelcol:ro
     ports:
       - "127.0.0.1:14318:4318"   # OTLP/HTTP  (point nginx here)
       - "127.0.0.1:14317:4317"   # OTLP/gRPC
