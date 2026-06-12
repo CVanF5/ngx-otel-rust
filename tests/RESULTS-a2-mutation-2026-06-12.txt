@@ -1,0 +1,79 @@
+A2 mutation evidence — 2026-06-12
+==================================
+GIT_COMMIT: e2a52539e2b62e31178ed41360b076c38036383a  (set AFTER final feat(A2) commit)
+
+Host: macOS arm64 (dev box — correctness gates only, not timing)
+Rust toolchain: stable (cargo test --lib)
+Command: make unittest  →  cargo test --lib --features test-support
+
+----------------------------------------------------------------
+BASELINE (no mutation) — all 238 tests PASS
+----------------------------------------------------------------
+test result: ok. 238 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.17s
+
+----------------------------------------------------------------
+MUTATION 1: default HTTPS port 443 → 80
+  File:   src/transport/hyper_http.rs
+  Change: parse_authority(authority, 443) → parse_authority(authority, 80)
+  Tests expected to FAIL:
+    - a2_https_default_port_is_443
+    - a2_https_authority_elides_default_port
+----------------------------------------------------------------
+RESULT (mutation applied):
+test transport::hyper_http::tests::a2_https_default_port_is_443 ... FAILED
+test transport::hyper_http::tests::a2_https_authority_elides_default_port ... FAILED
+test result: FAILED. 236 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.17s
+
+RESULT (mutation restored → PASS):
+test result: ok. 238 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.15s
+
+----------------------------------------------------------------
+MUTATION 2: is_tls() always returns false
+  File:   src/transport/hyper_http.rs
+  Change: matches!(self, Https { .. }) → false
+  Tests expected to FAIL:
+    - a2_is_tls_variant_discrimination
+----------------------------------------------------------------
+RESULT (mutation applied):
+test transport::hyper_http::tests::a2_is_tls_variant_discrimination ... FAILED
+test result: FAILED. 237 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.14s
+
+RESULT (mutation restored → PASS):
+test result: ok. 238 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.17s
+
+----------------------------------------------------------------
+MUTATION 3: ssl_verify_off() comparison inverted (!= 0 instead of == 0)
+  File:   src/config.rs
+  Change: self.ssl_verify == 0 → self.ssl_verify != 0
+  Tests expected to FAIL:
+    - a2_ssl_verify_off_accessor
+    - a2_exporter_config_tls_defaults
+----------------------------------------------------------------
+RESULT (mutation applied):
+test config::tests::a2_ssl_verify_off_accessor ... FAILED
+test config::tests::a2_exporter_config_tls_defaults ... FAILED
+test result: FAILED. 236 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.17s
+
+RESULT (mutation restored → PASS):
+test result: ok. 238 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.15s
+
+----------------------------------------------------------------
+MUTATION 4: is_ip_literal() always returns false
+  File:   src/transport/hyper_http.rs
+  Change: host_str.parse::<IpAddr>().is_ok() → false
+  Tests expected to FAIL:
+    - a2_is_ip_literal_classification
+----------------------------------------------------------------
+RESULT (mutation applied):
+test transport::hyper_http::tests::a2_is_ip_literal_classification ... FAILED
+test result: FAILED. 237 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.21s
+
+RESULT (mutation restored → PASS):
+test result: ok. 238 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.17s
+
+----------------------------------------------------------------
+FINAL STATE (all mutations restored)
+make unittest → 238 passed; 0 failed
+All 4 mutations caused the expected test(s) to FAIL.
+All 4 restores returned to PASS.
+----------------------------------------------------------------
