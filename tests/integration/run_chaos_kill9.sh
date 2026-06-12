@@ -196,6 +196,33 @@ sed \
     -e "s|@PREFIX@|${PREFIX}|g" \
     "${CONF_TEMPLATE}" > "${PREFIX}/nginx.conf"
 
+# ── Pre-flight: reap any stale nginx listening on port 9200 ─────────────────
+# Stale processes from a previous interrupted run cause EADDRINUSE and rc=2
+# TSAN anomalies. Kill any process owning port 9200 before starting our nginx.
+# Uses bracketed pgrep pattern to avoid self-match (/proc/<pid>/net/tcp check).
+if command -v fuser >/dev/null 2>&1; then
+    STALE_9200="$(fuser 9200/tcp 2>/dev/null | tr -d ' ' || true)"
+    if [[ -n "${STALE_9200}" ]]; then
+        info "Pre-flight: killing stale process(es) on :9200 — PIDs: ${STALE_9200}"
+        echo "${STALE_9200}" | xargs -r kill -KILL 2>/dev/null || true
+        sleep 0.5
+    fi
+elif command -v ss >/dev/null 2>&1; then
+    STALE_9200="$(ss -tlnp 'sport = :9200' 2>/dev/null | awk 'NR>1 && /pid=/ {match($0,/pid=([0-9]+)/,a); if(a[1]) print a[1]}' || true)"
+    if [[ -n "${STALE_9200}" ]]; then
+        info "Pre-flight: killing stale process(es) on :9200 — PIDs: ${STALE_9200}"
+        echo "${STALE_9200}" | xargs -r kill -KILL 2>/dev/null || true
+        sleep 0.5
+    fi
+fi
+# Also kill any leftover nginx worker/master from a prior run of this test.
+LEFTOVER_NGX="$(pgrep -f '[n]ginx: master' 2>/dev/null | head -5 || true)"
+if [[ -n "${LEFTOVER_NGX}" ]]; then
+    info "Pre-flight: killing leftover nginx master(s): ${LEFTOVER_NGX}"
+    echo "${LEFTOVER_NGX}" | xargs -r kill -QUIT 2>/dev/null || true
+    sleep 1
+fi
+
 info "Starting nginx..."
 "${NGINX_BINARY}" -p "${PREFIX}" -c "${PREFIX}/nginx.conf" &
 NGINX_PID=$!

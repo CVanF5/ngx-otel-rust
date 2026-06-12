@@ -4,3 +4,7 @@
 # Test-harness OTel collector file-exporter output (generated at runtime)
 /test-harness/logs/*.json
 /test-harness/logs/*.json.*
+# Claude Code project workspace — local only, not part of source history
+/.claude/
+# ASan run-log directories (timestamped, generated at runtime)
+/tests/asan-logs-*/

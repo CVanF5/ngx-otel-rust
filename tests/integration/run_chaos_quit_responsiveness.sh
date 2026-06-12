@@ -217,6 +217,42 @@ echo "${NGINX_CONF_BODY}" \
           -e "s|@PREFIX@|${PREFIX}|g" \
     > "${PREFIX}/nginx.conf"
 
+# ── Pre-flight: reap any stale process holding HANG_PORT ────────────────────
+# Stale Python hang-collectors from a prior interrupted run cause the new
+# Python server to fail EADDRINUSE and the test to fail rc=2 under TSAN.
+# Kill any process owning the port before we start a fresh one.
+if command -v fuser >/dev/null 2>&1; then
+    STALE_HANG="$(fuser "${HANG_PORT}/tcp" 2>/dev/null | tr -d ' ' || true)"
+    if [[ -n "${STALE_HANG}" ]]; then
+        info "Pre-flight: killing stale process(es) on :${HANG_PORT} — PIDs: ${STALE_HANG}"
+        echo "${STALE_HANG}" | xargs -r kill -KILL 2>/dev/null || true
+        sleep 0.5
+    fi
+elif command -v ss >/dev/null 2>&1; then
+    STALE_HANG="$(ss -tlnp "sport = :${HANG_PORT}" 2>/dev/null | awk 'NR>1 && /pid=/ {match($0,/pid=([0-9]+)/,a); if(a[1]) print a[1]}' || true)"
+    if [[ -n "${STALE_HANG}" ]]; then
+        info "Pre-flight: killing stale process(es) on :${HANG_PORT} — PIDs: ${STALE_HANG}"
+        echo "${STALE_HANG}" | xargs -r kill -KILL 2>/dev/null || true
+        sleep 0.5
+    fi
+fi
+# Kill any leftover nginx from a prior run of this test (listens on :9211).
+if command -v fuser >/dev/null 2>&1; then
+    STALE_9211="$(fuser 9211/tcp 2>/dev/null | tr -d ' ' || true)"
+    if [[ -n "${STALE_9211}" ]]; then
+        info "Pre-flight: killing stale process(es) on :9211 — PIDs: ${STALE_9211}"
+        echo "${STALE_9211}" | xargs -r kill -KILL 2>/dev/null || true
+        sleep 0.5
+    fi
+elif command -v ss >/dev/null 2>&1; then
+    STALE_9211="$(ss -tlnp 'sport = :9211' 2>/dev/null | awk 'NR>1 && /pid=/ {match($0,/pid=([0-9]+)/,a); if(a[1]) print a[1]}' || true)"
+    if [[ -n "${STALE_9211}" ]]; then
+        info "Pre-flight: killing stale process(es) on :9211 — PIDs: ${STALE_9211}"
+        echo "${STALE_9211}" | xargs -r kill -KILL 2>/dev/null || true
+        sleep 0.5
+    fi
+fi
+
 # ─── Start the accept-but-never-respond collector ───────────────────────────
 info "Starting accept-but-never-respond collector on :${HANG_PORT}..."
 "${PYTHON_BIN}" - "${HANG_PORT}" <<'PYEOF' &
