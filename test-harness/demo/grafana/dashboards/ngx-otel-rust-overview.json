@@ -1423,7 +1423,7 @@
         },
         {
           "id": 51,
-          "type": "traces",
+          "type": "table",
           "title": "Traces (nginx server spans via Tempo)",
           "collapsed": true,
           "gridPos": {
