@@ -1,0 +1,66 @@
+GIT_COMMIT=f284fb371c7686faf335210756ab13ef5cd1734e
+DATE=2026-06-12T18:15:09Z
+
+=== MUTATION A: OLD PAIRING (BUILD=debug, guard fires without escape hatch) ===
+error: failed to run custom build command for `ngx-otel-rust v0.1.0 (/home/cvandesande/project-nginx-otel/ngx-otel-rust)`
+  cargo::rerun-if-env-changed=NGX_OTEL_ALLOW_FLAVOR_MISMATCH
+  │  BUILD FLAVOR MISMATCH — release profile + debug nginx tree    │
+  │    NGX_OTEL_ALLOW_FLAVOR_MISMATCH=1 cargo test --release --lib │
+
+=== MUTATION A: GUARD FIRES (above) — REGRESSION DETECTOR CONFIRMED ===
+
+=== MUTATION B: NEW make test (BUILD=release default, guard must NOT fire) ===
+make sub-invocation:
+/usr/bin/make BUILD=release test
+NGINX_SOURCE_DIR="/home/cvandesande/project-nginx-otel/nginx" NGINX_BUILD_DIR="/home/cvandesande/project-nginx-otel/ngx-otel-rust/objs-release"  cargo build --release
+	&& NGINX_SOURCE_DIR="/home/cvandesande/project-nginx-otel/nginx" NGINX_BUILD_DIR="/home/cvandesande/project-nginx-otel/ngx-otel-rust/objs-release"  /usr/bin/make -f /home/cvandesande/project-nginx-otel/ngx-otel-rust/objs-release/Makefile modules
+make test run (PASS counts):
+==> tests/integration/run.sh
+[0;32m[PASS][0m metrics.json contains service.name = ngx-otel-step9-integration
+[0;32m[PASS][0m metrics.json contains http.server.request.duration
+[0;32m[PASS][0m error.log contains exactly 1 'export loop started' line (otel exporter process)
+[0;32m[PASS][0m graceful drain integrity: 1 start(s), 1 complete(s)
+[0;32m[PASS][0m All assertions passed. Step 9 end-to-end test COMPLETE.
+==> tests/integration/run_reload.sh
+[0;32m[PASS][0m error.log: exactly 2 'export loop started' lines (one per exporter generation)
+[0;32m[PASS][0m error.log: 2 'graceful drain complete' lines (≥ 2 expected)
+[0;32m[PASS][0m error.log: exactly 1 'otel: SIGHUP reload detected' line
+[0;32m[PASS][0m metrics.json: service.name = ngx-otel-step10-reload present (8 lines)
+[0;32m[PASS][0m metrics.json: 2 unique startTimeUnixNano values for ngx_otel.dropped_records (≥ 2 expected)
+[0;32m[PASS][0m metrics.json: all ngx_otel.dropped_records data points have timeUnixNano >= startTimeUnixNano
+[0;32m[PASS][0m All assertions passed. Step 10 SIGHUP reload test COMPLETE.
+==> tests/integration/run_endpoint_change.sh
+[0;32m[PASS][0m metrics.json: phase-A batches present (endpoint A = http://127.0.0.1:4318 worked)
+[0;32m[PASS][0m error.log: 3 'otel export: send failed' line(s) (≥ 2: send_failures counter advanced past 1)
+[0;32m[PASS][0m error.log: exactly 1 'otel: SIGHUP reload detected' line
+[0;32m[PASS][0m metrics.json: ngx_otel.send_failures present in phase-A with asInt=0 (initial value correct)
+[0;32m[PASS][0m All assertions passed. Step 10 endpoint-change reload test COMPLETE.
+==> tests/integration/run_traces.sh
+[0;32m[PASS][0m traces.json: ResourceSpans payload received — span reached the collector
+[0;32m[PASS][0m traces.json: span traceId=a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6 matches inbound traceparent
+[0;32m[PASS][0m traces.json: parentSpanId=f1e2d3c4b5a69788 matches inbound traceparent span_id
+[0;32m[PASS][0m traces.json: http.request.method attribute present
+[0;32m[PASS][0m traces.json: http.response.status_code attribute present
+[0;32m[PASS][0m traces.json: url.path attribute present
+[0;32m[PASS][0m logs.json: trace_id a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6 carried on tail LogRecord (cross-signal logs→trace)
+[0;32m[PASS][0m metrics.json: trace_id a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6 in metric exemplar (cross-signal metrics→trace)
+[0;32m[PASS][0m metrics.json: no resourceSpans in new data (FU1 split holds)
+[0;32m[PASS][0m D1a: sampled parent (d1aaaa00000000001111111111111111) → span present in traces.json (otel_trace $otel_parent_sampled works)
+[0;32m[PASS][0m D1b: unsampled parent (d1bbbb00000000002222222222222222) → no span in traces.json (correct: gate declined)
+[0;32m[PASS][0m All assertions passed.
+
+PASS_COUNT: 29
+FAIL_COUNT: 0
+0
+
+=== CACHE POISONING CHECK: after make test, make build-release must NOT rebuild nginx-sys ===
+    Finished `release` profile [optimized] target(s) in 0.03s
+    Finished `ngx-release` profile [optimized] target(s) in 0.03s
+
+=== target/release/build/nginx-sys NGX_DEBUG check (must be absent for release tree): ===
+
+
+=== macOS verify: /usr/bin/make -n test shows objs-release (GNU 3.81) ===
+(Performed on macOS host — see macOS verification section)
+
+=== VERDICT: PASS — 29 PASS / 0 FAIL, release pairing, no cache poisoning ===
