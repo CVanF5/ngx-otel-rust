@@ -132,4 +132,4 @@ OUT-OF-SCOPE OBSERVATIONS:
   the placeholder path /tmp/ngx-otel-demo-placeholder will fail. This is acceptable
   for a demo-only stack.
 
-── GIT_COMMIT: (stamped after commit) ───────────────────────────────────────────
+── GIT_COMMIT: 12d8af9f764c3e12a0a27118c2088f981b8bc801 ────────────────────────
