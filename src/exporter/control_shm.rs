@@ -42,7 +42,9 @@ use ngx::core::Status;
 ///   8     flags               8 B     reserved (Phase 5 fast-path reconfiguration)
 ///  16     crash_count         8 B     exporter restarts within crash window
 ///  24     window_start_unix   8 B     UNIX seconds: start of the current crash window
-///  32     _reserved[0..4]    32 B     Phase 5 payload budget
+///  32     successor_gen       8 B     B1 reload successor generation counter
+///  40     last_beat_msec      8 B     B4 liveness beat (exporter ngx_current_msec)
+///  48     _reserved[0..2]    16 B     Phase 5 payload budget
 /// ```
 /// Total: 8 × AtomicU64 = 64 bytes. `#[repr(C)]` layout is pinned by the
 /// `control_shm_struct_size` unit test.
@@ -96,9 +98,29 @@ pub struct ControlShm {
     /// each exporter is sole consumer of its own zones (see
     /// `ngx_master_process_cycle` in nginx's `ngx_process_cycle.c`).
     pub successor_gen: AtomicU64,
+    /// B4 follow-up 2 — exporter liveness heartbeat timestamp.
+    ///
+    /// **Written by the exporter** from a dedicated, self-rearming
+    /// `ngx_event_t` timer (`heartbeat_timer_handler` in `exporter/mod.rs`)
+    /// every [`crate::liveness::HEARTBEAT_PERIOD_MS`] ms.  The value is the
+    /// exporter's `ngx_current_msec` (nginx's cached **monotonic** millisecond
+    /// clock, derived from `CLOCK_MONOTONIC` — NOT wall-clock).  The timer is
+    /// independent of drain/send progress: a blackholed-collector send stall
+    /// parks the async send future but the nginx event loop keeps expiring
+    /// timers, so beats continue.
+    ///
+    /// **Read by workers** on the ring-full drop path only (symptom path —
+    /// never per-request).  A worker compares its own `ngx_current_msec`
+    /// against this value; both sides share the `CLOCK_MONOTONIC` basis, so
+    /// the comparison is meaningful across processes.  See
+    /// [`crate::liveness::heartbeat_is_stale`].
+    ///
+    /// `0` means "exporter has never beaten" (fresh zone) and is treated as
+    /// not-stale (startup grace: don't alert before the exporter's first beat).
+    pub last_beat_msec: AtomicU64,
     /// Reserved padding for forward-compatible additions.
-    /// Phase 5 payload budget: 3 × AtomicU64 = 24 bytes.
-    pub _reserved: [AtomicU64; 3],
+    /// Phase 5 payload budget: 2 × AtomicU64 = 16 bytes.
+    pub _reserved: [AtomicU64; 2],
 }
 
 impl ControlShm {
@@ -210,6 +232,11 @@ mod tests {
             "window_start_unix must start at 0"
         );
         assert_eq!(ctrl.successor_gen.load(Ordering::Relaxed), 0, "successor_gen must start at 0");
+        assert_eq!(
+            ctrl.last_beat_msec.load(Ordering::Relaxed),
+            0,
+            "last_beat_msec must start at 0 (= exporter never beaten)"
+        );
         for (i, r) in ctrl._reserved.iter().enumerate() {
             assert_eq!(r.load(Ordering::Relaxed), 0, "_reserved[{}] must start at 0", i);
         }
@@ -222,9 +249,11 @@ mod tests {
             "version must be 1 after one increment"
         );
 
-        // crash_count, flags, successor_gen and _reserved must be unaffected by the version increment.
+        // crash_count, flags, successor_gen, last_beat_msec and _reserved must
+        // be unaffected by the version increment.
         assert_eq!(ctrl.flags.load(Ordering::Relaxed), 0, "flags must be unaffected");
         assert_eq!(ctrl.crash_count.load(Ordering::Relaxed), 0, "crash_count unaffected");
+        assert_eq!(ctrl.last_beat_msec.load(Ordering::Relaxed), 0, "last_beat_msec unaffected");
         assert_eq!(
             ctrl.window_start_unix.load(Ordering::Relaxed),
             0,
@@ -260,7 +289,7 @@ mod tests {
     #[test]
     fn control_shm_struct_size() {
         // 8 × AtomicU64 (version + flags + crash_count + window_start_unix +
-        // successor_gen + 3 × _reserved) = 64 bytes.
+        // successor_gen + last_beat_msec + 2 × _reserved) = 64 bytes.
         assert_eq!(
             mem::size_of::<ControlShm>(),
             8 * mem::size_of::<AtomicU64>(),

@@ -72,6 +72,7 @@ pub mod data_model;
 pub mod encoder;
 mod export;
 pub(crate) mod exporter;
+pub(crate) mod liveness;
 pub(crate) mod logs;
 mod metric_source;
 pub(crate) mod processor;
@@ -1092,22 +1093,69 @@ pub(crate) unsafe extern "C" fn otel_status_content_handler(
     use ngx::core::{Buffer, Pool};
     use ngx::http::HttpModuleMainConf as _;
 
-    // Read control_shm version via the request's module conf (one Relaxed load).
+    // Read control_shm fields via the request's module conf.
     // ngx_http_request_t implements HttpModuleConfExt, so main_conf() works directly.
     // SAFETY: nginx invokes a content handler with a non-null, valid request `r`;
     // `as_ref()` additionally null-checks, yielding a shared borrow valid for the
     // handler's duration.
-    let version = unsafe { r.as_ref() }
-        .and_then(HttpOtelModule::main_conf)
+    let amcf_opt = unsafe { r.as_ref() }.and_then(HttpOtelModule::main_conf);
+    let (version, last_beat_msec, successor_gen) = amcf_opt
         .and_then(|amcf| amcf.control_shm_ptr())
         // SAFETY: `ctrl` is the control-shm pointer returned by `control_shm_ptr()`,
-        // which points to a live `ControlShm` in the mapped zone; `version` is an
-        // atomic field read with a relaxed load, so cross-process access is sound.
-        .map(|ctrl| unsafe { (*ctrl).version.load(Ordering::Relaxed) })
-        .unwrap_or(0);
+        // which points to a live `ControlShm` in the mapped zone; all fields are
+        // atomics read with relaxed loads, so cross-process access is sound.
+        .map(|ctrl| unsafe {
+            (
+                (*ctrl).version.load(Ordering::Relaxed),
+                (*ctrl).last_beat_msec.load(Ordering::Relaxed),
+                (*ctrl).successor_gen.load(Ordering::Relaxed),
+            )
+        })
+        .unwrap_or((0, 0, 0));
 
-    // Format as "version\n".
-    let body = std::format!("{}\n", version);
+    // B4 test-support introspection: ring drop counters summed across workers
+    // (drop evidence for the heartbeat-stale polarity tests) plus the
+    // worker-local monotonic clock for staleness cross-checks.
+    let mut access_dropped: u64 = 0;
+    let mut error_dropped: u64 = 0;
+    let mut spans_dropped: u64 = 0;
+    if let Some(amcf) = amcf_opt {
+        let n_workers = amcf.shm_n_workers();
+        if let Some(logs_base) = amcf.logs_shm_base() {
+            let cap = amcf.log_ring_cap();
+            for w in 0..n_workers {
+                // SAFETY: `logs_base` is the mapped logs-zone data start; the zone
+                // was sized for ≥ `shm_n_workers()` slots at registration with this
+                // `cap`, so both ring views are in-bounds.
+                unsafe {
+                    access_dropped += crate::shm::logs_access_ring(logs_base, w, cap).drop_count();
+                    error_dropped += crate::shm::logs_error_ring(logs_base, w, cap).drop_count();
+                }
+            }
+        }
+        if let Some(spans_base) = amcf.spans_shm_base() {
+            for w in 0..n_workers {
+                // SAFETY: the spans zone is registered with the same reserved
+                // worker count as the metrics zone (`n_workers_to_reserve`), so
+                // `w < shm_n_workers()` slots are in-bounds at the default cap.
+                unsafe {
+                    spans_dropped +=
+                        crate::shm::spans_ring(spans_base, w, crate::shm::DEFAULT_SPAN_RING_CAP)
+                            .drop_count();
+                }
+            }
+        }
+    }
+    // SAFETY: `ngx_current_msec` is an nginx global updated by this worker's own
+    // single-threaded event loop (standard cached-time access).
+    let now_msec = unsafe { nginx_sys::ngx_current_msec } as u64;
+
+    // Line 1 stays the bare version (existing heartbeat test contract);
+    // key=value lines follow.
+    let body = std::format!(
+        "{}\nlast_beat_msec={}\nnow_msec={}\nsuccessor_gen={}\nspans_dropped={}\naccess_dropped={}\nerror_dropped={}\n",
+        version, last_beat_msec, now_msec, successor_gen, spans_dropped, access_dropped, error_dropped
+    );
     let body_len = body.len();
 
     // Set response headers.

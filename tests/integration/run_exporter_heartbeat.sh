@@ -120,7 +120,8 @@ fi
 STATUS_URL="http://127.0.0.1:9201/otel_status"
 
 info "Reading V_INITIAL from ${STATUS_URL}..."
-V_INITIAL="$(curl -sf --max-time 3 "${STATUS_URL}" | tr -d '[:space:]')"
+# B4: the status body is now multi-line (version on line 1, key=value after).
+V_INITIAL="$(curl -sf --max-time 3 "${STATUS_URL}" | head -n1 | tr -d '[:space:]')"
 if [[ -z "${V_INITIAL}" ]]; then
     echo "=== error.log ===" >&2
     grep -i "otel\|status\|error" "${PREFIX}/logs/error.log" | head -20 >&2
@@ -135,7 +136,7 @@ info "Sleeping 5s (metric_interval=1s, expect ≥4 heartbeats)..."
 sleep 5
 
 info "Reading V_AFTER from ${STATUS_URL}..."
-V_AFTER="$(curl -sf --max-time 3 "${STATUS_URL}" | tr -d '[:space:]')"
+V_AFTER="$(curl -sf --max-time 3 "${STATUS_URL}" | head -n1 | tr -d '[:space:]')"
 if [[ -z "${V_AFTER}" ]]; then
     fail "Failed to read /otel_status on second curl"
 fi

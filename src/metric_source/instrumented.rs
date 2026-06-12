@@ -437,7 +437,26 @@ impl HttpRequestHandler for LogPhaseHandler {
                 };
 
                 // Sink 1: per-worker SPSC log ring (exception-tail LogRecord).
-                emit_access_record(&producer, &sampled);
+                // B4: a `false` return is the ring-full drop path (already
+                // counted in the ring's `dropped`) — the TRIGGER for the
+                // exporter-liveness check (heartbeat = the VERDICT).  Zero
+                // added cost on the healthy path (the bool was discarded
+                // pre-B4).
+                if !emit_access_record(&producer, &sampled) {
+                    // SAFETY: `request.connection()` is the request's live
+                    // connection pointer (may be null — handled inside);
+                    // `(*conn).log` is the connection log nginx error logging
+                    // uses for this request.
+                    let conn_log = unsafe {
+                        let conn = request.connection();
+                        if conn.is_null() {
+                            core::ptr::null_mut()
+                        } else {
+                            (*conn).log
+                        }
+                    };
+                    crate::liveness::check_exporter_liveness_on_drop(amcf, conn_log);
+                }
 
                 // Sink 2: exemplar reservoir (Phase 2.2 Steps 2.2.4 + 2.2.5).
                 // One fetch_add + ≤ 9 Relaxed stores + 2 memcpy = within budget.
@@ -564,7 +583,21 @@ impl HttpRequestHandler for LogPhaseHandler {
                 // lifetime and outlives this handler invocation.
                 let spans = unsafe { spans_ring(spans_base, worker_id, DEFAULT_SPAN_RING_CAP) };
                 let producer = WorkerRingProducer { ring: spans };
-                emit_span_record(&producer, &rec);
+                // B4: ring-full drop path → liveness check (see the access-ring
+                // hook above for the trigger/verdict rationale).
+                if !emit_span_record(&producer, &rec) {
+                    // SAFETY: same contract as the access-ring hook — null
+                    // connection handled, `(*conn).log` is the request's log.
+                    let conn_log = unsafe {
+                        let conn = request.connection();
+                        if conn.is_null() {
+                            core::ptr::null_mut()
+                        } else {
+                            (*conn).log
+                        }
+                    };
+                    crate::liveness::check_exporter_liveness_on_drop(amcf, conn_log);
+                }
             }
         }
 

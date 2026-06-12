@@ -420,6 +420,61 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
         let pool = Pool::from_ngx_pool((*cycle).pool);
         let _ = pool.allocate(task);
 
+        // 11.5. B4 follow-up 2 — dedicated liveness heartbeat timer.
+        //
+        //     A self-rearming `ngx_event_t` timer stamps the exporter's
+        //     `ngx_current_msec` into `ControlShm::last_beat_msec` every
+        //     `HEARTBEAT_PERIOD_MS`.  Workers read it on their ring-full drop
+        //     path to distinguish a saturated-but-alive exporter (beats
+        //     normally → no alert) from a silent one (beats stop → one latched
+        //     ALERT per worker per generation).
+        //
+        //     INDEPENDENCE FROM DRAIN/SEND PROGRESS (hard requirement): the
+        //     timer fires from `ngx_event_expire_timers` inside the
+        //     `ngx_process_events_and_timers(cycle)` call in the main loop
+        //     below (step 12).  The export task's sends are async futures
+        //     driven by this same event loop over NON-BLOCKING IO
+        //     (transport/grpc/transport.rs: NgxExecutor + ngx::async_::spawn —
+        //     no block_on; ngx-rust async_/spawn.rs: wakes are deferred via
+        //     ngx_post_event, never re-polled synchronously).  A
+        //     blackholed-collector send stall merely parks the send future; the
+        //     event loop keeps expiring timers, so beats continue.
+        //
+        //     The event is allocated from the cycle pool (stable address for
+        //     the process lifetime); the timer dies with the process.
+        if let Some(ctrl_ptr) = amcf.control_shm_ptr_mut() {
+            let hb_ev =
+                nginx_sys::ngx_pcalloc((*cycle).pool, mem::size_of::<nginx_sys::ngx_event_t>())
+                    as *mut nginx_sys::ngx_event_t;
+            if hb_ev.is_null() {
+                // Non-fatal: telemetry export still works; only the worker-side
+                // stale detection is unavailable (workers see last_beat == 0 or
+                // the pre-fork value and apply startup grace).
+                ngx::ngx_log_error!(
+                    nginx_sys::NGX_LOG_WARN,
+                    (*cycle).log,
+                    "otel exporter: heartbeat timer allocation failed; \
+                     liveness stale-detection disabled for this generation"
+                );
+            } else {
+                (*hb_ev).handler = Some(heartbeat_timer_handler);
+                (*hb_ev).data = ctrl_ptr.cast::<c_void>();
+                (*hb_ev).log = (*cycle).log;
+                // First beat immediately: workers must see liveness from the
+                // moment the exporter is up, not one period later.
+                (*ctrl_ptr)
+                    .last_beat_msec
+                    .store(nginx_sys::ngx_current_msec as u64, Ordering::Release);
+                // SAFETY (ngx_add_timer): hb_ev is a valid, zeroed, pool-pinned
+                // ngx_event_t; ngx_current_msec and ngx_event_timer_rbtree are
+                // initialised before any process cycle runs.
+                nginx_sys::ngx_add_timer(
+                    hb_ev,
+                    crate::liveness::HEARTBEAT_PERIOD_MS as nginx_sys::ngx_msec_t,
+                );
+            }
+        }
+
         // Copy the Copy-typed mutable statics into locals first: formatting
         // them directly would create shared refs to a `static mut`
         // (static_mut_refs). We're already in an unsafe fn, so the reads need
@@ -556,6 +611,37 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
 /// FFI callback invoked by nginx's timer infrastructure with a valid (possibly
 /// null-data) `ngx_event_t`.  The handler accesses nothing through `ev`.
 unsafe extern "C" fn noop_timer_handler(_ev: *mut nginx_sys::ngx_event_t) {}
+
+/// B4 follow-up 2 — liveness heartbeat timer handler (exporter process).
+///
+/// Stamps the exporter's `ngx_current_msec` (monotonic, `CLOCK_MONOTONIC`
+/// basis — same basis workers compare against) into
+/// `ControlShm::last_beat_msec`, then re-arms itself for
+/// [`crate::liveness::HEARTBEAT_PERIOD_MS`].  Runs entirely on the exporter's
+/// single-threaded event loop; one Release store + one rbtree insertion per
+/// period.  Independent of drain/send progress by construction — see the
+/// registration comment in `otel_exporter_cycle` step 11.5.
+///
+/// # Safety
+///
+/// FFI callback invoked by nginx's timer expiry with the pool-pinned event
+/// registered in `otel_exporter_cycle`; `ev.data` is the live `ControlShm`
+/// pointer for the mapped control zone (process lifetime).
+unsafe extern "C" fn heartbeat_timer_handler(ev: *mut nginx_sys::ngx_event_t) {
+    // SAFETY: `ev` is the valid pool-pinned event (fn contract); `data` was set
+    // to the live ControlShm pointer at registration; `last_beat_msec` is an
+    // AtomicU64, so the cross-process store is well-defined. `ngx_current_msec`
+    // is updated by this process's own single-threaded event loop.
+    unsafe {
+        let ctrl = (*ev).data as *const crate::exporter::control_shm::ControlShm;
+        if !ctrl.is_null() {
+            (*ctrl).last_beat_msec.store(nginx_sys::ngx_current_msec as u64, Ordering::Release);
+        }
+        // Re-arm unconditionally: beating while draining on ngx_quit is
+        // correct (the exporter IS alive); the timer dies with the process.
+        nginx_sys::ngx_add_timer(ev, crate::liveness::HEARTBEAT_PERIOD_MS as nginx_sys::ngx_msec_t);
+    }
+}
 
 /// Close sibling process channel FDs that this process should not own.
 ///
