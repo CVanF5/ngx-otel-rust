@@ -45,6 +45,45 @@ ensure_built() {
     [[ -x "${NGINX_BIN}" ]]   || { err "nginx not found: ${NGINX_BIN}"; exit 1; }
 }
 
+# Self-signed serving certs so the "Serving certificates" dashboard panel has
+# data: one SHORT-lived cert (~1 h → sits below the panel's 7 d threshold and
+# visibly counts down) and one LONG cert (90 d → green).
+#
+# A true 1-hour notAfter needs `openssl req -not_after` (OpenSSL >= 3.4).
+# Stock macOS LibreSSL lacks it, so we prefer a Homebrew OpenSSL when present
+# and fall back to `-days 1` (24 h — still well under the 7 d threshold).
+gen_demo_certs() {
+    local certs="${PREFIX}/certs"
+    mkdir -p "${certs}"
+
+    local ossl="openssl"
+    local cand
+    for cand in /opt/homebrew/opt/openssl*/bin/openssl /usr/local/opt/openssl*/bin/openssl; do
+        [[ -x "${cand}" ]] && ossl="${cand}" && break
+    done
+
+    local short_args=(-days 1)
+    if "${ossl}" req -help 2>&1 | grep -q -- '-not_after'; then
+        # notAfter = now + 1 h (UTC), format YYYYMMDDHHMMSSZ.
+        local not_after
+        not_after="$(date -u -v+1H +%Y%m%d%H%M%SZ 2>/dev/null \
+                     || date -u -d '+1 hour' +%Y%m%d%H%M%SZ)"
+        short_args=(-not_after "${not_after}")
+        info "generating demo serving certs (short: 1 h via ${ossl})..."
+    else
+        info "generating demo serving certs (short: 24 h fallback — ${ossl} lacks -not_after)..."
+    fi
+
+    "${ossl}" req -x509 -nodes -newkey rsa:2048 \
+        -keyout "${certs}/short.key" -out "${certs}/short.crt" \
+        -subj "/CN=demo-short.local" "${short_args[@]}" >/dev/null 2>&1
+    "${ossl}" req -x509 -nodes -newkey rsa:2048 \
+        -keyout "${certs}/long.key" -out "${certs}/long.crt" \
+        -subj "/CN=demo-long.local" -days 90 >/dev/null 2>&1
+
+    ok "serving certs: short=$("${ossl}" x509 -in "${certs}/short.crt" -noout -enddate), long=90d"
+}
+
 wait_for_collector() {
     local i
     for i in $(seq 1 30); do
@@ -98,6 +137,7 @@ cmd_up() {
 
     # Fresh sandbox prefix for nginx.
     rm -rf "${PREFIX}"; mkdir -p "${PREFIX}/logs"
+    gen_demo_certs
     sed -e "s|@MODULE_PATH@|${MODULE_PATH}|g" \
         -e "s|@PREFIX@|${PREFIX}|g" \
         "${DEMO_DIR}/nginx-demo.conf.template" > "${PREFIX}/nginx.conf"

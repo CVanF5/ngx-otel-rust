@@ -118,4 +118,26 @@ http {
             return 200 "backend response\n";
         }
     }
+
+    # ── TLS demo servers (Serving-certificates dashboard panel) ──────────
+    # Certs are generated per-run by run-demo.sh into @PREFIX@/certs:
+    #   short.crt  ~1 h (24 h on LibreSSL fallback) → red in the panel,
+    #              ngx_otel.tls.certificate.time_to_expiration counts down
+    #   long.crt   90 d                             → green
+    # No traffic needed: cert metrics are collected at config time from the
+    # live SSL_CTX (TELEMETRY_MODEL.md "ngx_otel.tls.certificate.*").
+    server {
+        listen 127.0.0.1:9443 ssl;
+        server_name demo-short.local;
+        ssl_certificate     @PREFIX@/certs/short.crt;
+        ssl_certificate_key @PREFIX@/certs/short.key;
+        location / { return 200 "tls-short\n"; }
+    }
+    server {
+        listen 127.0.0.1:9444 ssl;
+        server_name demo-long.local;
+        ssl_certificate     @PREFIX@/certs/long.crt;
+        ssl_certificate_key @PREFIX@/certs/long.key;
+        location / { return 200 "tls-long\n"; }
+    }
 }
