@@ -63,10 +63,12 @@
 //!   consumed for that BIO. Ownership of that single reference transfers to the
 //!   `SSL`; `SSL_free` frees the BIO. Therefore we MUST NOT call
 //!   `BIO_free_all` on it ourselves — doing so would double-free. The BIO is
-//!   freed exactly once, by `SSL_free`, in `TlsNgxConnIo::drop`. If
-//!   `SSL_set_bio` is never reached (an error between `BIO_new` and
-//!   `SSL_set_bio`), we free the orphan BIO ourselves with `BIO_free_all`
-//!   (see [`TlsNgxConnIo::new`]).
+//!   freed exactly once, by `SSL_free`, in `TlsNgxConnIo::drop`. In
+//!   `TlsNgxConnIo::new`, the only early-return path before `SSL_set_bio` is
+//!   `BIO_new` returning null (no BIO was created, so there is nothing to
+//!   free); once `BIO_new` succeeds, `SSL_set_bio` is called unconditionally
+//!   (no fallible operations intervene) and takes ownership of the single BIO
+//!   reference.
 //! - `BIO_METHOD`: a process-global, created once via `BIO_meth_new` and never
 //!   freed (it lives for the life of the exporter process, like a `'static`).
 //!   Shared by all `BIO`s; OpenSSL does not free a method when a BIO using it is
@@ -408,6 +410,20 @@ fn bio_method<I: hyper::rt::Read + hyper::rt::Write + Unpin>(
     }
     Ok(BIO_METHOD.load(Ordering::SeqCst))
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Safety note: abort-on-unwind for extern "C" callbacks
+//
+// All BIO callbacks below (`bio_create`, `bio_destroy`, `bio_ctrl`,
+// `bio_read`, `bio_write`) are declared `extern "C"`.  Since Rust 1.81,
+// unwinding across an `extern "C"` ABI boundary causes the process to
+// **abort** (not unwind into OpenSSL's C stack, which would be UB).
+//
+// None of these callbacks panics intentionally.  The abort-on-unwind
+// guarantee from rustc >=1.81 means that an unexpected panic here is still
+// sound — it terminates the exporter process rather than corrupting the C
+// call stack — so no `catch_unwind` wrapper is needed.
+// ──────────────────────────────────────────────────────────────────────────────
 
 /// BIO create callback: initialize a fresh BIO. We mark it initialized; the
 /// `data` slot (our `BioCtx`) is set later by `TlsNgxConnIo::new`.

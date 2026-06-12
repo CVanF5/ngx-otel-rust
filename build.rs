@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 fn main() {
     detect_nginx_features();
+    check_build_flavor();
 
     // Generate required compiler flags
     if cfg!(target_os = "macos") {
@@ -90,6 +91,106 @@ fn compile_c_shims() {
     }
 
     build.compile("ngx_otel_shims");
+}
+
+/// Guard against building a release-profile crate against a debug-flavored
+/// nginx tree (or vice versa).
+///
+/// The hazard: `.cargo/config.toml` defaults `NGINX_BUILD_DIR=objs-debug` so
+/// that `cargo check` / rust-analyzer work without going through `make`.  If a
+/// developer then runs `cargo test --release` bare, cargo passes `objs-debug`
+/// to the build — release-profile nginx-sys bindings built against the
+/// `--with-debug` nginx tree.  Those bindings land in `target/release`, where
+/// `make build-release` also writes its artefacts.  bindgen caches are keyed
+/// on the input headers; a stale cache from the wrong flavor silently produces
+/// incorrect bindings (the "bindgen cache lies" gotcha).
+///
+/// Detection: `ngx_auto_config.h` in the nginx build dir contains
+///   `#define NGX_DEBUG  1`
+/// when nginx was configured `--with-debug` (the debug flavor); the release
+/// flavor has no such line.
+///
+/// Escape hatch: set `NGX_OTEL_ALLOW_FLAVOR_MISMATCH=1` if you genuinely need
+/// to cross-link (unusual; prefer `make build-release` / `make unittest-release`
+/// instead).  After any intentional mismatch, run `cargo clean` to purge the
+/// release cache before further release builds.
+fn check_build_flavor() {
+    // Rebuild whenever the escape-hatch or the build dir changes.
+    println!("cargo::rerun-if-env-changed=NGX_OTEL_ALLOW_FLAVOR_MISMATCH");
+    println!("cargo::rerun-if-env-changed=NGINX_BUILD_DIR");
+
+    // Escape hatch: intentional cross-link (unusual).
+    if env::var("NGX_OTEL_ALLOW_FLAVOR_MISMATCH").as_deref() == Ok("1") {
+        return;
+    }
+
+    // cargo sets PROFILE to "debug" or "release" in build scripts.
+    let profile = env::var("PROFILE").unwrap_or_default();
+    let is_release = profile == "release";
+
+    // Read the build dir from nginx-sys's metadata export (DEP_NGINX_BUILD_DIR),
+    // falling back to the raw env var the user (or .cargo/config.toml) set.
+    // DEP_NGINX_BUILD_DIR is set by nginx-sys build script; NGINX_BUILD_DIR is
+    // the raw env var the user (or .cargo/config.toml) provides.
+    let build_dir = env::var_os("DEP_NGINX_BUILD_DIR")
+        .or_else(|| env::var_os("NGINX_BUILD_DIR"))
+        .map(PathBuf::from);
+
+    let auto_config_path = match &build_dir {
+        Some(dir) => dir.join("ngx_auto_config.h"),
+        None => return, // no build dir known; the existing bindgen error will fire
+    };
+
+    // Rerun when the auto-config changes (file may not exist yet if configure
+    // hasn't run; that's fine — the existing bindgen path handles that).
+    println!("cargo::rerun-if-changed={}", auto_config_path.display());
+
+    // Only guard on a POSITIVE NGX_DEBUG detection; missing / unreadable file
+    // → skip (the existing bindgen error already catches a broken NGINX_BUILD_DIR).
+    let contents = match std::fs::read_to_string(&auto_config_path) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let nginx_tree_is_debug = contents.contains("NGX_DEBUG");
+
+    if is_release && nginx_tree_is_debug {
+        // Hard error: release cargo profile + debug nginx tree = bad cache.
+        panic!(
+            "\n\
+             ┌────────────────────────────────────────────────────────────────┐\n\
+             │  BUILD FLAVOR MISMATCH — release profile + debug nginx tree    │\n\
+             ├────────────────────────────────────────────────────────────────┤\n\
+             │  NGINX_BUILD_DIR={dir} was configured with            │\n\
+             │  --with-debug (NGX_DEBUG=1), but cargo is building in RELEASE  │\n\
+             │  profile.  The bindgen cache in target/release would contain   │\n\
+             │  bindings generated from the wrong (debug-flavored) headers.   │\n\
+             │                                                                │\n\
+             │  Remedy:                                                       │\n\
+             │    make build-release        (recommended — sets objs-release) │\n\
+             │    make unittest-release     (release-profile unit tests)      │\n\
+             │  or, if you truly mean to cross-link:                         │\n\
+             │    NGX_OTEL_ALLOW_FLAVOR_MISMATCH=1 cargo test --release --lib │\n\
+             │  Then run `cargo clean` before the next release build to purge │\n\
+             │  the stale release cache.                                      │\n\
+             └────────────────────────────────────────────────────────────────┘\n",
+            dir = auto_config_path.parent().map(|p| p.display().to_string()).unwrap_or_default(),
+        );
+    }
+
+    // Reverse case: debug profile + non-debug tree.  This is less hazardous
+    // (the debug cache won't collide with a release build; debug bindings
+    // compiled against a non-debug nginx tree are valid for running debug
+    // tests, just without extra nginx assertions).  Warn rather than hard-error
+    // so that developers who have only a release-configured nginx available are
+    // not completely blocked from running debug tests.
+    if !is_release && !nginx_tree_is_debug {
+        println!(
+            "cargo::warning=Build flavor note: debug cargo profile with a non-debug nginx tree \
+             ({dir}). Tests will work but without nginx --with-debug assertions. \
+             Use `make build` (which configures --with-debug) for full debug coverage.",
+            dir = auto_config_path.parent().map(|p| p.display().to_string()).unwrap_or_default(),
+        );
+    }
 }
 
 /// Generates `ngx_os`, `ngx_feature` and nginx version cfg values.

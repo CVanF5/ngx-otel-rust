@@ -1,0 +1,72 @@
+A0.5 flavor-guard mutation cycle
+GIT_COMMIT (working tree base): 177b2ccf79c475b7c45061fee336c692151334d8
+Platform: macOS (aarch64-apple-darwin)
+Date: 2026-06-12
+Hypothesis: disabling the release+debug-tree guard (`&& false`) lets the
+            mismatch build succeed; restoring it rejects with the remedy message.
+
+========================================================================
+GUARD TRIGGER VERIFY (before mutation): bare `cargo test --release --lib`
+with .cargo/config.toml default (NGINX_BUILD_DIR=objs-debug, a debug tree)
+→ MUST fail with the remedy message.
+========================================================================
+RESULT: FAIL (as expected — guard fires)
+
+  thread 'main' panicked at build.rs:158:9:
+  ┌────────────────────────────────────────────────────────────────┐
+  │  BUILD FLAVOR MISMATCH — release profile + debug nginx tree    │
+  ├────────────────────────────────────────────────────────────────┤
+  │  NGINX_BUILD_DIR=.../objs-debug was configured with            │
+  │  --with-debug (NGX_DEBUG=1), but cargo is building in RELEASE  │
+  │  profile.  The bindgen cache in target/release would contain   │
+  │  bindings generated from the wrong (debug-flavored) headers.   │
+  │                                                                │
+  │  Remedy:                                                       │
+  │    make build-release        (recommended — sets objs-release) │
+  │    make unittest-release     (release-profile unit tests)      │
+  │  or, if you truly mean to cross-link:                         │
+  │    NGX_OTEL_ALLOW_FLAVOR_MISMATCH=1 cargo test --release --lib │
+  │  Then run `cargo clean` before the next release build to purge │
+  │  the stale release cache.                                      │
+  └────────────────────────────────────────────────────────────────┘
+
+  note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+  warning: build failed, waiting for other jobs to finish...
+
+========================================================================
+ESCAPE HATCH: same command with NGX_OTEL_ALLOW_FLAVOR_MISMATCH=1 → PASSES
+(then `cargo clean` to purge stale release cache)
+========================================================================
+$ NGX_OTEL_ALLOW_FLAVOR_MISMATCH=1 cargo test --release --lib
+
+test result: ok. 226 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.30s
+
+[cargo clean run immediately after]
+
+========================================================================
+HALF 1 — MUTANT (broken: `if is_release && nginx_tree_is_debug {`
+                         → `if is_release && nginx_tree_is_debug && false {`)
+========================================================================
+$ cargo test --release --lib   # no guard, mismatch not detected → BAD
+
+test result: ok. 226 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.34s
+
+BUILD SUCCEEDS — mismatch not rejected (expected: this is the broken state).
+[cargo clean run immediately after to purge stale release cache]
+
+========================================================================
+HALF 2 — RESTORED (guard re-enabled)
+========================================================================
+$ cargo test --release --lib   # guard fires again
+
+error: failed to run custom build command for `ngx-otel-rust v0.1.0 (...)`
+
+Caused by:
+  process didn't exit successfully: `.../build-script-build` (exit status: 101)
+  --- stderr
+  thread 'main' panicked at build.rs:158:9:
+  │  BUILD FLAVOR MISMATCH — release profile + debug nginx tree    │
+  │    NGX_OTEL_ALLOW_FLAVOR_MISMATCH=1 cargo test --release --lib │
+
+BUILD FAILS — mismatch correctly rejected (expected: guard works).
+[cargo clean run immediately after]

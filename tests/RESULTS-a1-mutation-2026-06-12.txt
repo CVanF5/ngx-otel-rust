@@ -41,3 +41,15 @@ test transport::tls::tests::bad_ca_handshake_fails ... ok
 
 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 221 filtered out; finished in 0.31s
 
+
+========================================================================
+PROVENANCE ADDENDUM (appended by A0.5 implement, 2026-06-12)
+========================================================================
+The GIT_COMMIT embedded above (daedbaa30af7fd3d5b93afcfd4807605aa6b8f55) is
+the pre-amend A1 commit at which the mutation cycle was first executed.  The
+final A1 commit (after the A1 reviewer's amend) is 177b2cc.  The content of
+src/transport/tls.rs and src/transport/tls_tests.rs is identical between
+daedbaa3 and 177b2cc (the amend added only the a1-review-report.md and updated
+the commit message; no Rust source was changed).  The A1 review (a1-review-
+report.md, check 7) independently re-executed this mutation cycle against
+177b2cc and confirmed both halves pass with the same result.

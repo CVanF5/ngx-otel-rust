@@ -612,6 +612,62 @@ The build-time knobs are:
 | `NGX_RUST_TARGET`     | `--target` for `cargo rustc` (cross-compile)       | (host)           |
 | Cargo feature `test-support` | Exposes `Spin*` test transports for unit tests  | off              |
 
+## Developing
+
+### Directory layout
+
+```
+../ngx-rust/   ← patched ngx-rust fork (branch ngx-otel-rust-deadlock-fix)
+../nginx/      ← NGINX source checkout
+ngx-otel-rust/ ← this repo
+```
+
+The Makefile defaults (`NGINX_SOURCE_DIR=../nginx`) and `.cargo/config.toml`
+both expect sibling checkouts at these paths.  Override via env vars if your
+layout differs.
+
+### First-time setup
+
+```sh
+# 1. Build nginx + debug module once (populates objs-debug/ and target/debug/).
+make build
+
+# 2. After that, rust-analyzer and bare `cargo check` / `cargo test` work
+#    without going through make, because .cargo/config.toml supplies the
+#    NGINX_SOURCE_DIR and NGINX_BUILD_DIR defaults automatically.
+```
+
+`.cargo/config.toml` contains `[env]` defaults pointing to the debug tree
+(`NGINX_BUILD_DIR = "objs-debug"`).  These defaults do NOT override variables
+already set in the environment, so Makefile targets and CI always win.
+
+### Canonical test commands
+
+```sh
+make check             # rustfmt + clippy (zero warnings required)
+make unittest          # cargo test --lib  (debug profile, objs-debug tree)
+make unittest-release  # cargo test --release --lib  (release profile, objs-release tree)
+make test              # bash integration suite (needs a running OTel collector)
+```
+
+`make unittest-release` requires `make build-release` to have been run first
+(to populate `objs-release/`).
+
+### Build-flavor guard
+
+A build-time guard in `build.rs` enforces that the cargo profile and the nginx
+tree flavor agree:
+
+- **release profile + `--with-debug` nginx tree → hard error** (names the
+  remedy).  This is the hazard that `.cargo/config.toml`'s `objs-debug`
+  default creates: bare `cargo test --release --lib` is blocked.  Use
+  `make unittest-release` instead.
+- **debug profile + non-debug nginx tree → warning only** (unusual; tests still
+  work, just without nginx's debug assertions).
+
+Escape hatch (intentional cross-link): set `NGX_OTEL_ALLOW_FLAVOR_MISMATCH=1`.
+Run `cargo clean` afterward to purge the stale release cache.
+
 ## Project layout
 
 ```

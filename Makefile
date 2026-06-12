@@ -96,7 +96,7 @@ TEST_ENV	+= NGINX_BUILD_DIR="$(NGINX_BUILD_DIR)"
 
 # Build targets
 
-.PHONY: help build check install-hooks unittest test full-test clean
+.PHONY: help build check install-hooks unittest unittest-release test full-test clean
 
 help:
 	@echo "Available targets:"
@@ -144,8 +144,14 @@ install-hooks: ## Install the local pre-commit gate (sets git core.hooksPath)
 	git config core.hooksPath .githooks
 	@echo "Installed: core.hooksPath=.githooks — pre-commit now runs 'make check'."
 
-unittest: $(NGINX_BUILD_DIR)/Makefile  ## Run unit-tests
+unittest: $(NGINX_BUILD_DIR)/Makefile  ## Run unit-tests (debug profile, objs-debug tree)
 	$(BUILD_ENV) $(NGX_CARGO) test --lib
+
+unittest-release: ## Run unit-tests in release profile (objs-release tree; requires make build-release first)
+	NGINX_SOURCE_DIR="$(NGINX_SOURCE_DIR)" \
+	NGINX_BUILD_DIR="$(CURDIR)/objs-release" \
+	$(OPENSSL_BUILD_ENV) \
+	$(NGX_CARGO) test --release --lib
 
 # Phase A test target: invoke our existing bash integration scripts via the
 # nginx binary we just built (TEST_NGINX_BINARY). Phase B replaces this with
