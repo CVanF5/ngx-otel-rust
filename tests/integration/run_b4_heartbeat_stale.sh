@@ -86,7 +86,8 @@ wait_for() {
 }
 
 exporter_pid() {
-    ps -eo pid,args 2>/dev/null | awk '/nginx: otel exporter/ {print $1; exit}'
+    # [o] bracket trick: without it the awk process matches its OWN args.
+    ps -eo pid,args 2>/dev/null | awk '/nginx: [o]tel exporter/ {print $1; exit}'
 }
 
 # status_field <port> <key>  — read a key=value line from /otel_status.
