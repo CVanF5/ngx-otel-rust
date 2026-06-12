@@ -1,0 +1,131 @@
+C1 — Build foundation: --with-http_ssl_module + bindings regen
+VERIFICATION EVIDENCE
+2026-06-12
+GIT_COMMIT: fe4539be4a4c3afd3fe98b81fada7b9713677309
+
+Change: Added --with-http_ssl_module to NGINX_CONFIGURE_BASE in Makefile.
+Procedure: cargo clean + rm objs-release + rm objs-debug + make build + make build-release
+           (objs dirs removed to force nginx reconfigure; bindgen cache cleared by cargo clean).
+
+════════════════════════════════════════════════════════════
+PLATFORM 1: macOS (darwin arm64)
+════════════════════════════════════════════════════════════
+
+Build: make build (debug) + make build-release — BOTH EXIT:0
+nginx binary: objs-release/nginx includes --with-http_ssl_module (confirmed via ngx_auto_config.h)
+
+ngx_auto_config.h SSL flags confirmed:
+  #define NGX_HTTP_SSL  1
+  #define NGX_OPENSSL   1
+  #define NGX_SSL       1
+
+Bindings file: target/release/build/nginx-sys-b5b663c83b4ce38e/out/bindings.rs
+
+FEATURES= line (release build output):
+cargo::metadata=features=http,compat,have_inet6,have_kqueue,have_openat,have_posix_memalign,have_sched_yield,have_sendfile,have_unix_domain,have_variadic_macros,http_cache,http_dav,http_gzip,http_headers,http_realip,http_ssi,http_ssl,http_upstream_sid,http_upstream_sticky,http_upstream_zone,http_x_forwarded_for,openssl,pcre,pcre2,ssl,stat_stub,stream_upstream_zone
+
+CHECK 1 — ngx_ssl_s has real fields (NOT opaque ZST): PASS
+  BEFORE (baseline): pub struct ngx_ssl_s { _unused: [u8; 0] }
+  AFTER (bindings line 62667):
+    pub struct ngx_ssl_s {
+        pub ctx: *mut SSL_CTX,
+        pub log: *mut ngx_log_t,
+        pub buffer_size: usize,
+        pub certs: ngx_array_t,
+        pub staple_rbtree: ngx_rbtree_t,
+        pub staple_sentinel: ngx_rbtree_node_t,
+    }
+
+CHECK 2 — pub static mut ngx_http_ssl_module emitted: PASS
+  bindings line 79004: pub static mut ngx_http_ssl_module: ngx_module_t;
+
+CHECK 3 — ngx_http_ssl_srv_conf_t presence: PRESENT (not absent as spec predicted)
+  bindings line 78966: pub struct ngx_http_ssl_srv_conf_t { ... }
+  NOTE: The struct has real fields (ssl: ngx_ssl_t, certificates: *mut ngx_array_t, etc.)
+        This is noted per spec ("if it IS present, note it"); C2 shim still planned as designed.
+        No redesign required — the shim provides the clean C-side accessor for C++ compat.
+
+BITFIELD-POLICY CHECK (macOS):
+  New SSL-related structs with bindgen bitfield accessors:
+  - ngx_ssl_connection_s: bitfields handshaked, renegotiation, buffered_send, ... (flags)
+  - ngx_ssl_ticket_key_t: bitfields size (8-bit), shared (1-bit)
+  - ngx_http_ssl_srv_conf_t: NO bitfields (all regular fields)
+  Policy: ZERO new bindgen bitfield-accessor uses in src/ code (grep confirms: no ngx_ssl_connection_s,
+          handshaked(), .shared() references). Existing ngx_http_request_t shim unchanged.
+
+UNIT TESTS (macOS, --release --lib):
+  test result: ok. 199 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out
+
+make check (macOS, BUILD=release): EXIT:0
+
+════════════════════════════════════════════════════════════
+PLATFORM 2: debian-vm (Linux aarch64, kernel 6.12.90)
+════════════════════════════════════════════════════════════
+
+Build: make build (debug) + make build-release — BOTH EXIT:0
+HEAD after git pull: fe4539be4a4c3afd3fe98b81fada7b9713677309 (verified, no silent no-op)
+
+ngx_auto_config.h SSL flags confirmed:
+  #define NGX_HTTP_SSL  1
+  #define NGX_OPENSSL   1
+  #define NGX_SSL       1
+
+Bindings file: target/release/build/nginx-sys-37a6b51a5fbb8ae6/out/bindings.rs
+
+FEATURES= line (release build output):
+cargo::metadata=features=http,compat,have_epollexclusive,have_epollrdhup,have_eventfd,have_inet6,have_memalign,have_openat,have_posix_memalign,have_sched_yield,have_sendfile,have_unix_domain,have_variadic_macros,http_cache,http_dav,http_gzip,http_headers,http_realip,http_ssi,http_ssl,http_upstream_sid,http_upstream_sticky,http_upstream_zone,http_x_forwarded_for,openssl,pcre,pcre2,ssl,stat_stub,stream_upstream_zone
+
+CHECK 1 — ngx_ssl_s has real fields (NOT opaque ZST): PASS
+  bindings line 61799:
+    pub struct ngx_ssl_s {
+        pub ctx: *mut SSL_CTX,
+        pub log: *mut ngx_log_t,
+        pub buffer_size: usize,
+        pub certs: ngx_array_t,
+        pub staple_rbtree: ngx_rbtree_t,
+        pub staple_sentinel: ngx_rbtree_node_t,
+    }
+
+CHECK 2 — pub static mut ngx_http_ssl_module emitted: PASS
+  bindings line 80559: pub static mut ngx_http_ssl_module: ngx_module_t;
+
+CHECK 3 — ngx_http_ssl_srv_conf_t presence: PRESENT (same as macOS)
+  bindings line 80521: pub struct ngx_http_ssl_srv_conf_t { ... }
+  NOTE: Same as macOS; noted per spec; C2 shim plan unchanged.
+
+BITFIELD-POLICY CHECK (debian-vm):
+  Same SSL structs with bitfields as macOS:
+  - ngx_ssl_connection_s (lines near 61809): bitfield flags
+  - ngx_ssl_ticket_key_t (lines near 62456): size + shared bitfields
+  - ngx_http_ssl_srv_conf_t: NO bitfields
+  Policy: ZERO new bitfield-accessor uses in src/ (grep confirmed). Policy intact.
+
+UNIT TESTS (debian-vm, make unittest BUILD=release):
+  test result: ok. 199 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out
+
+make check (debian-vm, BUILD=release): EXIT:0
+
+INTEGRATION TESTS (debian-vm, make test BUILD=release):
+  ==> tests/integration/run.sh            — ALL PASS (5 assertions)
+  ==> tests/integration/run_reload.sh     — ALL PASS (6 assertions)
+  ==> tests/integration/run_endpoint_change.sh — ALL PASS (4 assertions)
+  ==> tests/integration/run_traces.sh     — ALL PASS (11 assertions)
+  Total: 4 suites, 26 assertions, 0 FAIL
+
+════════════════════════════════════════════════════════════
+SUMMARY
+════════════════════════════════════════════════════════════
+
+Flag is BEHAVIORALLY INERT: all existing tests pass, wire output unchanged.
+
+Bindings checks:
+  [PASS] ngx_ssl_s — real layout with ctx: *mut SSL_CTX (both platforms)
+  [PASS] ngx_http_ssl_module — pub static mut emitted (both platforms)
+  [NOTE] ngx_http_ssl_srv_conf_t — PRESENT on both platforms (expected absent; no action needed)
+
+Bitfield policy: NO new bindgen bitfield accessors used in module Rust code.
+New bitfield structs from SSL module: ngx_ssl_connection_s, ngx_ssl_ticket_key_t (not touched by our code).
+
+Unit tests: 199/199 macOS + 199/199 debian-vm
+make check: EXIT:0 both platforms
+Integration: 4/4 suites, 26/26 assertions, 0 failures (debian-vm)
