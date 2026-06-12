@@ -577,20 +577,22 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             }
         }
         ExportProtocol::OtlpGrpc => {
-            // For gRPC, drop the TLS context — gRPC TLS dispatch is A3 scope.
-            // The gRPC connector receives the plain TCP IO from NgxConnector;
-            // TLS wrapping for gRPC will be wired in A3 when E2E integration
-            // tests can verify the full path.  For now, gRPC over https://
-            // builds and starts but the h2 handshake will fail (no TLS on the
-            // wire) — this is safe (fail-closed) and consistent with A2's scope.
-            drop(tls_ctx_opt);
+            // gRPC over https:// wraps each h2 connection in TLS (ALPN h2) via
+            // the same TlsNgxConnIo engine as the HTTP transport — the decision
+            // of record (ONE TLS engine, both transports). Plaintext http://
+            // endpoints leave `tls` unset → h2c, unchanged.
             match GrpcTransport::<NgxConnector>::with_ngx_log(
                 endpoint_str,
                 log,
                 amcf.resolver,
                 amcf.resolver_timeout,
             ) {
-                Ok(t) => ExportTransport::Grpc(t),
+                Ok(mut t) => {
+                    if let Some((ctx, insecure)) = tls_ctx_opt {
+                        t.set_tls(ctx, insecure);
+                    }
+                    ExportTransport::Grpc(t)
+                }
                 Err(e) => {
                     ngx::ngx_log_error!(
                         NGX_LOG_ERR,

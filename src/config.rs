@@ -144,6 +144,82 @@ impl ExporterConfig {
     }
 }
 
+/// Outcome of endpoint + TLS config-time validation (the pure logic behind the
+/// `post_config` checks). `Ok` carries whether the insecure WARN should be
+/// emitted; `Err` carries the specific config error so `post_config` can log
+/// the matching NGX_LOG_EMERG message and return `NGX_ERROR`.
+///
+/// This is split out of `post_config` so the validation DECISIONS can be unit
+/// tested without an `ngx_conf_t` FFI context (the production `post_config`
+/// calls exactly this function).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TlsConfigError {
+    /// Endpoint scheme is none of `unix:` / `http://` / `https://`.
+    BadScheme,
+    /// `ssl_certificate` set without `ssl_certificate_key`.
+    CertWithoutKey,
+    /// `ssl_certificate_key` set without `ssl_certificate`.
+    KeyWithoutCert,
+    /// A configured TLS file (label) does not exist / is not readable.
+    FileMissing(&'static str),
+}
+
+/// Inputs to [`validate_endpoint_tls`] (borrowed string slices for the
+/// endpoint + the three TLS file paths; empty string = unset).
+pub(crate) struct TlsValidationInput<'a> {
+    pub endpoint: &'a str,
+    pub trusted_cert: &'a str,
+    pub ssl_cert: &'a str,
+    pub ssl_cert_key: &'a str,
+    pub ssl_verify_off: bool,
+}
+
+/// Pure endpoint + TLS validation. `file_exists` is injected (production:
+/// `|p| Path::new(p).metadata().is_ok()`; tests: a closure over a known set) so
+/// the decision logic is testable without touching the filesystem layout.
+///
+/// Returns `Ok(warn_insecure)` on success, where `warn_insecure` is `true` iff
+/// the `ssl_verify off` WARN should be emitted. Returns the first failing check
+/// as `Err`. Mirrors the nginx idiom: validate at config-parse time.
+pub(crate) fn validate_endpoint_tls(
+    input: &TlsValidationInput<'_>,
+    file_exists: impl Fn(&str) -> bool,
+) -> Result<bool, TlsConfigError> {
+    let is_https = input.endpoint.starts_with("https://");
+    let valid_scheme =
+        input.endpoint.starts_with("unix:") || input.endpoint.starts_with("http://") || is_https;
+    if !valid_scheme {
+        return Err(TlsConfigError::BadScheme);
+    }
+
+    let has_cert = !input.ssl_cert.is_empty();
+    let has_key = !input.ssl_cert_key.is_empty();
+    if has_cert && !has_key {
+        return Err(TlsConfigError::CertWithoutKey);
+    }
+    if !has_cert && has_key {
+        return Err(TlsConfigError::KeyWithoutCert);
+    }
+
+    // File-existence checks only apply to https:// endpoints.
+    if is_https {
+        for (label, path) in &[
+            ("trusted_certificate", input.trusted_cert),
+            ("ssl_certificate", input.ssl_cert),
+            ("ssl_certificate_key", input.ssl_cert_key),
+        ] {
+            if path.is_empty() {
+                continue;
+            }
+            if !file_exists(path) {
+                return Err(TlsConfigError::FileMissing(label));
+            }
+        }
+    }
+
+    Ok(input.ssl_verify_off)
+}
+
 // ── Route and upstream tables (Phase 2.2 DP-E) ──────────────────────────────
 
 /// Maximum bytes stored per route name in the lookup table.
@@ -641,79 +717,66 @@ impl MainConfig {
             return Ok(());
         }
 
-        // Validate endpoint scheme.
-        let ep = self.exporter.endpoint.as_bytes();
-        let is_https = ep.starts_with(b"https://");
-        let valid_scheme = ep.starts_with(b"unix:") || ep.starts_with(b"http://") || is_https;
-
-        if !valid_scheme {
-            ngx_conf_log_error!(
-                NGX_LOG_EMERG,
-                &raw mut *cf,
-                "otel_exporter: \"endpoint\" must start with http://, https://, or unix:"
-            );
-            return Err(Status::NGX_ERROR);
-        }
-
-        // ── TLS directive validation (https:// endpoints only) ─────────────────
+        // ── Endpoint + TLS directive validation ────────────────────────────────
         //
         // Config-time checks follow the nginx idiom (fail at config parse, not at
-        // runtime).  These checks only apply to the exporter config block; workers
-        // never touch TLS paths.
-
-        // cert-without-key and key-without-cert are both hard errors.
-        let has_cert = !self.exporter.ssl_cert.is_empty();
-        let has_key = !self.exporter.ssl_cert_key.is_empty();
-        if has_cert && !has_key {
-            ngx_conf_log_error!(
-                NGX_LOG_EMERG,
-                &raw mut *cf,
-                "otel_exporter: ssl_certificate set but ssl_certificate_key is missing"
-            );
-            return Err(Status::NGX_ERROR);
-        }
-        if !has_cert && has_key {
-            ngx_conf_log_error!(
-                NGX_LOG_EMERG,
-                &raw mut *cf,
-                "otel_exporter: ssl_certificate_key set but ssl_certificate is missing"
-            );
-            return Err(Status::NGX_ERROR);
-        }
-
-        // ssl_verify off: one WARN at config time.
-        if self.exporter.ssl_verify_off() {
-            ngx_conf_log_error!(
-                NGX_LOG_WARN,
-                &raw mut *cf,
-                "otel_exporter: ssl_verify off — collector certificate verification is \
-                 DISABLED (INSECURE, for testing only)"
-            );
-        }
-
-        // Files must exist and be readable at config time (nginx idiom for certs).
-        // We check all three TLS file paths when configured.
-        if is_https {
-            for (label, field) in &[
-                ("trusted_certificate", &self.exporter.trusted_cert),
-                ("ssl_certificate", &self.exporter.ssl_cert),
-                ("ssl_certificate_key", &self.exporter.ssl_cert_key),
-            ] {
-                if field.is_empty() {
-                    continue;
+        // runtime). The DECISION logic lives in `validate_endpoint_tls` (pure,
+        // unit-tested); here we map its result to the matching nginx log message.
+        // These checks only apply to the exporter config block; workers never
+        // touch TLS paths.
+        let ep = self.exporter.endpoint.as_bytes();
+        let ep_str_for_val = core::str::from_utf8(ep).unwrap_or("");
+        let val_input = TlsValidationInput {
+            endpoint: ep_str_for_val,
+            trusted_cert: core::str::from_utf8(self.exporter.trusted_cert.as_bytes()).unwrap_or(""),
+            ssl_cert: core::str::from_utf8(self.exporter.ssl_cert.as_bytes()).unwrap_or(""),
+            ssl_cert_key: core::str::from_utf8(self.exporter.ssl_cert_key.as_bytes()).unwrap_or(""),
+            ssl_verify_off: self.exporter.ssl_verify_off(),
+        };
+        match validate_endpoint_tls(&val_input, |p| std::path::Path::new(p).metadata().is_ok()) {
+            Ok(warn_insecure) => {
+                // ssl_verify off: one WARN at config time.
+                if warn_insecure {
+                    ngx_conf_log_error!(
+                        NGX_LOG_WARN,
+                        &raw mut *cf,
+                        "otel_exporter: ssl_verify off — collector certificate verification is \
+                         DISABLED (INSECURE, for testing only)"
+                    );
                 }
-                if let Ok(s) = core::str::from_utf8(field.as_bytes()) {
-                    if std::path::Path::new(s).metadata().is_err() {
-                        ngx_conf_log_error!(
-                            NGX_LOG_EMERG,
-                            &raw mut *cf,
-                            "otel_exporter: {}: file not found or not readable: {}",
-                            label,
-                            s
-                        );
-                        return Err(Status::NGX_ERROR);
-                    }
-                }
+            }
+            Err(TlsConfigError::BadScheme) => {
+                ngx_conf_log_error!(
+                    NGX_LOG_EMERG,
+                    &raw mut *cf,
+                    "otel_exporter: \"endpoint\" must start with http://, https://, or unix:"
+                );
+                return Err(Status::NGX_ERROR);
+            }
+            Err(TlsConfigError::CertWithoutKey) => {
+                ngx_conf_log_error!(
+                    NGX_LOG_EMERG,
+                    &raw mut *cf,
+                    "otel_exporter: ssl_certificate set but ssl_certificate_key is missing"
+                );
+                return Err(Status::NGX_ERROR);
+            }
+            Err(TlsConfigError::KeyWithoutCert) => {
+                ngx_conf_log_error!(
+                    NGX_LOG_EMERG,
+                    &raw mut *cf,
+                    "otel_exporter: ssl_certificate_key set but ssl_certificate is missing"
+                );
+                return Err(Status::NGX_ERROR);
+            }
+            Err(TlsConfigError::FileMissing(label)) => {
+                ngx_conf_log_error!(
+                    NGX_LOG_EMERG,
+                    &raw mut *cf,
+                    "otel_exporter: {}: file not found or not readable",
+                    label
+                );
+                return Err(Status::NGX_ERROR);
             }
         }
 
@@ -3193,32 +3256,149 @@ mod tests {
         assert!(cfg.ssl_verify_off(), "ssl_verify=0 must be treated as off");
     }
 
-    /// `https://` endpoints pass `valid_scheme` validation in `post_config`.
+    /// Helper: build a `TlsValidationInput` with all-files-exist, http endpoint
+    /// defaults, overridable per test.
+    fn val_input<'a>(
+        endpoint: &'a str,
+        ssl_cert: &'a str,
+        ssl_cert_key: &'a str,
+        trusted_cert: &'a str,
+        ssl_verify_off: bool,
+    ) -> TlsValidationInput<'a> {
+        TlsValidationInput { endpoint, trusted_cert, ssl_cert, ssl_cert_key, ssl_verify_off }
+    }
+
+    /// Scheme validation through the PRODUCTION predicate (`validate_endpoint_tls`),
+    /// NOT a reimplementation. Accepts unix:/http://https://; rejects others.
     ///
-    /// Tested by checking the `valid_scheme` branch that the `post_config`
-    /// validator uses: `ep.starts_with(b"http://")` OR starts `https://`.
-    /// We exercise the same predicate directly.
-    ///
-    /// Mutation evidence: remove the `is_https` branch from `valid_scheme`
-    /// (set `is_https = false`) → `https://` endpoint fails validation → a
-    /// `post_config` call for that endpoint returns an error.
+    /// Mutation evidence: remove the `is_https` branch from `validate_endpoint_tls`'s
+    /// `valid_scheme` → `https://` returns `Err(BadScheme)` → this test FAILS.
     #[test]
     fn a2_https_scheme_is_valid() {
-        // Simulate the predicate used in validate_exporter_config.
-        let check = |ep: &[u8]| -> bool {
-            let is_https = ep.starts_with(b"https://");
-            ep.starts_with(b"unix:") || ep.starts_with(b"http://") || is_https
-        };
+        let exists = |_: &str| true;
+        // Valid schemes (no certs configured → Ok(false)).
+        for ep in [
+            "http://127.0.0.1:4318/",
+            "https://127.0.0.1:4317/",
+            "https://collector.example.com:4317/v1/metrics",
+            "unix:/run/otel.sock",
+        ] {
+            assert_eq!(
+                validate_endpoint_tls(&val_input(ep, "", "", "", false), exists),
+                Ok(false),
+                "{ep} must be a valid scheme"
+            );
+        }
+        // Invalid schemes → BadScheme.
+        for ep in ["grpc://127.0.0.1:4317/", "ftp://host/", ""] {
+            assert_eq!(
+                validate_endpoint_tls(&val_input(ep, "", "", "", false), exists),
+                Err(TlsConfigError::BadScheme),
+                "{ep:?} must be rejected as a bad scheme"
+            );
+        }
+    }
 
-        assert!(check(b"http://127.0.0.1:4318/"), "http:// must be valid");
-        assert!(check(b"https://127.0.0.1:4317/"), "https:// must be valid");
-        assert!(
-            check(b"https://collector.example.com:4317/v1/metrics"),
-            "https:// DNS must be valid"
+    /// F4: `ssl_certificate` without `ssl_certificate_key` is a config error,
+    /// and vice-versa — through the PRODUCTION validator.
+    ///
+    /// Mutation evidence: drop the `has_cert && !has_key` branch in
+    /// `validate_endpoint_tls` → the cert-without-key case returns Ok → FAILS.
+    #[test]
+    fn a2_cert_key_pairing_validated() {
+        let exists = |_: &str| true;
+
+        // cert without key.
+        assert_eq!(
+            validate_endpoint_tls(
+                &val_input("https://127.0.0.1:4317/", "/c/cert.pem", "", "", false),
+                exists
+            ),
+            Err(TlsConfigError::CertWithoutKey),
+            "ssl_certificate without ssl_certificate_key must error"
         );
-        assert!(check(b"unix:/run/otel.sock"), "unix: must be valid");
-        assert!(!check(b"grpc://127.0.0.1:4317/"), "grpc:// must be invalid");
-        assert!(!check(b"ftp://host/"), "ftp:// must be invalid");
-        assert!(!check(b""), "empty must be invalid");
+
+        // key without cert.
+        assert_eq!(
+            validate_endpoint_tls(
+                &val_input("https://127.0.0.1:4317/", "", "/c/key.pem", "", false),
+                exists
+            ),
+            Err(TlsConfigError::KeyWithoutCert),
+            "ssl_certificate_key without ssl_certificate must error"
+        );
+
+        // both present → ok.
+        assert_eq!(
+            validate_endpoint_tls(
+                &val_input("https://127.0.0.1:4317/", "/c/cert.pem", "/c/key.pem", "", false),
+                exists
+            ),
+            Ok(false),
+            "cert+key both present must be valid"
+        );
+    }
+
+    /// F4: a configured TLS file that does not exist is a config error (only on
+    /// https:// endpoints), reported with the correct directive label —
+    /// through the PRODUCTION validator.
+    ///
+    /// Mutation evidence: make `file_exists` unconditionally true in
+    /// `validate_endpoint_tls` (drop the `!file_exists` check) → FAILS.
+    #[test]
+    fn a2_missing_tls_file_validated() {
+        // trusted_certificate missing.
+        let only_certkey_exist = |p: &str| p != "/missing/ca.pem";
+        assert_eq!(
+            validate_endpoint_tls(
+                &val_input("https://127.0.0.1:4317/", "", "", "/missing/ca.pem", false),
+                only_certkey_exist
+            ),
+            Err(TlsConfigError::FileMissing("trusted_certificate")),
+            "missing trusted_certificate file must error with its label"
+        );
+
+        // ssl_certificate missing (key present).
+        let cert_missing = |p: &str| p == "/c/key.pem";
+        assert_eq!(
+            validate_endpoint_tls(
+                &val_input("https://127.0.0.1:4317/", "/c/cert.pem", "/c/key.pem", "", false),
+                cert_missing
+            ),
+            Err(TlsConfigError::FileMissing("ssl_certificate")),
+            "missing ssl_certificate file must error with its label"
+        );
+
+        // For http:// endpoints, file-existence is NOT checked (TLS inactive).
+        assert_eq!(
+            validate_endpoint_tls(
+                &val_input("http://127.0.0.1:4318/", "", "", "/missing/ca.pem", false),
+                |p: &str| p != "/missing/ca.pem"
+            ),
+            Ok(false),
+            "http:// endpoint must not file-check TLS paths"
+        );
+    }
+
+    /// F4: `ssl_verify off` default-on behaviour AND the WARN signal flow
+    /// through the PRODUCTION validator (`Ok(true)` = emit the WARN).
+    ///
+    /// Mutation evidence: hardcode the returned warn flag to `false` in
+    /// `validate_endpoint_tls` → the verify-off assertion FAILS.
+    #[test]
+    fn a2_ssl_verify_off_warn_signal() {
+        let exists = |_: &str| true;
+        // Default (verify on) → no WARN.
+        assert_eq!(
+            validate_endpoint_tls(&val_input("https://127.0.0.1:4317/", "", "", "", false), exists),
+            Ok(false),
+            "ssl_verify default (on) must not signal the insecure WARN"
+        );
+        // ssl_verify off → WARN signalled.
+        assert_eq!(
+            validate_endpoint_tls(&val_input("https://127.0.0.1:4317/", "", "", "", true), exists),
+            Ok(true),
+            "ssl_verify off must signal the insecure WARN"
+        );
     }
 }

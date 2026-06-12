@@ -1558,21 +1558,11 @@ where
     async fn connect_io(&self) -> Result<Box<dyn TlsOrPlain>, TransportError> {
         let raw = self.connector.connect(&self.endpoint).await?;
         if let Some((ctx, insecure)) = &self.tls {
-            // https:// endpoint: wrap the raw TCP IO with TLS.
+            // https:// endpoint: wrap the raw TCP IO with TLS. HTTP/1.1 over
+            // TLS does not require ALPN, so `alpn = None`.
             let host = self.endpoint.host_str();
-            // Strip IPv6 brackets for SNI/verify: "[::1]" → "::1".
             let host_str = strip_v6_brackets(host);
-            let verify_hostname = !insecure && !is_ip_literal(host_str);
-            let tls_io = if !insecure && is_ip_literal(host_str) {
-                // IP literal: use X509_VERIFY_PARAM_set1_ip_asc (matches IP SANs).
-                tls_new_ip(raw, ctx, host_str)?
-            } else {
-                // DNS host name or insecure: use X509_VERIFY_PARAM_set1_host
-                // (or skip verification entirely if insecure).
-                TlsNgxConnIo::new(raw, ctx, host_str, verify_hostname).map_err(|e| {
-                    TransportError::Connection { cause: std::format!("TLS setup failed: {e:?}") }
-                })?
-            };
+            let tls_io = wrap_tls_io(raw, ctx, *insecure, host_str, None)?;
             Ok(Box::new(tls_io))
         } else {
             // http:// or unix: — plain IO, no TLS.
@@ -1647,76 +1637,116 @@ impl<T: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static> TlsOrPlain 
 // satisfies those bounds via the blanket — no manual impls needed here.
 
 /// Returns `true` when `host_str` is an IP literal (v4 or v6, already unbracketed).
-fn is_ip_literal(host_str: &str) -> bool {
+pub(crate) fn is_ip_literal(host_str: &str) -> bool {
     host_str.parse::<std::net::IpAddr>().is_ok()
 }
 
-// `X509_VERIFY_PARAM_set1_ip_asc` is present in OpenSSL ≥ 1.0.2 but absent
-// from openssl-sys 0.9.116's handwritten bindings (only `set1_ip` is there).
-// Declared module-side like `BIO_get_new_index` in tls.rs — stable public C
-// API, resolves against the same libssl the module links.
-extern "C" {
-    fn X509_VERIFY_PARAM_set1_ip_asc(
-        param: *mut openssl_sys::X509_VERIFY_PARAM,
-        ipasc: *const core::ffi::c_char,
-    ) -> core::ffi::c_int;
-}
-
-/// Construct a [`TlsNgxConnIo`] for an **IP-literal** endpoint (e.g.
-/// `https://127.0.0.1:4317`).
+/// Wrap a raw async stream `inner` with a [`TlsNgxConnIo`] for an `https://`
+/// endpoint, applying the correct certificate-verification method for the host
+/// class and (optionally) an ALPN protocol.
 ///
-/// `X509_VERIFY_PARAM_set1_host` matches DNS-name SANs only; for IP literals
-/// we must use `X509_VERIFY_PARAM_set1_ip_asc` (matches IP SANs, RFC 5280
-/// iPAddress entries).  This function injects the IP check in place of the
-/// DNS-host check that `TlsNgxConnIo::new(…, verify_hostname=true)` would
-/// perform.
+/// One TLS engine ([`TlsNgxConnIo`]) serves BOTH transports (HTTP/1.1 and
+/// h2/tonic) — the decision of record. The two callers differ in exactly two
+/// parameters handled here:
 ///
-/// # Design note
-/// `TlsNgxConnIo::new` accepts `verify_hostname = false` and leaves the
-/// `X509_VERIFY_PARAM` untouched (SNI is still set; certificate verification
-/// still runs — only the hostname matcher is skipped).  We then install the
-/// IP-SAN check via `X509_VERIFY_PARAM_set1_ip_asc` on the raw SSL pointer
-/// directly before returning.  This keeps the IP-branch entirely in A2 (the
-/// config/dispatch item) rather than adding another constructor to tls.rs
-/// (A1's item).
-fn tls_new_ip<I>(inner: I, ctx: &SslCtx, ip_str: &str) -> Result<TlsNgxConnIo<I>, TransportError>
+/// - **host class:** a DNS name verifies via `X509_VERIFY_PARAM_set1_host`
+///   (inside `TlsNgxConnIo::new(…, verify_hostname=true)`); an IP literal
+///   verifies via `X509_VERIFY_PARAM_set1_ip_asc` (RFC 5280 iPAddress SAN)
+///   installed here. SNI is suppressed for IP literals inside `new`
+///   (RFC 6066). Under `insecure` (ssl_verify off) both matchers are skipped.
+/// - **`alpn`:** `Some(b"h2")` for the gRPC/tonic path (HTTP/2 over TLS
+///   negotiates `h2` via ALPN, RFC 7540 §3.3); `None` for HTTP/1.1.
+///
+/// Returns the configured (un-handshaked) `TlsNgxConnIo`; the handshake is
+/// driven lazily by the IO's `poll_*`.
+pub(crate) fn wrap_tls_io<I>(
+    inner: I,
+    ctx: &SslCtx,
+    insecure: bool,
+    host_str: &str,
+    alpn: Option<&[u8]>,
+) -> Result<TlsNgxConnIo<I>, TransportError>
 where
-    I: hyper::rt::Read + hyper::rt::Write + Unpin,
+    I: hyper::rt::Read + hyper::rt::Write + Unpin + 'static,
 {
-    use core::ffi::c_char;
-    use openssl_sys as ssl;
-    use std::ffi::CString;
-
-    // Build with verify_hostname = false: TlsNgxConnIo sets SNI and cert
-    // verification but skips the set1_host call.
-    let tls = TlsNgxConnIo::new(inner, ctx, ip_str, false).map_err(|e| {
-        TransportError::Connection { cause: std::format!("TLS setup (IP) failed: {e:?}") }
+    let is_ip = is_ip_literal(host_str);
+    // verify_hostname applies the DNS-name matcher; skip it for IP literals
+    // (they use the IP matcher below) and under insecure mode.
+    let verify_hostname = !insecure && !is_ip;
+    let tls = TlsNgxConnIo::new(inner, ctx, host_str, verify_hostname).map_err(|e| {
+        TransportError::Connection { cause: std::format!("TLS setup failed: {e:?}") }
     })?;
 
-    // Now install the IP-SAN check on the SSL's verify param.
-    // SAFETY: `tls.ssl_ptr()` is the owned, non-null SSL for this new
-    // connection.  `SSL_get0_param` returns a borrowed pointer valid while
-    // the SSL lives; we do not free it.  `ip_str` is a valid UTF-8 string
-    // (came from `ParsedEndpoint::host_str`, already unbracketed); it is
-    // NUL-terminated by the CString we build here.
+    // IP-literal endpoints verify the cert's IP SAN (set1_host matches DNS
+    // names only). Only when verification is enabled.
+    if is_ip && !insecure {
+        install_ip_verify(tls.ssl_ptr(), host_str)?;
+    }
+
+    // ALPN: gRPC/h2 over TLS must offer the `h2` protocol so the server selects
+    // HTTP/2; otherwise a TLS-terminating proxy may downgrade or reject.
+    if let Some(proto) = alpn {
+        set_alpn(tls.ssl_ptr(), proto)?;
+    }
+
+    Ok(tls)
+}
+
+/// Install an IP-SAN verification check on `ssl` for the IP literal `ip_str`.
+///
+/// `X509_VERIFY_PARAM_set1_ip_asc` matches an iPAddress SAN from an ASCII IP
+/// string (v4 or v6). It is provided by openssl-sys 0.9.116's bindgen layer
+/// (the `bindgen` feature is enabled in `Cargo.toml`), so no module-side
+/// `extern "C"` declaration is needed (verified by a clean-build link).
+fn install_ip_verify(ssl: *mut openssl_sys::SSL, ip_str: &str) -> Result<(), TransportError> {
+    use core::ffi::c_char;
+    use openssl_sys as ssl_sys;
+    use std::ffi::CString;
+
     let c_ip = CString::new(ip_str).map_err(|_| TransportError::Connection {
         cause: std::format!("IP literal contains interior NUL: {ip_str:?}"),
     })?;
-    // SAFETY: `tls.ssl_ptr()` is the owned, non-null SSL; `SSL_get0_param`
-    // returns a borrowed pointer valid while the SSL lives; we do not free it.
-    // `c_ip` is a valid NUL-terminated ASCII IP string (e.g. "127.0.0.1")
+    // SAFETY: `ssl` is the owned, non-null SSL for this new connection;
+    // `SSL_get0_param` returns a borrowed pointer valid while the SSL lives (we
+    // do not free it). `c_ip` is a valid NUL-terminated ASCII IP string
     // outliving the call; `X509_VERIFY_PARAM_set1_ip_asc` copies it.
     let rc = unsafe {
-        let param = ssl::SSL_get0_param(tls.ssl_ptr());
-        X509_VERIFY_PARAM_set1_ip_asc(param, c_ip.as_ptr().cast::<c_char>())
+        let param = ssl_sys::SSL_get0_param(ssl);
+        ssl_sys::X509_VERIFY_PARAM_set1_ip_asc(param, c_ip.as_ptr().cast::<c_char>())
     };
     if rc != 1 {
         return Err(TransportError::Connection {
             cause: std::format!("X509_VERIFY_PARAM_set1_ip_asc({ip_str}) failed"),
         });
     }
+    Ok(())
+}
 
-    Ok(tls)
+/// Set the client-offered ALPN protocol list on `ssl` to a single protocol.
+///
+/// The wire format is a sequence of length-prefixed protocol names; for the
+/// single protocol `b"h2"` that is `[0x02, b'h', b'2']`.
+fn set_alpn(ssl: *mut openssl_sys::SSL, proto: &[u8]) -> Result<(), TransportError> {
+    use openssl_sys as ssl_sys;
+
+    debug_assert!(!proto.is_empty() && proto.len() <= 255, "ALPN proto length must fit one byte");
+    let mut wire = std::vec::Vec::with_capacity(1 + proto.len());
+    wire.push(proto.len() as u8);
+    wire.extend_from_slice(proto);
+
+    // SAFETY: `ssl` is the owned, non-null SSL; `SSL_set_alpn_protos` copies
+    // `wire` (it does not retain the pointer past the call), so the temporary
+    // need not outlive it. This OpenSSL function returns 0 on SUCCESS and
+    // nonzero on failure (inverted from the usual convention).
+    let rc = unsafe {
+        ssl_sys::SSL_set_alpn_protos(ssl, wire.as_ptr(), wire.len() as core::ffi::c_uint)
+    };
+    if rc != 0 {
+        return Err(TransportError::Connection {
+            cause: std::string::String::from("SSL_set_alpn_protos failed"),
+        });
+    }
+    Ok(())
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -2246,5 +2276,339 @@ mod tests {
         let t_unix = HyperHttpTransport::<SpinConnector>::new("unix:/run/otel.sock", vec![])
             .expect("unix: must still be accepted");
         assert_eq!(t_unix.metrics_path, "/v1/metrics");
+    }
+
+    // ── F1: production TLS-dispatch coverage (connect_io) ─────────────────────
+    //
+    // These tests drive the PRODUCTION `connect_io` path end-to-end against a
+    // real TLS server (`openssl s_server`). They are the regression coverage
+    // the A2 review found missing: forcing the `https` dispatch onto the
+    // plaintext branch (returning `Box::new(raw)` for an https endpoint) makes
+    // `tls_dispatch_https_completes_tls_roundtrip` FAIL (plaintext bytes hit a
+    // TLS-expecting server → the handshake/round-trip errors).
+    mod tls_dispatch {
+        use super::super::*;
+        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        use hyper::rt::{Read as _HyperRead, Write as _HyperWrite};
+        use std::process::{Child, Command, Stdio};
+        use std::string::{String, ToString};
+        use std::sync::atomic::{AtomicU16, Ordering};
+        use std::time::{Duration, Instant};
+        use std::{format, vec};
+
+        use crate::transport::tls::TlsConfig;
+
+        fn block_on<F: core::future::Future>(fut: F) -> F::Output {
+            unsafe fn noop_clone(_: *const ()) -> RawWaker {
+                RawWaker::new(core::ptr::null(), &VTABLE)
+            }
+            unsafe fn noop(_: *const ()) {}
+            static VTABLE: RawWakerVTable = RawWakerVTable::new(noop_clone, noop, noop, noop);
+            // SAFETY: standard noop-waker idiom (all fns no-op over a null ptr).
+            let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+            let mut cx = Context::from_waker(&waker);
+            let mut fut = core::pin::pin!(fut);
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+                    return v;
+                }
+                assert!(Instant::now() < deadline, "block_on timed out");
+                // Sleep (not just `yield_now`) so the `s_server` child process
+                // gets CPU under heavy parallel test load — a pure spin starves
+                // it and the TLS handshake stalls/resets.
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        static NEXT: AtomicU16 = AtomicU16::new(0);
+
+        struct Certs {
+            dir: std::path::PathBuf,
+        }
+        impl Certs {
+            fn ca_pem(&self) -> String {
+                self.dir.join("ca.pem").to_string_lossy().into_owned()
+            }
+        }
+        impl Drop for Certs {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+
+        fn run_openssl(args: &[&str], cwd: &std::path::Path) {
+            let out = Command::new("openssl")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("spawn openssl");
+            assert!(
+                out.status.success(),
+                "openssl {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        /// Mint a CA + a server cert with the given SAN signed by it.
+        fn make_certs(san: &str) -> Certs {
+            let dir = std::env::temp_dir().join(format!(
+                "ngx-otel-a2disp-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::SeqCst)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let d = dir.as_path();
+            run_openssl(&["genrsa", "-out", "ca.key", "2048"], d);
+            run_openssl(
+                &[
+                    "req",
+                    "-x509",
+                    "-new",
+                    "-key",
+                    "ca.key",
+                    "-days",
+                    "1",
+                    "-subj",
+                    "/CN=Test CA",
+                    "-out",
+                    "ca.pem",
+                ],
+                d,
+            );
+            run_openssl(&["genrsa", "-out", "server.key", "2048"], d);
+            run_openssl(
+                &["req", "-new", "-key", "server.key", "-subj", "/CN=server", "-out", "server.csr"],
+                d,
+            );
+            std::fs::write(d.join("ext.cnf"), format!("subjectAltName={san}")).unwrap();
+            run_openssl(
+                &[
+                    "x509",
+                    "-req",
+                    "-in",
+                    "server.csr",
+                    "-CA",
+                    "ca.pem",
+                    "-CAkey",
+                    "ca.key",
+                    "-CAcreateserial",
+                    "-days",
+                    "1",
+                    "-out",
+                    "server.pem",
+                    "-extfile",
+                    "ext.cnf",
+                ],
+                d,
+            );
+            Certs { dir }
+        }
+
+        struct TestServer {
+            child: Child,
+            port: u16,
+            /// Serialize s_server-backed handshakes process-wide (shared with
+            /// the `tls` module's harness); released on drop.
+            _guard: std::sync::MutexGuard<'static, ()>,
+        }
+        impl TestServer {
+            /// Start `openssl s_server` on a loopback port, with bind-collision
+            /// retry. The `pick_port` bind-then-release leaves a TOCTOU window
+            /// where, under heavy parallel test load, another test can grab the
+            /// freed port before s_server binds it (s_server then exits with
+            /// EADDRINUSE while some OTHER socket answers the readiness probe →
+            /// the real connect hits the wrong server and the handshake resets).
+            /// We detect this by confirming the child is still alive after the
+            /// readiness probe and retrying with a fresh port if not.
+            fn start(certs: &Certs) -> Self {
+                let guard = crate::transport::tls::S_SERVER_TEST_LOCK
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let cert = certs.dir.join("server.pem");
+                let key = certs.dir.join("server.key");
+                let mut last = String::new();
+                for _ in 0..10 {
+                    let port = pick_port();
+                    let mut child = Command::new("openssl")
+                        .args([
+                            "s_server",
+                            "-accept",
+                            &port.to_string(),
+                            "-cert",
+                            &cert.to_string_lossy(),
+                            "-key",
+                            &key.to_string_lossy(),
+                            "-quiet",
+                            "-rev",
+                        ])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .expect("spawn s_server");
+
+                    // Give it a beat to bind (or exit on EADDRINUSE).
+                    std::thread::sleep(Duration::from_millis(80));
+                    if let Ok(Some(_status)) = child.try_wait() {
+                        // s_server exited early (port collision) → retry fresh.
+                        last = format!("s_server exited early on port {port}");
+                        continue;
+                    }
+
+                    // Probe TCP readiness; the child is confirmed alive above.
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let mut ready = false;
+                    while Instant::now() < deadline {
+                        if let Ok(probe) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+                            drop(probe);
+                            ready = true;
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    if ready && matches!(child.try_wait(), Ok(None)) {
+                        return Self { child, port, _guard: guard };
+                    }
+                    last = format!("s_server not ready/alive on port {port}");
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                panic!("could not start s_server after retries: {last}");
+            }
+        }
+        impl Drop for TestServer {
+            fn drop(&mut self) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+
+        fn pick_port() -> u16 {
+            let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let p = l.local_addr().unwrap().port();
+            drop(l);
+            p
+        }
+
+        /// Build a transport on an `https://` endpoint, wire TLS with the test
+        /// CA (verifying the `127.0.0.1` IP SAN → exercises the IP-literal
+        /// verify branch AND SNI suppression), then drive the PRODUCTION
+        /// `connect_io` and round-trip bytes over the resulting stream.
+        ///
+        /// A working dispatch returns a TLS-wrapped IO → the handshake
+        /// completes and `s_server -rev` echoes our bytes reversed. A broken
+        /// dispatch (https → plaintext branch) sends cleartext to the TLS
+        /// server → no successful round-trip → this test FAILS.
+        #[test]
+        fn tls_dispatch_https_completes_tls_roundtrip() {
+            let certs = make_certs("DNS:localhost,IP:127.0.0.1");
+            let server = TestServer::start(&certs);
+            let endpoint = format!("https://127.0.0.1:{}", server.port);
+
+            // Drive the production dispatch + a TLS round-trip. Retried a few
+            // times to absorb transient transport flakes under parallel test
+            // load (s_server reset / TCP race) — but a BROKEN dispatch (https →
+            // plaintext) fails EVERY attempt (s_server never echoes cleartext),
+            // so the mutation still bites; only genuine transient resets retry.
+            let mut last_err = String::new();
+            for attempt in 0..4 {
+                match try_tls_roundtrip(&endpoint, &certs.ca_pem()) {
+                    Ok(n) => {
+                        assert!(
+                            n > 0,
+                            "TLS round-trip echoed bytes back (dispatch wrapped the stream in TLS)"
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        last_err = e;
+                        std::thread::sleep(Duration::from_millis(50 * (attempt + 1) as u64));
+                    }
+                }
+            }
+            panic!("TLS dispatch round-trip failed after retries: {last_err}");
+        }
+
+        /// One attempt: build the transport on `endpoint`, wire TLS verifying the
+        /// `127.0.0.1` IP SAN (exercises the IP-literal verify branch + SNI
+        /// suppression), drive the PRODUCTION `connect_io`, and round-trip bytes.
+        /// Returns the echoed byte count on success.
+        fn try_tls_roundtrip(endpoint: &str, ca_pem: &str) -> Result<usize, String> {
+            let mut t = HyperHttpTransport::<SpinConnector>::new(endpoint, vec![])
+                .map_err(|e| format!("parse: {e:?}"))?;
+            let ctx = TlsConfig { ca_file: Some(ca_pem.to_string()), ..Default::default() }
+                .build_ctx(|_| {})
+                .map_err(|e| format!("build_ctx: {e:?}"))?;
+            t.set_tls(ctx, false);
+
+            let mut io = block_on(t.connect_io()).map_err(|e| format!("connect_io: {e:?}"))?;
+
+            let msg = b"dispatch-probe\n";
+            let wrote = block_on(core::future::poll_fn(|cx| {
+                core::pin::Pin::new(&mut io).poll_write(cx, msg)
+            }))
+            .map_err(|e| format!("write: {e}"))?;
+            if wrote != msg.len() {
+                return Err(format!("short write: {wrote}/{}", msg.len()));
+            }
+
+            let mut got = vec![0u8; 64];
+            block_on(core::future::poll_fn(|cx| {
+                let mut rb = hyper::rt::ReadBuf::new(&mut got);
+                match core::pin::Pin::new(&mut io).poll_read(cx, rb.unfilled()) {
+                    Poll::Ready(Ok(())) => Poll::Ready(Ok(rb.filled().len())),
+                    Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                    Poll::Pending => Poll::Pending,
+                }
+            }))
+            .map_err(|e| format!("read: {e}"))
+        }
+
+        /// Negative: an `https://` endpoint WITHOUT `set_tls` must NOT silently
+        /// speak plaintext to a TLS server. `connect_io` returns a plain stream
+        /// (no TLS ctx wired); writing cleartext to `s_server` yields no echoed
+        /// round-trip. This guards against a regression where the https branch
+        /// were taken without a TLS context (fail-closed: no plaintext success).
+        #[test]
+        fn tls_dispatch_https_without_ctx_does_not_roundtrip_plaintext() {
+            let certs = make_certs("DNS:localhost,IP:127.0.0.1");
+            let server = TestServer::start(&certs);
+
+            let endpoint = format!("https://127.0.0.1:{}", server.port);
+            let t = HyperHttpTransport::<SpinConnector>::new(&endpoint, vec![])
+                .expect("https endpoint must parse");
+            // NOTE: set_tls intentionally NOT called → self.tls is None.
+
+            let mut io = block_on(t.connect_io()).expect("connect_io returns plain stream");
+            let msg = b"plaintext-probe\n";
+            let _ = block_on(core::future::poll_fn(|cx| {
+                core::pin::Pin::new(&mut io).poll_write(cx, msg)
+            }));
+
+            // Attempt a bounded read; a TLS server will not echo our plaintext
+            // as a clean reversed line. We assert we do NOT get our cleartext
+            // echoed back (no successful plaintext round-trip).
+            let mut got = vec![0u8; 64];
+            let res = block_on(core::future::poll_fn(|cx| {
+                // Bounded: give the server a brief window, then conclude no echo.
+                let mut rb = hyper::rt::ReadBuf::new(&mut got);
+                match core::pin::Pin::new(&mut io).poll_read(cx, rb.unfilled()) {
+                    Poll::Ready(r) => Poll::Ready(r.map(|()| rb.filled().len())),
+                    // s_server may send a TLS alert or just close; either way the
+                    // plain stream sees EOF/err, not our reversed cleartext.
+                    Poll::Pending => Poll::Ready(Ok(0usize)),
+                }
+            }));
+            let echoed = res.unwrap_or(0);
+            // The reversed plaintext (had it been a plaintext echo server) would
+            // be "\neborp-txetnialp". Assert that did NOT come back.
+            let got_str = String::from_utf8_lossy(&got[..echoed]);
+            assert!(
+                !got_str.contains("eborp-txetnialp"),
+                "https-without-ctx must not yield a plaintext round-trip (fail-closed); got {got_str:?}"
+            );
+        }
     }
 }

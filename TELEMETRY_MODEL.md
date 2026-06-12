@@ -24,10 +24,11 @@ at u8 key width; high-cardinality detail (`url.path`, `client.address`,
 `user_agent.original`, upstream peer addr) is never a metric dimension — it rides
 on exemplars, the access tail, or error-record bodies. Transport is OTLP (HTTP or
 gRPC, `otel_export_protocol`) from the dedicated `nginx: otel exporter` process.
-OTLP/HTTP supports `http://`, `https://` (TLS; configured via `ssl_certificate`,
+Both transports support `https://` (TLS; configured via `ssl_certificate`,
 `ssl_certificate_key`, `ssl_verify`, and `trusted_certificate` inside
-`otel_exporter {}`), and `unix:` endpoints. OTLP/gRPC uses plaintext (h2c) only
-in this release.
+`otel_exporter {}`); OTLP/HTTP additionally supports `http://` and `unix:`
+endpoints. OTLP/gRPC over `https://` negotiates HTTP/2 via ALPN `h2`; over
+`http://` it uses plaintext h2c.
 
 ## Resource and scope
 

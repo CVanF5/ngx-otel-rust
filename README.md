@@ -39,7 +39,8 @@ What this module emits:
 
 Two production export transports (`otel_export_protocol`): **OTLP/HTTP** over
 HTTP/1.1 (`otlp_http`, default) and **OTLP/gRPC** unary over HTTP/2 (`otlp_grpc`).
-Supports `http://`, `https://` (TLS), and `unix:` endpoints for OTLP/HTTP.
+Both support `https://` (TLS); `http://` and `unix:` (OTLP/HTTP) are also
+accepted. gRPC over `https://` negotiates HTTP/2 via ALPN `h2`.
 
 **Performance (metrics-only build, 2026-05-22):** zero-cost-when-disabled
 invariant verified at ≤ 0.01% throughput delta (module-loaded-but-disabled vs
@@ -737,10 +738,6 @@ ngx-otel-rust/
   `[alert]` at startup to remind you.  See
   [LIFECYCLE.md §"Known limitation: gen-1 exporter under daemon on"](LIFECYCLE.md)
   for the full explanation and the deferred self-supervisor design.
-- **OTLP/gRPC TLS is not yet implemented.**  `https://` endpoints are
-  accepted and work for OTLP/HTTP.  OTLP/gRPC runs over plaintext (h2c)
-  even when an `https://` endpoint is configured; TLS for gRPC is deferred
-  to a later phase.
 - **Hot path is single-process-per-worker**; per-histogram attribute
   populations are reserved for a later iteration that needs
   multi-dimensional shm.

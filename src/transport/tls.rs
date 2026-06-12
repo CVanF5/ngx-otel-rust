@@ -69,10 +69,13 @@
 //!   free); once `BIO_new` succeeds, `SSL_set_bio` is called unconditionally
 //!   (no fallible operations intervene) and takes ownership of the single BIO
 //!   reference.
-//! - `BIO_METHOD`: a process-global, created once via `BIO_meth_new` and never
+//! - `BIO_METHOD`: created once **per concrete inner-IO type `I`** (keyed by
+//!   `TypeId` in the `BIO_METHODS` registry) via `BIO_meth_new`, and never
 //!   freed (it lives for the life of the exporter process, like a `'static`).
-//!   Shared by all `BIO`s; OpenSSL does not free a method when a BIO using it is
-//!   freed.
+//!   Per-`I` keying is required for soundness: the callbacks are
+//!   `I`-monomorphized and cast the BIO `data` slot to `*mut BioCtx<I>`, so a
+//!   method must never be shared across different `I`s. OpenSSL does not free a
+//!   method when a BIO using it is freed.
 
 extern crate alloc;
 
@@ -81,7 +84,6 @@ use alloc::string::{String, ToString};
 use core::ffi::{c_char, c_int, c_long, c_void, CStr};
 use core::pin::Pin;
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use core::task::{Context, Poll};
 use std::io;
 use std::sync::Once;
@@ -302,6 +304,15 @@ impl TlsConfig {
     }
 }
 
+/// Returns `true` when `host` is an IP literal (v4 or v6), which must NOT be
+/// sent as an SNI HostName (RFC 6066 §3). `host` is expected already
+/// unbracketed (the connector strips IPv6 `[]`); we also accept a bracketed
+/// IPv6 form defensively by trimming a single surrounding pair.
+fn is_ip_literal(host: &str) -> bool {
+    let h = host.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(host);
+    h.parse::<std::net::IpAddr>().is_ok()
+}
+
 /// Convert a Rust path string to a C string, mapping interior-NUL to a
 /// `TlsConfig` error (paths must not contain NUL).
 fn to_cstring(s: &str) -> Result<alloc::ffi::CString, TransportError> {
@@ -335,63 +346,63 @@ impl<I> BioCtx<I> {
     }
 }
 
-/// Process-global custom `BIO_METHOD`, created once. Stored as a raw pointer in
-/// an `AtomicPtr` set under a `Once`. Never freed (process-lifetime).
-static BIO_METHOD: AtomicPtr<ssl::BIO_METHOD> = AtomicPtr::new(ptr::null_mut());
-static BIO_METHOD_INIT: Once = Once::new();
-static BIO_METHOD_FAILED: AtomicBool = AtomicBool::new(false);
-
 /// `BIO_TYPE_SOURCE_SINK | <next index>` — a source/sink BIO. We OR the
 /// source/sink class bit with a fresh per-process index from
 /// `BIO_get_new_index`.
 const BIO_TYPE_SOURCE_SINK: c_int = 0x0400;
 
-/// Get (lazily creating) the process-global custom `BIO_METHOD` for `I`.
+/// Process-wide registry of custom `BIO_METHOD`s, keyed by the concrete
+/// inner-IO type `I` (`TypeId`). The method-table pointer is stored as `usize`
+/// (raw pointers are not `Send`); it is a process-lifetime allocation never
+/// freed (like a `'static`).
 ///
-/// The method is monomorphized per inner-IO type `I` (the callbacks are
-/// generic), so the global is keyed by `I` via a generic static is not
-/// possible; instead each concrete `TlsNgxConnIo<I>` calls this and we create a
-/// distinct method on first use. To keep it simple and correct we create ONE
-/// method per process here using `I`-generic callbacks — safe because the
-/// callbacks recover `I` from the BIO's typed `BioCtx<I>` pointer, and a given
-/// process only ever instantiates the production `I`. Tests use their own `I`
-/// but run in separate processes/binaries.
-fn bio_method<I: hyper::rt::Read + hyper::rt::Write + Unpin>(
-) -> Result<*const ssl::BIO_METHOD, TransportError> {
-    BIO_METHOD_INIT.call_once(|| {
-        // SAFETY: `BIO_get_new_index` allocates a fresh BIO type index;
-        // `BIO_meth_new` allocates a method table with that type + a static
-        // name. Both are standard one-shot setup calls.
-        let m = unsafe {
-            let idx = ssl::BIO_get_new_index();
-            let name = c"ngx-otel-tls-bio".as_ptr();
-            ssl::BIO_meth_new(BIO_TYPE_SOURCE_SINK | idx, name)
-        };
-        if m.is_null() {
-            BIO_METHOD_FAILED.store(true, Ordering::SeqCst);
-            return;
-        }
-        // SAFETY: `m` is the freshly-allocated method table; these setters
-        // install our callbacks. The function-pointer types match OpenSSL's
-        // "new" BIO method signatures (the `__fixed_rust` aliases in
-        // openssl-sys). Each returns 1 on success; on the (unexpected) failure
-        // we still publish the method — a later BIO op would simply error.
-        unsafe {
-            ssl::BIO_meth_set_write__fixed_rust(m, Some(bio_write::<I>));
-            ssl::BIO_meth_set_read__fixed_rust(m, Some(bio_read::<I>));
-            ssl::BIO_meth_set_ctrl__fixed_rust(m, Some(bio_ctrl));
-            ssl::BIO_meth_set_create__fixed_rust(m, Some(bio_create));
-            ssl::BIO_meth_set_destroy__fixed_rust(m, Some(bio_destroy));
-        }
-        BIO_METHOD.store(m, Ordering::SeqCst);
-    });
+/// Keying per `I` is REQUIRED for soundness: the read/write callbacks are
+/// monomorphized per `I` (`bio_read::<I>` casts the BIO `data` slot to
+/// `*mut BioCtx<I>`), so a method built for one `I` must never be attached to a
+/// BIO carrying a `BioCtx` of a different `I` — that would type-pun the data
+/// pointer. A plain process-global (or a `static` inside this generic fn, which
+/// Rust shares across all monomorphizations) would do exactly that when more
+/// than one `I` exists in a process (e.g. the test binary uses both `TestIo`
+/// and `SpinIo`). In production there is a single `I` (`Pin<Box<NgxConnIo>>`).
+static BIO_METHODS: std::sync::Mutex<std::vec::Vec<(core::any::TypeId, usize)>> =
+    std::sync::Mutex::new(std::vec::Vec::new());
 
-    if BIO_METHOD_FAILED.load(Ordering::SeqCst) {
+/// Get (lazily creating) the custom `BIO_METHOD` for the inner-IO type `I`.
+fn bio_method<I: hyper::rt::Read + hyper::rt::Write + Unpin + 'static>(
+) -> Result<*const ssl::BIO_METHOD, TransportError> {
+    let key = core::any::TypeId::of::<I>();
+    let mut reg = BIO_METHODS.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some((_, p)) = reg.iter().find(|(k, _)| *k == key) {
+        return Ok(*p as *const ssl::BIO_METHOD);
+    }
+
+    // SAFETY: `BIO_get_new_index` allocates a fresh BIO type index;
+    // `BIO_meth_new` allocates a method table with that type + a static name.
+    // Both are standard one-shot setup calls.
+    let m = unsafe {
+        let idx = ssl::BIO_get_new_index();
+        let name = c"ngx-otel-tls-bio".as_ptr();
+        ssl::BIO_meth_new(BIO_TYPE_SOURCE_SINK | idx, name)
+    };
+    if m.is_null() {
         return Err(TransportError::TlsConfig {
             cause: "BIO_meth_new failed (out of memory)".to_string(),
         });
     }
-    Ok(BIO_METHOD.load(Ordering::SeqCst))
+    // SAFETY: `m` is the freshly-allocated method table; these setters install
+    // our `I`-monomorphized callbacks. The function-pointer types match
+    // OpenSSL's "new" BIO method signatures (the `__fixed_rust` aliases in
+    // openssl-sys).
+    unsafe {
+        ssl::BIO_meth_set_write__fixed_rust(m, Some(bio_write::<I>));
+        ssl::BIO_meth_set_read__fixed_rust(m, Some(bio_read::<I>));
+        ssl::BIO_meth_set_ctrl__fixed_rust(m, Some(bio_ctrl));
+        ssl::BIO_meth_set_create__fixed_rust(m, Some(bio_create));
+        ssl::BIO_meth_set_destroy__fixed_rust(m, Some(bio_destroy));
+    }
+    reg.push((key, m as usize));
+    Ok(m)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -582,7 +593,7 @@ pub struct TlsNgxConnIo<I> {
 // SAFETY: single-threaded exporter event loop; see `SslCtx`.
 unsafe impl<I: Send> Send for TlsNgxConnIo<I> {}
 
-impl<I: hyper::rt::Read + hyper::rt::Write + Unpin> TlsNgxConnIo<I> {
+impl<I: hyper::rt::Read + hyper::rt::Write + Unpin + 'static> TlsNgxConnIo<I> {
     /// Create a TLS stream over `inner` using `ctx`, with SNI / hostname
     /// verification for `server_name`.
     ///
@@ -646,13 +657,22 @@ impl<I: hyper::rt::Read + hyper::rt::Write + Unpin> TlsNgxConnIo<I> {
         unsafe { ssl::SSL_set_connect_state(ssl_ptr) };
 
         // SNI: set the server name extension (host the collector expects).
-        if let Ok(c_name) = to_cstring(server_name) {
-            // SAFETY: `ssl_ptr` owned SSL; `SSL_set_tlsext_host_name` is the
-            // SNI macro (SSL_ctrl under the hood). It copies the string, so the
-            // temporary `c_name` need not outlive the call. The cast to
-            // `*mut c_char` matches the macro signature (it does not mutate).
-            unsafe {
-                ssl::SSL_set_tlsext_host_name(ssl_ptr, c_name.as_ptr().cast_mut());
+        //
+        // RFC 6066 §3 forbids IP literals in the SNI HostName ("Literal IPv4
+        // and IPv6 addresses are not permitted"). Strict / SNI-routed front
+        // ends may reject or mis-route a ClientHello carrying an IP as SNI, so
+        // we suppress the extension entirely for IP-literal `server_name`s
+        // (the IP path verifies via `X509_VERIFY_PARAM_set1_ip(_asc)` instead).
+        // For DNS names we set SNI as normal.
+        if !is_ip_literal(server_name) {
+            if let Ok(c_name) = to_cstring(server_name) {
+                // SAFETY: `ssl_ptr` owned SSL; `SSL_set_tlsext_host_name` is the
+                // SNI macro (SSL_ctrl under the hood). It copies the string, so
+                // the temporary `c_name` need not outlive the call. The cast to
+                // `*mut c_char` matches the macro signature (it does not mutate).
+                unsafe {
+                    ssl::SSL_set_tlsext_host_name(ssl_ptr, c_name.as_ptr().cast_mut());
+                }
             }
         }
 
@@ -776,7 +796,7 @@ impl<I: hyper::rt::Read + hyper::rt::Write + Unpin> TlsNgxConnIo<I> {
     }
 }
 
-impl<I: hyper::rt::Read + hyper::rt::Write + Unpin> hyper::rt::Read for TlsNgxConnIo<I> {
+impl<I: hyper::rt::Read + hyper::rt::Write + Unpin + 'static> hyper::rt::Read for TlsNgxConnIo<I> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -825,7 +845,7 @@ impl<I: hyper::rt::Read + hyper::rt::Write + Unpin> hyper::rt::Read for TlsNgxCo
     }
 }
 
-impl<I: hyper::rt::Read + hyper::rt::Write + Unpin> hyper::rt::Write for TlsNgxConnIo<I> {
+impl<I: hyper::rt::Read + hyper::rt::Write + Unpin + 'static> hyper::rt::Write for TlsNgxConnIo<I> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -901,6 +921,14 @@ impl<I> Drop for TlsNgxConnIo<I> {
         }
     }
 }
+
+/// Test-only serialization lock for tests that spawn `openssl s_server` and
+/// drive a busy-spin client. Many such tests running concurrently overload the
+/// scheduler (multiple `s_server` subprocesses + spin loops), causing transient
+/// handshake EOFs (`SSL_ERROR_SYSCALL`). Both the `tls` and `hyper_http` test
+/// harnesses lock this so only one s_server-backed handshake runs at a time.
+#[cfg(test)]
+pub(crate) static S_SERVER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 #[path = "tls_tests.rs"]

@@ -29,6 +29,7 @@
 //! is deferred to a later phase.
 
 use core::ptr::NonNull;
+use std::boxed::Box;
 
 use http::uri::Uri;
 use nginx_sys::ngx_log_t;
@@ -45,7 +46,10 @@ use crate::encoder::opentelemetry::proto::collector::trace::v1::{
 };
 use crate::transport::grpc::executor::NgxExecutor;
 use crate::transport::grpc::shim::SendRequestService;
-use crate::transport::hyper_http::{Connector, NgxConnector, ParsedEndpoint};
+use crate::transport::hyper_http::{
+    strip_v6_brackets, wrap_tls_io, Connector, NgxConnector, ParsedEndpoint, TlsOrPlain,
+};
+use crate::transport::tls::SslCtx;
 use crate::transport::TransportError;
 
 // ── GrpcTransport<C> ─────────────────────────────────────────────────────────
@@ -77,6 +81,11 @@ pub struct GrpcTransport<C: Connector> {
     logs_client: Option<LogsServiceClient<SendRequestService<tonic::body::Body>>>,
     /// Cached gRPC traces client (Phase 3.1).  Uses a separate h2 connection.
     traces_client: Option<TraceServiceClient<SendRequestService<tonic::body::Body>>>,
+    /// TLS context for `https://` endpoints (TLS Phase A — A2). `None` for
+    /// plaintext (`http://`) h2c. `bool` mirrors `ssl_verify off` (insecure).
+    /// One `TlsNgxConnIo` engine serves both transports (decision of record);
+    /// the gRPC path additionally negotiates ALPN `h2`.
+    tls: Option<(SslCtx, bool)>,
 }
 
 // SAFETY: `GrpcTransport` is only used from NGINX's single-threaded exporter
@@ -159,14 +168,50 @@ impl<C: Connector> GrpcTransport<C> {
             client: None,
             logs_client: None,
             traces_client: None,
+            tls: None,
         })
+    }
+
+    /// Wire in a TLS context for `https://` endpoints.
+    ///
+    /// `ctx` is a pre-built `SslCtx` (from `TlsConfig::build_ctx`); `insecure`
+    /// mirrors `ssl_verify off`. Call after `with_connector` / `with_ngx_log`
+    /// when the endpoint is `https://`. When set, every gRPC connection is
+    /// wrapped with `TlsNgxConnIo` (ALPN `h2`) before the h2 handshake.
+    pub fn set_tls(&mut self, ctx: SslCtx, insecure: bool) {
+        self.tls = Some((ctx, insecure));
+    }
+}
+
+#[allow(private_bounds)] // see note on the struct above
+impl<C: Connector> GrpcTransport<C>
+where
+    C::Io: Send + 'static,
+{
+    /// Open a connection to the endpoint and, for `https://` endpoints, wrap it
+    /// with TLS (ALPN `h2`) so tonic's h2 handshake runs over an encrypted
+    /// stream. Returns a boxed `TlsOrPlain` so the plain (`h2c`) and TLS paths
+    /// share one return type for `hyper::client::conn::http2::handshake`.
+    async fn connect_io(&self) -> Result<Box<dyn TlsOrPlain>, TransportError> {
+        let raw = self.connector.connect(&self.endpoint).await?;
+        if let Some((ctx, insecure)) = &self.tls {
+            let host = strip_v6_brackets(self.endpoint.host_str());
+            // gRPC over TLS REQUIRES HTTP/2 → offer ALPN `h2`.
+            let tls_io = wrap_tls_io(raw, ctx, *insecure, host, Some(b"h2"))?;
+            Ok(Box::new(tls_io))
+        } else {
+            Ok(Box::new(raw))
+        }
     }
 }
 
 // ── Transport impl ────────────────────────────────────────────────────────────
 
 #[allow(private_bounds)] // see note on the struct definition above
-impl<C: Connector + Send> GrpcTransport<C> {
+impl<C: Connector + Send> GrpcTransport<C>
+where
+    C::Io: Send + 'static,
+{
     /// Send a batch of OTLP metrics (encoded protobuf) over OTLP/gRPC unary.
     pub async fn send(&mut self, bytes: std::vec::Vec<u8>) -> Result<(), TransportError> {
         // ── Decode bytes → typed request ──────────────────────────────────
@@ -188,8 +233,10 @@ impl<C: Connector + Send> GrpcTransport<C> {
         // dropped the connection), build one now.  This mirrors the construction
         // in smoke.rs:200-271.
         if self.client.is_none() {
-            // 1. Connect via the configured connector (NgxConnector in production).
-            let io = self.connector.connect(&self.endpoint).await?;
+            // 1. Connect via the configured connector (NgxConnector in
+            //    production); for https:// endpoints this wraps the stream in
+            //    TLS (ALPN h2) so the h2 handshake runs encrypted.
+            let io = self.connect_io().await?;
 
             // 2. HTTP/2 handshake driven by NgxExecutor.
             //    Turbofish `<_, _, tonic::body::Body>` required so hyper knows
@@ -246,7 +293,10 @@ impl<C: Connector + Send> GrpcTransport<C> {
 // ── Logs send (Phase 2.1) ─────────────────────────────────────────────────────
 
 #[allow(private_bounds)] // see note on the struct definition above
-impl<C: Connector + Send> GrpcTransport<C> {
+impl<C: Connector + Send> GrpcTransport<C>
+where
+    C::Io: Send + 'static,
+{
     /// Send an `ExportLogsServiceRequest` (already prost-encoded) to the
     /// `LogsService/Export` RPC.
     ///
@@ -268,7 +318,7 @@ impl<C: Connector + Send> GrpcTransport<C> {
         })?;
 
         if self.logs_client.is_none() {
-            let io = self.connector.connect(&self.endpoint).await?;
+            let io = self.connect_io().await?;
             let (sender, conn) = hyper::client::conn::http2::handshake::<_, _, tonic::body::Body>(
                 crate::transport::grpc::executor::NgxExecutor,
                 io,
@@ -324,7 +374,7 @@ impl<C: Connector + Send> GrpcTransport<C> {
         })?;
 
         if self.traces_client.is_none() {
-            let io = self.connector.connect(&self.endpoint).await?;
+            let io = self.connect_io().await?;
             let (sender, conn) = hyper::client::conn::http2::handshake::<_, _, tonic::body::Body>(
                 crate::transport::grpc::executor::NgxExecutor,
                 io,

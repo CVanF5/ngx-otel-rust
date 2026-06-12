@@ -248,6 +248,9 @@ static NEXT: AtomicU16 = AtomicU16::new(0);
 struct TestServer {
     child: Child,
     port: u16,
+    /// Serialize s_server-backed handshakes process-wide (see the lock docs).
+    /// Held for the server's lifetime; released on drop.
+    _guard: std::sync::MutexGuard<'static, ()>,
 }
 
 impl TestServer {
@@ -257,6 +260,7 @@ impl TestServer {
     /// single accept slot and the real test connect would be refused. The
     /// server stays up serving multiple connections until `Drop` kills it.
     fn start(certs: &Certs) -> Self {
+        let guard = super::S_SERVER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let port = pick_port();
         let child = Command::new("openssl")
             .args([
@@ -286,7 +290,7 @@ impl TestServer {
             assert!(Instant::now() < deadline, "s_server did not start");
             std::thread::sleep(Duration::from_millis(50));
         }
-        Self { child, port }
+        Self { child, port, _guard: guard }
     }
 }
 
@@ -433,6 +437,68 @@ fn hostname_mismatch_fails() {
         res.is_err(),
         "cert SAN=example.com verified against host 127.0.0.1 MUST fail (hostname check off?)"
     );
+}
+
+/// Read the client-side SNI HostName that `TlsNgxConnIo::new` set on the SSL,
+/// by querying OpenSSL directly (`SSL_get_servername`). Returns `None` when no
+/// SNI extension was set. This inspects the ACTUAL SSL setup decision made by
+/// the production `new`, not a reimplementation of the classifier.
+fn sni_set_on(tls: &TlsNgxConnIo<TestIo>) -> Option<String> {
+    use core::ffi::CStr;
+    use openssl_sys as ssl;
+    // SAFETY: `tls.ssl_ptr()` is the owned, non-null SSL just built by `new`;
+    // `SSL_get_servername` returns a borrowed C string (the client SNI we set)
+    // or null if none was set. We do not free it.
+    let p = unsafe { ssl::SSL_get_servername(tls.ssl_ptr(), ssl::TLSEXT_NAMETYPE_host_name) };
+    if p.is_null() {
+        None
+    } else {
+        // SAFETY: `p` is a non-null, NUL-terminated C string owned by the SSL.
+        Some(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
+    }
+}
+
+/// F2 (RFC 6066): SNI MUST be set for a DNS-name `server_name` and MUST be
+/// suppressed for an IP literal (v4 and v6). Asserts the real SSL setup
+/// decision via `SSL_get_servername`, not a reimplementation.
+///
+/// Mutation target: making `TlsNgxConnIo::new` set SNI unconditionally (drop
+/// the `is_ip_literal` guard) makes the IP assertions FAIL.
+#[test]
+fn sni_set_for_dns_suppressed_for_ip() {
+    let cfg = TlsConfig::default();
+    let c = ctx(&cfg);
+
+    // DNS name → SNI present and equal to the host.
+    let dns = TlsNgxConnIo::new(connect_loopback_io(), &c, "collector.example.com", true)
+        .expect("new dns");
+    assert_eq!(
+        sni_set_on(&dns).as_deref(),
+        Some("collector.example.com"),
+        "DNS host must set SNI to the host name"
+    );
+
+    // IPv4 literal → no SNI (RFC 6066).
+    let v4 = TlsNgxConnIo::new(connect_loopback_io(), &c, "127.0.0.1", false).expect("new v4");
+    assert_eq!(sni_set_on(&v4), None, "IPv4 literal must NOT be sent as SNI (RFC 6066)");
+
+    // IPv6 literal (unbracketed, as the connector passes it) → no SNI.
+    let v6 = TlsNgxConnIo::new(connect_loopback_io(), &c, "::1", false).expect("new v6");
+    assert_eq!(sni_set_on(&v6), None, "IPv6 literal must NOT be sent as SNI (RFC 6066)");
+}
+
+/// Build a `TestIo` over a throwaway accepted loopback connection. No TLS
+/// server is needed: `TlsNgxConnIo::new` only configures the SSL (SNI / verify
+/// params); it does NOT touch the wire until `poll_handshake`. We connect to a
+/// listener we keep alive for the duration so the socket is valid.
+fn connect_loopback_io() -> TestIo {
+    // A listener that stays bound; we never read from it. The client socket is
+    // only used to construct the SSL wrapper, not to handshake.
+    let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = l.local_addr().unwrap().port();
+    // Leak the listener so it outlives the returned TestIo (test-only).
+    std::mem::forget(l);
+    connect_nonblocking(port)
 }
 
 /// Constructing a TlsNgxConnIo and dropping it mid-handshake (before
