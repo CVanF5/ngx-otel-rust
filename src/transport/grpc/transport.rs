@@ -489,4 +489,261 @@ mod tests {
             t.err()
         );
     }
+
+    // ── gRPC TLS dispatch coverage (connect_io wraps the stream in TLS) ───────
+    //
+    // Drives the PRODUCTION GrpcTransport::connect_io against a real TLS server
+    // (`openssl s_server`) over the SpinConnector https path. A working dispatch
+    // wraps the stream in TlsNgxConnIo (ALPN h2) → the handshake completes and
+    // a round-trip succeeds. Dropping the TLS wrap on the gRPC path (mutation 2)
+    // sends cleartext to the TLS server → no round-trip → this test FAILS.
+    mod tls_dispatch {
+        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        use std::boxed::Box;
+        use std::process::{Child, Command, Stdio};
+        use std::string::{String, ToString};
+        use std::sync::atomic::{AtomicU16, Ordering};
+        use std::time::{Duration, Instant};
+        use std::{format, vec};
+
+        use crate::transport::hyper_http::SpinConnector;
+        use crate::transport::tls::TlsConfig;
+
+        use super::super::GrpcTransport;
+
+        fn block_on<F: core::future::Future>(fut: F) -> F::Output {
+            unsafe fn noop_clone(_: *const ()) -> RawWaker {
+                RawWaker::new(core::ptr::null(), &VTABLE)
+            }
+            unsafe fn noop(_: *const ()) {}
+            static VTABLE: RawWakerVTable = RawWakerVTable::new(noop_clone, noop, noop, noop);
+            // SAFETY: standard noop-waker idiom (all fns no-op over a null ptr).
+            let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+            let mut cx = Context::from_waker(&waker);
+            let mut fut = core::pin::pin!(fut);
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+                    return v;
+                }
+                assert!(Instant::now() < deadline, "block_on timed out");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        static NEXT: AtomicU16 = AtomicU16::new(0);
+
+        struct Certs {
+            dir: std::path::PathBuf,
+        }
+        impl Certs {
+            fn ca_pem(&self) -> String {
+                self.dir.join("ca.pem").to_string_lossy().into_owned()
+            }
+        }
+        impl Drop for Certs {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+
+        fn run_openssl(args: &[&str], cwd: &std::path::Path) {
+            let out = Command::new("openssl")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("spawn openssl");
+            assert!(out.status.success(), "openssl {:?} failed", args);
+        }
+
+        fn make_certs(san: &str) -> Certs {
+            let dir = std::env::temp_dir().join(format!(
+                "ngx-otel-grpc-tls-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::SeqCst)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let d = dir.as_path();
+            run_openssl(&["genrsa", "-out", "ca.key", "2048"], d);
+            run_openssl(
+                &[
+                    "req",
+                    "-x509",
+                    "-new",
+                    "-key",
+                    "ca.key",
+                    "-days",
+                    "1",
+                    "-subj",
+                    "/CN=Test CA",
+                    "-out",
+                    "ca.pem",
+                ],
+                d,
+            );
+            run_openssl(&["genrsa", "-out", "server.key", "2048"], d);
+            run_openssl(
+                &["req", "-new", "-key", "server.key", "-subj", "/CN=server", "-out", "server.csr"],
+                d,
+            );
+            std::fs::write(d.join("ext.cnf"), format!("subjectAltName={san}")).unwrap();
+            run_openssl(
+                &[
+                    "x509",
+                    "-req",
+                    "-in",
+                    "server.csr",
+                    "-CA",
+                    "ca.pem",
+                    "-CAkey",
+                    "ca.key",
+                    "-CAcreateserial",
+                    "-days",
+                    "1",
+                    "-out",
+                    "server.pem",
+                    "-extfile",
+                    "ext.cnf",
+                ],
+                d,
+            );
+            Certs { dir }
+        }
+
+        struct TestServer {
+            child: Child,
+            port: u16,
+            _guard: std::sync::MutexGuard<'static, ()>,
+        }
+        impl TestServer {
+            fn start(certs: &Certs) -> Self {
+                let guard = crate::transport::tls::S_SERVER_TEST_LOCK
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let cert = certs.dir.join("server.pem");
+                let key = certs.dir.join("server.key");
+                let mut last = String::new();
+                for _ in 0..10 {
+                    let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+                    let port = l.local_addr().unwrap().port();
+                    drop(l);
+                    let mut child = Command::new("openssl")
+                        .args([
+                            "s_server",
+                            "-accept",
+                            &port.to_string(),
+                            "-cert",
+                            &cert.to_string_lossy(),
+                            "-key",
+                            &key.to_string_lossy(),
+                            // Offer h2 via ALPN so the gRPC client's ALPN h2 is
+                            // accepted; the handshake completes either way, this
+                            // just makes the negotiation realistic.
+                            "-alpn",
+                            "h2",
+                            "-quiet",
+                            "-rev",
+                        ])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .expect("spawn s_server");
+                    std::thread::sleep(Duration::from_millis(80));
+                    if let Ok(Some(_)) = child.try_wait() {
+                        last = format!("s_server exited early on {port}");
+                        continue;
+                    }
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let mut ready = false;
+                    while Instant::now() < deadline {
+                        if let Ok(p) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+                            drop(p);
+                            ready = true;
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    if ready && matches!(child.try_wait(), Ok(None)) {
+                        return Self { child, port, _guard: guard };
+                    }
+                    last = format!("not ready on {port}");
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                panic!("could not start s_server: {last}");
+            }
+        }
+        impl Drop for TestServer {
+            fn drop(&mut self) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+
+        /// The gRPC `connect_io` must wrap the stream in TLS (ALPN h2) for an
+        /// https endpoint. We drive it against a TLS s_server and round-trip
+        /// bytes via the boxed IO's hyper Read/Write.
+        #[test]
+        fn grpc_connect_io_https_completes_tls_roundtrip() {
+            use hyper::rt::{Read, Write};
+
+            let certs = make_certs("DNS:localhost,IP:127.0.0.1");
+            let server = TestServer::start(&certs);
+            let endpoint = format!("https://127.0.0.1:{}", server.port);
+
+            let mut last = String::new();
+            for attempt in 0..4 {
+                let mut t =
+                    GrpcTransport::<SpinConnector>::with_connector(&endpoint, SpinConnector)
+                        .expect("https grpc endpoint must parse");
+                let ctx = TlsConfig { ca_file: Some(certs.ca_pem()), ..Default::default() }
+                    .build_ctx(|_| {})
+                    .expect("build_ctx");
+                t.set_tls(ctx, false);
+
+                let mut io = match block_on(t.connect_io()) {
+                    Ok(io) => io,
+                    Err(e) => {
+                        last = format!("connect_io: {e:?}");
+                        std::thread::sleep(Duration::from_millis(50 * (attempt + 1)));
+                        continue;
+                    }
+                };
+                let msg = b"grpc-tls-probe\n";
+                match block_on(core::future::poll_fn(|cx| {
+                    core::pin::Pin::new(&mut io).poll_write(cx, msg)
+                })) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        last = format!("write: {e}");
+                        std::thread::sleep(Duration::from_millis(50 * (attempt + 1)));
+                        continue;
+                    }
+                }
+                let mut got = vec![0u8; 64];
+                let n = block_on(core::future::poll_fn(|cx| {
+                    let mut rb = hyper::rt::ReadBuf::new(&mut got);
+                    match core::pin::Pin::new(&mut io).poll_read(cx, rb.unfilled()) {
+                        Poll::Ready(Ok(())) => Poll::Ready(Ok(rb.filled().len())),
+                        Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                        Poll::Pending => Poll::Pending,
+                    }
+                }));
+                match n {
+                    Ok(n) if n > 0 => return, // TLS round-trip succeeded → dispatch wrapped TLS
+                    Ok(_) => last = "no bytes echoed (no TLS round-trip)".to_string(),
+                    Err(e) => last = format!("read: {e}"),
+                }
+                std::thread::sleep(Duration::from_millis(50 * (attempt + 1)));
+            }
+            panic!("gRPC TLS dispatch round-trip failed after retries: {last}");
+        }
+
+        // Keep `Box` referenced (connect_io returns Box<dyn TlsOrPlain>).
+        #[allow(dead_code)]
+        fn _box_marker() -> Box<u8> {
+            Box::new(0)
+        }
+    }
 }
