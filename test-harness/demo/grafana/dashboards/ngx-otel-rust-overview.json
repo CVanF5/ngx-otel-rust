@@ -1420,6 +1420,102 @@
               "sort": "desc"
             }
           }
+        },
+        {
+          "id": 51,
+          "type": "table",
+          "title": "Traces (nginx server spans via Tempo)",
+          "collapsed": true,
+          "gridPos": {
+            "h": 10,
+            "w": 24,
+            "x": 0,
+            "y": 66
+          },
+          "panels": [
+            {
+              "id": 52,
+              "type": "traces",
+              "title": "nginx Server Spans (Tempo)",
+              "description": "nginx server spans emitted by ngx-otel-rust. Enable the `traces` compose profile to start receiving spans. Click an exemplar diamond on the 'Request Latency' panel to jump directly to the matching span here.",
+              "datasource": {
+                "type": "tempo",
+                "uid": "tempo"
+              },
+              "gridPos": {
+                "h": 12,
+                "w": 24,
+                "x": 0,
+                "y": 101
+              },
+              "targets": [
+                {
+                  "datasource": {
+                    "type": "tempo",
+                    "uid": "tempo"
+                  },
+                  "queryType": "traceqlSearch",
+                  "filters": [
+                    {
+                      "id": "service-name",
+                      "operator": "=",
+                      "scope": "resource",
+                      "tag": "service.name",
+                      "value": [
+                        "$service"
+                      ],
+                      "valueType": "string"
+                    },
+                    {
+                      "id": "span-name",
+                      "operator": "=~",
+                      "scope": "span",
+                      "tag": "name",
+                      "value": [],
+                      "valueType": "string"
+                    }
+                  ],
+                  "refId": "A"
+                }
+              ],
+              "options": {
+                "dedupStrategy": "none",
+                "enableNodeGraph": false,
+                "showBreadcrumbs": true,
+                "spanBar": {
+                  "type": "duration"
+                },
+                "traceQuery": {
+                  "timeShiftEnabled": true,
+                  "spanStartTimeShift": "1m",
+                  "spanEndTimeShift": "-1m"
+                }
+              }
+            }
+          ],
+          "datasource": {
+            "type": "tempo",
+            "uid": "tempo"
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "tempo",
+                "uid": "tempo"
+              },
+              "refId": "A",
+              "queryType": "traceql",
+              "query": "{resource.service.name=\"nginx-otel\"}",
+              "limit": 20,
+              "tableType": "traces"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {},
+            "overrides": []
+          },
+          "options": {},
+          "description": "nginx OTel server spans (root traces) via Tempo TraceQL. Click a trace to open it; from a span use 'Logs for this span' to reach the matching Loki access-tail log."
         }
       ]
     },
@@ -1946,102 +2042,6 @@
           }
         }
       ]
-    },
-    {
-      "id": 51,
-      "type": "table",
-      "title": "Traces (Phase 3 \u2014 nginx server spans via Tempo)",
-      "collapsed": true,
-      "gridPos": {
-        "h": 10,
-        "w": 24,
-        "x": 0,
-        "y": 121
-      },
-      "panels": [
-        {
-          "id": 52,
-          "type": "traces",
-          "title": "nginx Server Spans (Tempo)",
-          "description": "nginx server spans emitted by ngx-otel-rust (Phase 3). Enable the `traces` compose profile to start receiving spans. Click an exemplar diamond on the 'Request Latency' panel to jump directly to the matching span here.",
-          "datasource": {
-            "type": "tempo",
-            "uid": "tempo"
-          },
-          "gridPos": {
-            "h": 12,
-            "w": 24,
-            "x": 0,
-            "y": 101
-          },
-          "targets": [
-            {
-              "datasource": {
-                "type": "tempo",
-                "uid": "tempo"
-              },
-              "queryType": "traceqlSearch",
-              "filters": [
-                {
-                  "id": "service-name",
-                  "operator": "=",
-                  "scope": "resource",
-                  "tag": "service.name",
-                  "value": [
-                    "$service"
-                  ],
-                  "valueType": "string"
-                },
-                {
-                  "id": "span-name",
-                  "operator": "=~",
-                  "scope": "span",
-                  "tag": "name",
-                  "value": [],
-                  "valueType": "string"
-                }
-              ],
-              "refId": "A"
-            }
-          ],
-          "options": {
-            "dedupStrategy": "none",
-            "enableNodeGraph": false,
-            "showBreadcrumbs": true,
-            "spanBar": {
-              "type": "duration"
-            },
-            "traceQuery": {
-              "timeShiftEnabled": true,
-              "spanStartTimeShift": "1m",
-              "spanEndTimeShift": "-1m"
-            }
-          }
-        }
-      ],
-      "datasource": {
-        "type": "tempo",
-        "uid": "tempo"
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "tempo",
-            "uid": "tempo"
-          },
-          "refId": "A",
-          "queryType": "traceql",
-          "query": "{resource.service.name=\"nginx-otel\"}",
-          "limit": 20,
-          "tableType": "traces"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {},
-        "overrides": []
-      },
-      "options": {},
-      "description": "nginx OTel server spans (root traces) via Tempo TraceQL. Click a trace to open it; from a span use 'Logs for this span' to reach the matching Loki access-tail log."
     },
     {
       "id": 53,

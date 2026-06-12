@@ -72,6 +72,18 @@ include	build/build-$(BUILD).mk
 BUILD_ENV	+= NGINX_SOURCE_DIR="$(NGINX_SOURCE_DIR)"
 BUILD_ENV	+= NGINX_BUILD_DIR="$(NGINX_BUILD_DIR)"
 
+# macOS: openssl-sys MUST link the SAME OpenSSL that nginx links (dynamic
+# openssl@3), or the module carries its own incompatible OpenSSL and the
+# Phase C cert walk silently enumerates ZERO certs from nginx's SSL_CTX
+# objects (found via the demo 2026-06-12; the C2 review flagged the skew).
+# Linux has one system OpenSSL, so this expands to nothing there.
+# Flavor-neutral dual assignment (same idiom as MAKE_FLAVOR above): GNU make
+# 3.81 (macOS system make) ignores `!=` and takes the `:=`/$(shell) line;
+# POSIX-2024/GNU-4 makes take the `!=` line. Both compute the same string.
+OPENSSL_BUILD_ENV := $(shell if [ "`uname -s`" = "Darwin" ] && [ -e /opt/homebrew/opt/openssl@3/lib/libssl.dylib ]; then echo "OPENSSL_DIR=/opt/homebrew/opt/openssl@3 OPENSSL_STATIC=0 OPENSSL_NO_VENDOR=1"; fi)
+OPENSSL_BUILD_ENV != if [ "`uname -s`" = "Darwin" ] && [ -e /opt/homebrew/opt/openssl@3/lib/libssl.dylib ]; then echo "OPENSSL_DIR=/opt/homebrew/opt/openssl@3 OPENSSL_STATIC=0 OPENSSL_NO_VENDOR=1"; fi
+BUILD_ENV	+= $(OPENSSL_BUILD_ENV)
+
 TEST_ENV	+= RUST_BACKTRACE=1
 TEST_ENV	+= TEST_NGINX_BINARY="$(TEST_NGINX_BINARY)"
 TEST_ENV	+= TEST_NGINX_GLOBALS="$(TEST_NGINX_GLOBALS)"
