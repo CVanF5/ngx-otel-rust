@@ -19,6 +19,7 @@ pub mod span_start;
 // warnings that would otherwise fire only in that build config.
 #[cfg_attr(not(ngx_feature = "stat_stub"), allow(dead_code))]
 pub mod stub_status;
+pub mod tls_cert;
 
 use crate::data_model::Metric;
 

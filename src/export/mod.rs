@@ -56,6 +56,7 @@ use crate::logs::severity::nginx_to_otel;
 use crate::metric_source::instrumented::InstrumentedSource;
 #[cfg(ngx_feature = "stat_stub")]
 use crate::metric_source::stub_status::StubStatusSource;
+use crate::metric_source::tls_cert::ServingCertSource;
 use crate::metric_source::MetricSource;
 use crate::processor::Processor;
 use crate::shm::{
@@ -2130,6 +2131,14 @@ fn collect_all_sources(amcf: &MainConfig, worker_start_ns: u64) -> Batch {
         }
     }
 
+    // 5. Serving-certificate gauges (TLS cert-metrics Phase C, item C3).
+    //    `cert_table` is populated once at postconfiguration (C2) and immutable
+    //    afterwards; the exporter inherited it at fork. When the table is empty
+    //    (no-ssl nginx build, or no `ssl_certificate` configured) the source
+    //    yields NO metrics, so the three `ngx_otel.tls.certificate.*` series
+    //    are ABSENT — not present-as-zero (stub_status H3F7 precedent).
+    metrics.extend(ServingCertSource { certs: &amcf.cert_table }.collect());
+
     Batch {
         resource: Resource { attributes: build_resource_attrs(amcf) },
         scope: Scope { name: "ngx-otel-rust".into(), version: env!("CARGO_PKG_VERSION").into() },
@@ -3012,6 +3021,50 @@ mod tests {
                 !stub_names.contains(&m.name.as_str()),
                 "stub_status series {} must be ABSENT in a no-stat_stub build",
                 m.name
+            );
+        }
+    }
+
+    /// C3 registration-level absent-not-zero: with an EMPTY cert table the
+    /// three `ngx_otel.tls.certificate.*` series are ABSENT from the real
+    /// collection path; with a populated table all three appear. (Source-level
+    /// arithmetic/attribute tests live in `metric_source::tls_cert`.)
+    #[test]
+    fn collect_all_sources_cert_series_absent_when_table_empty() {
+        let cert_names = [
+            crate::metric_source::tls_cert::NOT_AFTER,
+            crate::metric_source::tls_cert::NOT_BEFORE,
+            crate::metric_source::tls_cert::TIME_TO_EXPIRATION,
+        ];
+
+        // Empty table (the MainConfig default — also the no-ssl-build shape).
+        let mut amcf = crate::config::MainConfig::default();
+        let batch = collect_all_sources(&amcf, 0);
+        for m in &batch.metrics {
+            assert!(
+                !cert_names.contains(&m.name.as_str()),
+                "cert series {} must be ABSENT when the cert table is empty",
+                m.name
+            );
+        }
+
+        // Populated table → all three series present.
+        amcf.cert_table.push(crate::cert_table::CertInfo {
+            file_path: "/etc/ssl/a.crt".into(),
+            server_name: "a.example.test".into(),
+            not_before_unix: 1_700_000_000,
+            not_after_unix: 1_893_456_000,
+            subject_cn: "a.example.test".into(),
+            issuer_cn: "Test CA".into(),
+            serial: "01".into(),
+            pubkey_alg: "RSA".into(),
+            sig_alg: "RSA-SHA256".into(),
+        });
+        let batch = collect_all_sources(&amcf, 0);
+        for name in cert_names {
+            assert!(
+                batch.metrics.iter().any(|m| m.name == name),
+                "cert series {name} must be PRESENT when the cert table is populated"
             );
         }
     }
