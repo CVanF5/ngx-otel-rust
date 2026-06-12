@@ -1,0 +1,60 @@
+A2-FIX mutation evidence — EXECUTED, both halves each
+Date: 2026-06-12  Platform: macOS (aarch64)  openssl: OpenSSL 3.6.2
+GIT_COMMIT_AT_RUN: c122ae3433a3f848ae83ce90265a0a99217c9725
+
+============================================================
+MUTATION 1 — https dispatch -> plaintext branch (the prescribed A2 mutation)
+  connect_io() forced to take the plaintext (else) arm for https endpoints
+  (the exact fail-closed violation that returned 238/0 in the A2 review).
+------------------------------------------------------------
+BROKEN (mutation applied):
+test transport::hyper_http::tests::tls_dispatch::tls_dispatch_https_completes_tls_roundtrip ... FAILED
+---- transport::hyper_http::tests::tls_dispatch::tls_dispatch_https_completes_tls_roundtrip stdout ----
+thread 'transport::hyper_http::tests::tls_dispatch::tls_dispatch_https_completes_tls_roundtrip' (69531411) panicked at src/transport/hyper_http.rs:2515:25:
+    transport::hyper_http::tests::tls_dispatch::tls_dispatch_https_completes_tls_roundtrip
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 243 filtered out; finished in 0.28s
+RESTORED (mutation reverted):
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 243 filtered out; finished in 0.30s
+
+============================================================
+MUTATION 2 — gRPC: drop the TLS wrap on the gRPC connect_io path
+  GrpcTransport::connect_io forced to return the plain stream for https.
+------------------------------------------------------------
+BROKEN (mutation applied):
+test transport::grpc::transport::tests::tls_dispatch::grpc_connect_io_https_completes_tls_roundtrip ... FAILED
+---- transport::grpc::transport::tests::tls_dispatch::grpc_connect_io_https_completes_tls_roundtrip stdout ----
+thread 'transport::grpc::transport::tests::tls_dispatch::grpc_connect_io_https_completes_tls_roundtrip' (69600115) panicked at src/transport/grpc/transport.rs:701:13:
+gRPC TLS dispatch round-trip failed after retries: no bytes echoed (no TLS round-trip)
+    transport::grpc::transport::tests::tls_dispatch::grpc_connect_io_https_completes_tls_roundtrip
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 245 filtered out; finished in 0.79s
+RESTORED (mutation reverted):
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 245 filtered out; finished in 0.23s
+
+============================================================
+MUTATION 3 — SNI set unconditionally (incl. IP literals)
+  TlsNgxConnIo::new SNI guard 'if !is_ip_literal' forced to 'if true'.
+------------------------------------------------------------
+BROKEN (mutation applied):
+test transport::tls::tests::sni_set_for_dns_suppressed_for_ip ... FAILED
+thread 'transport::tls::tests::sni_set_for_dns_suppressed_for_ip' (69622284) panicked at src/transport/tls_tests.rs:483:5:
+assertion `left == right` failed: IPv4 literal must NOT be sent as SNI (RFC 6066)
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 245 filtered out; finished in 0.01s
+RESTORED (mutation reverted):
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 245 filtered out; finished in 0.01s
+
+============================================================
+MUTATION 4 — flavor guard: substring detection vs positive #define parse
+  Unit-level (the build.rs detection predicate, extracted).
+  Fixture: a NON-debug tree's ngx_auto_config.h that references NGX_DEBUG
+  ONLY in an '#ifndef NGX_DEBUG' guard (no actual define).
+------------------------------------------------------------
+BROKEN substring on ifndef-only tree -> nginx_tree_is_debug=true (FALSE POSITIVE; guard would fire on a NON-debug tree)
+FIXED  positive-define on ifndef-only tree -> nginx_tree_is_debug=false (correct: not a debug tree)
+FIXED  positive-define on real debug tree  -> nginx_tree_is_debug=true (correct: guard still triggers)
+MUTATION 4 OK: substring=false-positive; positive-define=correct both halves
+
+NOTE: the positive-define fix is correct (this mutation proves it), but it
+does NOT by itself unblock 'make test' on debian-vm — see STOP-AND-ASK in
+RESULTS-a2fix-2026-06-12.txt (root cause: integration scripts build
+--release against the objs-debug tree make test hands them; the guard
+correctly catches release+debug-tree).

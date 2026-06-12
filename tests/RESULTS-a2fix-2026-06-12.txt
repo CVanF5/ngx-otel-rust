@@ -1,0 +1,132 @@
+A2-FIX verification + findings — 2026-06-12 (Opus)
+Remediation of the A2 review FAIL (a2-review-report.md), findings F1-F6 + A0.5.
+
+GIT_COMMIT_AT_RUN: c122ae3433a3f848ae83ce90265a0a99217c9725
+Platforms: macOS (aarch64, OpenSSL 3.6.2) + debian-vm (Linux verification host).
+
+================================================================
+SUITES (EXECUTED, both platforms)
+================================================================
+macOS:
+  make check (fmt + clippy -D warnings) ......... RC=0, no findings
+  make unittest (debug, objs-debug) ............. 245 passed; 0 failed; 1 ignored
+  make build-release + make unittest-release .... 245 passed; 0 failed; 1 ignored
+  transport:: suite serial AND parallel x5 ...... all 42 green (BIO type-pun fix verified)
+
+debian-vm (HEAD = final tip, pulled + verified):
+  make check .................................... RC=0
+  make unittest ................................. 245 passed; 0 failed; 1 ignored
+  integration suite (run.sh, run_reload.sh,
+    run_endpoint_change.sh, run_traces.sh) ...... 29 [PASS], 0 [FAIL], INT_RC=0
+    (UNCHANGED — no integration script modified; zero-regression confirmed)
+    NOTE: run WITH NGX_OTEL_ALLOW_FLAVOR_MISMATCH=1 — see A0.5 STOP-AND-ASK below;
+    `make test` WITHOUT the hatch is still blocked by the flavor guard, but the
+    root cause is NOT the substring (now fixed) — it is the integration scripts
+    building --release against the objs-debug tree.
+
+================================================================
+FINDINGS RESOLVED
+================================================================
+F1 (hollow dispatch coverage): RESOLVED. New production-dispatch tests:
+   - transport::hyper_http::tests::tls_dispatch::tls_dispatch_https_completes_tls_roundtrip
+     (drives HyperHttpTransport::connect_io against a TLS s_server; prescribed
+      mutation https→plaintext makes it FAIL — see mutation 1).
+   - ..::tls_dispatch_https_without_ctx_does_not_roundtrip_plaintext (fail-closed).
+   - transport::grpc::transport::tests::tls_dispatch::grpc_connect_io_https_completes_tls_roundtrip
+     (gRPC connect_io TLS wrap, ALPN h2; mutation 2 makes it FAIL).
+   - transport::tls::tests::sni_set_for_dns_suppressed_for_ip (SNI decision via
+     SSL_get_servername; mutation 3 makes it FAIL).
+
+F2 (IP-literal SNI, RFC 6066): RESOLVED. TlsNgxConnIo::new now suppresses
+   SSL_set_tlsext_host_name for IP-literal server_name; DNS names still set SNI.
+   IP endpoints verify via X509_VERIFY_PARAM_set1_ip_asc, no SNI extension.
+
+F3 (gRPC TLS — substantive gap): RESOLVED. GrpcTransport gains tls + set_tls;
+   connect_io wraps every gRPC connection in TlsNgxConnIo with ALPN "h2"
+   (SSL_set_alpn_protos, present in openssl-sys handwritten bindings) before
+   the h2 handshake — same engine as the HTTP transport. export/mod.rs no longer
+   drops the TLS ctx for gRPC. See DESIGN NOTE below.
+
+F4 (config error-case coverage + hollow scheme test): RESOLVED. Extracted the
+   pure validate_endpoint_tls (scheme / cert-without-key / key-without-cert /
+   missing-file-with-label / verify-off WARN signal) out of post_config; the
+   formerly-hollow a2_https_scheme_is_valid now calls the production predicate.
+   New tests: a2_https_scheme_is_valid, a2_cert_key_pairing_validated,
+   a2_missing_tls_file_validated, a2_ssl_verify_off_warn_signal.
+
+F5 (redundant set1_ip_asc extern): RESOLVED + FINDING CONFIRMED. Removed the
+   module-side `extern "C" X509_VERIFY_PARAM_set1_ip_asc`. openssl-sys 0.9.116's
+   bindgen layer provides it: generated bindgen.rs at
+   target/debug/build/openssl-sys-*/out/bindgen.rs contains
+   `X509_VERIFY_PARAM_set1_ip_asc` (count=1); the crate now calls
+   openssl_sys::X509_VERIFY_PARAM_set1_ip_asc and LINKS CLEANLY (full debug +
+   release builds green). Confirms the review's inconsistency finding: the same
+   bindgen mechanism that justified removing the BIO_get_new_index extern in A2
+   also provides set1_ip_asc.
+
+F6 (evidence SHA discipline): GIT_COMMIT_AT_RUN = c122ae3 in both this file and
+   RESULTS-a2fix-mutation-2026-06-12.txt — the pushed code tip the suites and all
+   four mutations were EXECUTED against (the last code commit of the A2-FIX). The
+   commit that adds these two evidence files is its direct child (it changes no
+   code, so the executed results hold at it too).
+
+================================================================
+SOUNDNESS FIX (exposed by F1 — not in the original findings, but real)
+================================================================
+The custom BIO_METHOD was a single process-global shared across ALL inner-IO
+types `I`. Its read/write callbacks are `I`-monomorphized (bio_read::<I> casts
+the BIO `data` slot to `*mut BioCtx<I>`); sharing one method across different
+`I`s type-puns that pointer. Production has a single `I` so it never bit, but
+the new multi-`I` test binary (TestIo + SpinIo) deterministically corrupted
+later handshakes. Replaced with a TypeId-keyed registry (one method per concrete
+`I`; requires `I: 'static`). A `static` inside the generic fn does NOT fix it
+(Rust shares such statics across monomorphizations). A process-wide
+S_SERVER_TEST_LOCK additionally serializes the s_server-backed test harnesses.
+
+================================================================
+A0.5 FLAVOR-GUARD — FIX + STOP-AND-ASK
+================================================================
+FIX (committed): detection changed from `contents.contains("NGX_DEBUG")` to a
+   whitespace-tolerant positive `#define NGX_DEBUG 1` parse. Verified on macOS:
+   a real debug tree (objs-debug, which has `#define NGX_DEBUG 1`) under the
+   release profile STILL triggers the hard error; an ifndef-only tree does NOT
+   (mutation 4, unit-level, both halves executed).
+
+STOP-AND-ASK (premise divergence — the brief's diagnosis was incomplete):
+   The brief hypothesised the false positive was `contains` matching
+   `#ifndef NGX_DEBUG`. On debian-vm that is NOT the cause: objs-debug genuinely
+   has `#define NGX_DEBUG 1`. The real cause of `make test` aborting is that the
+   integration scripts (tests/integration/run.sh etc.) run `cargo build --release`
+   against the NGINX_BUILD_DIR that `make test` hands them via TEST_ENV =
+   objs-debug (the DEBUG tree). That is a genuine release-profile + debug-tree
+   pairing, which the guard correctly flags. The `ngx-debug` cargo profile used
+   by the nginx-module build inherits "dev" and reports PROFILE=debug (fine); it
+   is specifically the integration scripts' `--release` build that trips it.
+
+   The positive-define fix is correct and prescribed, but it does NOT by itself
+   unblock `make test`, because the integration `--release` build against the
+   debug tree is a legitimate guard trigger. Unblocking requires either:
+     (a) the integration scripts to build against a release tree (objs-release)
+         — FORBIDDEN by the brief ("zero changes to existing integration scripts");
+     (b) make test's TEST_ENV to point the scripts at objs-release (Makefile
+         change — within scope, but changes test wiring and may mismatch the
+         debug nginx binary the scripts also use); or
+     (c) relaxing the guard for the release-against-debug-tree case to a WARN
+         rather than a hard abort (weakens the protection A0.5 deliberately added).
+   This is a design decision; per the unconditional STOP-AND-ASK trigger on a
+   false premise, it is surfaced rather than decided unilaterally. The escape
+   hatch (NGX_OTEL_ALLOW_FLAVOR_MISMATCH=1) makes the suite green today.
+
+================================================================
+DESIGN NOTE — how TLS enters the gRPC connection (F3)
+================================================================
+GrpcTransport::send/send_logs/send_traces each do, on lazy connect:
+    let io = self.connect_io().await?;          // was: self.connector.connect(...)
+    hyper::client::conn::http2::handshake::<_, _, tonic::body::Body>(NgxExecutor, io)
+connect_io opens the raw TCP stream via the connector, then — for an https://
+endpoint — calls the shared wrap_tls_io(raw, ctx, insecure, host, Some(b"h2")),
+which builds a TlsNgxConnIo (one engine, both transports), installs IP-SAN
+verification for IP literals, and sets ALPN "h2" via SSL_set_alpn_protos so the
+collector negotiates HTTP/2 over TLS (RFC 7540 §3.3). The boxed Box<dyn TlsOrPlain>
+satisfies the h2 handshake's IO bounds via hyper's blanket Read/Write impl. No
+tonic connector seam was needed — the seam is the IO handed to the h2 handshake.
