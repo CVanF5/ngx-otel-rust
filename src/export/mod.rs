@@ -64,6 +64,7 @@ use crate::shm::{
     spans_n_workers_from_zone, spans_ring, DEFAULT_SPAN_RING_CAP,
 };
 use crate::transport::hyper_http::{extract_http_path, NgxConnector};
+use crate::transport::tls::TlsConfig;
 use crate::transport::{GrpcTransport, HyperHttpTransport};
 
 // ── Self-metric atomics ──────────────────────────────────────────────────────
@@ -504,6 +505,46 @@ pub async fn export_loop(amcf: &'static MainConfig) {
         })
         .collect();
 
+    // ── Build TLS config (https:// endpoints only) ───────────────────────────
+    //
+    // TLS config is constructed here, in the exporter process, from the
+    // ExporterConfig directives set by the master process at config time.
+    // Workers never reach this path.
+    let is_https = endpoint_str.starts_with("https://");
+    let tls_ctx_opt: Option<(crate::transport::tls::SslCtx, bool)> = if is_https {
+        let trusted_cert = core::str::from_utf8(amcf.exporter.trusted_cert.as_bytes())
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(std::string::String::from);
+        let client_cert = core::str::from_utf8(amcf.exporter.ssl_cert.as_bytes())
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(std::string::String::from);
+        let client_key = core::str::from_utf8(amcf.exporter.ssl_cert_key.as_bytes())
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(std::string::String::from);
+        let insecure = amcf.exporter.ssl_verify_off();
+        let tls_cfg = TlsConfig { ca_file: trusted_cert, client_cert, client_key, insecure };
+        let log_ptr = log.as_ptr();
+        match tls_cfg.build_ctx(|msg| {
+            ngx::ngx_log_error!(NGX_LOG_WARN, log_ptr, "otel export: {}", msg);
+        }) {
+            Ok(ctx) => Some((ctx, insecure)),
+            Err(e) => {
+                ngx::ngx_log_error!(
+                    NGX_LOG_ERR,
+                    log.as_ptr(),
+                    "otel export: failed to build TLS context: {}",
+                    e
+                );
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
     // ── Construct production transport (NgxConnector; NEVER SpinConnector) ─
     //
     // Transport selected by `otel_export_protocol` (default: otlp_http).
@@ -517,7 +558,13 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                 amcf.resolver,
                 amcf.resolver_timeout,
             ) {
-                Ok(t) => ExportTransport::Http(t),
+                Ok(mut t) => {
+                    // Wire TLS context for https:// endpoints.
+                    if let Some((ctx, insecure)) = tls_ctx_opt {
+                        t.set_tls(ctx, insecure);
+                    }
+                    ExportTransport::Http(t)
+                }
                 Err(e) => {
                     ngx::ngx_log_error!(
                         NGX_LOG_ERR,
@@ -530,6 +577,13 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             }
         }
         ExportProtocol::OtlpGrpc => {
+            // For gRPC, drop the TLS context — gRPC TLS dispatch is A3 scope.
+            // The gRPC connector receives the plain TCP IO from NgxConnector;
+            // TLS wrapping for gRPC will be wired in A3 when E2E integration
+            // tests can verify the full path.  For now, gRPC over https://
+            // builds and starts but the h2 handshake will fail (no TLS on the
+            // wire) — this is safe (fail-closed) and consistent with A2's scope.
+            drop(tls_ctx_opt);
             match GrpcTransport::<NgxConnector>::with_ngx_log(
                 endpoint_str,
                 log,

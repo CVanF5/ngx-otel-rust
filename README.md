@@ -39,8 +39,7 @@ What this module emits:
 
 Two production export transports (`otel_export_protocol`): **OTLP/HTTP** over
 HTTP/1.1 (`otlp_http`, default) and **OTLP/gRPC** unary over HTTP/2 (`otlp_grpc`).
-`http://` and `unix:` endpoints; `https://` / TLS is not yet implemented
-(see [Limitations](#limitations)).
+Supports `http://`, `https://` (TLS), and `unix:` endpoints for OTLP/HTTP.
 
 **Performance (metrics-only build, 2026-05-22):** zero-cost-when-disabled
 invariant verified at ≤ 0.01% throughput delta (module-loaded-but-disabled vs
@@ -466,8 +465,16 @@ load_module modules/ngx_http_otel_module.so;
 http {
     otel_exporter {
         endpoint http://127.0.0.1:4318;   # OTLP/HTTP: base URL; /v1/{metrics,logs,traces} appended per signal
+        # endpoint https://collector.example.com:4317; # OTLP/HTTP over TLS (default port 443)
         # endpoint http://127.0.0.1:4317; # OTLP/gRPC: host:port only (path N/A for gRPC)
         # endpoint unix:/run/otel-collector.sock;   # Unix socket (base path "/"; signals appended)
+
+        # TLS options (apply when endpoint uses https://):
+        # trusted_certificate /etc/ssl/certs/ca-bundle.pem;  # CA bundle; default = system trust store
+        # ssl_certificate     /etc/nginx/certs/client.crt;   # mTLS client cert
+        # ssl_certificate_key /etc/nginx/certs/client.key;   # mTLS client private key
+        # ssl_verify          on;                             # on (default) | off — off disables cert verification (INSECURE)
+
         # Per-signal overrides (optional; used as-is, no path appended):
         # metrics_endpoint http://metrics-host:4318/v1/metrics;
         # logs_endpoint    http://logs-host:4318/v1/logs;
@@ -730,10 +737,10 @@ ngx-otel-rust/
   `[alert]` at startup to remind you.  See
   [LIFECYCLE.md §"Known limitation: gen-1 exporter under daemon on"](LIFECYCLE.md)
   for the full explanation and the deferred self-supervisor design.
-- **HTTPS / TLS is not yet implemented.**  `https://` endpoints are
-  rejected at config parse (`http://` and `unix:` only); both the
-  OTLP/HTTP and OTLP/gRPC transports run over plaintext (h2c for gRPC).
-  TLS is deferred to a later phase.
+- **OTLP/gRPC TLS is not yet implemented.**  `https://` endpoints are
+  accepted and work for OTLP/HTTP.  OTLP/gRPC runs over plaintext (h2c)
+  even when an `https://` endpoint is configured; TLS for gRPC is deferred
+  to a later phase.
 - **Hot path is single-process-per-worker**; per-histogram attribute
   populations are reserved for a later iteration that needs
   multi-dimensional shm.

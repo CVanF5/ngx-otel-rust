@@ -91,23 +91,6 @@ use openssl_sys as ssl;
 use super::TransportError;
 
 // ──────────────────────────────────────────────────────────────────────────────
-// OpenSSL symbols not bound by openssl-sys 0.9.116 but present in the linked
-// libcrypto/libssl (OpenSSL >= 1.1.0, which the README already requires). These
-// are stable public C functions; declaring them module-side does NOT touch the
-// frozen ngx-rust fork (they resolve against the same libssl the module links).
-// ──────────────────────────────────────────────────────────────────────────────
-extern "C" {
-    /// Allocate a fresh, process-unique BIO type index (OpenSSL >= 1.1.0).
-    ///
-    /// Reachable only via `bio_method::<I>` which is monomorphized when a
-    /// concrete `TlsNgxConnIo<I>` is instantiated. A1 ships the engine; the
-    /// production instantiation lands in A2 (connector dispatch). Until then the
-    /// non-test lib build sees no monomorphization, so allow dead_code here.
-    #[allow(dead_code)]
-    fn BIO_get_new_index() -> c_int;
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
 // TlsConfig + SSL_CTX builder
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -626,9 +609,10 @@ impl<I: hyper::rt::Read + hyper::rt::Write + Unpin> TlsNgxConnIo<I> {
         }
 
         // SAFETY: `method` is our process-global method table; `BIO_new`
-        // allocates a BIO using it (or null on OOM). Ownership of this single
-        // BIO ref is ours until `SSL_set_bio` consumes it (below); on the error
-        // paths between here and `SSL_set_bio` we free it with `BIO_free_all`.
+        // allocates a BIO using it (or null on OOM). The only early-return path
+        // before `SSL_set_bio` is `BIO_new` returning null — in that case no
+        // BIO exists, so nothing to free. On success, `SSL_set_bio` (below)
+        // consumes this single ref; `SSL_free` will then free the BIO for us.
         let bio = unsafe { ssl::BIO_new(method) };
         if bio.is_null() {
             // SAFETY: `ssl_ptr` is the owned SSL with no BIO attached yet; free
@@ -709,6 +693,18 @@ impl<I: hyper::rt::Read + hyper::rt::Write + Unpin> TlsNgxConnIo<I> {
             bio_ctx,
             handshake: HandshakeState::Pending,
         })
+    }
+
+    /// Raw pointer to the owned `SSL` session.
+    ///
+    /// Exposed for callers that need to perform additional per-connection
+    /// `SSL_*` configuration after `new` but before the handshake (e.g.
+    /// `X509_VERIFY_PARAM_set1_ip_asc` for IP-literal endpoints — A2).
+    ///
+    /// The pointer is owned by this `TlsNgxConnIo` and freed in `Drop`.
+    /// Callers MUST NOT free it themselves.
+    pub fn ssl_ptr(&self) -> *mut ssl::SSL {
+        self.ssl
     }
 
     /// Run `op` (a closure calling exactly one `SSL_*` function on `self.ssl`)

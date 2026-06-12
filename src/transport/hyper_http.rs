@@ -68,6 +68,7 @@ use nginx_sys::{
 };
 use ngx::core::Pool;
 
+use super::tls::{SslCtx, TlsNgxConnIo};
 use super::TransportError;
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -94,6 +95,18 @@ pub(crate) enum ParsedEndpoint {
         port: u16,
         path: std::string::String,
     },
+    /// HTTPS (TLS) endpoint.  Introduced in A2 (TLS Phase A).
+    ///
+    /// Default port is 4317 (same as `http://` for gRPC) when the URL contains
+    /// no explicit port — this matches OTel spec § `OTEL_EXPORTER_OTLP_ENDPOINT`
+    /// default-port behaviour for both OTLP/HTTP (`/v1/*` paths, port 4318) and
+    /// OTLP/gRPC (no path, port 4317).  Like `Http`, the caller determines which
+    /// default applies based on the configured `otel_export_protocol`.
+    Https {
+        host: std::string::String,
+        port: u16,
+        path: std::string::String,
+    },
     Unix {
         // Used by SpinConnector (test) and will be used by NgxConnector when
         // Unix-socket support lands (Phase 1.2).
@@ -110,14 +123,20 @@ impl ParsedEndpoint {
                 Some(i) => (&rest[..i], std::string::String::from(&rest[i..])),
                 None => (rest, std::string::String::from("/")),
             };
+            // Default port 80 (HTTP convention); callers that want 4317/4318
+            // will override at construction time, but `parse` stores whatever
+            // the URL says (or 80 as the fallback for bare http://).
             let (host, port) = parse_authority(authority, 80);
             Ok(ParsedEndpoint::Http { host: std::string::String::from(host), port, path })
-        } else if input.starts_with("https://") {
-            Err(TransportError::TlsConfig {
-                cause: std::string::String::from(
-                    "HTTPS transport not yet implemented; use http:// or unix:",
-                ),
-            })
+        } else if let Some(rest) = input.strip_prefix("https://") {
+            let (authority, path) = match rest.find('/') {
+                Some(i) => (&rest[..i], std::string::String::from(&rest[i..])),
+                None => (rest, std::string::String::from("/")),
+            };
+            // Default port 443 (HTTPS convention); OTel collectors typically
+            // advertise 4317 (gRPC) or 4318 (HTTP) explicitly in the URL.
+            let (host, port) = parse_authority(authority, 443);
+            Ok(ParsedEndpoint::Https { host: std::string::String::from(host), port, path })
         } else if let Some(rest) = input.strip_prefix("unix:///") {
             Ok(ParsedEndpoint::Unix {
                 socket_path: std::format!("/{}", rest),
@@ -150,6 +169,13 @@ impl ParsedEndpoint {
                     std::format!("{}:{}", host, port)
                 }
             }
+            ParsedEndpoint::Https { host, port, .. } => {
+                if *port == 443 {
+                    host.clone()
+                } else {
+                    std::format!("{}:{}", host, port)
+                }
+            }
             ParsedEndpoint::Unix { .. } => std::string::String::from("localhost"),
         }
     }
@@ -160,8 +186,33 @@ impl ParsedEndpoint {
     /// Call [`derive_signal_paths`] to get the three per-signal paths.
     pub(crate) fn base_path(&self) -> &str {
         match self {
-            ParsedEndpoint::Http { path, .. } => path,
+            ParsedEndpoint::Http { path, .. } | ParsedEndpoint::Https { path, .. } => path,
             ParsedEndpoint::Unix { http_path, .. } => http_path,
+        }
+    }
+
+    /// Returns `true` when this endpoint requires TLS (i.e. `https://`).
+    #[allow(dead_code)]
+    pub(crate) fn is_tls(&self) -> bool {
+        matches!(self, ParsedEndpoint::Https { .. })
+    }
+
+    /// Returns the host string, stripping IPv6 bracket notation if present.
+    pub(crate) fn host_str(&self) -> &str {
+        match self {
+            ParsedEndpoint::Http { host, .. } | ParsedEndpoint::Https { host, .. } => host,
+            ParsedEndpoint::Unix { .. } => "localhost",
+        }
+    }
+
+    /// Returns the port number.
+    // Used in A2 unit tests; production dispatch uses the host/port fields
+    // from the enum arms directly.
+    #[allow(dead_code)]
+    pub(crate) fn port(&self) -> Option<u16> {
+        match self {
+            ParsedEndpoint::Http { port, .. } | ParsedEndpoint::Https { port, .. } => Some(*port),
+            ParsedEndpoint::Unix { .. } => None,
         }
     }
 }
@@ -961,6 +1012,25 @@ impl Connector for SpinConnector {
                     .map_err(|e| TransportError::Connection { cause: e.to_string() })?;
                 Ok(SpinIo::Unix(SpinUnixIo(stream)))
             }
+            // For HTTPS, SpinConnector opens a plain TCP connection; the TLS
+            // handshake is layered on top by the caller (TlsNgxConnIo). This
+            // matches the production path where NgxConnector also returns a raw
+            // TCP stream for Https endpoints.
+            ParsedEndpoint::Https { host, port, .. } => {
+                let addr = std::format!("{}:{}", host, port);
+                let stream = TcpStream::connect(&addr)
+                    .map_err(|e| TransportError::Connection { cause: e.to_string() })?;
+                stream
+                    .set_nonblocking(true)
+                    .map_err(|e| TransportError::Connection { cause: e.to_string() })?;
+                stream
+                    .set_read_timeout(Some(SPIN_IO_TIMEOUT))
+                    .map_err(|e| TransportError::Connection { cause: e.to_string() })?;
+                stream
+                    .set_write_timeout(Some(SPIN_IO_TIMEOUT))
+                    .map_err(|e| TransportError::Connection { cause: e.to_string() })?;
+                Ok(SpinIo::Tcp(SpinTcpIo(stream)))
+            }
         }
     }
 }
@@ -1016,7 +1086,11 @@ impl Connector for NgxConnector {
         endpoint: &ParsedEndpoint,
     ) -> Result<Pin<Box<NgxConnIo>>, TransportError> {
         match endpoint {
-            ParsedEndpoint::Http { host, port, .. } => {
+            // Both Http and Https use TCP at the NgxConnector level. For Https
+            // endpoints the caller wraps the returned NgxConnIo with
+            // TlsNgxConnIo to perform the TLS handshake; the TCP connect itself
+            // is identical regardless of scheme.
+            ParsedEndpoint::Http { host, port, .. } | ParsedEndpoint::Https { host, port, .. } => {
                 let mut io = Box::pin(NgxConnIo::new(self.log)?);
 
                 // Strip IPv6 bracket notation ("[::1]" → "::1") before parsing.
@@ -1355,6 +1429,14 @@ pub struct HyperHttpTransport<C> {
     logs_path: std::string::String,
     /// HTTP request path for traces (`/v1/traces` from base, or per-signal override).
     traces_path: std::string::String,
+    /// TLS context for `https://` endpoints.  `None` for `http://` and `unix:`.
+    /// When `Some`, each `send*` call wraps the raw TCP IO with a
+    /// [`TlsNgxConnIo`] before handing it to [`http_post`].
+    ///
+    /// `insecure = true` (from `ssl_verify off`) → `verify_hostname = false` on
+    /// the `TlsNgxConnIo` constructor (verification disabled in the `SslCtx`
+    /// anyway; the flag just suppresses the hostname-check call as well).
+    tls: Option<(SslCtx, bool)>,
 }
 
 // Manual Debug so we don't require C: Debug on the struct itself.
@@ -1395,7 +1477,20 @@ impl<C: Connector> HyperHttpTransport<C> {
     ) -> Result<Self, TransportError> {
         let endpoint = ParsedEndpoint::parse(endpoint_str)?;
         let (metrics_path, logs_path, traces_path) = derive_signal_paths(endpoint.base_path());
-        Ok(Self { endpoint, headers, connector, metrics_path, logs_path, traces_path })
+        Ok(Self { endpoint, headers, connector, metrics_path, logs_path, traces_path, tls: None })
+    }
+
+    /// Wire in a TLS context for `https://` endpoints.
+    ///
+    /// `ctx` is a pre-built `SslCtx` (from `TlsConfig::build_ctx`).
+    /// `insecure` mirrors the `ssl_verify off` flag: when `true`, hostname
+    /// verification is skipped on the per-connection [`TlsNgxConnIo`] (the
+    /// `SslCtx` was already built with `SSL_VERIFY_NONE`).
+    ///
+    /// Call this after `with_connector` / `with_ngx_log` when the endpoint is
+    /// `https://`.
+    pub fn set_tls(&mut self, ctx: SslCtx, insecure: bool) {
+        self.tls = Some((ctx, insecure));
     }
 
     /// Override the HTTP request path used for metrics.
@@ -1449,14 +1544,49 @@ impl HyperHttpTransport<NgxConnector> {
 }
 
 #[allow(private_bounds)] // Connector is pub(crate); see note on struct above.
-impl<C: Connector> HyperHttpTransport<C> {
+impl<C: Connector> HyperHttpTransport<C>
+where
+    C::Io: Send + 'static,
+{
+    /// Open a connection and optionally wrap it with TLS for `https://`
+    /// endpoints.  Returns a boxed `IO` trait object so both the plain and TLS
+    /// paths share the same return type for use with [`http_post`].
+    ///
+    /// The `SslCtx` is owned by `self.tls` for the transport's lifetime; the
+    /// per-connection [`TlsNgxConnIo`] borrows a reference to it for the
+    /// handshake (it takes its own `SSL` ref via `SSL_new`).
+    async fn connect_io(&self) -> Result<Box<dyn TlsOrPlain>, TransportError> {
+        let raw = self.connector.connect(&self.endpoint).await?;
+        if let Some((ctx, insecure)) = &self.tls {
+            // https:// endpoint: wrap the raw TCP IO with TLS.
+            let host = self.endpoint.host_str();
+            // Strip IPv6 brackets for SNI/verify: "[::1]" → "::1".
+            let host_str = strip_v6_brackets(host);
+            let verify_hostname = !insecure && !is_ip_literal(host_str);
+            let tls_io = if !insecure && is_ip_literal(host_str) {
+                // IP literal: use X509_VERIFY_PARAM_set1_ip_asc (matches IP SANs).
+                tls_new_ip(raw, ctx, host_str)?
+            } else {
+                // DNS host name or insecure: use X509_VERIFY_PARAM_set1_host
+                // (or skip verification entirely if insecure).
+                TlsNgxConnIo::new(raw, ctx, host_str, verify_hostname).map_err(|e| {
+                    TransportError::Connection { cause: std::format!("TLS setup failed: {e:?}") }
+                })?
+            };
+            Ok(Box::new(tls_io))
+        } else {
+            // http:// or unix: — plain IO, no TLS.
+            Ok(Box::new(raw))
+        }
+    }
+
     /// Send a batch of OTLP/HTTP protobuf metrics to the derived metrics path.
     ///
     /// Uses `self.metrics_path` (derived from the base endpoint as
     /// `base/v1/metrics`, or overridden via [`set_metrics_path`]).
     /// Maintains no cached connection; a failure leaves nothing to clean up.
     pub async fn send(&mut self, bytes: std::vec::Vec<u8>) -> Result<(), TransportError> {
-        let io = self.connector.connect(&self.endpoint).await?;
+        let io = self.connect_io().await?;
         let authority = self.endpoint.authority();
         let path = self.metrics_path.clone();
         http_post(io, &authority, &path, &self.headers, bytes).await
@@ -1467,7 +1597,7 @@ impl<C: Connector> HyperHttpTransport<C> {
     /// Uses `self.logs_path` (derived from the base endpoint as
     /// `base/v1/logs`, or overridden via [`set_logs_path`]).
     pub async fn send_logs(&mut self, bytes: std::vec::Vec<u8>) -> Result<(), TransportError> {
-        let io = self.connector.connect(&self.endpoint).await?;
+        let io = self.connect_io().await?;
         let authority = self.endpoint.authority();
         let path = self.logs_path.clone();
         http_post(io, &authority, &path, &self.headers, bytes).await
@@ -1478,7 +1608,7 @@ impl<C: Connector> HyperHttpTransport<C> {
     /// Uses `self.traces_path` (derived from the base endpoint as
     /// `base/v1/traces`, or overridden via [`set_traces_path`]).
     pub async fn send_traces(&mut self, bytes: std::vec::Vec<u8>) -> Result<(), TransportError> {
-        let io = self.connector.connect(&self.endpoint).await?;
+        let io = self.connect_io().await?;
         let authority = self.endpoint.authority();
         let path = self.traces_path.clone();
         http_post(io, &authority, &path, &self.headers, bytes).await
@@ -1493,10 +1623,100 @@ impl<C: Connector> HyperHttpTransport<C> {
         path: &str,
         bytes: std::vec::Vec<u8>,
     ) -> Result<(), TransportError> {
-        let io = self.connector.connect(&self.endpoint).await?;
+        let io = self.connect_io().await?;
         let authority = self.endpoint.authority();
         http_post(io, &authority, path, &self.headers, bytes).await
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// TlsOrPlain: trait alias for IO types usable by http_post
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Marker trait alias: any IO that satisfies `http_post`'s bounds.
+///
+/// Sealed as `pub(crate)` — only `hyper_http.rs` produces boxed `TlsOrPlain`.
+pub(crate) trait TlsOrPlain:
+    hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static
+{
+}
+
+impl<T: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static> TlsOrPlain for T {}
+// Note: `hyper` provides blanket impls of `hyper::rt::Read + Write` for any
+// `Box<T: Read + Write + Unpin + ?Sized>`, so `Box<dyn TlsOrPlain>` already
+// satisfies those bounds via the blanket — no manual impls needed here.
+
+/// Returns `true` when `host_str` is an IP literal (v4 or v6, already unbracketed).
+fn is_ip_literal(host_str: &str) -> bool {
+    host_str.parse::<std::net::IpAddr>().is_ok()
+}
+
+// `X509_VERIFY_PARAM_set1_ip_asc` is present in OpenSSL ≥ 1.0.2 but absent
+// from openssl-sys 0.9.116's handwritten bindings (only `set1_ip` is there).
+// Declared module-side like `BIO_get_new_index` in tls.rs — stable public C
+// API, resolves against the same libssl the module links.
+extern "C" {
+    fn X509_VERIFY_PARAM_set1_ip_asc(
+        param: *mut openssl_sys::X509_VERIFY_PARAM,
+        ipasc: *const core::ffi::c_char,
+    ) -> core::ffi::c_int;
+}
+
+/// Construct a [`TlsNgxConnIo`] for an **IP-literal** endpoint (e.g.
+/// `https://127.0.0.1:4317`).
+///
+/// `X509_VERIFY_PARAM_set1_host` matches DNS-name SANs only; for IP literals
+/// we must use `X509_VERIFY_PARAM_set1_ip_asc` (matches IP SANs, RFC 5280
+/// iPAddress entries).  This function injects the IP check in place of the
+/// DNS-host check that `TlsNgxConnIo::new(…, verify_hostname=true)` would
+/// perform.
+///
+/// # Design note
+/// `TlsNgxConnIo::new` accepts `verify_hostname = false` and leaves the
+/// `X509_VERIFY_PARAM` untouched (SNI is still set; certificate verification
+/// still runs — only the hostname matcher is skipped).  We then install the
+/// IP-SAN check via `X509_VERIFY_PARAM_set1_ip_asc` on the raw SSL pointer
+/// directly before returning.  This keeps the IP-branch entirely in A2 (the
+/// config/dispatch item) rather than adding another constructor to tls.rs
+/// (A1's item).
+fn tls_new_ip<I>(inner: I, ctx: &SslCtx, ip_str: &str) -> Result<TlsNgxConnIo<I>, TransportError>
+where
+    I: hyper::rt::Read + hyper::rt::Write + Unpin,
+{
+    use core::ffi::c_char;
+    use openssl_sys as ssl;
+    use std::ffi::CString;
+
+    // Build with verify_hostname = false: TlsNgxConnIo sets SNI and cert
+    // verification but skips the set1_host call.
+    let tls = TlsNgxConnIo::new(inner, ctx, ip_str, false).map_err(|e| {
+        TransportError::Connection { cause: std::format!("TLS setup (IP) failed: {e:?}") }
+    })?;
+
+    // Now install the IP-SAN check on the SSL's verify param.
+    // SAFETY: `tls.ssl_ptr()` is the owned, non-null SSL for this new
+    // connection.  `SSL_get0_param` returns a borrowed pointer valid while
+    // the SSL lives; we do not free it.  `ip_str` is a valid UTF-8 string
+    // (came from `ParsedEndpoint::host_str`, already unbracketed); it is
+    // NUL-terminated by the CString we build here.
+    let c_ip = CString::new(ip_str).map_err(|_| TransportError::Connection {
+        cause: std::format!("IP literal contains interior NUL: {ip_str:?}"),
+    })?;
+    // SAFETY: `tls.ssl_ptr()` is the owned, non-null SSL; `SSL_get0_param`
+    // returns a borrowed pointer valid while the SSL lives; we do not free it.
+    // `c_ip` is a valid NUL-terminated ASCII IP string (e.g. "127.0.0.1")
+    // outliving the call; `X509_VERIFY_PARAM_set1_ip_asc` copies it.
+    let rc = unsafe {
+        let param = ssl::SSL_get0_param(tls.ssl_ptr());
+        X509_VERIFY_PARAM_set1_ip_asc(param, c_ip.as_ptr().cast::<c_char>())
+    };
+    if rc != 1 {
+        return Err(TransportError::Connection {
+            cause: std::format!("X509_VERIFY_PARAM_set1_ip_asc({ip_str}) failed"),
+        });
+    }
+
+    Ok(tls)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1511,16 +1731,13 @@ impl<C: Connector> HyperHttpTransport<C> {
 ///   which store the waker and return `Pending` on `NGX_AGAIN`.
 /// - The C event handler wakes the task; the `poll_fn` is re-polled; progress
 ///   is made — no busy-spin, no blocking.
-async fn http_post<IO>(
-    io: IO,
+async fn http_post(
+    io: Box<dyn TlsOrPlain>,
     authority: &str,
     http_path: &str,
     extra_headers: &[(std::string::String, std::string::String)],
     body: std::vec::Vec<u8>,
-) -> Result<(), TransportError>
-where
-    IO: hyper::rt::Read + hyper::rt::Write + Unpin + 'static,
-{
+) -> Result<(), TransportError> {
     let body_len = body.len();
     let full_body = Full::new(Bytes::from(body));
 
@@ -1552,9 +1769,10 @@ where
     let req =
         builder.body(full_body).map_err(|e| TransportError::Connection { cause: e.to_string() })?;
 
-    let (mut sender, conn) = hyper::client::conn::http1::handshake::<IO, Full<Bytes>>(io)
-        .await
-        .map_err(|e| TransportError::Connection { cause: e.to_string() })?;
+    let (mut sender, conn) =
+        hyper::client::conn::http1::handshake::<Box<dyn TlsOrPlain>, Full<Bytes>>(io)
+            .await
+            .map_err(|e| TransportError::Connection { cause: e.to_string() })?;
 
     let resp_fut = sender.send_request(req);
 
@@ -1876,5 +2094,157 @@ mod tests {
                 _ => panic!("expected Http variant for {url}"),
             }
         }
+    }
+
+    // ── A2: HTTPS endpoint parsing + dispatch ─────────────────────────────────
+
+    /// `ParsedEndpoint::parse` accepts `https://` and returns the `Https` variant
+    /// (no longer returns an error).
+    ///
+    /// Mutation evidence: change the `Https` branch in `parse` back to returning
+    /// `Err(…)` → `unwrap()` panics → test FAILS; restore → PASS.
+    #[test]
+    fn a2_https_endpoint_parses_to_https_variant() {
+        let ep = ParsedEndpoint::parse("https://collector.example.com:4317/v1/metrics").unwrap();
+        match ep {
+            ParsedEndpoint::Https { host, port, path } => {
+                assert_eq!(host, "collector.example.com");
+                assert_eq!(port, 4317);
+                assert_eq!(path, "/v1/metrics");
+            }
+            _ => panic!("expected Https variant"),
+        }
+    }
+
+    /// `https://` without an explicit port defaults to 443 (the OTel URL convention).
+    ///
+    /// Mutation evidence: change the default port constant from 443 to 80 →
+    /// `assert_eq!(port, 443)` fails → test FAILS; restore → PASS.
+    #[test]
+    fn a2_https_default_port_is_443() {
+        let ep = ParsedEndpoint::parse("https://collector.example.com/").unwrap();
+        match ep {
+            ParsedEndpoint::Https { port, .. } => {
+                assert_eq!(port, 443, "https:// default port must be 443");
+            }
+            _ => panic!("expected Https variant"),
+        }
+    }
+
+    /// `https://` with an explicit non-443 port stores that port.
+    #[test]
+    fn a2_https_explicit_port_preserved() {
+        let ep = ParsedEndpoint::parse("https://127.0.0.1:4318/").unwrap();
+        match ep {
+            ParsedEndpoint::Https { port, .. } => {
+                assert_eq!(port, 4318, "explicit port must be stored");
+            }
+            _ => panic!("expected Https variant"),
+        }
+    }
+
+    /// `authority()` for an `Https` endpoint omits the port when it is 443 (the
+    /// default), and includes it for non-default ports.
+    ///
+    /// Mutation evidence: remove the `port == 443` elision (always include port)
+    /// → the `no-port` assertion (`"collector.example.com"`) gets
+    /// `"collector.example.com:443"` → FAILS; restore → PASS.
+    #[test]
+    fn a2_https_authority_elides_default_port() {
+        // Default port 443 → omitted.
+        let ep_default = ParsedEndpoint::parse("https://collector.example.com/v1/metrics").unwrap();
+        assert_eq!(
+            ep_default.authority(),
+            "collector.example.com",
+            "authority() must omit :443 for https:// default port"
+        );
+
+        // Non-default port → included.
+        let ep_custom = ParsedEndpoint::parse("https://127.0.0.1:4318/").unwrap();
+        assert_eq!(
+            ep_custom.authority(),
+            "127.0.0.1:4318",
+            "authority() must include non-default port"
+        );
+    }
+
+    /// `is_tls()` returns `true` only for `Https` variants.
+    ///
+    /// Mutation evidence: change `matches!(self, ParsedEndpoint::Https { .. })`
+    /// to always return `false` → both `https` assertions fail → test FAILS;
+    /// restore → PASS.
+    #[test]
+    fn a2_is_tls_variant_discrimination() {
+        let http_ep = ParsedEndpoint::parse("http://127.0.0.1:4318/").unwrap();
+        let https_ep = ParsedEndpoint::parse("https://127.0.0.1:4317/").unwrap();
+        let unix_ep = ParsedEndpoint::parse("unix:/run/otel.sock").unwrap();
+
+        assert!(!http_ep.is_tls(), "http:// must not be TLS");
+        assert!(https_ep.is_tls(), "https:// must be TLS");
+        assert!(!unix_ep.is_tls(), "unix: must not be TLS");
+    }
+
+    /// `host_str()` returns the host field for both `Http` and `Https` variants,
+    /// and `"localhost"` for `Unix`.
+    #[test]
+    fn a2_host_str_returns_correct_host() {
+        let http_ep = ParsedEndpoint::parse("http://my-collector:4318/").unwrap();
+        assert_eq!(http_ep.host_str(), "my-collector");
+
+        let https_ep = ParsedEndpoint::parse("https://secure-collector.example.com:4317/").unwrap();
+        assert_eq!(https_ep.host_str(), "secure-collector.example.com");
+
+        let unix_ep = ParsedEndpoint::parse("unix:/run/otel.sock").unwrap();
+        assert_eq!(unix_ep.host_str(), "localhost");
+    }
+
+    /// `is_ip_literal` correctly classifies IPv4, IPv6 brackets, and DNS names.
+    ///
+    /// Mutation evidence: replace `host.parse::<std::net::IpAddr>().is_ok()`
+    /// with `false` → all IP rows fail → test FAILS; restore → PASS.
+    #[test]
+    fn a2_is_ip_literal_classification() {
+        // IPv4 literals.
+        assert!(is_ip_literal("127.0.0.1"), "IPv4 loopback must be IP literal");
+        assert!(is_ip_literal("10.0.0.1"), "private IPv4 must be IP literal");
+        assert!(is_ip_literal("192.168.1.100"), "private IPv4 must be IP literal");
+
+        // IPv6 literals (already stripped of brackets by strip_v6_brackets before
+        // `is_ip_literal` is called in production).
+        assert!(is_ip_literal("::1"), "IPv6 loopback must be IP literal");
+        assert!(is_ip_literal("2001:db8::1"), "IPv6 global must be IP literal");
+
+        // DNS names — must NOT be classified as IP literals.
+        assert!(!is_ip_literal("collector.example.com"), "FQDN must not be IP literal");
+        assert!(!is_ip_literal("localhost"), "localhost must not be IP literal");
+        assert!(!is_ip_literal("my-otel-collector"), "hostname must not be IP literal");
+    }
+
+    /// `HyperHttpTransport::new` accepts an `https://` URL and derives the correct
+    /// per-signal paths.
+    ///
+    /// Mutation evidence: change the `Https` branch in `ParsedEndpoint::parse`
+    /// back to `Err(…)` → `new()` returns `Err` → `expect("parse")` panics →
+    /// test FAILS; restore → PASS.
+    #[test]
+    fn a2_transport_new_accepts_https_endpoint() {
+        let t = HyperHttpTransport::<SpinConnector>::new("https://127.0.0.1:4317", vec![])
+            .expect("HyperHttpTransport::new must accept https:// endpoints");
+
+        assert_eq!(t.metrics_path, "/v1/metrics");
+        assert_eq!(t.logs_path, "/v1/logs");
+        assert_eq!(t.traces_path, "/v1/traces");
+    }
+
+    /// `http://` and `unix:` paths continue to work after A2 changes (no regression).
+    #[test]
+    fn a2_existing_http_and_unix_paths_unaffected() {
+        let t_http = HyperHttpTransport::<SpinConnector>::new("http://127.0.0.1:4318", vec![])
+            .expect("http:// must still be accepted");
+        assert_eq!(t_http.metrics_path, "/v1/metrics");
+
+        let t_unix = HyperHttpTransport::<SpinConnector>::new("unix:/run/otel.sock", vec![])
+            .expect("unix: must still be accepted");
+        assert_eq!(t_unix.metrics_path, "/v1/metrics");
     }
 }

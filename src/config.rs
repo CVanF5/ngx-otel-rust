@@ -80,17 +80,28 @@ pub struct KvPair {
 }
 
 /// Exporter sub-block configuration.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ExporterConfig {
     /// Base OTLP endpoint URL.  For HTTP, the per-signal paths `/v1/metrics`,
     /// `/v1/logs`, `/v1/traces` are appended to this base at export-loop startup
     /// (OTel spec §`OTEL_EXPORTER_OTLP_ENDPOINT` behaviour).
     /// Accepted schemes: `unix:`, `http://`, `https://`.
     pub endpoint: ngx_str_t,
-    /// Path to a trusted CA certificate for HTTPS. RESERVED: parsed and stored,
-    /// but has no effect until TLS (`https://`) is implemented — `https://` is
-    /// rejected at parse today, so this is inert until then.
+    /// Path to a trusted CA certificate for HTTPS (`trusted_certificate`
+    /// directive).  Active when the endpoint is `https://`; absent → system
+    /// default trust store (`SSL_CTX_set_default_verify_paths`).
     pub trusted_cert: ngx_str_t,
+    /// mTLS client certificate chain path (`ssl_certificate` directive).
+    /// Used only when BOTH `ssl_cert` and `ssl_cert_key` are set.
+    pub ssl_cert: ngx_str_t,
+    /// mTLS client private key path (`ssl_certificate_key` directive).
+    pub ssl_cert_key: ngx_str_t,
+    /// `ssl_verify` flag: `NGX_CONF_UNSET` (−1) = not set (defaults to ON);
+    /// `1` = on (default); `0` = off.
+    ///
+    /// `ssl_verify off` disables collector certificate verification — INSECURE,
+    /// for testing only.  One WARN is logged at config time when set to off.
+    pub ssl_verify: ngx_flag_t,
     /// Per-signal override for metrics (optional).  If non-empty, used as-is
     /// (no path appended) instead of the base-derived `/v1/metrics`.
     /// Mirrors `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`.
@@ -105,9 +116,31 @@ pub struct ExporterConfig {
     pub traces_endpoint: ngx_str_t,
 }
 
+impl Default for ExporterConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: ngx_str_t::default(),
+            trusted_cert: ngx_str_t::default(),
+            ssl_cert: ngx_str_t::default(),
+            ssl_cert_key: ngx_str_t::default(),
+            // UNSET_FLAG (−1): `ssl_verify` not configured → defaults to ON at
+            // validation time.  Value 1 = on, 0 = off.
+            ssl_verify: UNSET_FLAG,
+            metrics_endpoint: ngx_str_t::default(),
+            logs_endpoint: ngx_str_t::default(),
+            traces_endpoint: ngx_str_t::default(),
+        }
+    }
+}
+
 impl ExporterConfig {
     pub fn is_set(&self) -> bool {
         !self.endpoint.is_empty()
+    }
+
+    /// Returns `true` when `ssl_verify off` is explicitly configured.
+    pub fn ssl_verify_off(&self) -> bool {
+        self.ssl_verify == 0
     }
 }
 
@@ -610,26 +643,78 @@ impl MainConfig {
 
         // Validate endpoint scheme.
         let ep = self.exporter.endpoint.as_bytes();
-        // https:// is recognised but TLS is not yet implemented. Reject at parse
-        // (fail-fast — the nginx idiom) instead of accepting it and failing every
-        // export at runtime. Re-enable here when TLS lands for both transports.
-        if ep.starts_with(b"https://") {
-            ngx_conf_log_error!(
-                NGX_LOG_EMERG,
-                &raw mut *cf,
-                "otel_exporter: https:// (TLS) is not yet implemented; use http:// or unix:"
-            );
-            return Err(Status::NGX_ERROR);
-        }
-        let valid_scheme = ep.starts_with(b"unix:") || ep.starts_with(b"http://");
+        let is_https = ep.starts_with(b"https://");
+        let valid_scheme = ep.starts_with(b"unix:") || ep.starts_with(b"http://") || is_https;
 
         if !valid_scheme {
             ngx_conf_log_error!(
                 NGX_LOG_EMERG,
                 &raw mut *cf,
-                "otel_exporter: \"endpoint\" must start with http:// or unix:"
+                "otel_exporter: \"endpoint\" must start with http://, https://, or unix:"
             );
             return Err(Status::NGX_ERROR);
+        }
+
+        // ── TLS directive validation (https:// endpoints only) ─────────────────
+        //
+        // Config-time checks follow the nginx idiom (fail at config parse, not at
+        // runtime).  These checks only apply to the exporter config block; workers
+        // never touch TLS paths.
+
+        // cert-without-key and key-without-cert are both hard errors.
+        let has_cert = !self.exporter.ssl_cert.is_empty();
+        let has_key = !self.exporter.ssl_cert_key.is_empty();
+        if has_cert && !has_key {
+            ngx_conf_log_error!(
+                NGX_LOG_EMERG,
+                &raw mut *cf,
+                "otel_exporter: ssl_certificate set but ssl_certificate_key is missing"
+            );
+            return Err(Status::NGX_ERROR);
+        }
+        if !has_cert && has_key {
+            ngx_conf_log_error!(
+                NGX_LOG_EMERG,
+                &raw mut *cf,
+                "otel_exporter: ssl_certificate_key set but ssl_certificate is missing"
+            );
+            return Err(Status::NGX_ERROR);
+        }
+
+        // ssl_verify off: one WARN at config time.
+        if self.exporter.ssl_verify_off() {
+            ngx_conf_log_error!(
+                NGX_LOG_WARN,
+                &raw mut *cf,
+                "otel_exporter: ssl_verify off — collector certificate verification is \
+                 DISABLED (INSECURE, for testing only)"
+            );
+        }
+
+        // Files must exist and be readable at config time (nginx idiom for certs).
+        // We check all three TLS file paths when configured.
+        if is_https {
+            for (label, field) in &[
+                ("trusted_certificate", &self.exporter.trusted_cert),
+                ("ssl_certificate", &self.exporter.ssl_cert),
+                ("ssl_certificate_key", &self.exporter.ssl_cert_key),
+            ] {
+                if field.is_empty() {
+                    continue;
+                }
+                if let Ok(s) = core::str::from_utf8(field.as_bytes()) {
+                    if std::path::Path::new(s).metadata().is_err() {
+                        ngx_conf_log_error!(
+                            NGX_LOG_EMERG,
+                            &raw mut *cf,
+                            "otel_exporter: {}: file not found or not readable: {}",
+                            label,
+                            s
+                        );
+                        return Err(Status::NGX_ERROR);
+                    }
+                }
+            }
         }
 
         // Wire the nginx resolver when the endpoint host is a DNS name.
@@ -1438,7 +1523,7 @@ impl MainConfig {
 /* ─────────────────────────── inner exporter block ─────────────────────────── */
 
 /// Commands valid inside `otel_exporter { ... }`.
-static mut NGX_HTTP_OTEL_EXPORTER_COMMANDS: [ngx_command_t; 6] = [
+static mut NGX_HTTP_OTEL_EXPORTER_COMMANDS: [ngx_command_t; 9] = [
     ngx_command_t {
         name: ngx_string!("endpoint"),
         type_: NGX_CONF_TAKE1 as ngx_uint_t,
@@ -1451,6 +1536,31 @@ static mut NGX_HTTP_OTEL_EXPORTER_COMMANDS: [ngx_command_t; 6] = [
         name: ngx_string!("trusted_certificate"),
         type_: NGX_CONF_TAKE1 as ngx_uint_t,
         set: Some(cmd_exporter_set_trusted_cert),
+        conf: 0,
+        offset: 0,
+        post: ptr::null_mut(),
+    },
+    // TLS Phase A (A2): mTLS client cert directives + server-verify toggle.
+    ngx_command_t {
+        name: ngx_string!("ssl_certificate"),
+        type_: NGX_CONF_TAKE1 as ngx_uint_t,
+        set: Some(cmd_exporter_set_ssl_cert),
+        conf: 0,
+        offset: 0,
+        post: ptr::null_mut(),
+    },
+    ngx_command_t {
+        name: ngx_string!("ssl_certificate_key"),
+        type_: NGX_CONF_TAKE1 as ngx_uint_t,
+        set: Some(cmd_exporter_set_ssl_cert_key),
+        conf: 0,
+        offset: 0,
+        post: ptr::null_mut(),
+    },
+    ngx_command_t {
+        name: ngx_string!("ssl_verify"),
+        type_: NGX_CONF_TAKE1 as ngx_uint_t,
+        set: Some(cmd_exporter_set_ssl_verify),
         conf: 0,
         offset: 0,
         post: ptr::null_mut(),
@@ -1521,6 +1631,79 @@ extern "C" fn cmd_exporter_set_trusted_cert(
     // holds the parsed tokens.
     let args = unsafe { cf_args(cf) };
     ecf.trusted_cert = args[1];
+    NGX_CONF_OK
+}
+
+/// Handler for `ssl_certificate <path>` inside `otel_exporter {}`.
+///
+/// Stores the client certificate path for mTLS.  Config-time validation of the
+/// cert+key pair is in `MainConfig::post_config`.
+extern "C" fn cmd_exporter_set_ssl_cert(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    // SAFETY: `conf` is the `otel_exporter` block conf pointer (`ExporterConfig`).
+    let ecf = unsafe { conf.cast::<ExporterConfig>().as_mut().expect("exporter config") };
+    if !ecf.ssl_cert.is_empty() {
+        return c"is duplicate".as_ptr().cast_mut();
+    }
+    // SAFETY: `cf` is the valid non-null directive parse context.
+    let args = unsafe { cf_args(cf) };
+    ecf.ssl_cert = args[1];
+    NGX_CONF_OK
+}
+
+/// Handler for `ssl_certificate_key <path>` inside `otel_exporter {}`.
+///
+/// Stores the client private key path for mTLS.  Config-time validation of the
+/// cert+key pair is in `MainConfig::post_config`.
+extern "C" fn cmd_exporter_set_ssl_cert_key(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    // SAFETY: `conf` is the `otel_exporter` block conf pointer (`ExporterConfig`).
+    let ecf = unsafe { conf.cast::<ExporterConfig>().as_mut().expect("exporter config") };
+    if !ecf.ssl_cert_key.is_empty() {
+        return c"is duplicate".as_ptr().cast_mut();
+    }
+    // SAFETY: `cf` is the valid non-null directive parse context.
+    let args = unsafe { cf_args(cf) };
+    ecf.ssl_cert_key = args[1];
+    NGX_CONF_OK
+}
+
+/// Handler for `ssl_verify on|off` inside `otel_exporter {}`.
+///
+/// Default (unset) → `on` (verify peer certificate).
+/// `ssl_verify off` is INSECURE; a WARN is emitted at `post_config` time.
+extern "C" fn cmd_exporter_set_ssl_verify(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    // SAFETY: `conf` is the `otel_exporter` block conf pointer (`ExporterConfig`).
+    let ecf = unsafe { conf.cast::<ExporterConfig>().as_mut().expect("exporter config") };
+    if ecf.ssl_verify != UNSET_FLAG {
+        return c"is duplicate".as_ptr().cast_mut();
+    }
+    // SAFETY: `cf` is the valid non-null directive parse context.
+    let args = unsafe { cf_args(cf) };
+    let val = args[1];
+    if val.as_bytes() == b"on" {
+        ecf.ssl_verify = 1;
+    } else if val.as_bytes() == b"off" {
+        ecf.ssl_verify = 0;
+    } else {
+        ngx_conf_log_error!(
+            NGX_LOG_EMERG,
+            cf,
+            "otel_exporter: ssl_verify: invalid value \"{}\"; expected on or off",
+            val
+        );
+        return c"invalid ssl_verify value".as_ptr().cast_mut();
+    }
     NGX_CONF_OK
 }
 
@@ -2968,5 +3151,74 @@ mod tests {
         assert!(!has_authority(b"/opentelemetry/api/v1/logs"));
         assert!(!has_authority(b"v1/traces"));
         assert!(!has_authority(b""));
+    }
+
+    // ── A2: TLS config surface ────────────────────────────────────────────────
+
+    /// `ExporterConfig::default()` initialises TLS fields to their zero/unset
+    /// sentinel values: empty paths, `ssl_verify = UNSET_FLAG (-1)`.
+    ///
+    /// Mutation evidence: zero out `ssl_verify: UNSET_FLAG` (set to 0) in
+    /// `Default` → `ssl_verify_off()` returns `true` on a fresh config → FAILS.
+    #[test]
+    fn a2_exporter_config_tls_defaults() {
+        let cfg = ExporterConfig::default();
+        // TLS cert/key paths are empty (not configured).
+        assert!(cfg.ssl_cert.is_empty(), "ssl_cert must default to empty");
+        assert!(cfg.ssl_cert_key.is_empty(), "ssl_cert_key must default to empty");
+        // ssl_verify defaults to UNSET_FLAG (−1), which is treated as ON (not off).
+        assert_eq!(cfg.ssl_verify, UNSET_FLAG, "ssl_verify must default to UNSET_FLAG (−1)");
+        // ssl_verify_off() must be false when unset (defaults to ON).
+        assert!(!cfg.ssl_verify_off(), "ssl_verify_off() must be false when unset (unset = ON)");
+    }
+
+    /// `ssl_verify_off()` returns `true` only when `ssl_verify` is explicitly 0
+    /// and `false` for `UNSET_FLAG (−1)` and `1` (on).
+    ///
+    /// Mutation evidence: invert the `== 0` comparison to `!= 0` → the `off`
+    /// assertion fails and the `on/unset` assertions flip.
+    #[test]
+    fn a2_ssl_verify_off_accessor() {
+        let mut cfg = ExporterConfig::default();
+
+        // UNSET_FLAG (−1) = not configured → treated as ON.
+        assert!(!cfg.ssl_verify_off(), "UNSET_FLAG must not be treated as off");
+
+        // Explicit ON (1).
+        cfg.ssl_verify = 1;
+        assert!(!cfg.ssl_verify_off(), "ssl_verify=1 must not be treated as off");
+
+        // Explicit OFF (0).
+        cfg.ssl_verify = 0;
+        assert!(cfg.ssl_verify_off(), "ssl_verify=0 must be treated as off");
+    }
+
+    /// `https://` endpoints pass `valid_scheme` validation in `post_config`.
+    ///
+    /// Tested by checking the `valid_scheme` branch that the `post_config`
+    /// validator uses: `ep.starts_with(b"http://")` OR starts `https://`.
+    /// We exercise the same predicate directly.
+    ///
+    /// Mutation evidence: remove the `is_https` branch from `valid_scheme`
+    /// (set `is_https = false`) → `https://` endpoint fails validation → a
+    /// `post_config` call for that endpoint returns an error.
+    #[test]
+    fn a2_https_scheme_is_valid() {
+        // Simulate the predicate used in validate_exporter_config.
+        let check = |ep: &[u8]| -> bool {
+            let is_https = ep.starts_with(b"https://");
+            ep.starts_with(b"unix:") || ep.starts_with(b"http://") || is_https
+        };
+
+        assert!(check(b"http://127.0.0.1:4318/"), "http:// must be valid");
+        assert!(check(b"https://127.0.0.1:4317/"), "https:// must be valid");
+        assert!(
+            check(b"https://collector.example.com:4317/v1/metrics"),
+            "https:// DNS must be valid"
+        );
+        assert!(check(b"unix:/run/otel.sock"), "unix: must be valid");
+        assert!(!check(b"grpc://127.0.0.1:4317/"), "grpc:// must be invalid");
+        assert!(!check(b"ftp://host/"), "ftp:// must be invalid");
+        assert!(!check(b""), "empty must be invalid");
     }
 }

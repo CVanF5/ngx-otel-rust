@@ -124,11 +124,17 @@ impl<C: Connector> GrpcTransport<C> {
     pub(crate) fn with_connector(endpoint_str: &str, connector: C) -> Result<Self, TransportError> {
         let endpoint = ParsedEndpoint::parse(endpoint_str)?;
 
-        // Build the origin URI: `http://host:port` (no path).
+        // Build the origin URI: `http://host:port` or `https://host:port` (no path).
         // This is what tonic's `MetricsServiceClient::with_origin` expects.
+        // For HTTPS endpoints the scheme is `https://` so tonic's H2 framing
+        // uses the correct authority and scheme in the :authority / :scheme
+        // pseudo-headers.
         let origin_str = match &endpoint {
             ParsedEndpoint::Http { host, port, .. } => {
                 std::format!("http://{host}:{port}")
+            }
+            ParsedEndpoint::Https { host, port, .. } => {
+                std::format!("https://{host}:{port}")
             }
             ParsedEndpoint::Unix { .. } => {
                 return Err(TransportError::InvalidEndpoint {
@@ -385,13 +391,22 @@ mod tests {
         );
     }
 
-    /// HTTPS endpoints must be rejected (not yet implemented).
+    /// HTTPS endpoints must be accepted by GrpcTransport (TLS Phase A — A2).
+    ///
+    /// `ParsedEndpoint::parse("https://...")` now returns `Https { .. }` instead
+    /// of an error; `GrpcTransport::with_connector` builds an `https://` origin
+    /// URI for tonic.  The TLS handshake is wired in the connector dispatch layer
+    /// (A2 / A3); construction itself must succeed here.
     #[test]
-    fn grpc_transport_rejects_https_endpoint() {
+    fn grpc_transport_accepts_https_endpoint() {
         let log_ptr = core::ptr::NonNull::dangling();
         let result =
             GrpcTransport::<NgxConnector>::with_ngx_log("https://127.0.0.1:4317", log_ptr, None, 0);
-        assert!(result.is_err(), "https:// endpoints must fail (TLS not implemented)");
+        assert!(
+            result.is_ok(),
+            "https:// endpoints must be accepted by GrpcTransport (TLS Phase A): {:?}",
+            result.err()
+        );
     }
 
     /// `GrpcTransport<NgxConnector>` must be `Send` so it can live in the

@@ -203,6 +203,12 @@ pub async fn fire_one_grpc_export(
         ParsedEndpoint::Http { host, port, .. } => {
             std::format!("http://{host}:{port}")
         }
+        ParsedEndpoint::Https { .. } => {
+            // TLS smoke tests are A3 scope; plaintext gRPC smoke only.
+            return Err(SmokeError::InvalidEndpoint(std::string::String::from(
+                "https:// endpoints unsupported for gRPC smoke (use http://host:port)",
+            )));
+        }
         ParsedEndpoint::Unix { .. } => {
             return Err(SmokeError::InvalidEndpoint(std::string::String::from(
                 "unix sockets unsupported for gRPC smoke (use http://host:port)",
@@ -332,6 +338,11 @@ pub async fn fire_one_bidi_stream(
     let origin_str = match &endpoint {
         crate::transport::hyper_http::ParsedEndpoint::Http { host, port, .. } => {
             std::format!("http://{host}:{port}")
+        }
+        crate::transport::hyper_http::ParsedEndpoint::Https { .. } => {
+            return Err(SmokeError::InvalidEndpoint(std::string::String::from(
+                "https:// endpoints unsupported for bidi smoke (use http://host:port)",
+            )));
         }
         crate::transport::hyper_http::ParsedEndpoint::Unix { .. } => {
             return Err(SmokeError::InvalidEndpoint(std::string::String::from(
@@ -549,6 +560,11 @@ pub async fn fire_bidi_overload(
     let origin_str = match &endpoint {
         crate::transport::hyper_http::ParsedEndpoint::Http { host, port, .. } => {
             std::format!("http://{host}:{port}")
+        }
+        crate::transport::hyper_http::ParsedEndpoint::Https { .. } => {
+            return Err(SmokeError::InvalidEndpoint(std::string::String::from(
+                "https:// endpoints unsupported for bidi overload (use http://host:port)",
+            )));
         }
         crate::transport::hyper_http::ParsedEndpoint::Unix { .. } => {
             return Err(SmokeError::InvalidEndpoint(std::string::String::from(
