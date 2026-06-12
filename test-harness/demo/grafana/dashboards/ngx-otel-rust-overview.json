@@ -1520,6 +1520,134 @@
       ]
     },
     {
+      "id": 53,
+      "type": "row",
+      "title": "Serving Certificates (TLS \u2014 ngx-otel-rust cert metrics)",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 15
+      },
+      "panels": [
+        {
+          "id": 54,
+          "type": "table",
+          "title": "Serving Certificates \u2014 Time to Expiration",
+          "description": "TLS serving certificates as enumerated from the live SSL_CTX at startup/reload (ngx_otel.tls.certificate.time_to_expiration). What nginx SERVES, not what is on disk: a renewed file changes nothing until reload. Negative = expired. Thresholds: red < 7d, orange < 30d.",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 132
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "refId": "A",
+              "expr": "ngx_otel_tls_certificate_time_to_expiration{service_name=\"$service\"}",
+              "instant": true,
+              "format": "table"
+            }
+          ],
+          "transformations": [
+            {
+              "id": "organize",
+              "options": {
+                "excludeByName": {
+                  "Time": true,
+                  "__name__": true,
+                  "job": true,
+                  "instance": true,
+                  "service_name": true,
+                  "service_instance_id": true
+                },
+                "indexByName": {
+                  "tls_server_subject": 0,
+                  "server_address": 1,
+                  "public_key_algorithm": 2,
+                  "tls_server_issuer": 3,
+                  "serial_number": 4,
+                  "file_path": 5,
+                  "Value": 6
+                },
+                "renameByName": {
+                  "tls_server_subject": "Subject CN",
+                  "server_address": "Server",
+                  "public_key_algorithm": "Key",
+                  "tls_server_issuer": "Issuer CN",
+                  "serial_number": "Serial",
+                  "file_path": "File",
+                  "Value": "Time to expiration"
+                }
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "red",
+                    "value": null
+                  },
+                  {
+                    "color": "orange",
+                    "value": 604800
+                  },
+                  {
+                    "color": "green",
+                    "value": 2592000
+                  }
+                ]
+              },
+              "color": {
+                "mode": "thresholds"
+              }
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "Time to expiration"
+                },
+                "properties": [
+                  {
+                    "id": "unit",
+                    "value": "s"
+                  },
+                  {
+                    "id": "custom.cellOptions",
+                    "value": {
+                      "type": "color-background"
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "showHeader": true,
+            "sortBy": [
+              {
+                "displayName": "Time to expiration",
+                "desc": false
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
       "id": 28,
       "type": "row",
       "title": "Enhanced by ngx-otel-rust \u2014 Logs (Loki)",
@@ -1528,7 +1656,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 15
+        "y": 16
       },
       "panels": [
         {
@@ -1760,7 +1888,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 16
+        "y": 17
       },
       "panels": [
         {
@@ -2039,134 +2167,6 @@
               "mode": "multi",
               "sort": "desc"
             }
-          }
-        }
-      ]
-    },
-    {
-      "id": 53,
-      "type": "row",
-      "title": "Serving Certificates (TLS \u2014 ngx-otel-rust cert metrics)",
-      "collapsed": true,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 131
-      },
-      "panels": [
-        {
-          "id": 54,
-          "type": "table",
-          "title": "Serving Certificates \u2014 Time to Expiration",
-          "description": "TLS serving certificates as enumerated from the live SSL_CTX at startup/reload (ngx_otel.tls.certificate.time_to_expiration). What nginx SERVES, not what is on disk: a renewed file changes nothing until reload. Negative = expired. Thresholds: red < 7d, orange < 30d.",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "gridPos": {
-            "h": 8,
-            "w": 24,
-            "x": 0,
-            "y": 132
-          },
-          "targets": [
-            {
-              "datasource": {
-                "type": "prometheus",
-                "uid": "prometheus"
-              },
-              "refId": "A",
-              "expr": "ngx_otel_tls_certificate_time_to_expiration{service_name=\"$service\"}",
-              "instant": true,
-              "format": "table"
-            }
-          ],
-          "transformations": [
-            {
-              "id": "organize",
-              "options": {
-                "excludeByName": {
-                  "Time": true,
-                  "__name__": true,
-                  "job": true,
-                  "instance": true,
-                  "service_name": true,
-                  "service_instance_id": true
-                },
-                "indexByName": {
-                  "tls_server_subject": 0,
-                  "server_address": 1,
-                  "public_key_algorithm": 2,
-                  "tls_server_issuer": 3,
-                  "serial_number": 4,
-                  "file_path": 5,
-                  "Value": 6
-                },
-                "renameByName": {
-                  "tls_server_subject": "Subject CN",
-                  "server_address": "Server",
-                  "public_key_algorithm": "Key",
-                  "tls_server_issuer": "Issuer CN",
-                  "serial_number": "Serial",
-                  "file_path": "File",
-                  "Value": "Time to expiration"
-                }
-              }
-            }
-          ],
-          "fieldConfig": {
-            "defaults": {
-              "thresholds": {
-                "mode": "absolute",
-                "steps": [
-                  {
-                    "color": "red",
-                    "value": null
-                  },
-                  {
-                    "color": "orange",
-                    "value": 604800
-                  },
-                  {
-                    "color": "green",
-                    "value": 2592000
-                  }
-                ]
-              },
-              "color": {
-                "mode": "thresholds"
-              }
-            },
-            "overrides": [
-              {
-                "matcher": {
-                  "id": "byName",
-                  "options": "Time to expiration"
-                },
-                "properties": [
-                  {
-                    "id": "unit",
-                    "value": "s"
-                  },
-                  {
-                    "id": "custom.cellOptions",
-                    "value": {
-                      "type": "color-background"
-                    }
-                  }
-                ]
-              }
-            ]
-          },
-          "options": {
-            "showHeader": true,
-            "sortBy": [
-              {
-                "displayName": "Time to expiration",
-                "desc": false
-              }
-            ]
           }
         }
       ]
