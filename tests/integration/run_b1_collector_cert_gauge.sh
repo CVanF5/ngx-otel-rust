@@ -295,9 +295,14 @@ stop_nginx "${NGINX_PID}"
 DELTA_A="$(delta_log "${TLS_METRICS_LOG}" "${OFF_A}")"
 [[ -n "${DELTA_A}" ]] || fail "(a) TLS endpoint: no metrics received by collector"
 
+# DELTA_A is NDJSON (one JSON object per line). Use jq --slurp to read all
+# lines into an array, then flatten the metrics across all objects.
+
 # Assert 1: metric name is present.
-GAUGE_PRESENT="$(echo "${DELTA_A}" | jq -r \
-    '[.resourceMetrics[]?.scopeMetrics[]?.metrics[]?.name] | map(select(. == "ngx_otel.tls.collector_cert.not_after")) | length' \
+# Use --slurp so jq collects all NDJSON lines into an array before filtering.
+GAUGE_PRESENT="$(echo "${DELTA_A}" | jq --slurp -r \
+    '[.[].resourceMetrics[]?.scopeMetrics[]?.metrics[]?.name
+      | select(. == "ngx_otel.tls.collector_cert.not_after")] | length' \
     2>/dev/null || echo 0)"
 [[ "${GAUGE_PRESENT}" -gt 0 ]] \
     || fail "(a) TLS endpoint: metric ngx_otel.tls.collector_cert.not_after ABSENT — expected PRESENT (mutation target: break SSL_get1_peer_certificate block in poll_handshake)"
@@ -305,20 +310,26 @@ GAUGE_PRESENT="$(echo "${DELTA_A}" | jq -r \
 pass "(a) TLS endpoint: metric ngx_otel.tls.collector_cert.not_after is PRESENT"
 
 # Assert 2: value equals the OpenSSL-derived notAfter epoch.
-GAUGE_VALUE="$(echo "${DELTA_A}" | jq -r \
-    '[.resourceMetrics[]?.scopeMetrics[]?.metrics[]? | select(.name == "ngx_otel.tls.collector_cert.not_after") | .gauge.dataPoints[]?.asInt] | first // empty' \
+GAUGE_VALUE="$(echo "${DELTA_A}" | jq --slurp -r \
+    '[.[].resourceMetrics[]?.scopeMetrics[]?.metrics[]?
+      | select(.name == "ngx_otel.tls.collector_cert.not_after")
+      | .gauge.dataPoints[]?.asInt] | first // empty' \
     2>/dev/null || echo "")"
 [[ -n "${GAUGE_VALUE}" ]] \
     || fail "(a) TLS endpoint: could not extract gauge value from metric data"
 
 [[ "${GAUGE_VALUE}" == "${EXPECTED_EPOCH}" ]] \
-    || fail "(a) TLS endpoint: gauge value ${GAUGE_VALUE} != expected epoch ${EXPECTED_EPOCH} (ground truth: openssl notAfter → GNU date -d)"
+    || fail "(a) TLS endpoint: gauge value ${GAUGE_VALUE} != expected epoch ${EXPECTED_EPOCH} (ground truth: openssl notAfter -> GNU date -d)"
 
 pass "(a) TLS endpoint: gauge value ${GAUGE_VALUE} == openssl-derived epoch ${EXPECTED_EPOCH} (EXACT MATCH)"
 
 # Assert 3: server.address attribute equals the collector hostname.
-ADDR_ATTR="$(echo "${DELTA_A}" | jq -r \
-    '[.resourceMetrics[]?.scopeMetrics[]?.metrics[]? | select(.name == "ngx_otel.tls.collector_cert.not_after") | .gauge.dataPoints[]?.attributes[]? | select(.key == "server.address") | .value.stringValue] | first // empty' \
+ADDR_ATTR="$(echo "${DELTA_A}" | jq --slurp -r \
+    '[.[].resourceMetrics[]?.scopeMetrics[]?.metrics[]?
+      | select(.name == "ngx_otel.tls.collector_cert.not_after")
+      | .gauge.dataPoints[]?.attributes[]?
+      | select(.key == "server.address")
+      | .value.stringValue] | first // empty' \
     2>/dev/null || echo "")"
 [[ -n "${ADDR_ATTR}" ]] \
     || fail "(a) TLS endpoint: server.address attribute absent on ngx_otel.tls.collector_cert.not_after data point"
@@ -379,9 +390,10 @@ SVC_B_DATA="$(echo "${DELTA_B}" | jq -c \
     2>/dev/null || echo "")"
 [[ -n "${SVC_B_DATA}" ]] || fail "(b) Plaintext endpoint: no data found for service.name=${SVC_B}"
 
-# Assert: metric name is ABSENT.
-CERT_GAUGE_COUNT="$(echo "${SVC_B_DATA}" | jq -r \
-    '[.resourceMetrics[]?.scopeMetrics[]?.metrics[]?.name] | map(select(. == "ngx_otel.tls.collector_cert.not_after")) | length' \
+# Assert: metric name is ABSENT. SVC_B_DATA is NDJSON; use --slurp.
+CERT_GAUGE_COUNT="$(echo "${SVC_B_DATA}" | jq --slurp -r \
+    '[.[].resourceMetrics[]?.scopeMetrics[]?.metrics[]?.name
+      | select(. == "ngx_otel.tls.collector_cert.not_after")] | length' \
     2>/dev/null || echo 0)"
 [[ "${CERT_GAUGE_COUNT}" -eq 0 ]] \
     || fail "(b) Plaintext endpoint: metric ngx_otel.tls.collector_cert.not_after PRESENT — expected ABSENT for plaintext endpoint"
