@@ -22,6 +22,7 @@ HALF2 PASS: RESTORED code delivered ZERO data with bad CA (verification enforced
 === SUMMARY ===
 Pre-mutation SHA:  b14af497c813f7d16070a918e7a74a709bc82170
 Post-restore SHA:  b14af497c813f7d16070a918e7a74a709bc82170
+Final A3 commit:   d9100e7
 Half 1 (mutated):  PASS — bad CA delivered data (mutation effective)
 Half 2 (restored): PASS — bad CA delivered ZERO data (fix verified)
 
