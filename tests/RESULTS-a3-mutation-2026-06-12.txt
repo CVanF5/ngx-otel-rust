@@ -1,0 +1,29 @@
+# A3 TLS mutation evidence
+# Date: 2026-06-12T18:48:30Z
+# Host: debian-vm (Linux debian-vm 6.12.90+deb13.1-arm64 #1 SMP Debian 6.12.90-2 (2026-05-27) aarch64 GNU/Linux)
+# Git SHA (pre-mutation): b14af497c813f7d16070a918e7a74a709bc82170
+# Mutation: SSL_VERIFY_PEER → SSL_VERIFY_NONE in tls.rs build_ctx
+# Expectation: with mutation, scenario (c) DELIVERS data (assertion catches it);
+#              without mutation, scenario (c) delivers ZERO data.
+
+=== HALF 1: MUTATED ===
+Target line: ssl::SSL_CTX_set_verify(ctx, ssl::SSL_VERIFY_PEER, None)
+Mutation applied.
+   Compiling ngx-otel-rust v0.1.0 (/home/cvandesande/project-nginx-otel/ngx-otel-rust)
+    Finished `release` profile [optimized] target(s) in 8.47s
+HALF1 PASS: MUTATED code DELIVERED data with bad CA (verification is disabled)
+tls.rs restored.
+
+=== HALF 2: RESTORED ===
+   Compiling ngx-otel-rust v0.1.0 (/home/cvandesande/project-nginx-otel/ngx-otel-rust)
+    Finished `release` profile [optimized] target(s) in 8.77s
+HALF2 PASS: RESTORED code delivered ZERO data with bad CA (verification enforced)
+
+=== SUMMARY ===
+Pre-mutation SHA:  b14af497c813f7d16070a918e7a74a709bc82170
+Post-restore SHA:  b14af497c813f7d16070a918e7a74a709bc82170
+Half 1 (mutated):  PASS — bad CA delivered data (mutation effective)
+Half 2 (restored): PASS — bad CA delivered ZERO data (fix verified)
+
+Mutation: src/transport/tls.rs, build_ctx, SSL_VERIFY_PEER → SSL_VERIFY_NONE
+Evidence file: /home/cvandesande/project-nginx-otel/ngx-otel-rust/tests/RESULTS-a3-mutation-2026-06-12.txt

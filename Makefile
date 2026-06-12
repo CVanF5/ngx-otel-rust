@@ -12,7 +12,8 @@ BUILD		?= debug
 TESTS		?= tests/integration/run.sh \
 		   tests/integration/run_reload.sh \
 		   tests/integration/run_endpoint_change.sh \
-		   tests/integration/run_traces.sh
+		   tests/integration/run_traces.sh \
+		   tests/integration/run_a3_tls_e2e.sh
 NGX_CARGO	?= cargo
 
 # nginx configure base flags. Phase 1.1 needs --with-compat (for loading a

@@ -498,6 +498,56 @@ TraceService method). All span encoding and I/O happen on the cold path.
 
 ---
 
+## Transport security (TLS)
+
+Both OTLP/HTTP and OTLP/gRPC support TLS when `endpoint` uses the `https://`
+scheme. TLS is handled by the dedicated exporter process via a custom OpenSSL
+async BIO bridge (`src/transport/tls.rs`). Workers never hold collector sockets
+and are not involved in TLS.
+
+### Directives
+
+| Directive              | Default                    | Behaviour                                                                                                                                                        |
+|------------------------|----------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `trusted_certificate`  | System trust store         | CA bundle (PEM) for validating the collector's server cert. When omitted, `SSL_CTX_set_default_verify_paths` loads the OS default store.                         |
+| `ssl_certificate`      | (none — mTLS disabled)     | Client certificate chain (PEM) for mutual TLS. Must be set together with `ssl_certificate_key`.                                                                 |
+| `ssl_certificate_key`  | (none — mTLS disabled)     | Client private key (PEM) for mutual TLS. Must be set together with `ssl_certificate`.                                                                           |
+| `ssl_verify`           | `on`                       | `off` disables server certificate verification (INSECURE). Emits a config-time WARN. Useful for testing against a self-signed collector without a CA bundle.      |
+
+### Verification model
+
+- **Minimum TLS version**: 1.2 (`SSL_CTX_set_min_proto_version(TLS1_2_VERSION)`).
+- **Certificate chain**: validated against `trusted_certificate` (or the OS
+  trust store). An untrusted chain causes a TLS handshake failure — the exporter
+  logs `send_failed` error alerts, activates retry backoff, and increments
+  `ngx_otel.send_failures`. Zero data is delivered. Nginx continues serving.
+- **Hostname verification (DNS endpoints)**: `X509_VERIFY_PARAM_set1_host` checks
+  the cert's DNS SAN against the endpoint hostname. A mismatch fails closed.
+- **IP-address verification (IP-literal endpoints)**: `X509_VERIFY_PARAM_set1_ip_asc`
+  checks the cert's iPAddress SAN against the endpoint IP (RFC 5280). A mismatch
+  fails closed. SNI is suppressed for IP literals per RFC 6066 §3.
+- **mTLS**: when both `ssl_certificate` and `ssl_certificate_key` are set, the
+  exporter presents the client cert during the TLS handshake. Without a client cert,
+  a collector configured to require mutual TLS will reject the handshake (fails closed).
+- **SIGHUP reload**: the new exporter generation reads the current cert/CA paths —
+  rotating a cert or CA takes effect at reload, not at the next connection attempt.
+- **gRPC over TLS**: `otel_export_protocol otlp_grpc` with an `https://` endpoint
+  automatically negotiates ALPN `h2` for HTTP/2 — no extra configuration.
+
+### Transport security notes for operators
+
+- `ssl_verify off` should never be used in production. It disables all certificate
+  chain and hostname checks, meaning any server can intercept the export stream.
+  The config-time WARN is logged once per exporter generation to alert operators.
+- The `trusted_certificate` path is read at config-parse time (existence-checked)
+  but loaded into the `SSL_CTX` when the exporter process starts. A missing or
+  unreadable CA file after config-parse causes an exporter startup error.
+- For self-signed collector certs in test/dev environments, prefer `trusted_certificate
+  /path/to/your-ca.pem` over `ssl_verify off`. This maintains chain validation while
+  avoiding a commercial CA requirement.
+
+---
+
 ## Exporter self-observability metrics (`SelfMetricsSource`)
 
 The exporter process emits its own health metrics every export interval

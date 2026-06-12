@@ -542,6 +542,42 @@ Notes:
 - Counters reset on `nginx -s reload`; downstream collectors handle
   continuity via OTLP's `start_time_unix_nano`.
 
+#### TLS directive reference
+
+TLS options are set inside `otel_exporter {}` and take effect when
+`endpoint` uses the `https://` scheme.  They have no effect for `http://`
+or `unix:` endpoints.
+
+| Directive                  | Context          | Default                    | Description                                                                              |
+|----------------------------|------------------|----------------------------|------------------------------------------------------------------------------------------|
+| `trusted_certificate <path>` | `otel_exporter` | System trust store         | CA bundle for validating the collector's server certificate. Absolute path to a PEM file (single CA or chain). When omitted, `SSL_CTX_set_default_verify_paths` loads the OS default trust store. |
+| `ssl_certificate <path>`   | `otel_exporter`  | (none — mTLS disabled)     | Client certificate chain for mTLS. PEM file. Must be set together with `ssl_certificate_key`. |
+| `ssl_certificate_key <path>` | `otel_exporter` | (none — mTLS disabled)     | Client private key for mTLS. PEM file. Must be set together with `ssl_certificate`. |
+| `ssl_verify on\|off`       | `otel_exporter`  | `on`                       | `off` disables collector certificate verification. **INSECURE — for testing only.** Emits a config-time WARN when set to `off`. |
+
+Key behaviours:
+
+- **Server cert verification** is enforced by default: the exporter validates
+  the collector's certificate against `trusted_certificate` (or the system
+  store) and checks hostname / IP-SAN against the endpoint host. A mismatch
+  causes a TLS handshake failure, `send_failed` error-log alerts, and retry
+  backoff — zero data is delivered and nginx continues serving normally.
+- **Hostname verification**: DNS-name endpoints use `X509_VERIFY_PARAM_set1_host`
+  (matches the cert's DNS SAN); IP-literal endpoints (e.g. `https://127.0.0.1:4317`)
+  use `X509_VERIFY_PARAM_set1_ip_asc` (matches the cert's iPAddress SAN).
+- **mTLS**: set both `ssl_certificate` and `ssl_certificate_key` together.
+  Setting only one is a config-time error. When not set, no client certificate
+  is presented (plain server-auth TLS).
+- **SIGHUP reload**: the new exporter generation spawned after a reload reads
+  the current `trusted_certificate`, `ssl_certificate`, and `ssl_certificate_key`
+  paths — cert/CA rotation takes effect at reload time.
+- **gRPC over TLS**: when `endpoint` is `https://` and `otel_export_protocol
+  otlp_grpc` is set, the gRPC transport negotiates `h2` via ALPN automatically.
+  No extra configuration is needed.
+- **Minimum OpenSSL version**: 1.1.1 (API `X509_VERIFY_PARAM_set1_host` and
+  `set1_ip_asc` first available in 1.0.2; 1.1.1+ recommended). See
+  [`OPENSSL_SUPPORT.md`](OPENSSL_SUPPORT.md) for the full support matrix.
+
 ### Running tests
 
 ```sh

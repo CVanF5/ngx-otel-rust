@@ -1,11 +1,5 @@
 # OpenSSL support matrix — ngx-otel-rust
 
-**STATUS: STUB** — filled fully by Phase A item A3 once the TLS layer pins
-actual version requirements. The rule below is verified and binding now
-(discovered via demo 2026-06-12, `f2d8455`).
-
----
-
 ## THE RULE (binding)
 
 > **`openssl-sys` must link the SAME OpenSSL that nginx links, dynamically.**
@@ -25,6 +19,40 @@ Mixing OpenSSL runtimes causes silent corruption on SSL context access:
 **Consequence**: NEVER allow `openssl-sys` to vendor or statically link its
 own OpenSSL when the module is loaded into a running nginx process.  Always
 resolve to the exact same shared library nginx resolved at its own link time.
+
+---
+
+## Minimum OpenSSL version
+
+**Minimum: OpenSSL 1.1.1** (released September 2018).
+
+The TLS client in `src/transport/tls.rs` uses the following API calls, all of
+which are present in OpenSSL 1.1.1:
+
+| API call                              | Introduced | Purpose                                    |
+|---------------------------------------|------------|--------------------------------------------|
+| `TLS_client_method`                   | 1.1.0      | Flexible TLS method (replaces `TLSv1_2_method`) |
+| `SSL_CTX_set_min_proto_version`       | 1.1.0      | Enforce minimum TLS 1.2                    |
+| `SSL_CTX_load_verify_locations`       | 0.9.x      | Load trusted CA bundle                     |
+| `SSL_CTX_set_default_verify_paths`    | 0.9.x      | Load system default trust store            |
+| `SSL_CTX_use_certificate_chain_file`  | 0.9.x      | Load mTLS client certificate               |
+| `SSL_CTX_use_PrivateKey_file`         | 0.9.x      | Load mTLS client private key               |
+| `SSL_CTX_check_private_key`           | 0.9.x      | Verify cert/key match                      |
+| `X509_VERIFY_PARAM_set1_host`         | 1.0.2      | DNS-name hostname verification             |
+| `X509_VERIFY_PARAM_set1_ip_asc`       | 1.0.2      | IP-address SAN verification (A2)           |
+| `SSL_get0_param`                      | 1.0.2      | Retrieve verify params from SSL            |
+| `BIO_meth_new` / `BIO_meth_set_*`     | 1.1.0      | Custom BIO method (async bridge)           |
+| `BIO_get_new_index`                   | 1.1.0      | Per-process BIO type index                 |
+| `SSL_set_tlsext_host_name`            | 1.0.0      | SNI hostname extension                     |
+
+`X509_VERIFY_PARAM_set1_host` and `set1_ip_asc` (1.0.2) are the binding lower
+bound. In practice, **OpenSSL 1.1.1 or later is strongly recommended** because
+1.0.2 reached end-of-life in December 2019 and many distributions no longer
+ship it. OpenSSL 3.x (3.0, 3.1, 3.2, 3.3, 3.4, 3.5) is fully supported and
+is the version shipped by current Debian/Ubuntu/Fedora/RHEL releases.
+
+**Verified on**: OpenSSL 3.5.6 (Debian arm64, debian-vm, 2026-06-12, A3 full
+E2E test — all scenarios a-g including mTLS and IP-SAN verification).
 
 ---
 
@@ -56,17 +84,43 @@ On Linux there is a single system OpenSSL; no override is needed because
 
 ---
 
-## Summary table (to be completed in A3)
+## Platform support matrix
 
-| Platform         | nginx OpenSSL         | Required env vars                                             | Notes                        |
-|------------------|-----------------------|---------------------------------------------------------------|------------------------------|
-| macOS (Homebrew) | openssl@3 (dynamic)   | `OPENSSL_DIR=openssl@3 OPENSSL_STATIC=0 OPENSSL_NO_VENDOR=1` | See Makefile pin above       |
-| Debian/Ubuntu    | system libssl3        | _(none — default resolution is correct)_                     | Verified on debian-vm        |
-| Other Linux      | system libssl         | _(none — default resolution is correct)_                     | To be confirmed in A3        |
-| CI (Docker)      | TBD in A3             | TBD in A3                                                     |                              |
+| Platform            | nginx OpenSSL             | Required env vars                                             | Tested | Notes                                    |
+|---------------------|---------------------------|---------------------------------------------------------------|--------|------------------------------------------|
+| macOS (Homebrew)    | openssl@3 (dynamic)       | `OPENSSL_DIR=openssl@3 OPENSSL_STATIC=0 OPENSSL_NO_VENDOR=1` | Yes    | See Makefile pin; A0/C2/C3 verified      |
+| Debian/Ubuntu arm64 | libssl3 (system)          | _(none — default resolution is correct)_                     | Yes    | debian-vm; A3 full E2E 2026-06-12        |
+| Debian/Ubuntu amd64 | libssl3 (system)          | _(none — default resolution is correct)_                     | Yes    | TSAN/ASan dockerized gate                |
+| Other Linux (glibc) | libssl3 or libssl1.1      | _(none — default resolution correct if single OpenSSL)_      | No     | Expected to work; min version 1.1.1      |
+| Alpine Linux (musl) | system libssl             | May need `OPENSSL_DIR` if pkg name differs from nginx build   | No     | Not tested                               |
+| CI (Docker/GitHub)  | libssl3 (Debian-based)    | _(none)_                                                      | Partial| TSAN/ASan images use debian:bookworm     |
 
-**Minimum OpenSSL version**: TBD in A3 (driven by `SSL_set1_host` /
-`X509_VERIFY_PARAM` API availability — will be pinned once A1 lands).
+---
+
+## TLS feature set (what is exercised E2E)
+
+Verified by `tests/integration/run_a3_tls_e2e.sh` on debian-vm, 2026-06-12:
+
+- **Server cert verification** (`trusted_certificate`): OTLP/HTTP and gRPC
+  both validate the collector's certificate against the configured CA (scenarios
+  a + b). A wrong CA causes fail-closed with no data delivery (scenario c).
+- **Insecure mode** (`ssl_verify off`): delivers despite mismatched CA;
+  config-time WARN is emitted (scenario d).
+- **mTLS** (`ssl_certificate` + `ssl_certificate_key`): client cert presented
+  to a collector requiring mutual TLS (scenario e1); missing client cert
+  fails closed (scenario e2).
+- **DNS hostname verification** (`X509_VERIFY_PARAM_set1_host`): cert SAN
+  mismatch for DNS names fails (scenario f1).
+- **IP-literal hostname verification** (`X509_VERIFY_PARAM_set1_ip_asc`):
+  cert IP SAN mismatch for IP-literal endpoints fails (scenario f2). This
+  exercises the A2 IP-literal branch distinctly from the DNS branch.
+- **TLS 1.2 minimum**: enforced via `SSL_CTX_set_min_proto_version(TLS1_2_VERSION)`.
+- **SIGHUP reload**: new exporter generation reads updated cert/CA paths after
+  reload (scenario g).
+- **ALPN h2** (gRPC over TLS): negotiated automatically by the gRPC transport
+  when the endpoint is `https://`.
+- **SNI** (DNS names): set via `SSL_set_tlsext_host_name`; suppressed for
+  IP-literal endpoints per RFC 6066 §3.
 
 ---
 
@@ -86,9 +140,3 @@ statically linked OpenSSL:
 Setting `OPENSSL_STATIC=0` + `OPENSSL_NO_VENDOR=1` prevents the fallback
 and causes a hard build error if the correct shared OpenSSL cannot be found
 — which is the correct failure mode.
-
----
-
-*This file is a stub. A3 will add: minimum version requirements, CI matrix,
-TLS 1.2/1.3 feature flags, mTLS cert/key format constraints, and tested
-platform matrix.*
