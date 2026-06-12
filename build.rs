@@ -15,21 +15,30 @@ fn main() {
         println!("cargo::rustc-link-arg=dynamic_lookup");
     }
 
-    // Compile the module-side bitfield shim (H3F1) against the real nginx headers.
-    compile_bitfield_shim();
+    // Compile the module-side C shims (H3F1 bitfield accessors + C2 ssl/cert
+    // accessors) against the real nginx headers.
+    compile_c_shims();
 
     // Compile proto files for OTLP encoding (used in Step 7)
     compile_protos();
 }
 
-/// Compile `src/shim/ngx_otel_bitfield_shim.c` — module-side C accessors for
-/// `ngx_http_request_t` bitfields that rust-bindgen reads at the wrong bit
-/// offset (allocation-unit-sharing bug; see the file header and
-/// `BINDGEN_BITFIELD_ISSUE_DRAFT.md`).
+/// Compile the module-side C shims against the real nginx headers:
 ///
-/// The shim is compiled by *our* build against the *same* nginx headers and
-/// `-D` defines nginx-sys used to build nginx, so the layout it sees is
-/// byte-identical to nginx's own — correct by construction.
+/// - `src/shim/ngx_otel_bitfield_shim.c` — accessors for `ngx_http_request_t`
+///   bitfields that rust-bindgen reads at the wrong bit offset
+///   (allocation-unit-sharing bug; see the file header and
+///   `BINDGEN_BITFIELD_ISSUE_DRAFT.md`).
+/// - `src/shim/ngx_otel_ssl_shim.c` — `ngx_http_ssl_srv_conf_t` accessors and
+///   the OpenSSL `SSL_CTX_set_current_cert` cert-enumeration wrapper for the
+///   config-time cert table (TLS cert-metrics item C2; see its file header).
+///
+/// The shims are compiled by *our* build against the *same* nginx headers and
+/// `-D` defines nginx-sys used to build nginx, so the layout they see is
+/// byte-identical to nginx's own — correct by construction.  The nginx include
+/// list (`DEP_NGINX_INCLUDE`, parsed from the generated objs/Makefile's
+/// `ALL_INCS`) also carries the OpenSSL include directory nginx itself was
+/// configured with, so `<openssl/ssl.h>` resolves to the same headers.
 ///
 /// Include paths and defines are taken from the `DEP_NGINX_INCLUDE` /
 /// `DEP_NGINX_BUILD_DIR` / `DEP_NGINX_CFLAGS` environment variables that
@@ -37,14 +46,16 @@ fn main() {
 /// `cargo::metadata=include=…` / `=build_dir=…` / `=cflags=…`), so we do not
 /// re-derive them.  `DEP_NGINX_INCLUDE` is an `env::join_paths` list (OS path
 /// separator); `DEP_NGINX_CFLAGS` is a space-separated `-Dname[=value]` list.
-fn compile_bitfield_shim() {
+fn compile_c_shims() {
     println!("cargo::rerun-if-changed=src/shim/ngx_otel_bitfield_shim.c");
+    println!("cargo::rerun-if-changed=src/shim/ngx_otel_ssl_shim.c");
     println!("cargo::rerun-if-env-changed=DEP_NGINX_INCLUDE");
     println!("cargo::rerun-if-env-changed=DEP_NGINX_BUILD_DIR");
     println!("cargo::rerun-if-env-changed=DEP_NGINX_CFLAGS");
 
     let mut build = cc::Build::new();
     build.file("src/shim/ngx_otel_bitfield_shim.c");
+    build.file("src/shim/ngx_otel_ssl_shim.c");
 
     // Include dirs from nginx-sys (src/core, src/event, src/os/unix, src/http,
     // src/http/modules, …) plus the build/objs dir (ngx_auto_config.h /
@@ -78,7 +89,7 @@ fn compile_bitfield_shim() {
         }
     }
 
-    build.compile("ngx_otel_bitfield_shim");
+    build.compile("ngx_otel_shims");
 }
 
 /// Generates `ngx_os`, `ngx_feature` and nginx version cfg values.
