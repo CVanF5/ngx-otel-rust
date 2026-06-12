@@ -1423,7 +1423,7 @@
         },
         {
           "id": 51,
-          "type": "table",
+          "type": "traces",
           "title": "Traces (nginx server spans via Tempo)",
           "collapsed": true,
           "gridPos": {
@@ -1612,7 +1612,8 @@
               },
               "color": {
                 "mode": "thresholds"
-              }
+              },
+              "unit": "s"
             },
             "overrides": [
               {
@@ -1876,6 +1877,77 @@
             "defaults": {},
             "overrides": []
           }
+        },
+        {
+          "id": 56,
+          "type": "timeseries",
+          "title": "Error Events by Severity (ngx_otel.error_log.events)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "description": "Producer-side error-event counter by severity_class \u2014 the metrics-primary companion to the coalesced error LogRecords.",
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 58
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "sum by (severity_class) (rate(ngx_otel_error_log_events{service_name=\"$service\"}[$__rate_interval]))",
+              "legendFormat": "{{severity_class}}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "stacking": {
+                  "mode": "none"
+                },
+                "axisLabel": "",
+                "gradientMode": "opacity"
+              },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "color": {
+                "mode": "palette-classic"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "calcs": [
+                "mean",
+                "max",
+                "last"
+              ],
+              "displayMode": "table",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
         }
       ]
     },
@@ -2032,7 +2104,7 @@
                 "uid": "prometheus"
               },
               "refId": "A",
-              "expr": "sum(rate(ngx_otel_dropped_records{service_name=\"$service\"}[$__rate_interval])) + sum(rate(ngx_otel_logs_access_dropped_records{service_name=\"$service\"}[$__rate_interval])) + sum(rate(ngx_otel_logs_error_dropped_records{service_name=\"$service\"}[$__rate_interval]))"
+              "expr": "sum(rate(ngx_otel_dropped_records{service_name=\"$service\"}[$__rate_interval])) + sum(rate(ngx_otel_logs_access_dropped_records{service_name=\"$service\"}[$__rate_interval])) + sum(rate(ngx_otel_logs_error_dropped_records{service_name=\"$service\"}[$__rate_interval])) + sum(rate(ngx_otel_traces_dropped_records{service_name=\"$service\"}[$__rate_interval])) + sum(rate(ngx_otel_bidi_backpressure_drops{service_name=\"$service\"}[$__rate_interval]))"
             }
           ],
           "fieldConfig": {
@@ -2122,6 +2194,42 @@
               "refId": "D",
               "expr": "sum(rate(ngx_otel_send_failures{service_name=\"$service\"}[$__rate_interval]))",
               "legendFormat": "send failures"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "sum(rate(ngx_otel_traces_dropped_records{service_name=\"$service\"}[$__rate_interval]))",
+              "legendFormat": "traces dropped (ring full)",
+              "refId": "E"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "sum(rate(ngx_otel_bidi_backpressure_drops{service_name=\"$service\"}[$__rate_interval]))",
+              "legendFormat": "bidi backpressure drops",
+              "refId": "F"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "sum(rate(ngx_otel_logs_send_failures{service_name=\"$service\"}[$__rate_interval]))",
+              "legendFormat": "logs send failures",
+              "refId": "G"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "sum(rate(ngx_otel_logs_error_coalesced_orphaned_records{service_name=\"$service\"}[$__rate_interval]))",
+              "legendFormat": "coalesced orphaned",
+              "refId": "H"
             }
           ],
           "fieldConfig": {
@@ -2167,6 +2275,64 @@
               "mode": "multi",
               "sort": "desc"
             }
+          }
+        },
+        {
+          "id": 55,
+          "type": "stat",
+          "title": "Exporter Restarts (crash-loop window)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "description": "Prior exporter crashes observed at current exporter startup (0 = clean start). Non-zero means the crash-loop backoff engaged; see LIFECYCLE.md. Absent entirely after crash-loop give-up.",
+          "gridPos": {
+            "h": 5,
+            "w": 6,
+            "x": 18,
+            "y": 25
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+              },
+              "expr": "max(ngx_otel_exporter_restarts{service_name=\"$service\"})",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 1
+                  }
+                ]
+              },
+              "unit": "none"
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "graphMode": "none",
+            "colorMode": "value",
+            "textMode": "auto",
+            "justifyMode": "auto"
           }
         }
       ]
