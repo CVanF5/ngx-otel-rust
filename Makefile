@@ -17,11 +17,13 @@ NGX_CARGO	?= cargo
 
 # nginx configure base flags. Phase 1.1 needs --with-compat (for loading a
 # separately-built dynamic module) and --with-http_stub_status_module (for
-# the ngx_stat_* atomics our StubStatusSource reads). Phase 1.2 will add
-# --with-http_ssl_module + --with-pcre etc.
+# the ngx_stat_* atomics our StubStatusSource reads). Phase C adds
+# --with-http_ssl_module so bindgen sees the real ngx_ssl_s layout and
+# ngx_http_ssl_module is emitted (required for cert-metrics in C2/C3).
 NGINX_CONFIGURE_BASE	= \
 	auto/configure \
 		--with-compat \
+		--with-http_ssl_module \
 		--with-http_stub_status_module
 
 NGINX_SOURCE_DIR	?= ../nginx
