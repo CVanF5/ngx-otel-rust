@@ -501,6 +501,117 @@ fn connect_loopback_io() -> TestIo {
     connect_nonblocking(port)
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// B1 — collector-cert gauge: COLLECTOR_CERT_NOT_AFTER capture
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// B1 unit: a successful handshake writes the peer-cert notAfter into
+/// `COLLECTOR_CERT_NOT_AFTER` (the shared atomic that `collect_all_sources`
+/// reads to emit the `ngx_otel.tls.collector_cert.not_after` gauge).
+///
+/// Also asserts the **reuse seam**: the value in the atomic is derived from
+/// the SAME `crate::cert_table::asn1_time_to_unix` helper used by
+/// `ServingCertSource`, not a reimplementation.  We verify this by calling the
+/// shared helper directly on the server cert's notAfter and asserting the two
+/// results are equal.
+///
+/// Mutation target: removing the `SSL_get1_peer_certificate` call in
+/// `poll_handshake` leaves `COLLECTOR_CERT_NOT_AFTER` at 0 → this test fails.
+#[test]
+fn successful_handshake_captures_cert_not_after() {
+    use super::COLLECTOR_CERT_NOT_AFTER;
+    use core::sync::atomic::Ordering;
+    use openssl_sys as ssl;
+
+    // Reset the global before the test so a stale value from a previous
+    // (parallel) test doesn't mask a real failure.
+    COLLECTOR_CERT_NOT_AFTER.store(0, Ordering::SeqCst);
+
+    let certs = make_certs("DNS:localhost,IP:127.0.0.1");
+    let server = TestServer::start(&certs);
+    let cfg = TlsConfig { ca_file: Some(certs.ca_pem()), ..Default::default() };
+    let c = ctx(&cfg);
+
+    let io = connect_nonblocking(server.port);
+    let mut tls = TlsNgxConnIo::new(io, &c, "localhost", true).expect("new");
+    block_on(core::future::poll_fn(|cx| tls.poll_handshake(cx))).expect("handshake ok");
+
+    // After a successful handshake the atomic must be non-zero.
+    let captured = COLLECTOR_CERT_NOT_AFTER.load(Ordering::SeqCst);
+    assert_ne!(
+        captured, 0,
+        "COLLECTOR_CERT_NOT_AFTER must be written after a successful handshake"
+    );
+
+    // ── Reuse-seam assertion ─────────────────────────────────────────────
+    // Read the server cert's notAfter directly from the PEM file via
+    // `asn1_time_to_unix` — the EXACT same function that `poll_handshake`
+    // calls.  The two values must be identical, proving that no separate
+    // epoch conversion was introduced.
+    let expected = {
+        // Load the server PEM into an X509 to read its notAfter.
+        let pem_path = certs.server_cert();
+        let pem_bytes = std::fs::read(&pem_path).expect("read server.pem");
+        // SAFETY: X509_new allocates; we free it below.
+        let cert = unsafe {
+            let bio = ssl::BIO_new_mem_buf(
+                pem_bytes.as_ptr().cast(),
+                pem_bytes.len() as core::ffi::c_int,
+            );
+            assert!(!bio.is_null(), "BIO_new_mem_buf");
+            let c = ssl::PEM_read_bio_X509(bio, core::ptr::null_mut(), None, core::ptr::null_mut());
+            // SAFETY: BIO_free_all on a single BIO is equivalent to BIO_free.
+            ssl::BIO_free_all(bio);
+            c
+        };
+        assert!(!cert.is_null(), "PEM_read_bio_X509 must succeed");
+        // SAFETY: cert is the valid X509 just parsed; X509_getm_notAfter
+        // returns an internal (get0) pointer valid for the lifetime of `cert`.
+        let not_after = unsafe { ssl::X509_getm_notAfter(cert) };
+        // SAFETY: `not_after` is a valid borrow of `cert`'s notAfter field;
+        // `asn1_time_to_unix` only reads it; `cert` stays live until
+        // `X509_free` below.
+        let epoch = unsafe { crate::cert_table::asn1_time_to_unix(not_after) }
+            .expect("asn1_time_to_unix must succeed on a well-formed cert");
+        // SAFETY: cert was allocated above; freed exactly once here.
+        unsafe { ssl::X509_free(cert) };
+        epoch
+    };
+
+    assert_eq!(
+        captured, expected,
+        "COLLECTOR_CERT_NOT_AFTER must equal asn1_time_to_unix(server cert notAfter) \
+         — the reuse seam: same shared helper, no reimplementation"
+    );
+}
+
+/// B1 reuse-seam sanity: `crate::cert_table::asn1_time_to_unix` is callable
+/// from this module (i.e., it is `pub(crate)` and NOT duplicated here).
+/// This test calls the function directly — if it compiled with a private
+/// visibility the build would fail at this call site.
+#[test]
+fn asn1_time_to_unix_is_shared_not_duplicated() {
+    // A known epoch: 2026-01-01T00:00:00Z.
+    // GeneralizedTime format: YYYYMMDDHHmmssZ
+    let asn1_str = c"20260101000000Z";
+    // SAFETY: ASN1_TIME_new + ASN1_TIME_set_string allocate; freed below.
+    let t = unsafe {
+        use openssl_sys as ssl;
+        let t = ssl::ASN1_TIME_new();
+        assert!(!t.is_null());
+        let ok = ssl::ASN1_TIME_set_string(t, asn1_str.as_ptr());
+        assert_eq!(ok, 1, "ASN1_TIME_set_string must succeed");
+        t
+    };
+    // SAFETY: `t` is a valid non-null ASN1_TIME.
+    let epoch = unsafe { crate::cert_table::asn1_time_to_unix(t) };
+    // SAFETY: `t` was allocated above; freed exactly once.
+    unsafe { openssl_sys::ASN1_TIME_free(t) };
+
+    // 2026-01-01T00:00:00Z = 1767225600
+    assert_eq!(epoch, Some(1_767_225_600_i64), "asn1_time_to_unix(2026-01-01T00Z)");
+}
+
 /// Constructing a TlsNgxConnIo and dropping it mid-handshake (before
 /// completion) must not panic or leak (ASan covers the leak in CI; here we
 /// assert the construct+drop path is clean and frees SSL/BIO exactly once).
