@@ -129,10 +129,13 @@ cleanup() {
 trap cleanup EXIT
 
 # ── Leftover cleanup ───────────────────────────────────────────────────────────
-# Phase B identifies the exporter by proctitle, so stray test-sandbox nginx
-# (conf under /tmp/ngx-*) and orphaned exporters from earlier runs must go.
-pgrep -f "[n]ginx: master process.*/tmp/ngx-" | xargs -r kill -KILL 2>/dev/null || true
-pgrep -f "[n]ginx: otel exporter" | xargs -r kill -KILL 2>/dev/null || true
+# Phase B identifies the exporter by proctitle, so stray nginx instances and
+# orphaned exporters from earlier test runs must go.  Masters first (otherwise
+# a surviving master respawns its exporter between our kill and the check).
+# This assumes a dedicated test host — it kills ANY nginx master.
+pgrep -f "[n]ginx: master process" | xargs -r kill -KILL 2>/dev/null || true
+sleep 1
+pgrep -f "[n]ginx: " | xargs -r kill -KILL 2>/dev/null || true
 sleep 1
 [[ -z "$(exporter_pid)" ]] || fail "Preflight: stray otel exporter (PID $(exporter_pid)) survived cleanup"
 
