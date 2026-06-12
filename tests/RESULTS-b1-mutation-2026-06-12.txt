@@ -2,7 +2,7 @@ B1 Collector-Cert Gauge — Mutation Evidence
 ==============================================
 Date: 2026-06-12T19:38:38Z
 Platform: macOS (darwin aarch64, make unittest)
-GIT_COMMIT: 61579e7494f720e2316689d54227d5767be25087
+GIT_COMMIT: ec1dc3beec9e85f15e1ebb206c22f36f67a2cd7c
 
 Mutation target: src/transport/tls.rs, poll_handshake B1 capture block.
 Test: transport::tls::tests::successful_handshake_captures_cert_not_after
