@@ -67,6 +67,7 @@ use ngx::http::{add_phase_handler, HttpModule, HttpModuleLocationConf, HttpModul
 #[cfg(any(test, feature = "test-support"))]
 use ngx::core::Pool;
 
+pub mod cert_table;
 mod config;
 pub mod data_model;
 pub mod encoder;

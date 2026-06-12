@@ -330,6 +330,15 @@ pub struct MainConfig {
     /// `0` when `resolver` is `None`.  Falls back to 5000 ms when the core
     /// http conf has no explicit `resolver_timeout` (matching nginx-acme).
     pub resolver_timeout: nginx_sys::ngx_msec_t,
+
+    // ── TLS cert-metrics (Phase C, item C2) ──────────────────────────────────
+    //
+    /// Serving-certificate table, populated ONCE at `postconfiguration` time by
+    /// [`crate::cert_table::build_cert_table`] (master process, before workers
+    /// fork) and read-only afterwards.  Plain Rust heap: the exporter process
+    /// inherits it at fork; workers never touch it (no worker-side code).
+    /// Empty when nginx lacks http_ssl_module or no server has certificates.
+    pub cert_table: std::vec::Vec<crate::cert_table::CertInfo>,
 }
 
 impl Default for MainConfig {
@@ -379,6 +388,8 @@ impl Default for MainConfig {
             // DNS resolver: None until postconfiguration wires it for DNS endpoints.
             resolver: None,
             resolver_timeout: 0,
+            // C2: populated at postconfiguration by build_cert_table.
+            cert_table: std::vec::Vec::new(),
         }
     }
 }
@@ -713,6 +724,14 @@ impl MainConfig {
         // SAFETY: same as above — valid `cf` at postconfiguration time satisfies
         // `build_upstream_table`'s contract.
         unsafe { self.build_upstream_table(cf) };
+
+        // Build the TLS serving-certificate table (Phase C item C2).  Runs
+        // after ngx_http_ssl_module's merge_srv_conf has loaded all config-time
+        // certificates into each server's SSL_CTX (merges complete before any
+        // postconfiguration handler), in the single-threaded master.
+        // SAFETY: `cf` is the valid non-null postconfiguration parse context,
+        // satisfying `build_cert_table`'s contract.
+        unsafe { crate::cert_table::build_cert_table(self, cf) };
 
         Ok(())
     }
