@@ -32,9 +32,7 @@
 //!   NOTICE: nginx defers such certs to per-handshake loading
 //!   (`certificate_values`), so they are not in the `SSL_CTX` at config time.
 
-#[cfg(ngx_feature = "http_ssl")]
-use core::ffi::c_void;
-use core::ffi::{c_char, c_int, CStr};
+use core::ffi::{c_char, c_int, c_void, CStr};
 use core::ptr;
 use std::string::{String, ToString};
 #[cfg(ngx_feature = "http_ssl")]
