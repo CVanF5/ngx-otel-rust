@@ -272,6 +272,15 @@ design proposal to integrate. In brief:
   `ngx_otel.bidi_backpressure_drops`, `ngx_otel.export_interval`,
   `ngx_otel.exporter.restarts`. See
   `TELEMETRY_MODEL.md` § "Exporter self-observability metrics".
+- **Serving-certificate metrics** (requires nginx built with
+  `--with-http_ssl_module` — the default `make build` includes it):
+  `ngx_otel.tls.certificate.not_after`, `ngx_otel.tls.certificate.not_before`,
+  `ngx_otel.tls.certificate.time_to_expiration` — three gauges per TLS serving
+  certificate, collected at startup/reload from what nginx actually **serves**
+  (a renewed file on disk changes nothing until reload);
+  `time_to_expiration` goes negative after expiry. Absent entirely when nginx
+  lacks the ssl module or no `ssl_certificate` is configured. See
+  `TELEMETRY_MODEL.md` § "Serving-certificate metrics".
 
 A ready-made Grafana dashboard is provided at
 [`test-harness/demo/grafana/dashboards/ngx-otel-rust-overview.json`](test-harness/demo/grafana/dashboards/ngx-otel-rust-overview.json).
@@ -403,8 +412,17 @@ Produces:
 >   `ngx_stat_*` symbols the module references are not present in that nginx.
 >   Build the module against headers from the same nginx you will load it into.
 
+> **`--with-http_ssl_module` and the `ngx_otel.tls.certificate.*` metrics.**
+> The serving-certificate gauges (`not_after` / `not_before` /
+> `time_to_expiration`) require nginx built with `--with-http_ssl_module`
+> (the default build above includes it). When the module runs in a nginx
+> built **without** the ssl module, it still loads and serves: the three
+> series are **absent** from the export (not present-as-zero) and one
+> config-time NOTICE (`cert metrics unavailable: nginx built without
+> http_ssl_module`) explains why. Every other signal works normally.
+
 Internals: `make build` invokes
-`./auto/configure --add-dynamic-module=$(CURDIR) --with-compat --with-http_stub_status_module`
+`./auto/configure --add-dynamic-module=$(CURDIR) --with-compat --with-http_ssl_module --with-http_stub_status_module`
 against `$(NGINX_SOURCE_DIR)`, which sources our `config` script,
 which in turn loads `auto/rust` from this tree.  `auto/rust` then
 adds a Makefile target that calls `cargo rustc --crate-type staticlib

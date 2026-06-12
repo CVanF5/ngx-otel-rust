@@ -513,6 +513,65 @@ The exporter process emits its own health metrics every export interval
 
 ---
 
+## Serving-certificate metrics (`ngx_otel.tls.certificate.*`)
+
+Three int64 Gauges per TLS **serving** certificate
+(`src/metric_source/tls_cert.rs`, `ServingCertSource`), emitted every export
+interval by the exporter process. Requires nginx built with
+`--with-http_ssl_module`; without it (or with no `ssl_certificate`
+configured) the three series are **absent** from the export — not
+present-as-zero — and a one-shot config-time NOTICE explains why.
+
+| Metric | Instrument | Unit | Description |
+|---|---|---|---|
+| `ngx_otel.tls.certificate.not_after` | Gauge (int64) | `s` | Certificate `notAfter` as Unix epoch seconds |
+| `ngx_otel.tls.certificate.not_before` | Gauge (int64) | `s` | Certificate `notBefore` as Unix epoch seconds |
+| `ngx_otel.tls.certificate.time_to_expiration` | Gauge (int64) | `s` | `not_after − now` (wall clock), recomputed each export interval. **Negative once the certificate has expired** — the series does not disappear at expiry; alert on small or negative values, not on absence |
+
+### Attributes
+
+Each data point carries **exactly** this bounded attribute set (one data
+point per certificate; the set is deliberately closed — no PEM, no key
+material, no fingerprints, no full DNs, no SANs):
+
+| Attribute | Value | Source |
+|---|---|---|
+| `file_path` | certificate file path as configured by `ssl_certificate` | `src/cert_table.rs` |
+| `tls.server.subject` | subject CN only (empty string when the subject has no CN) | `src/cert_table.rs` |
+| `tls.server.issuer` | issuer CN only (empty string when the issuer has no CN) | `src/cert_table.rs` |
+| `serial_number` | serial as an uppercase hex string (no `0x` prefix) | `src/cert_table.rs` |
+| `public_key_algorithm` | `"RSA"`, `"EC"`, `"ED25519"`, ... | `src/cert_table.rs` |
+| `signature_algorithm` | signature algorithm short name (e.g. `"RSA-SHA256"`) | `src/cert_table.rs` |
+| `server.address` | first non-wildcard `server_name` of the owning server block; `"_"` when the block has none | `src/cert_table.rs` |
+
+A server block with multiple certificates (e.g. dual RSA + ECDSA) yields one
+series per certificate per metric, distinguished by `file_path` /
+`public_key_algorithm` / `serial_number`.
+
+### Cadence: what nginx *serves*, not what is on disk
+
+The certificate table is built **once per configuration cycle** — at startup
+and on every reload — by walking the live `SSL_CTX` of each `server` block at
+`postconfiguration` time (`src/cert_table.rs`, item C2). Between reloads the
+values are constant except `time_to_expiration`, which is recomputed against
+the wall clock each export interval.
+
+This deliberately differs from file-watching tools (e.g. NGINX Agent, which
+watches certificate *files*): a renewed certificate written to disk does
+**not** change these metrics until nginx reloads, because nginx does not
+*serve* the new certificate until reload. If `time_to_expiration` stays low
+after your renewal automation ran, the renewed cert is on disk but nginx was
+never reloaded — exactly the failure mode these metrics are designed to
+expose.
+
+### Limitations
+
+- **Variable certificate paths** (`ssl_certificate $var`) are skipped with a
+  config-time NOTICE — nginx defers loading such certificates to handshake
+  time, so there is nothing to enumerate at config time.
+- **Leaf certificates only**: intermediate/chain certificates in the
+  configured bundle are not enumerated (deferred).
+
 ## Dashboard
 
 A reference Grafana dashboard is committed at
@@ -520,7 +579,9 @@ A reference Grafana dashboard is committed at
 emitted surface: request rate / latency by method · status-class · route
 (`by_route`, topk) · upstream zone (`by_upstream`); body-size and upstream-timing
 quantiles (explicit-bucket); nginx `stub_status`; the exporter self-metrics; an
-error-rate panel (`ngx_otel.error_log.events`); a Loki panel for 4xx/5xx access logs;
+error-rate panel (`ngx_otel.error_log.events`); a serving-certificate expiry table
+(`ngx_otel.tls.certificate.time_to_expiration`, 30d/7d thresholds); a Loki panel
+for 4xx/5xx access logs;
 and the exemplar → Tempo trace pivot (`exemplarTraceIdDestinations` on the Tempo
 datasource) for the metric → exemplar → trace → log drill-down.
 
