@@ -306,24 +306,38 @@ tail -c "+$(( MID_SIZE + 1 ))" "${METRICS_LOG}" \
     > "${DELTA2}" || true
 [[ -s "${DELTA2}" ]] || fail "(6) no collector records after reload"
 
-GOT_SWAPPED="$(jq -r --arg p "${CERTS}/a.crt" \
+# Membership assertions (NOT order-dependent: `sort | tail -1` is
+# locale-collation-fragile for the CN strings, and old-exporter drain
+# flushes may interleave with the new exporter's during reload overlap).
+NOT_AFTER_VALUES="$(jq -r --arg p "${CERTS}/a.crt" \
     ".resourceMetrics[].scopeMetrics[].metrics[]
      | select(.name == \"ngx_otel.tls.certificate.not_after\")
      | .gauge.dataPoints[]
      | select(any(.attributes[]; .key == \"file_path\" and .value.stringValue == \$p))
-     | .asInt" "${DELTA2}" | sort -u | tail -1)"
-[[ "${GOT_SWAPPED}" == "${EXP_SWAPPED}" ]] \
-    || fail "(6) after reload expected not_after=${EXP_SWAPPED} for a.crt, last distinct value '${GOT_SWAPPED}'"
-SWAPPED_CN="$(jq -r --arg p "${CERTS}/a.crt" \
+     | .asInt" "${DELTA2}" | sort -u)"
+grep -qx "${EXP_SWAPPED}" <<< "${NOT_AFTER_VALUES}" \
+    || fail "(6) after reload expected not_after=${EXP_SWAPPED} for a.crt; distinct values: $(tr '\n' ' ' <<< "${NOT_AFTER_VALUES}")"
+SWAPPED_CNS="$(jq -r --arg p "${CERTS}/a.crt" \
     ".resourceMetrics[].scopeMetrics[].metrics[]
      | select(.name == \"ngx_otel.tls.certificate.not_after\")
      | .gauge.dataPoints[]
      | select(any(.attributes[]; .key == \"file_path\" and .value.stringValue == \$p))
      | .attributes[] | select(.key == \"tls.server.subject\").value.stringValue" \
-    "${DELTA2}" | sort -u | tail -1)"
-[[ "${SWAPPED_CN}" == "cert-a2.example.test" ]] \
-    || fail "(6) after reload expected subject CN cert-a2.example.test, got '${SWAPPED_CN}'"
-pass "(6) reload: swapped cert exported (not_after=${EXP_SWAPPED}, CN=cert-a2.example.test)"
+    "${DELTA2}" | sort -u)"
+grep -qx "cert-a2.example.test" <<< "${SWAPPED_CNS}" \
+    || fail "(6) after reload expected subject CN cert-a2.example.test; distinct CNs: $(tr '\n' ' ' <<< "${SWAPPED_CNS}")"
+# The swapped values must come from the SAME data point (CN + not_after
+# updated together): at least one post-reload point carries both.
+jq -e --arg p "${CERTS}/a.crt" --arg exp "${EXP_SWAPPED}" \
+    "[.resourceMetrics[].scopeMetrics[].metrics[]
+      | select(.name == \"ngx_otel.tls.certificate.not_after\")
+      | .gauge.dataPoints[]
+      | select(any(.attributes[]; .key == \"file_path\" and .value.stringValue == \$p))
+      | select(.asInt == \$exp)
+      | select(any(.attributes[]; .key == \"tls.server.subject\" and .value.stringValue == \"cert-a2.example.test\"))
+     ] | length > 0" "${DELTA2}" >/dev/null \
+    || fail "(6) no post-reload point carries BOTH not_after=${EXP_SWAPPED} and CN=cert-a2.example.test"
+pass "(6) reload: swapped cert exported (not_after=${EXP_SWAPPED}, CN=cert-a2.example.test on the same point)"
 
 # (5) NGINX Agent's metric name appears NOWHERE in our collector output.
 if grep -qF 'nginx.certificate.time_to_expiration' "${DELTA1}" "${DELTA2}"; then
