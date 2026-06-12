@@ -84,6 +84,7 @@ use alloc::string::{String, ToString};
 use core::ffi::{c_char, c_int, c_long, c_void, CStr};
 use core::pin::Pin;
 use core::ptr;
+use core::sync::atomic::{AtomicI64, Ordering};
 use core::task::{Context, Poll};
 use std::io;
 use std::sync::Once;
@@ -91,6 +92,26 @@ use std::sync::Once;
 use openssl_sys as ssl;
 
 use super::TransportError;
+
+// ── B1 collector-cert gauge ───────────────────────────────────────────────────
+
+/// `notAfter` of the peer certificate from the most recent successful TLS
+/// handshake with the collector, as Unix epoch seconds.
+///
+/// `0`  = no successful TLS handshake yet in this exporter generation
+///        (plaintext endpoint, or TLS not yet attempted) — the metric is
+///        **absent** (absent-not-zero precedent: stub_status H3F7) when this
+///        value is zero.
+///
+/// Written **once per successful handshake** by `TlsNgxConnIo::poll_handshake`
+/// (the exporter is single-threaded; the `Relaxed` store/load is sound because
+/// the write and the read in `collect_all_sources` happen on the same thread,
+/// the nginx exporter event loop, with no concurrent writers).
+///
+/// The value is **stable per exporter generation**: the collector cert does not
+/// change mid-connection; every handshake with the same collector endpoint
+/// writes the same value.
+pub(crate) static COLLECTOR_CERT_NOT_AFTER: AtomicI64 = AtomicI64::new(0);
 
 // ──────────────────────────────────────────────────────────────────────────────
 // TlsConfig + SSL_CTX builder
@@ -767,6 +788,57 @@ impl<I: hyper::rt::Read + hyper::rt::Write + Unpin + 'static> TlsNgxConnIo<I> {
         });
         if rc == 1 {
             self.handshake = HandshakeState::Done;
+            // B1 — Capture collector cert notAfter on first successful handshake.
+            //
+            // `SSL_get_peer_certificate` returns an OWNED `X509*` (unlike the
+            // get0 variants it increments the reference count); we MUST call
+            // `X509_free` after reading the field to avoid a reference leak.
+            //
+            // We call the SHARED `asn1_time_to_unix` helper from
+            // `crate::cert_table` — zero duplication of the epoch math.  The
+            // unit test asserts this reuse seam directly.
+            //
+            // Absent-not-zero: on failure (null cert or conversion error) the
+            // atomic is left at its initial value (0), so the metric stays
+            // absent.  On success the atomic is written once; subsequent
+            // handshakes (one new `TlsNgxConnIo` per send) overwrite with the
+            // same value (stable per endpoint/generation).
+            //
+            // SAFETY:
+            // - `self.ssl` is the owned, non-null SSL; handshake just succeeded.
+            // - `SSL_get1_peer_certificate` returns an OWNED `X509*` (the get1
+            //   variant increments the refcount; rc 1 guarantees handshake
+            //   completed and the peer cert was verified); NULL if the peer
+            //   sent no cert (should not happen for a server, but we guard).
+            // - `X509_getm_notAfter` returns an INTERNAL (get0) pointer owned by
+            //   the cert; valid until `X509_free` is called below.
+            // - `X509_free` decrements the refcount exactly once; we do not use
+            //   `cert` after this call.
+            // SAFETY: `SSL_get1_peer_certificate` returns an OWNED `X509*`
+            // (the get1 variant increments the refcount, unlike get0 which is
+            // borrowed).  We MUST call `X509_free` exactly once after reading.
+            let cert = unsafe { ssl::SSL_get1_peer_certificate(self.ssl) };
+            if !cert.is_null() {
+                // SAFETY: `cert` is the owned, non-null X509 obtained above;
+                // `X509_getm_notAfter` returns an internal (get0) borrow valid
+                // for the lifetime of `cert` (until `X509_free` below).
+                let not_after_asn1 = unsafe { ssl::X509_getm_notAfter(cert) };
+                // SAFETY: `not_after_asn1` is a valid borrow of `cert`'s
+                // notAfter field; `asn1_time_to_unix` only reads it; `cert`
+                // stays live until `X509_free` below.
+                let epoch_opt =
+                    // SAFETY: see comment above.
+                    unsafe { crate::cert_table::asn1_time_to_unix(not_after_asn1) };
+                if let Some(epoch_secs) = epoch_opt {
+                    // Relaxed is sound: the exporter is single-threaded; the
+                    // write and the read in `collect_all_sources` happen on the
+                    // same thread with no concurrent writers.
+                    COLLECTOR_CERT_NOT_AFTER.store(epoch_secs, Ordering::Relaxed);
+                }
+                // SAFETY: `cert` was obtained from `SSL_get_peer_certificate`
+                // (owned reference); freed exactly once here.
+                unsafe { ssl::X509_free(cert) };
+            }
             return Poll::Ready(Ok(()));
         }
         self.map_ssl_err(rc, "handshake")

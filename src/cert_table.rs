@@ -461,9 +461,12 @@ unsafe fn extract_cert_info(
 /// Method: diff against an `ASN1_TIME_set(NULL, 0)` epoch baseline, then
 /// `days * 86400 + secs` (`ASN1_TIME_to_tm` is not exposed by openssl-sys).
 ///
+/// Exposed as `pub(crate)` so that `src/transport/tls.rs` can reuse this
+/// helper for the B1 collector-cert gauge without duplicating the epoch math.
+///
 /// # Safety
 /// `t` must be NULL or a valid `ASN1_TIME*`.
-unsafe fn asn1_time_to_unix(t: *const ossl::ASN1_TIME) -> Option<i64> {
+pub(crate) unsafe fn asn1_time_to_unix(t: *const ossl::ASN1_TIME) -> Option<i64> {
     if t.is_null() {
         return None;
     }

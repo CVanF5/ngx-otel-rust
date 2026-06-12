@@ -63,8 +63,8 @@ use crate::shm::{
     logs_access_ring, logs_coalesce_table, logs_error_ring, logs_n_workers_from_zone,
     spans_n_workers_from_zone, spans_ring, DEFAULT_SPAN_RING_CAP,
 };
-use crate::transport::hyper_http::{extract_http_path, NgxConnector};
-use crate::transport::tls::TlsConfig;
+use crate::transport::hyper_http::{extract_http_path, NgxConnector, ParsedEndpoint};
+use crate::transport::tls::{TlsConfig, COLLECTOR_CERT_NOT_AFTER};
 use crate::transport::{GrpcTransport, HyperHttpTransport};
 
 // ── Self-metric atomics ──────────────────────────────────────────────────────
@@ -494,6 +494,15 @@ pub async fn export_loop(amcf: &'static MainConfig) {
         }
     };
 
+    // ── Collector host for the B1 collector-cert gauge attribute ─────────
+    // Parsed once at startup; stable per exporter generation.  Plaintext
+    // endpoints parse to a host string too — the gauge is gated on the
+    // COLLECTOR_CERT_NOT_AFTER atomic (which is only written by TLS
+    // handshakes), so no metric appears for plaintext even if the host is set.
+    let collector_host: std::string::String = ParsedEndpoint::parse(endpoint_str)
+        .map(|ep| std::string::String::from(ep.host_str()))
+        .unwrap_or_default();
+
     // ── Build extra headers ───────────────────────────────────────────────
     let headers: std::vec::Vec<(std::string::String, std::string::String)> = amcf
         .exporter_headers
@@ -816,6 +825,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                     worker_start_ns,
                     &processor,
                     my_gen,
+                    &collector_host,
                 )
                 .await;
                 EXPORT_LOOP_DONE.store(true, Ordering::Release);
@@ -1191,6 +1201,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                 worker_start_ns,
                 &processor,
                 my_gen,
+                &collector_host,
             )
             .await;
             EXPORT_LOOP_DONE.store(true, Ordering::Release);
@@ -1279,7 +1290,8 @@ pub async fn export_loop(amcf: &'static MainConfig) {
 
         // ── Collect fresh metrics from all sources ────────────────────────
         // Pdata pipeline: wrap → process → encode → send (Step U2).
-        let mut metrics_pd = Pdata::Metrics(collect_all_sources(amcf, worker_start_ns));
+        let mut metrics_pd =
+            Pdata::Metrics(collect_all_sources(amcf, worker_start_ns, &collector_host));
         processor.process(&mut metrics_pd);
         let n_pts = count_pdata_records(&metrics_pd);
         if n_pts > 0 {
@@ -1474,6 +1486,7 @@ async fn graceful_drain(
     worker_start_ns: u64,
     processor: &Processor,
     my_gen: u64,
+    collector_host: &str,
 ) {
     let log = ngx::log::ngx_cycle_log();
     let queued = queues.metrics.len();
@@ -1541,7 +1554,7 @@ async fn graceful_drain(
     }
 
     // Final freshly-collected metrics batch (Pdata pipeline, Step U2).
-    let mut final_pd = Pdata::Metrics(collect_all_sources(amcf, worker_start_ns));
+    let mut final_pd = Pdata::Metrics(collect_all_sources(amcf, worker_start_ns, collector_host));
     processor.process(&mut final_pd);
     let n_pts = count_pdata_records(&final_pd);
     if n_pts > 0 {
@@ -2122,7 +2135,7 @@ fn build_resource_attrs(amcf: &MainConfig) -> std::vec::Vec<KeyValue> {
 /// called both from the async export loop (which holds `'static`) and from
 /// the [`graceful_drain`] path, which holds a shorter-lived reference to the
 /// current cycle's config.
-fn collect_all_sources(amcf: &MainConfig, worker_start_ns: u64) -> Batch {
+fn collect_all_sources(amcf: &MainConfig, worker_start_ns: u64, collector_host: &str) -> Batch {
     let mut metrics = std::vec::Vec::new();
 
     // 1. NGINX connection / request counters (stub_status equivalents).
@@ -2194,6 +2207,20 @@ fn collect_all_sources(amcf: &MainConfig, worker_start_ns: u64) -> Batch {
     //    yields NO metrics, so the three `ngx_otel.tls.certificate.*` series
     //    are ABSENT — not present-as-zero (stub_status H3F7 precedent).
     metrics.extend(ServingCertSource { certs: &amcf.cert_table }.collect());
+
+    // 6. B1 — Collector-cert gauge.
+    //    Emitted only once the first TLS handshake with the collector has
+    //    completed (COLLECTOR_CERT_NOT_AFTER != 0).  Plaintext endpoints and
+    //    pre-handshake state → metric ABSENT (absent-not-zero precedent).
+    //    The value is stable per exporter generation (same cert per collector
+    //    endpoint; each successful handshake writes the same epoch value).
+    {
+        let not_after = COLLECTOR_CERT_NOT_AFTER.load(Ordering::Relaxed);
+        if not_after != 0 {
+            let now_ns = crate::util::now_unix_nano();
+            metrics.push(collector_cert_gauge(not_after, now_ns, collector_host));
+        }
+    }
 
     Batch {
         resource: Resource { attributes: build_resource_attrs(amcf) },
@@ -2734,6 +2761,33 @@ fn gauge_metric(name: &str, desc: &str, unit: &str, value: i64, time_ns: u64) ->
     }
 }
 
+/// Build the B1 collector-cert Gauge with a single data point.
+///
+/// `server_address` is the collector hostname or IP-literal (parsed from the
+/// configured `otel_exporter` endpoint).  Only one attribute is emitted — per
+/// the scope guard — exactly as documented in `TELEMETRY_MODEL.md`.
+fn collector_cert_gauge(not_after: i64, time_ns: u64, server_address: &str) -> Metric {
+    Metric {
+        name: "ngx_otel.tls.collector_cert.not_after".into(),
+        description: "Collector TLS certificate notAfter (Unix epoch seconds), \
+                      captured post-handshake; absent before the first TLS \
+                      handshake and on plaintext (http://) endpoints"
+            .into(),
+        unit: "s".into(),
+        data: MetricData::Gauge(GaugeData {
+            data_points: std::vec![NumberDataPoint {
+                attributes: std::vec![KeyValue {
+                    key: "server.address".into(),
+                    value: AnyValue::String(server_address.into()),
+                }],
+                start_time_unix_nano: 0,
+                time_unix_nano: time_ns,
+                value: NumberValue::AsInt(not_after),
+            }],
+        }),
+    }
+}
+
 /// Build the `ngx_otel.error_log.events` Sum metric (Phase 2.3 DP-B).
 ///
 /// Sums `WorkerSlots::error_rate_counters` across all workers, producing one
@@ -3003,7 +3057,7 @@ mod tests {
 
         // ── (a) Metrics Resource ──────────────────────────────────────────────
         // Pass 1
-        let batch1 = collect_all_sources(&amcf, 0);
+        let batch1 = collect_all_sources(&amcf, 0, "");
         let id1 = find_attr(&batch1.resource.attributes, "service.instance.id")
             .expect("service.instance.id must be present in metrics Resource (pass 1)");
         assert_eq!(
@@ -3013,7 +3067,7 @@ mod tests {
         );
 
         // Pass 2 — stability: same id without changing MASTER_PID
-        let batch2 = collect_all_sources(&amcf, 0);
+        let batch2 = collect_all_sources(&amcf, 0, "");
         let id2 = find_attr(&batch2.resource.attributes, "service.instance.id")
             .expect("service.instance.id must be present in metrics Resource (pass 2)");
         assert_eq!(id1, id2, "service.instance.id must be stable across successive encode calls");
@@ -3061,7 +3115,7 @@ mod tests {
     #[test]
     fn collect_all_sources_omits_stub_status_without_stat_stub() {
         let amcf = crate::config::MainConfig::default();
-        let batch = collect_all_sources(&amcf, 0);
+        let batch = collect_all_sources(&amcf, 0, "");
 
         let stub_names = [
             "nginx.connections.accepted",
@@ -3095,7 +3149,7 @@ mod tests {
 
         // Empty table (the MainConfig default — also the no-ssl-build shape).
         let mut amcf = crate::config::MainConfig::default();
-        let batch = collect_all_sources(&amcf, 0);
+        let batch = collect_all_sources(&amcf, 0, "");
         for m in &batch.metrics {
             assert!(
                 !cert_names.contains(&m.name.as_str()),
@@ -3116,7 +3170,7 @@ mod tests {
             pubkey_alg: "RSA".into(),
             sig_alg: "RSA-SHA256".into(),
         });
-        let batch = collect_all_sources(&amcf, 0);
+        let batch = collect_all_sources(&amcf, 0, "");
         for name in cert_names {
             assert!(
                 batch.metrics.iter().any(|m| m.name == name),
