@@ -480,7 +480,7 @@ Standard OTel HTTP semconv attributes recorded on every span:
 
 ### One span per request (internal redirects & subrequests)
 
-Mirrors the C++ `nginx-otel` module's redirect-safe design (H3F1):
+Mirrors the C++ `nginx-otel` module's redirect-safe design:
 
 - **Internal redirects** (`error_page`, `try_files`, named locations) re-run the
   REWRITE phase with `r->internal` set and the per-request module-ctx array

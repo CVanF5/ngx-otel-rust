@@ -78,7 +78,7 @@ Verdicts: **TRUE** = verified against code (no action needed); **FALSE** = comme
 | :48 | "would add ~1.8 × 10^19 to the cumulative sum" (C1 doc) | TRUE | `(ngx_msec_t)-1` as u64 = u64::MAX; correct math |
 | :61 | "No allocation guarantee" | TRUE | Enforced by `f_worst_case_record_no_alloc` test |
 | :102 | "catch the [null slot] case" | TRUE | Bounds-check path verified by A1 regression |
-| :108 | "Hard invariant violation" (zone undersized) | TRUE | alert + module-disable; verified by A1/A1b tests |
+| :108 | "Hard invariant violation" (zone undersized) | TRUE | alert + module-disable; verified by zone-sizing tests |
 | :157 | "always ≥ 0, NTP-immune" (monotonic clock) | TRUE | `CLOCK_MONOTONIC`; `elapsed()` is non-negative by construction |
 | :184 | "`status_class` and `base_idx` always computed" | TRUE | F2 fix comment; histogram bump unconditional, gate is after |
 | :318 | "histogram bump above is always-on and NOT gated here" | TRUE | Comment describes the F2 invariant correctly |
