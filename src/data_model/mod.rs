@@ -64,14 +64,13 @@ pub struct Metric {
 
 /// The data payload of a metric.
 ///
-/// Phase 1.1 carries three shapes: histograms for the request-duration /
+/// Carries several shapes: histograms for the request-duration /
 /// upstream-latency surface, sums for monotonic counters (`ngx_otel.dropped_records`,
-/// `ngx_otel.send_failures`), and gauges for non-monotonic instantaneous
-/// readings (`ngx_otel.export_interval_seconds`).  Per OTLP semantics these
+/// `ngx_otel.send_failures`), gauges for non-monotonic instantaneous
+/// readings (`ngx_otel.export_interval_seconds`), and an exponential histogram
+/// for the request-duration metric.  Per OTLP semantics these
 /// must be distinct variants — emitting a counter as a single-bucket histogram
 /// causes downstream backends to misclassify the metric type.
-///
-/// Phase 2.2 DP-F adds `ExponentialHistogram` for the request-duration metric.
 #[derive(Debug, Clone)]
 pub enum MetricData {
     Histogram(HistogramData),
@@ -147,14 +146,14 @@ pub struct HistogramDataPoint {
     pub explicit_bounds: std::vec::Vec<f64>,
 }
 
-/// An OTel exponential histogram metric aggregation (Phase 2.2 DP-F).
+/// An OTel exponential histogram metric aggregation.
 #[derive(Debug, Clone)]
 pub struct ExponentialHistogramData {
     pub aggregation_temporality: AggregationTemporality,
     pub data_points: std::vec::Vec<ExponentialHistogramDataPoint>,
 }
 
-/// An OTel exemplar attached to a histogram data point (Phase 2.2 Step 2.2.4).
+/// An OTel exemplar attached to a histogram data point.
 ///
 /// Carries a representative observation with optional trace context.
 #[derive(Debug, Clone)]
@@ -170,7 +169,6 @@ pub struct Exemplar {
     /// Whether `trace_id` / `span_id` carry valid trace context.
     pub has_trace: bool,
     /// Per-exemplar high-cardinality attributes (url.path, client.address, user_agent).
-    /// Added in Step 2.2.5; empty in Step 2.2.4.
     pub filtered_attributes: std::vec::Vec<KeyValue>,
 }
 
@@ -201,7 +199,7 @@ pub struct ExponentialHistogramDataPoint {
     pub positive_offset: i32,
     pub positive_bucket_counts: std::vec::Vec<u64>,
     // `negative` is always empty for request durations (non-negative).
-    /// Exemplars sampled from the reservoir (Step 2.2.4).  One per representative
+    /// Exemplars sampled from the reservoir.  One per representative
     /// observation for this histogram data point.  May be empty.
     pub exemplars: std::vec::Vec<Exemplar>,
 }
@@ -222,7 +220,7 @@ pub struct Batch {
 }
 
 // ────────────────────────────────────────────────────────────────
-// Log types (Phase 2.1)
+// Log types
 // ────────────────────────────────────────────────────────────────
 
 /// OTel severity number per the OTel Log Data Model spec.
@@ -262,9 +260,9 @@ pub enum SeverityNumber {
 
 /// A single OTel log record.
 ///
-/// Mirrors the `LogRecord` proto message shape (Phase 2.1).
-/// `trace_id` / `span_id` are left empty — Phase 3 will correlate with
-/// spans.  `body` carries a short string for access logs; structured
+/// Mirrors the `LogRecord` proto message shape.
+/// `trace_id` / `span_id` may be left empty when there is no span to correlate
+/// with.  `body` carries a short string for access logs; structured
 /// attributes carry the HTTP semconv fields.
 #[derive(Debug, Clone)]
 pub struct LogRecord {
@@ -285,7 +283,7 @@ pub struct LogRecord {
     pub event_name: std::string::String,
     /// W3C trace context (16 bytes), empty when absent. Carried natively on the
     /// `LogRecord` (not as an attribute) so the management plane can pivot to the
-    /// trace. Populated from an inbound `traceparent` (Phase 2.2.3).
+    /// trace. Populated from an inbound `traceparent`.
     pub trace_id: std::vec::Vec<u8>,
     /// W3C span id (8 bytes), empty when absent.
     pub span_id: std::vec::Vec<u8>,
@@ -303,7 +301,7 @@ pub struct LogsBatch {
 }
 
 // ────────────────────────────────────────────────────────────────
-// Trace types (Phase 3.1)
+// Trace types
 // ────────────────────────────────────────────────────────────────
 
 /// OTel span kind — mirrors `SpanKind` in `trace.proto`.
@@ -364,7 +362,7 @@ pub struct SpanLink {
 /// Rule: do NOT `use opentelemetry_proto::*` in this module.
 /// Raw field bytes are carried here; protobuf is built in the exporter.
 ///
-/// Phase 3.1 cold-path: constructed synthetically; real spans arrive in Loop 2.
+/// Represents one OTel span.
 #[derive(Debug, Clone)]
 pub struct Span {
     /// 16-byte W3C trace ID.
@@ -415,8 +413,8 @@ pub struct SpansBatch {
 /// keeping signal-specific logic inside the processor while exposing a
 /// single entry point to the pipeline.
 ///
-/// **Row-backed, no Arrow** — Arrow is a Phase 5 representation swap inside
-/// the same enum shape.
+/// **Row-backed, no Arrow** — a future OTel Arrow transport would be a
+/// representation swap inside the same enum shape.
 #[derive(Debug, Clone)]
 pub enum Pdata {
     /// A metrics batch (Prometheus-model counters, histograms, gauges).

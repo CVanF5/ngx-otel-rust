@@ -3,26 +3,26 @@
 // This source code is licensed under the Apache License, Version 2.0 license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! Config-time TLS serving-certificate table (TLS cert-metrics item C2).
+//! Config-time TLS serving-certificate table.
 //!
 //! At `postconfiguration` time (single-threaded master, before workers fork)
 //! we walk every `server {}` block, find its `ngx_http_ssl_module` srv conf,
 //! and enumerate EVERY leaf certificate installed in the server's `SSL_CTX`
-//! (decision Q5: dual RSA+ECDSA blocks must yield BOTH certs).  Each cert is
-//! reduced to a [`CertInfo`] row — identity fields only, per the Phase C scope
-//! guard: file path, server name, validity window, subject/issuer CN, serial,
+//! (dual RSA+ECDSA blocks must yield BOTH certs).  Each cert is
+//! reduced to a [`CertInfo`] row — identity fields only:
+//! file path, server name, validity window, subject/issuer CN, serial,
 //! public-key algorithm, signature algorithm.  Nothing else is extracted (no
 //! PEM, no keys, no fingerprints, no full DNs, no SANs, no key sizes).
 //!
-//! The resulting `Vec<CertInfo>` is stored on [`MainConfig`] (plain Rust heap,
+//! The resulting `Vec<CertInfo>` is stored on `MainConfig` (plain Rust heap,
 //! written once here, read-only afterwards) and is inherited by the exporter
-//! process at fork.  C3 builds the `ngx_otel.tls.certificate.*` gauges on top.
+//! process at fork.  The `ngx_otel.tls.certificate.*` gauges are built on top.
 //!
-//! Layering notes (decisions of record):
+//! Layering notes:
 //! - `ngx_http_ssl_srv_conf_t` is dereferenced ONLY in the C shim
-//!   (`src/shim/ngx_otel_ssl_shim.c`) — see the shim header for the C1
-//!   premise-correction rationale.  `ngx_ssl_t`'s `ctx`/`certs` fields are the
-//!   recorded exception (bitfield-free core struct, layout verified in C1).
+//!   (`src/shim/ngx_otel_ssl_shim.c`) — see the shim header for the rationale.
+//!   `ngx_ssl_t`'s `ctx`/`certs` fields are the exception read directly from
+//!   Rust (bitfield-free core struct, layout verified against nginx).
 //! - The `ngx_http_ssl_module` global symbol is deliberately NEVER referenced
 //!   from Rust: nginx loads dynamic modules with `dlopen(RTLD_NOW)`, so an
 //!   undefined data symbol would make a no-ssl nginx binary REFUSE to load us.
@@ -48,8 +48,8 @@ use crate::config::MainConfig;
 
 /// One serving leaf certificate, collected once at config time.
 ///
-/// Field set is FROZEN by the Phase C scope guard (joint review) — do not add
-/// fields without a new decision of record.
+/// Field set is intentionally minimal (identity only) — do not add fields
+/// without a deliberate scope decision.
 #[derive(Debug, Clone)]
 pub struct CertInfo {
     /// Certificate file path as configured by `ssl_certificate`.
@@ -246,9 +246,8 @@ unsafe fn collect_server_certs(
     if ssl.is_null() {
         return;
     }
-    // `ngx_ssl_t` field reads through the bindings are the recorded exception
-    // to the shim rule: bitfield-free struct, layout verified in C1
-    // (tests/RESULTS-c1-bindings-2026-06-12.txt).
+    // `ngx_ssl_t` field reads through the bindings are the exception
+    // to the shim rule: bitfield-free struct, layout verified against nginx.
     // SAFETY: `ssl` is the non-null `ngx_ssl_t*` embedded in conf-pool memory;
     // reading its `ctx` pointer field is sound.
     let ngx_ssl_ctx: *mut nginx_sys::SSL_CTX = unsafe { (*ssl).ctx };
@@ -312,7 +311,7 @@ unsafe fn collect_server_certs(
     // declares another; the pointee is identical.
     let ssl_ctx: *mut ossl::SSL_CTX = ngx_ssl_ctx.cast::<ossl::SSL_CTX>();
 
-    // Enumerate every leaf cert in the ctx (Q5 full enumeration).
+    // Enumerate every leaf cert in the ctx (full enumeration).
     let mut enumerated: Vec<*mut ossl::X509> = Vec::new();
     // SAFETY: `ssl_ctx` is the server's live config-time SSL_CTX; we are in
     // the single-threaded master before workers fork, which is the shim
@@ -462,7 +461,7 @@ unsafe fn extract_cert_info(
 /// `days * 86400 + secs` (`ASN1_TIME_to_tm` is not exposed by openssl-sys).
 ///
 /// Exposed as `pub(crate)` so that `src/transport/tls.rs` can reuse this
-/// helper for the B1 collector-cert gauge without duplicating the epoch math.
+/// helper for the collector-cert gauge without duplicating the epoch math.
 ///
 /// # Safety
 /// `t` must be NULL or a valid `ASN1_TIME*`.

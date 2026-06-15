@@ -3,7 +3,7 @@
 // This source code is licensed under the Apache License, Version 2.0 license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! Access-record formatter (Phase 2.1).
+//! Access-record formatter.
 //!
 //! Formats a fixed-shape HTTP access log record **on the stack** (no heap
 //! allocation) and pushes it into the calling worker's per-worker ring via
@@ -22,17 +22,17 @@
 //! [u64 response_bytes big-endian ]
 //! [u16 client_addr_len big-endian]
 //! [client_addr_len bytes         ]
-//! --- Phase 2.2 Step 2.2.3: W3C trace correlation ---
+//! --- W3C trace correlation ---
 //! [u8  has_trace  = 0|1          ]  (1 = valid traceparent was present)
 //! if has_trace == 1:
 //!   [16 bytes trace_id            ]
 //!   [8  bytes span_id (parent_id) ]
-//! --- Phase 2.2 Step 2.2.5: high-cardinality detail ---
+//! --- high-cardinality detail ---
 //! [u16 url_path_len big-endian   ]
 //! [url_path_len bytes of url.path]
 //! [u16 user_agent_len big-endian ]
 //! [user_agent_len bytes          ]
-//! --- Phase 2 S2: request duration ---
+//! --- request duration ---
 //! [u64 duration_us big-endian    ]  (µs; same unit as exp-histogram)
 //! ```
 //!
@@ -60,12 +60,12 @@ use super::LogProducer;
 /// - 2  (client_addr_len) + `MAX_CLIENT_ADDR` = 46 bytes (max IPv6 with brackets + port)
 /// - 1  (has_trace) + 16 (trace_id) + 8 (span_id) = 25 bytes
 ///
-/// Phase 2.2 Step 2.2.5 — high-cardinality detail:
+/// High-cardinality detail:
 ///
 /// - 2  (url_path_len) + `MAX_URL_PATH` = 64 bytes
 /// - 2  (user_agent_len) + `MAX_USER_AGENT` = 128 bytes
 ///
-/// Phase 2 S2 — request duration:
+/// Request duration:
 ///
 /// - 8  (duration_us, big-endian u64 — µs precision, same unit as exp-histogram)
 ///
@@ -133,7 +133,7 @@ pub struct SampledRequest<'a> {
     pub url_path: &'a [u8],
     /// `user_agent.original` — high-cardinality, tail/exemplar only.
     pub user_agent: &'a [u8],
-    /// Request duration in microseconds — exemplar value + log attribute (decision #3).
+    /// Request duration in microseconds — exemplar value + log attribute.
     pub duration_us: u64,
     /// Base `{method × status_class × protocol}` combo index — histogram join key.
     pub combo_idx: u32,
@@ -148,7 +148,7 @@ pub struct SampledRequest<'a> {
     pub response_bytes: u64,
     /// Client address string (e.g. `b"127.0.0.1"`).
     pub client_addr: &'a [u8],
-    // route_idx/upstream_idx: deferred to Phase 3 — see PHASE_3_NOTES.md
+    // route_idx/upstream_idx: deferred.
 }
 
 /// HTTP access record kind byte.
@@ -225,7 +225,7 @@ pub fn emit_access_record(producer: &dyn LogProducer, req: &SampledRequest<'_>) 
     // client.address
     write_bytes_with_u16_len!(req.client_addr, MAX_CLIENT_ADDR);
 
-    // W3C trace correlation (Phase 2.2.3).
+    // W3C trace correlation.
     match req.trace {
         Some((trace_id, span_id)) => {
             write_u8!(1u8); // has_trace = 1
@@ -239,14 +239,14 @@ pub fn emit_access_record(producer: &dyn LogProducer, req: &SampledRequest<'_>) 
         }
     }
 
-    // High-cardinality detail (Phase 2.2.5) — on tail/exemplar records ONLY.
-    // NEVER promoted to metric dimensions (plan §DP-E; keeps combo index WithinU8).
+    // High-cardinality detail — on tail/exemplar records ONLY.
+    // NEVER promoted to metric dimensions (keeps the combo index within a u8).
     write_bytes_with_u16_len!(req.url_path, MAX_URL_PATH);
     write_bytes_with_u16_len!(req.user_agent, MAX_USER_AGENT);
 
-    // Request duration (Phase 2 S2 — decision #3): carries µs duration so the
-    // tail LogRecord can surface `http.server.request.duration` without a second
-    // time read on the export path.
+    // Request duration: carries µs duration so the tail LogRecord can surface
+    // `http.server.request.duration` without a second time read on the export
+    // path.
     write_u64_be!(req.duration_us);
 
     producer.push(&buf[..pos])
@@ -264,7 +264,6 @@ pub fn emit_access_record(producer: &dyn LogProducer, req: &SampledRequest<'_>) 
 ///
 /// Used by tests and as the simplified accessor when flags are not needed.
 /// Production hot path uses [`parse_traceparent_full`] which also returns flags.
-/// `#[allow(dead_code)]` guards the S1→S3 gap; removed when `inject` / S3 uses it.
 #[allow(dead_code)]
 pub fn parse_traceparent(header: &[u8]) -> Option<([u8; 16], [u8; 8])> {
     parse_traceparent_full(header).map(|(tid, sid, _)| (tid, sid))
@@ -520,7 +519,7 @@ mod tests {
         );
     }
 
-    /// F7 — Table-driven W3C traceparent parser: strict rejection per spec.
+    /// Table-driven W3C traceparent parser: strict rejection per spec.
     ///
     /// Each row is (header, expected_result_is_some, description).
     ///
@@ -658,7 +657,7 @@ mod tests {
         }
     }
 
-    /// F7 — Root spans export empty parent_span_id; child spans export 8 bytes.
+    /// Root spans export empty parent_span_id; child spans export 8 bytes.
     ///
     /// OTLP `Span.parent_span_id` is a `bytes` field: empty = root span,
     /// 8 bytes = child span.  The ring wire format stores [0u8;8] for root spans;
@@ -781,7 +780,7 @@ mod tests {
     /// `MAX_ACCESS_RECORD`.  Also verifies the record is exactly
     /// `ACCESS_RECORD_WORST_CASE` bytes (all caps hit simultaneously).
     ///
-    /// This test guards against the C1 regression where `MAX_ACCESS_RECORD = 320`
+    /// This test guards against a regression where `MAX_ACCESS_RECORD = 320`
     /// but the 323-byte worst-case record triggered an index-out-of-bounds panic.
     #[test]
     fn access_record_worst_case_fits_in_buffer() {

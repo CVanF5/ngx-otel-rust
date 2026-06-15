@@ -3,7 +3,7 @@
 // This source code is licensed under the Apache License, Version 2.0 license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! OTel error-log writer — `ngx_log_writer_pt` implementation (Phase 2.3 §6.6.2).
+//! OTel error-log writer — `ngx_log_writer_pt` implementation.
 //!
 //! # Architecture
 //!
@@ -20,12 +20,12 @@
 //!   writer fires from signal handlers and OOM paths.
 //! - **No logging from the writer** — would cause re-entrancy.
 //! - **No request-context deref** — the writer's `log->wdata` is `OtelErrorWriterState`
-//!   (our own state); `log->data` is not a request context here (decision #6, 2026-06-05).
+//!   (our own state); `log->data` is not a request context here.
 //!
-//! ## Multi-origin guard (DP-C — added at Step 2.3.5)
-//! The writer is woven into the chain before workers fork.  The DP-C
-//! process-role guard (`exporter::ngx_process() == Worker`) is added at
-//! Step 2.3.5 so the writer is a no-op in master/config-load/exporter contexts.
+//! ## Multi-origin guard
+//! The writer is woven into the chain before workers fork.  A process-role
+//! guard (`exporter::ngx_process() == Worker`) ensures the writer is a no-op in
+//! master/config-load/exporter contexts.
 //!
 //! ## Verbatim opt-out (`otel_error_log_coalesce off`)
 //! Best-effort, NOT guaranteed delivery.  Verbatim mode pushes every
@@ -87,17 +87,17 @@ pub struct OtelErrorWriterState {
     /// `level > level_floor` ⇒ less severe than the threshold ⇒ drop.
     pub level_floor: ngx_uint_t,
     /// The logs shm zone pointer (set by `init_process`; null until then).
-    /// Used by the coalescer (Step 2.3.2) and error-rate metric (Step 2.3.4).
+    /// Used by the coalescer and error-rate metric.
     pub logs_zone: *mut ngx_shm_zone_t,
     /// Pre-computed pointer to this worker's coalescer table within the logs shm zone.
-    /// Set by `init_process` (Step 2.3.5) alongside `coalesce_enabled`.
-    /// The coalescer path is a no-op (fall-through to TODO 2.3.3 ring push) until this is non-null.
+    /// Set by `init_process` alongside `coalesce_enabled`.
+    /// The coalescer path is a no-op (fall-through to the ring push) until this is non-null.
     pub coalesce_table: *mut CoalesceSlot,
-    /// Mirrors `MainConfig::error_log_coalesce`.  Set by `init_process` (Step 2.3.5).
+    /// Mirrors `MainConfig::error_log_coalesce`.  Set by `init_process`.
     /// Default zero/false means "no coalescing"; overridden before first error is emitted.
     pub coalesce_enabled: bool,
     /// Pre-computed pointer to the start of the **error ring** header for this worker
-    /// (within the logs shm zone).  Set by `init_process` (Step 2.3.5) at the same time
+    /// (within the logs shm zone).  Set by `init_process` at the same time
     /// as `coalesce_table`.  Null until then; writer silently skips the ring push.
     ///
     /// SAFETY invariant: non-null ⇒ the pointer is valid for
@@ -105,7 +105,7 @@ pub struct OtelErrorWriterState {
     /// long as the worker process.
     pub error_ring_ptr: *mut u8,
     /// Pre-computed pointer to `WorkerSlots::error_rate_counters[0]` for this worker
-    /// in the metrics shm zone (Phase 2.3 DP-B).  Set by `init_process` (Step 2.3.5);
+    /// in the metrics shm zone.  Set by `init_process`;
     /// null until then — the metric bump is a no-op.
     ///
     /// The array has `N_SEVERITY_CLASSES` elements; index with
@@ -141,9 +141,9 @@ unsafe impl Sync for OtelErrorWriterState {}
 /// 1. Cleanup flag — drop if cycle is tearing down.
 /// 2. Busy flag — drop re-entrant / concurrent calls.
 /// 3. Severity floor — drop if `level > level_floor`.
-/// 4. Process-role guard (DP-C, Step 2.3.5): Worker + logs shm mapped.
-/// 5. Error-rate metric bump (DP-B, Step 2.3.4): every floor-passing event.
-/// 6. Coalescer / verbatim push (Step 2.3.2 + 2.3.3).
+/// 4. Process-role guard: Worker + logs shm mapped.
+/// 5. Error-rate metric bump: every floor-passing event.
+/// 6. Coalescer / verbatim push.
 ///
 /// # Safety
 /// `log` must be a non-null pointer to an `ngx_log_t` whose `wdata` is a
@@ -174,7 +174,7 @@ pub unsafe extern "C" fn ngx_otel_error_writer(
         return;
     }
 
-    // 4. Process-role guard (DP-C, Step 2.3.5).
+    // 4. Process-role guard.
     //    The writer fires in EVERY nginx context (master, config-load, workers,
     //    exporter helper) because the chain node is inserted before fork.  Only
     //    worker processes have the logs shm mapped AND should touch the ring/coalescer.
@@ -191,10 +191,10 @@ pub unsafe extern "C" fn ngx_otel_error_writer(
         return;
     }
 
-    // 4a. Companion error-rate metric bump (Step 2.3.4, DP-B).
+    // 4a. Companion error-rate metric bump.
     //     Fires for EVERY floor-passing event, independent of coalescing — counts
     //     the true event volume, not just the verbatim samples.
-    //     error_rate_ptr is null until init_process (Step 2.3.5); no-op until then.
+    //     error_rate_ptr is null until init_process; no-op until then.
     let error_rate = (*state).error_rate_ptr;
     if !error_rate.is_null() {
         let idx = crate::shm::severity_class_index(level as u8);
@@ -203,9 +203,9 @@ pub unsafe extern "C" fn ngx_otel_error_writer(
         (*error_rate.add(idx)).fetch_add(1, Ordering::Relaxed);
     }
 
-    // 5. Coalescer (Step 2.3.2): exact-hash dedup with verbatim exception tail.
-    //    coalesce_table is null until init_process (Step 2.3.5) populates it.
-    //    When null, fall through (no record pushed yet; ring push wired at Step 2.3.3).
+    // 5. Coalescer: exact-hash dedup with verbatim exception tail.
+    //    coalesce_table is null until init_process populates it.
+    //    When null, fall through (no record pushed).
     let coalesce_table = (*state).coalesce_table;
     if !coalesce_table.is_null() {
         // SAFETY: buf is valid for `len` bytes per ngx_log_error_core contract.
@@ -218,8 +218,8 @@ pub unsafe extern "C" fn ngx_otel_error_writer(
                 return;
             }
             CoalesceResult::EmitVerbatim { template_hash } => {
-                // Push the verbatim sample to the error ring (Step 2.3.3).
-                // error_ring_ptr is null until init_process (Step 2.3.5) — skip silently.
+                // Push the verbatim sample to the error ring.
+                // error_ring_ptr is null until init_process — skip silently.
                 let ring_ptr = (*state).error_ring_ptr;
                 if !ring_ptr.is_null() {
                     // OTel timestamps are Unix-epoch nanoseconds. Use nginx's cached
@@ -283,7 +283,7 @@ fn cached_unix_nanos(tp: *const nginx_sys::ngx_time_t) -> u64 {
 /// so 532 bytes is safe.
 ///
 /// # Safety
-/// `ring_ptr` must be a valid pointer to an initialised [`LogsWorkerRingHeader`]
+/// `ring_ptr` must be a valid pointer to an initialised `LogsWorkerRingHeader`
 /// in the logs shm zone, valid for the duration of this call.
 pub unsafe fn push_error_record(
     ring_ptr: *mut u8,
@@ -314,7 +314,7 @@ pub unsafe fn push_error_record(
 /// Walk the `cycle->new_log` chain and set `cleanup = true` on every
 /// `OtelErrorWriterState` node (identified by `writer == ngx_otel_error_writer`).
 ///
-/// Called from `ngx_otel_exit_process` (Step 2.3.3) to stop new emissions before
+/// Called from `ngx_otel_exit_process` to stop new emissions before
 /// the nginx cycle tears down its log infrastructure.  After this returns, any
 /// call to the writer exits immediately at the cleanup-flag check without touching
 /// the ring or the coalescer.
@@ -355,7 +355,7 @@ pub unsafe fn set_cleanup_flag(cycle: *const nginx_sys::ngx_cycle_t) {
     }
 }
 
-// ── Init-process wiring (Step 2.3.5) ─────────────────────────────────────────
+// ── Init-process wiring ──────────────────────────────────────────────────────
 
 /// Walk `cycle->new_log` and populate `OtelErrorWriterState` with the three
 /// pre-computed shm pointers: coalescer table, error ring, and error-rate counter base,
@@ -498,14 +498,14 @@ mod tests {
             level_floor,
             logs_zone: core::ptr::null_mut(),
             // coalesce_table null: coalescer path is dormant in unit tests
-            // (no shm available; init_process wires this at Step 2.3.5).
+            // (no shm available; init_process wires this).
             coalesce_table: core::ptr::null_mut(),
             coalesce_enabled: false,
             // error_ring_ptr null: ring-push path is dormant in unit tests
-            // (no logs shm available; init_process wires this at Step 2.3.5).
+            // (no logs shm available; init_process wires this).
             error_ring_ptr: core::ptr::null_mut(),
             // error_rate_ptr null: metric-bump path is dormant in unit tests
-            // (no metrics shm available; init_process wires this at Step 2.3.5).
+            // (no metrics shm available; init_process wires this).
             error_rate_ptr: core::ptr::null_mut(),
         });
         // SAFETY: `ngx_log_t` is a plain C struct, so an all-zero bit pattern is
@@ -697,7 +697,7 @@ mod tests {
         }
     }
 
-    /// Verify the process-role guard (DP-C) fires before the metric bump and
+    /// Verify the process-role guard fires before the metric bump and
     /// coalescer: when `logs_zone` is null (or ngx_process() returns non-Worker),
     /// a floor-passing event must NOT touch `error_rate_ptr` or the coalescer.
     ///
@@ -752,7 +752,7 @@ mod tests {
     /// read by Loki (and any freshness-windowed OTLP backend) as ~1970 and the
     /// whole batch is rejected (HTTP 400). This asserts the conversion math and,
     /// crucially, that the result is a *plausible wall-clock* value — the hard
-    /// assert the original Phase 2.3 suite lacked (it ran against a file exporter
+    /// assert the original test suite lacked (it ran against a file exporter
     /// that never validated timestamps).
     #[test]
     fn cached_unix_nanos_is_wall_clock_not_monotonic() {

@@ -623,7 +623,7 @@ mod tests {
 
     /// Encode a Batch carrying an ExponentialHistogram data point, decode it,
     /// and verify scale / zero_count / positive buckets round-trip correctly.
-    /// This is the Phase 2.2 DP-F verification gate.
+    /// This is the exponential-histogram round-trip verification gate.
     #[test]
     fn exp_histogram_roundtrips() {
         use crate::data_model::{
@@ -713,7 +713,7 @@ mod tests {
     }
 
     /// Encode a [`SpansBatch`] with one server span, decode it, and assert
-    /// structural equivalence.  This is the S1 round-trip verification gate.
+    /// structural equivalence.  This is the spans round-trip verification gate.
     #[test]
     fn traces_round_trip() {
         use crate::data_model::{Span, SpanKind, SpanStatus, SpansBatch, StatusCode};

@@ -3,7 +3,7 @@
 // This source code is licensed under the Apache License, Version 2.0 license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! Per-request span context (`SpanCtx`) — Phase 3.3 hot path.
+//! Per-request span context (`SpanCtx`) — hot path.
 //!
 //! `SpanCtx` is allocated once on the **nginx request pool** in the Rewrite phase
 //! and stored via `set_module_ctx`.  The Log phase reads it back via
@@ -37,9 +37,9 @@ use ngx::core::Pool;
 /// before use (see `span_start.rs`), the zeroed-bytes state is never observed.
 ///
 /// Fields `parent_span_id`, `flags`, `start_time_unix_nano`, and `start_mono`
-/// are written in S1 (REWRITE) and consumed in S2 (LOG span record).
+/// are written in REWRITE and consumed in the LOG span record.
 ///
-/// # Dual-clock span timing (D-2 fix)
+/// # Dual-clock span timing
 /// Two anchors are captured at REWRITE:
 /// - `start_time_unix_nano`: wall-clock absolute timestamp for the span start.
 /// - `start_mono`: monotonic anchor; `start_mono.elapsed()` at LOG gives the
@@ -52,21 +52,21 @@ pub struct SpanCtx {
     /// This request's span ID (8 bytes, newly generated in REWRITE).
     pub span_id: [u8; 8],
     /// Inbound parent span ID from `traceparent` (zeros = root span).
-    /// Written in S1 (REWRITE); read in S2 (LOG span record).
+    /// Written in REWRITE; read in the LOG span record.
     pub parent_span_id: [u8; 8],
     /// W3C trace flags low byte (bit 0 = sampled, as recorded in traceparent).
-    /// Written in S1 (REWRITE); read in S2 (LOG span record).
+    /// Written in REWRITE; read in the LOG span record.
     pub flags: u32,
     /// Span start time — Unix epoch, nanoseconds (set at REWRITE phase entry).
     /// Wall-clock anchor for the absolute span start timestamp.
-    /// Written in S1 (REWRITE); read in S2 (LOG span record).
+    /// Written in REWRITE; read in the LOG span record.
     pub start_time_unix_nano: u64,
     /// Monotonic anchor captured alongside `start_time_unix_nano` at REWRITE.
     ///
     /// `start_mono.elapsed()` at LOG gives the request duration, always ≥ 0.
     /// Span end = `start_time_unix_nano + elapsed_nanos`.
     /// Also used for the `http.server.request.duration` histogram (coherent).
-    /// Written in S1 (REWRITE); read in S2 (LOG span record).
+    /// Written in REWRITE; read in the LOG span record.
     pub start_mono: std::time::Instant,
     /// Whether this request is sampled.
     ///
@@ -76,10 +76,10 @@ pub struct SpanCtx {
     pub sampled: bool,
 }
 
-// ── Pool allocator + redirect-safe cleanup anchor (H3F1) ───────────────────────
+// ── Pool allocator + redirect-safe cleanup anchor ──────────────────────────────
 
 /// No-op cleanup handler that serves as the *findable anchor* for the request's
-/// `SpanCtx` (H3F1, mirroring the C++ module's `cleanupOtelCtx`,
+/// `SpanCtx` (mirroring the C++ module's `cleanupOtelCtx`,
 /// `nginx-otel/src/http_module.cpp:191-193`).
 ///
 /// nginx zeroes the whole per-request module-ctx array on an internal redirect
@@ -149,7 +149,7 @@ pub fn alloc_span_ctx(pool: &Pool) -> *mut SpanCtx {
 /// anchor — i.e. it is NOT redirect-survivable and `recover_span_ctx` will never
 /// re-install it after a redirect clears the module-ctx slot.
 ///
-/// Used for the PRE-GATE `SpanCtx` (H3F9(f)): that ctx exists only so Gate 2's
+/// Used for the PRE-GATE `SpanCtx`: that ctx exists only so Gate 2's
 /// `$otel_parent_sampled` complex-value read can see the inbound flags WITHIN the
 /// same span-start handler pass.  It must never outlive a decline.  If the
 /// pre-gate path registered the cleanup anchor (as [`alloc_span_ctx`] does), a
@@ -159,7 +159,7 @@ pub fn alloc_span_ctx(pool: &Pool) -> *mut SpanCtx {
 /// declined request.  A plain alloc has no anchor, so a declined request leaves
 /// nothing for `recover_span_ctx` to find.  The final POST-GATE [`alloc_span_ctx`]
 /// (only reached when the gate PASSES) still registers the anchor, preserving the
-/// H3F1 redirect-survival semantics for spans that are actually emitted.
+/// redirect-survival semantics for spans that are actually emitted.
 ///
 /// Returns `null_mut()` on OOM (pool bump failure — extremely rare).
 ///
@@ -207,7 +207,7 @@ pub unsafe fn recover_span_ctx(
     }
     // Read `internal` / `filter_finalize` via the C shim, NOT the bindgen
     // `*_raw` accessors: bindgen mis-lays-out this struct's bitfields and reads
-    // both flags 2 bits low (see `crate::shim` / `BINDGEN_BITFIELD_ISSUE_DRAFT.md`).
+    // both flags 2 bits low (see `crate::shim`).
     // SAFETY: `r` is a valid request pointer; the shim only reads the `internal`
     // / `filter_finalize` bitfields through nginx's own header layout.
     let is_redirect =
@@ -252,11 +252,11 @@ pub unsafe fn pool_from_request(r: *mut ngx_http_request_t) -> Pool {
     unsafe { Pool::from_ngx_pool((*r).pool) }
 }
 
-// ── DRBG — per-thread ChaCha20 CSPRNG (D-1 fix) ─────────────────────────────
+// ── DRBG — per-thread ChaCha20 CSPRNG ───────────────────────────────────────
 //
-// The prior xorshift64 was reversible: an observer of a few IDs could recover
-// the state and predict future trace IDs.  Replaced with a seeded ChaCha20
-// DRBG: cryptographically-unpredictable IDs, zero per-request syscalls.
+// A reversible PRNG (e.g. xorshift64) would let an observer of a few IDs
+// recover the state and predict future trace IDs.  A seeded ChaCha20 DRBG
+// gives cryptographically-unpredictable IDs with zero per-request syscalls.
 //
 // Design (OTel-SDK-idiomatic):
 //   - Seeded EAGERLY in worker `init_process` (off the request path) via the
@@ -265,7 +265,7 @@ pub unsafe fn pool_from_request(r: *mut ngx_http_request_t) -> Pool {
 //   - Thereafter: pure ChaCha20 block operations, no syscall per request.
 //   - Thread-local `Cell<Option<ChaCha20Rng>>` (infallible take/set access).
 //
-// H3F2 — non-panicking OS-RNG failure handling:
+// Non-panicking OS-RNG failure handling:
 //   A persistent OS-RNG failure (e.g. seccomp denying `getrandom(2)`) must NOT
 //   panic inside the `extern "C"` REWRITE handler — that aborts the worker and
 //   every respawn aborts on its first traced request (a crash loop).  Instead,
@@ -439,7 +439,7 @@ pub(crate) fn gen_span_id() -> [u8; 8] {
 mod tests {
     use super::*;
 
-    /// H3F2 — under injected OS-RNG seed failure, the eager seed path must NOT
+    /// Under injected OS-RNG seed failure, the eager seed path must NOT
     /// panic; it must set the worker-local tracing-disabled flag and return Err.
     ///
     /// Each assertion runs on a freshly-spawned thread so the `thread_local!`
@@ -467,7 +467,7 @@ mod tests {
         assert!(outcome.is_ok(), "test thread must not panic");
     }
 
-    /// H3F2 — EMERG-once: the failing seed returns `Err` only on the FIRST
+    /// EMERG-once: the failing seed returns `Err` only on the FIRST
     /// call; a subsequent call returns `Ok` (flag already set) so the caller
     /// emits exactly one `NGX_LOG_EMERG` line per worker.
     #[test]
@@ -490,7 +490,7 @@ mod tests {
         .expect("test thread must not panic");
     }
 
-    /// H3F2 — the happy path: with no injected failure, eager seeding succeeds,
+    /// The happy path: with no injected failure, eager seeding succeeds,
     /// tracing stays enabled, and the DRBG yields non-zero values.
     #[test]
     fn h3f2_eager_seed_success_enables_tracing() {
@@ -520,9 +520,9 @@ mod tests {
         assert_eq!(set.len(), vals.len(), "drbg64 sequence must not repeat in 64 calls");
     }
 
-    /// D-1: two ChaCha20Rng instances with different seeds must diverge.
+    /// Two ChaCha20Rng instances with different seeds must diverge.
     ///
-    /// Verifies the D-1 fix property: IDs from distinct workers (which each
+    /// Verifies the property that IDs from distinct workers (which each
     /// seed their DRBG independently from `getrandom`) cannot collide in bulk.
     /// Different seeds produce statistically independent streams.
     #[test]
@@ -537,7 +537,7 @@ mod tests {
         assert_ne!(vals1, vals2, "ChaCha20Rng with different seeds must produce different output");
     }
 
-    /// D-1: trace IDs are 16 bytes, distinct across a batch of generations.
+    /// Trace IDs are 16 bytes, distinct across a batch of generations.
     #[test]
     fn trace_ids_batch_unique() {
         let ids: std::vec::Vec<[u8; 16]> = (0..100).map(|_| gen_trace_id()).collect();
@@ -548,7 +548,7 @@ mod tests {
         }
     }
 
-    /// D-1: span IDs are 8 bytes, distinct across a batch of generations.
+    /// Span IDs are 8 bytes, distinct across a batch of generations.
     #[test]
     fn span_ids_batch_unique() {
         let ids: std::vec::Vec<[u8; 8]> = (0..100).map(|_| gen_span_id()).collect();
@@ -587,9 +587,9 @@ mod tests {
         assert!((45..=96).contains(&sz), "SpanCtx size {sz} is outside expected range 45..96");
     }
 
-    /// D-2 dual-clock coherence: span end = start + duration, end >= start.
+    /// Dual-clock coherence: span end = start + duration, end >= start.
     ///
-    /// Verifies the D-2 fix: using monotonic duration guarantees
+    /// Verifies that using monotonic duration guarantees
     /// `end_time_unix_nano ≥ start_time_unix_nano` (NTP-immune) and
     /// `span (end−start) == http.server.request.duration attribute` (coherent).
     #[test]
@@ -629,7 +629,7 @@ mod tests {
         );
     }
 
-    /// S2 — Read-once traceparent guard (§6.6.3 parse-once design).
+    /// Read-once traceparent guard (parse-once design).
     ///
     /// Proves the single-scan contract: the inbound `traceparent` header is parsed
     /// **once** (by `parse_traceparent_full` in the REWRITE handler) and the result

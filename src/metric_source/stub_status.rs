@@ -140,8 +140,8 @@ unsafe fn read_stats() -> (u64, u64, u64, u64, u64, u64, u64) {
 /// Build a cumulative-sum "counter" metric from a scalar value.
 ///
 /// We model counters as single-bucket histograms (count=1, sum=value) so the
-/// encoder can emit them uniformly.  A proper `Sum` instrument is added in
-/// Step 7's encoder.
+/// encoder can emit them uniformly.  A proper `Sum` instrument is a possible
+/// future encoder refinement.
 fn counter_metric(name: &str, desc: &str, unit: &str, value: u64, time_ns: u64) -> Metric {
     scalar_histogram(name, desc, unit, value, time_ns, AggregationTemporality::Cumulative)
 }

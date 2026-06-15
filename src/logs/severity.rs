@@ -7,7 +7,7 @@
 //!
 //! nginx levels are defined in `nginx/src/core/ngx_log.h:16-24` as integer
 //! constants.  They are *inverted* from OTel — lower nginx level = more
-//! severe.  The mapping follows the recommendation in `PHASE_2_RESEARCH.md §3`.
+//! severe.
 //!
 //! | nginx | name   | OTel SeverityNumber |
 //! |-------|--------|---------------------|

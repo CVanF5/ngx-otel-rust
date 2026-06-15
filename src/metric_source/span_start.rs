@@ -3,7 +3,7 @@
 // This source code is licensed under the Apache License, Version 2.0 license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! Rewrite-phase span-start handler — Phase 3.3 hot path.
+//! Rewrite-phase span-start handler — hot path.
 //!
 //! `SpanStartHandler` runs at `HttpPhase::Rewrite` and is responsible for:
 //! 1. Checking whether tracing is enabled for the request (zero-cost exit when not).
@@ -15,16 +15,16 @@
 //!
 //! After this handler runs, the Log phase reads `SpanCtx` and:
 //! - stamps the access tail/exemplar with the cached trace correlation, AND
-//! - (when sampled) pushes a `SpanRecord` to the spans ring (Phase 3.4, Step S2).
+//! - (when sampled) pushes a `SpanRecord` to the spans ring.
 //!
-//! The Log phase no longer re-scans request headers for `traceparent`; this
-//! closes the §6.6.3 parse-once plan item.
+//! The Log phase no longer re-scans request headers for `traceparent`; the
+//! parse happens once here (the parse-once design).
 //!
 //! # Hard budget rules
 //! - **Zero cost when disabled:** handler is only registered when
 //!   `amcf.is_configured()` is true (see `lib.rs::postconfiguration`).  If
-//!   tracing is not configured for a location (Phase 3.5 will add the per-location
-//!   `otel_trace` directive), the handler returns immediately.
+//!   tracing is not configured for a location (the per-location `otel_trace`
+//!   directive), the handler returns immediately.
 //! - **Bounded when unsampled:** pool-alloc + one header scan + sampling branch.
 //!   No span record, no ring push, no second header scan in LOG.
 //! - No heap allocation, no locks, no logging, no `std::thread::spawn`.
@@ -61,7 +61,7 @@ impl HttpRequestHandler for SpanStartHandler {
     /// `SpanCtx` with `sampled=false` and stores it.  LOG reads it and skips
     /// ring work.  The pool alloc is a bump pointer — effectively free.
     fn handler(request: &mut Request) -> Status {
-        // ── Gate 0: internal-redirect / subrequest guard (H3F1) ───────────────
+        // ── Gate 0: internal-redirect / subrequest guard ──────────────────────
         // Mirrors the C++ module's REWRITE early-return
         // (`nginx-otel/src/http_module.cpp:356-361`): "don't let internal
         // redirects override the sampling decision".  nginx re-runs the REWRITE
@@ -79,7 +79,7 @@ impl HttpRequestHandler for SpanStartHandler {
         //
         // Read via the C shim, NOT the bindgen `internal()` accessor: bindgen
         // mis-lays-out this struct's bitfields and reads `internal` 2 bits low
-        // (see `crate::shim` / `BINDGEN_BITFIELD_ISSUE_DRAFT.md`).
+        // (see `crate::shim`).
         //
         // Ordering: we check `internal` BEFORE the config/location gates,
         // mirroring the C++ module (`http_module.cpp:356-361`, which checks
@@ -138,7 +138,7 @@ impl HttpRequestHandler for SpanStartHandler {
         // process lifetime; `addr_of!` yields a stable pointer to it.
         let module_ref = unsafe { &*core::ptr::addr_of!(crate::ngx_http_otel_module) };
 
-        // ── D1 fix: parse inbound `traceparent` BEFORE Gate 2 ────────────────
+        // ── Parse inbound `traceparent` BEFORE Gate 2 ────────────────────────
         // `$otel_parent_sampled` reads its value from the request's SpanCtx.
         // Gate 2 calls `ngx_http_complex_value` which evaluates whatever
         // `otel_trace` is set to — including `$otel_parent_sampled`.  In the old
@@ -194,7 +194,7 @@ impl HttpRequestHandler for SpanStartHandler {
         // `sampled` is left false (zeroed) — the full sampling decision is made
         // post-gate.  If Gate 2 declines, we clear this ctx before returning.
         //
-        // H3F9(f): use `alloc_span_ctx_plain` (NO cleanup anchor) here, NOT
+        // Use `alloc_span_ctx_plain` (NO cleanup anchor) here, NOT
         // `alloc_span_ctx`.  The pre-gate ctx only needs to live for Gate 2's
         // `$otel_parent_sampled` read within this handler pass; it must NOT be
         // redirect-survivable.  If it registered the cleanup anchor, a
@@ -244,7 +244,7 @@ impl HttpRequestHandler for SpanStartHandler {
         };
         if cv_bytes.is_empty() || cv_bytes == b"0" || cv_bytes == b"off" {
             // Gate declined. Clear any pre-gate SpanCtx so $otel_trace_id returns
-            // empty for declined requests (same semantics as before D1 fix).
+            // empty for declined requests.
             // set_module_ctx(null) is always safe; if no pre-gate ctx was set
             // this is a no-op write to the ctx array slot.
             request.set_module_ctx(core::ptr::null_mut(), module_ref);
@@ -253,7 +253,7 @@ impl HttpRequestHandler for SpanStartHandler {
 
         // Gate passed.
 
-        // ── Record span start time (OTel-SDK-idiomatic dual-clock, D-2) ─────
+        // ── Record span start time (OTel-SDK-idiomatic dual-clock) ─────────
         // Moved after Gate 2: avoids vDSO calls for gate-declined requests.
         // Wall-clock anchor: SystemTime::now() → absolute start timestamp.
         // Monotonic anchor: Instant::now() → elapsed at LOG gives duration,
@@ -269,7 +269,7 @@ impl HttpRequestHandler for SpanStartHandler {
         };
         let start_mono = std::time::Instant::now();
 
-        // ── H3F2: OS-RNG seed failed → tracing disabled for this worker ──────
+        // ── OS-RNG seed failed → tracing disabled for this worker ────────────
         // If `getrandom` failed at worker init (e.g. seccomp denial), the
         // worker-local DRBG is unseeded and `drbg64()` returns 0; calling
         // `gen_trace_id`/`gen_span_id` here would spin forever rerolling for a
@@ -381,10 +381,10 @@ fn hex_encode_into_slice(src: &[u8], dst: &mut [u8]) {
 /// `r->headers_in.headers` so that nginx proxy modules forward it to the
 /// upstream.
 ///
-/// **H3F1 — update-don't-append (mirrors the C++ `setHeader`,
+/// **Update-don't-append (mirrors the C++ `setHeader`,
 /// `nginx-otel/src/http_module.cpp:278-307`):** an inbound request may already
-/// carry a `traceparent` (the common case under `propagate`).  The pre-H3F1 code
-/// always pushed a *new* entry, leaving the inbound header in place — so the
+/// carry a `traceparent` (the common case under `propagate`).  Always pushing a
+/// *new* entry would leave the inbound header in place — so the
 /// upstream received TWO `traceparent` headers (the stale inbound one and our
 /// freshly-minted one), and the downstream span linkage was ambiguous.  This
 /// function now finds the existing `traceparent` and overwrites its value in
@@ -603,7 +603,7 @@ mod tests {
         assert_ne!(sid, [0u8; 8]);
     }
 
-    // ── H3F1: update-vs-append decision (find_header_in) ─────────────────────
+    // ── update-vs-append decision (find_header_in) ───────────────────────────
     //
     // These tests fabricate a single-part `ngx_list_t` of `ngx_table_elt_t` on
     // the Rust heap (both are `#[repr(C)]` POD structs) and exercise the

@@ -3,7 +3,7 @@
 // This source code is licensed under the Apache License, Version 2.0 license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! Span record wire format (worker → exporter) — Phase 3.2 cold-path.
+//! Span record wire format (worker → exporter) — cold-path.
 //!
 //! # Wire format
 //!
@@ -36,7 +36,7 @@
 //! `emit_span_record` serialises into a fixed-size stack buffer
 //! `[u8; MAX_SPAN_RECORD]`.  Fields exceeding their caps are silently truncated.
 //!
-//! # Compile-time size guard (C1 pattern)
+//! # Compile-time size guard
 //!
 //! `SPAN_RECORD_WORST_CASE ≤ MAX_SPAN_RECORD` is a `const assert!` so that
 //! any future cap increase that would overflow the buffer is a **build failure**
@@ -45,7 +45,7 @@
 pub mod ctx;
 
 use crate::logs::LogProducer;
-// S3: method and url.path caps are single-homed in logs::access (same semantic
+// method and url.path caps are single-homed in logs::access (same semantic
 // field on the same nginx request).  Import them here so span and access records
 // always use the same value — a bump to MAX_URL_PATH propagates automatically.
 use crate::logs::access::{MAX_METHOD, MAX_URL_PATH};
@@ -103,7 +103,7 @@ const _: () = assert!(
 /// Descriptor for a completed server span, built at span-end in the Log phase.
 ///
 /// All byte-slice fields borrow nginx request memory — no allocation.
-/// Built from `SpanCtx` + request fields in `LogPhaseHandler` (Phase 3.4, S2).
+/// Built from `SpanCtx` + request fields in `LogPhaseHandler`.
 pub struct SpanRecord<'a> {
     /// 16-byte W3C trace ID.
     pub trace_id: [u8; 16],
@@ -131,7 +131,7 @@ pub struct SpanRecord<'a> {
     pub url_path: &'a [u8],
     /// Request duration in microseconds.
     pub duration_us: u64,
-    /// Extra span attributes from `otel_span_attr` directives (Phase 3.5 S3).
+    /// Extra span attributes from `otel_span_attr` directives.
     ///
     /// Slice of `(key_bytes, value_bytes)` pairs built in `LogPhaseHandler` from
     /// `LocationConf::span_attrs` — conf pool memory, valid for process lifetime.
@@ -150,7 +150,7 @@ pub struct SpanRecord<'a> {
 /// All formatting is done into a `[u8; MAX_SPAN_RECORD]` stack buffer.
 /// No `Vec`, no `Box`, no heap use.
 ///
-/// Called from `LogPhaseHandler` (Phase 3.4, S2) for every sampled request.
+/// Called from `LogPhaseHandler` for every sampled request.
 #[inline]
 pub fn emit_span_record(producer: &dyn LogProducer, rec: &SpanRecord<'_>) -> bool {
     let mut buf = [0u8; MAX_SPAN_RECORD];
@@ -221,7 +221,7 @@ pub fn emit_span_record(producer: &dyn LogProducer, rec: &SpanRecord<'_>) -> boo
     write_capped!(rec.url_path, MAX_URL_PATH, u16);
     write_u64_be!(rec.duration_us);
 
-    // Extra attributes from otel_span_attr directives (Phase 3.5 S3).
+    // Extra attributes from otel_span_attr directives.
     let n = rec.extra_attrs.len().min(MAX_SPAN_EXTRA_ATTRS);
     write_u16_be!(n as u16);
     for (key, val) in &rec.extra_attrs[..n] {
@@ -258,7 +258,7 @@ pub fn parse_span_record(buf: &[u8], observed_ns: u64) -> Option<crate::data_mod
     // **empty** parent_span_id bytes field for root spans (proto `bytes` default
     // = empty means "no parent"); exporting [0u8;8] signals a non-existent
     // parent to backends and breaks trace-root detection.
-    // Intended wire change (F7): root spans now export empty parent_span_id.
+    // Root spans export empty parent_span_id.
     let parent_span_id = {
         let raw = &buf[pos..pos + 8];
         if raw == [0u8; 8] {
@@ -344,7 +344,7 @@ pub fn parse_span_record(buf: &[u8], observed_ns: u64) -> Option<crate::data_mod
     let duration_us = u64::from_be_bytes(buf[pos..pos + 8].try_into().ok()?);
     pos += 8;
 
-    // Extra attributes (Phase 3.5 S3) — gracefully absent in older records.
+    // Extra attributes — gracefully absent in older records.
     let n_extra = if pos + 2 <= buf.len() {
         let n = u16::from_be_bytes(buf[pos..pos + 2].try_into().ok()?) as usize;
         pos += 2;
@@ -508,7 +508,7 @@ mod tests {
             "duration attribute must be present"
         );
 
-        // S1 regression guard: duration must be in seconds (µs / 1_000_000), not ms.
+        // Regression guard: duration must be in seconds (µs / 1_000_000), not ms.
         // rec.duration_us == 1000 → 0.001 s exactly.
         let dur_attr = span
             .attributes
@@ -527,12 +527,12 @@ mod tests {
         }
     }
 
-    /// S2 — Structural golden: encode a maximally-populated SpanRecord, parse it
+    /// Structural golden: encode a maximally-populated SpanRecord, parse it
     /// back, and assert every decoded field value precisely.
     ///
-    /// This is the regression seal for S3–S5: those steps are wire-format-neutral
-    /// for well-formed input — this test MUST stay green across them.  A failure
-    /// here means a nominally-neutral change altered emitted bytes.
+    /// This is a regression seal: the wire format is neutral for well-formed
+    /// input — this test MUST stay green.  A failure here means a
+    /// nominally-neutral change altered emitted bytes.
     ///
     /// Regeneration: update the `SpanRecord` input literal below if the wire
     /// format is intentionally changed (requires deliberate review).
@@ -633,7 +633,7 @@ mod tests {
             other => panic!("url.path must be String, got {other:?}"),
         }
 
-        // http.server.request.duration — S1 fix: seconds, not ms
+        // http.server.request.duration — seconds, not ms
         // 1_234_567 µs == 1.234567 s exactly (no floating-point loss at this magnitude).
         match find_attr("http.server.request.duration")
             .expect("http.server.request.duration must be present")
@@ -650,7 +650,7 @@ mod tests {
             }
         }
 
-        // ── Extra attributes (S2 golden covers the extra-attrs path) ──────────
+        // ── Extra attributes (golden covers the extra-attrs path) ─────────────
         match find_attr("env").expect("extra attr 'env' must be present") {
             AnyValue::String(s) => assert_eq!(s, "prod", "env attr value must be 'prod'"),
             other => panic!("extra attr 'env' must be String, got {other:?}"),
@@ -673,7 +673,7 @@ mod tests {
         assert_eq!(extra_keys, vec!["env"], "only 'env' extra attr expected");
     }
 
-    /// S4 — Parser sanity cap: a corrupted `n_extra` field must not cause the
+    /// Parser sanity cap: a corrupted `n_extra` field must not cause the
     /// parser to loop more than `MAX_SPAN_EXTRA_ATTRS` times.
     ///
     /// Produces a well-formed span record with one extra attr, then patches the

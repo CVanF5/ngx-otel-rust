@@ -36,7 +36,7 @@
 //! - NO locks on the producer path — atomic-only.
 //! - `push` never blocks; increments `dropped` on full.
 //! - Read/write offsets are **monotonically increasing `u64`** stored in the
-//!   header in shm, so a fresh exporter resumes across SIGHUP (gotcha #6).
+//!   header in shm, so a fresh exporter resumes across SIGHUP.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -392,7 +392,7 @@ pub(crate) mod tests {
         assert_eq!(out.as_slice(), data.as_slice());
     }
 
-    /// (a2) Dual-consumer documents the SPSC ring's load-then-store contract.
+    /// Dual-consumer documents the SPSC ring's load-then-store contract.
     ///
     /// `pop_into` reads `read_offset` with `Acquire`, copies the record, then
     /// advances `read_offset` with `Release` — there is NO compare-exchange.
@@ -400,18 +400,14 @@ pub(crate) mod tests {
     /// stores, producing duplicate records (total > N).
     ///
     /// This test verifies that ONE consumer reads exactly N records (the
-    /// positive case); it also demonstrates the dual-consumer violation: the
-    /// test body shows the race condition that B1-FU1 prevents.
-    ///
-    /// The violation half is NOT run automatically (it would be a failing test)
-    /// but IS captured in the mutation evidence artifact to document the causal
-    /// chain: ring is fragile → gate is load-bearing → removal causes harm.
+    /// positive case); the dual-consumer violation is demonstrated in
+    /// `b1_dual_consumer_violation` below.
     #[test]
     fn b1_single_consumer_reads_exactly_n_records() {
         // Positive case: one consumer, one ring, N records → total == N.
         // The corresponding dual-consumer violation evidence (total != N) is
         // captured by `b1_dual_consumer_violation` below — see its doc comment
-        // for the expected failure mode and the B1-FU1 causal link.
+        // for the expected failure mode.
         const N: usize = 500;
         const RECORD_BYTES: usize = 8;
         let cap = N * (4 + RECORD_BYTES) * 2;
@@ -433,7 +429,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// (a2-race) Documents the dual-consumer violation: TWO concurrent threads
+    /// Documents the dual-consumer violation: TWO concurrent threads
     /// calling `pop_into` on the same ring, each asserting exclusivity.
     ///
     /// `pop_into` uses load → read → store, NOT compare-exchange.  Two threads
@@ -443,12 +439,11 @@ pub(crate) mod tests {
     ///
     /// This test is `#[ignore]` because it is expected to FAIL (the violation
     /// IS the evidence).  Run explicitly with `cargo test -- --ignored
-    /// b1_dual_consumer_violation` to capture the FAIL output for the artifact.
+    /// b1_dual_consumer_violation` to capture the FAIL output.
     ///
-    /// On a single-core machine the race may not manifest; see the chaos (a-iv)
-    /// assertion for the deterministic pid-keyed observable.
+    /// On a single-core machine the race may not manifest.
     #[test]
-    #[ignore = "expected to FAIL — run explicitly for mutation evidence (a2)"]
+    #[ignore = "expected to FAIL — run explicitly for mutation evidence"]
     fn b1_dual_consumer_violation() {
         use std::sync::{Arc, Barrier};
         use std::thread;
@@ -526,13 +521,13 @@ pub(crate) mod tests {
 
         // This assertion FAILS when the race fires: both threads read the same
         // slot → total > N.  That is the expected outcome and the evidence that
-        // the ring is SPSC-only.  B1-FU1's gate prevents this in production.
+        // the ring is SPSC-only.  The single-consumer gate prevents this in production.
         assert_eq!(
             total,
             N,
             "dual-consumer SPSC violation: expected {} pops (one per record), \
             got {} — {} duplicate(s) produced by concurrent load-then-store in pop_into \
-            (this FAILURE is the evidence for B1-FU1)",
+            (this FAILURE is the evidence the ring is SPSC-only)",
             N,
             total,
             total.saturating_sub(N),

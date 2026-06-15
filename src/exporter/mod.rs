@@ -3,13 +3,13 @@
 // This source code is licensed under the Apache License, Version 2.0 license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! Exporter process lifecycle — Phase 1.3.2.
+//! Exporter process lifecycle.
 //!
 //! This module provides the `nginx: otel exporter` child process, spawned by
 //! master via the `init_module` hook in `src/lib.rs`. The exporter handles
 //! master channel signals (QUIT / TERMINATE / REOPEN), drops privileges to the
-//! configured nginx user, runs the nginx event loop, and now (Phase 1.3.2)
-//! owns the async export task spawned via [`ngx::async_::spawn`].
+//! configured nginx user, runs the nginx event loop, and owns the async export
+//! task spawned via [`ngx::async_::spawn`].
 //!
 //! Workers are bump-and-defer only — no event loop work, no allocation, no
 //! sockets on the cold path. The collector connection originates exclusively
@@ -94,10 +94,6 @@ pub(crate) fn crash_backoff_ms(count: u64) -> u64 {
 /// `NgxProcess` but adds the `Exporter` variant that distinguishes the
 /// dedicated `nginx: otel exporter` child from a generic helper. The
 /// distinction is tracked via the process-local `IS_OTEL_EXPORTER` flag.
-///
-/// See `PHASE_1_3_RESEARCH.md` §3.5 for the design rationale.
-// Phase 2.3.5: first live caller is `wire_error_writer_state` (init_process
-// process-role guard, DP-C). The allow(dead_code) annotations are dropped here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NgxProcess {
     Single,
@@ -149,12 +145,12 @@ pub(crate) fn ngx_process() -> NgxProcess {
 /// Sequence mirrors `ngx_cache_manager_process_cycle`
 /// (`nginx/src/os/unix/ngx_process_cycle.c:1088-1136`) with the addition of
 /// signal-handler installation (needed at initial start because `init_module`
-/// fires before `ngx_init_signals` in master — see §2.8 of the research doc).
+/// fires before `ngx_init_signals` in master).
 ///
 /// # Sequencing constraints (order is load-bearing)
 /// 1. `ngx_init_signals` BEFORE `sigprocmask` clears the mask.
 /// 2. `close_sibling_channels` BEFORE `ngx_add_channel_event` (close
-///    FDs we don't own; keep `ngx_channel` = our channel[1]).
+///    FDs we don't own; keep `ngx_channel` = our `channel[1]`).
 /// 3. `drop_privileges_and_chdir` AFTER `ngx_add_channel_event` (safer to
 ///    register before dropping).
 /// 4. `ngx_setproctitle` last, just before entering the loop.
@@ -192,7 +188,7 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
         //      transport setup in the async task). The shm zone was mapped by nginx
         //      before fork, so the control-shm pointer is valid here.
         //
-        //      Algorithm (matches the unit-tested `simulate_startup` in control_shm tests):
+        //      Algorithm (matches the unit-tested `simulate_startup` in control_shm):
         //        a) If now − window_start > WINDOW (or window is 0): reset counter+window.
         //        b) Increment crash_count.
         //        c) If crash_count > MAX_CRASH_RESTARTS: log ALERT + exit(2) (degraded).
@@ -274,7 +270,6 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
         //    path (signals are already installed in master). It is REQUIRED at
         //    initial start: init_module fires before ngx_init_signals in master
         //    (nginx.c:293 vs :345), so the forked child inherits SIG_DFL.
-        //    See PHASE_1_3_RESEARCH.md §2.8.
         let _ = nginx_sys::ngx_init_signals((*cycle).log);
 
         // 2a. Drop privileges and chdir, matching ngx_worker_process_init, which
@@ -339,8 +334,8 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
         close_sibling_channels(cycle);
 
         // 7. Register our channel event handler on ngx_channel (our
-        //    channel[1]). This is how master sends QUIT/TERMINATE/REOPEN
-        //    commands to us. See PHASE_1_3_RESEARCH.md §2.4, §3.4.
+        //    `channel[1]`). This is how master sends QUIT/TERMINATE/REOPEN
+        //    commands to us.
         // Use NGX_RS_READ_EVENT (ngx-rust wrapper.h helper) rather than
         // nginx_sys::NGX_READ_EVENT directly — the latter is a parenthesised
         // compound #define on Linux epoll and bindgen does not lift it.
@@ -412,15 +407,14 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
         // 11. Spawn the async export task. The task lives for the process
         //     lifetime; allocating it on the exporter's pool keeps it pinned
         //     until the cycle tears down. The task reads the shm rings written
-        //     by workers via fork-shared pages (PHASE_1_3_RESEARCH.md §4.1).
-        //     Sub-item 2 (Phase 1.3.2): this is the new owner of the export loop.
+        //     by workers via fork-shared pages. The exporter owns the export loop.
         let amcf =
             HttpOtelModule::main_conf(&*cycle).expect("exporter cycle: missing otel main conf");
         let task = ngx::async_::spawn(crate::export::export_loop(amcf));
         let pool = Pool::from_ngx_pool((*cycle).pool);
         let _ = pool.allocate(task);
 
-        // 11.5. B4 follow-up 2 — dedicated liveness heartbeat timer.
+        // 11.5. Dedicated liveness heartbeat timer.
         //
         //     A self-rearming `ngx_event_t` timer stamps the exporter's
         //     `ngx_current_msec` into `ControlShm::last_beat_msec` every
@@ -508,26 +502,26 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
                 // its graceful drain and sets EXPORT_LOOP_DONE, or until a
                 // hard deadline is reached.
                 //
-                // §6.3 RESOLVED: the exporter is not a worker and is not subject
-                // to ngx_event_no_timers_left. Cancelable sleep timers fire
+                // The exporter is not a worker and is not subject to
+                // ngx_event_no_timers_left. Cancelable sleep timers fire
                 // normally, so the export loop detects ngx_quit within at most
                 // SHUTDOWN_POLL_INTERVAL (250 ms) and runs graceful_drain.
                 //
-                // B1 RESOLVED Q2: the old "dedup via time_unix_nano" approach was
-                // valid only for cumulative metrics and FALSE for log/span rings
-                // (concurrent pop_into races on read_offset with no CAS → garbage
-                // record lengths).  B1 fixes this via successor_gen abdication:
-                // the master writes successor_gen = N+1 before forking the new
-                // exporter; the old exporter checks it here and skips ring pops
-                // when a successor is present.  See graceful_drain in
-                // export/mod.rs for the abdication logic.
+                // Dedup-via-time_unix_nano was valid only for cumulative metrics
+                // and FALSE for log/span rings (concurrent pop_into races on
+                // read_offset with no CAS → garbage record lengths). Instead we
+                // use successor_gen abdication: the master writes
+                // successor_gen = N+1 before forking the new exporter; the old
+                // exporter checks it here and skips ring pops when a successor is
+                // present.  See graceful_drain in export/mod.rs for the
+                // abdication logic.
                 // Drive the event loop until the export loop signals it finished
                 // draining, or the backstop elapses. `ngx_process_events_and_timers`
                 // BLOCKS on epoll/kqueue (the same call as the main loop below) —
                 // this is not a busy-spin; the deadline just prevents a wedged send
                 // from stalling shutdown forever.
                 //
-                // B3 fix — backstop timer (layer 2): register an nginx timer that
+                // Backstop timer (layer 2): register an nginx timer that
                 // fires at GRACEFUL_DRAIN_BACKSTOP ms, ensuring
                 // ngx_process_events_and_timers ALWAYS returns by the deadline.
                 // Pre-fix: if export_loop aborted early (bad endpoint / transport
@@ -599,7 +593,7 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
 // ── Lifecycle helpers ─────────────────────────────────────────────────────────
 
 /// No-op nginx event handler used as the backstop timer callback in the
-/// drain-wait loop (B3 fix, `otel_exporter_cycle`).
+/// drain-wait loop (`otel_exporter_cycle`).
 ///
 /// When the backstop timer fires, nginx's event expire loop calls this
 /// handler.  Nothing needs to happen here — merely returning causes
@@ -612,7 +606,7 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
 /// null-data) `ngx_event_t`.  The handler accesses nothing through `ev`.
 unsafe extern "C" fn noop_timer_handler(_ev: *mut nginx_sys::ngx_event_t) {}
 
-/// B4 follow-up 2 — liveness heartbeat timer handler (exporter process).
+/// Liveness heartbeat timer handler (exporter process).
 ///
 /// Stamps the exporter's `ngx_current_msec` (monotonic, `CLOCK_MONOTONIC`
 /// basis — same basis workers compare against) into
@@ -698,8 +692,7 @@ unsafe fn close_sibling_channels(cycle: *mut nginx_sys::ngx_cycle_t) {
 /// Drop privileges to the configured nginx user and chdir to the working
 /// directory.
 ///
-/// Implements the Q5-RESOLVED drop-privileges specification from
-/// `PHASE_1_3_RESEARCH.md`: `setgid` → `initgroups` → `setuid`, then
+/// Drops privileges in the order `setgid` → `initgroups` → `setuid`, then
 /// `chdir`. Mirrors `ngx_worker_process_init:799-879`.
 ///
 /// Skipped when `geteuid() != 0` (not running as root), mirroring the same
@@ -710,7 +703,7 @@ unsafe fn close_sibling_channels(cycle: *mut nginx_sys::ngx_cycle_t) {
 ///
 /// The `NGX_HAVE_CAPABILITIES` + `transparent` branch is intentionally
 /// omitted: the exporter does not proxy with transparent addresses.
-/// `TODO(phase-N):` if future requirements change, add it here.
+/// `TODO:` if future requirements change, add it here.
 ///
 /// `prctl(PR_SET_DUMPABLE)` is also omitted (nice-to-have for coredumps;
 /// not required for correctness — can be added later).
@@ -769,7 +762,7 @@ unsafe fn drop_privileges_and_chdir(cycle: *mut nginx_sys::ngx_cycle_t) {
         );
     }
 
-    // TODO(phase-N): skip NGX_HAVE_CAPABILITIES + transparent branch.
+    // TODO: skip NGX_HAVE_CAPABILITIES + transparent branch.
     // The exporter does not proxy with transparent addresses today.
 
     if libc::setuid((*ccf).user as libc::uid_t) == -1 {
@@ -782,7 +775,7 @@ unsafe fn drop_privileges_and_chdir(cycle: *mut nginx_sys::ngx_cycle_t) {
         std::process::exit(2);
     }
 
-    // TODO(phase-N): skip prctl(PR_SET_DUMPABLE) reset. Nice-to-have for
+    // TODO: skip prctl(PR_SET_DUMPABLE) reset. Nice-to-have for
     // coredumps after setuid; not required for correctness. Add here if
     // production diagnostics demand it.
 

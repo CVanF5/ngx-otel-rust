@@ -43,7 +43,7 @@ pub const DURATION_BOUNDS_MS: [u64; 14] =
 /// Used by the byte-size histograms.
 pub const N_DURATION_BUCKETS: usize = 15;
 
-// ── Exponential-histogram constants (Phase 2.2 DP-F) ─────────────────────────
+// ── Exponential-histogram constants ─────────────────────────
 
 /// OTel exponential histogram scale for `request_duration_combos`.
 ///
@@ -184,7 +184,7 @@ pub const N_BYTES_BUCKETS: usize = 7;
 /// `count` establishes the snapshot invariant `Σbuckets ≥ count`.
 #[repr(C)]
 pub struct Histogram<const BUCKETS: usize> {
-    /// Per-bucket cumulative count (bucket[i] counts values <= boundary[i-1]).
+    /// Per-bucket cumulative count (`bucket[i]` counts values <= `boundary[i-1]`).
     pub bucket: [AtomicU64; BUCKETS],
     /// Sum of all observed values.
     pub sum: AtomicU64,
@@ -403,7 +403,7 @@ impl ProtoVersion {
     }
 }
 
-// ── Route and upstream-zone dimensions (DP-E, Phase 2.2 — DECOMPOSED) ───────
+// ── Route and upstream-zone dimensions (DECOMPOSED) ─────────────────────────
 //
 // **Decomposed, not cross-producted**: route and upstream are now
 // *separate* histogram tables alongside the base `method × status-class ×
@@ -434,13 +434,13 @@ pub const N_UPSTREAM_SLOTS: usize = UPSTREAM_CAP + 1;
 
 /// Total number of `{method × status_class × protocol}` base combinations.
 /// Each combination maps to one [`ExpHistogramSlot`] in
-/// `WorkerSlots::request_duration_combos`.  Unchanged from Phase 2.1 (160).
+/// `WorkerSlots::request_duration_combos` (160).
 pub const N_COMBOS: usize = N_HTTP_METHODS * N_STATUS_CLASSES * N_PROTO_VERSIONS;
 
 /// Memory budget for all three histogram arrays in `WorkerSlots`.
 ///
 /// With default caps 64/32 and N_EXP_BUCKETS=192 (scale 3):
-///   size_of::<ExpHistogramSlot>() = (192 + 3) × 8 = 1560 bytes
+///   `size_of::<ExpHistogramSlot>()` = (192 + 3) × 8 = 1560 bytes
 ///   total = (160 + 65 + 33) × 1560 = 403,920 bytes ≈ 395 KB ≪ 4 MiB.
 pub const SLOT_BUDGET: usize = 4 * 1024 * 1024; // 4 MiB per worker
 
@@ -467,9 +467,9 @@ pub fn combo_index(method: HttpMethod, status_class: StatusClass, proto: ProtoVe
 /// Upstream slot index for over-cap or no-upstream requests (the "other" bucket).
 pub const UPSTREAM_IDX_OTHER: usize = UPSTREAM_CAP;
 
-// ── Error-rate severity classes (Phase 2.3 DP-B) ────────────────────────────
+// ── Error-rate severity classes ─────────────────────────────────────────────
 
-/// Number of severity classes for the companion error-rate metric (DP-B).
+/// Number of severity classes for the companion error-rate metric.
 ///
 /// WithinU8 cardinality — 5 classes map nginx levels 1–8 to coarse buckets:
 /// `fatal` (1–3), `error` (4), `warn` (5), `info` (6–7), `debug` (8).
@@ -511,7 +511,7 @@ pub fn severity_class_index(ngx_level: u8) -> usize {
 /// the shared memory zone. A worker only ever writes to its own slot
 /// (`ngx_worker`-indexed); the export worker reads from all slots.
 ///
-/// **Phase 2.2 DP-E (decomposed)**: three independent histogram arrays:
+/// **Decomposed dimensions**: three independent histogram arrays:
 /// 1. `request_duration_combos[160]`: base `{method × status_class × protocol}`.
 /// 2. `route_duration_combos[65]`: per-route (`http.route` = location name).
 /// 3. `upstream_duration_combos[33]`: per-upstream zone (`nginx.upstream.zone`).
@@ -519,7 +519,7 @@ pub fn severity_class_index(ngx_level: u8) -> usize {
 /// Each request bumps ONE slot in each of the three arrays.  The joint
 /// route×upstream cell is intentionally dropped.
 ///
-/// Phase 2.2 DP-F: each slot is an `ExpHistogramSlot` (exponential histogram).
+/// Each slot is an `ExpHistogramSlot` (exponential histogram).
 ///
 /// The five `status_Nxx` counters have been removed — their information is
 /// captured by the per-combination histograms.
@@ -547,12 +547,12 @@ pub struct WorkerSlots {
     pub upstream_bytes_received: Histogram<N_BYTES_BUCKETS>,
     /// `http.server.upstream.bytes.sent` (bytes)
     pub upstream_bytes_sent: Histogram<N_BYTES_BUCKETS>,
-    /// Exemplar reservoir (Phase 2.2 Step 2.2.4).
+    /// Exemplar reservoir.
     /// Shared across all combos; per-entry `combo_idx` identifies the histogram.
     /// The runtime `access_sample_size` directive caps the effective reservoir
     /// size to ≤ `MAX_EXEMPLAR_RESERVOIR`.
     pub exemplar_reservoir: ExemplarReservoir,
-    /// Per-severity-class error-log event counters (Phase 2.3 DP-B).
+    /// Per-severity-class error-log event counters.
     ///
     /// `error_rate_counters[severity_class_index(ngx_level)]` is bumped by the
     /// worker's error-log writer on EVERY floor-passing event (independent of
@@ -566,7 +566,7 @@ pub struct WorkerSlots {
     pub error_rate_counters: [AtomicU64; N_SEVERITY_CLASSES],
 }
 
-// ── Exemplar reservoir (Phase 2.2 Step 2.2.4) ─────────────────────────────
+// ── Exemplar reservoir ─────────────────────────────
 
 /// Maximum per-worker exemplar reservoir size.
 ///
@@ -845,7 +845,7 @@ pub unsafe fn register_zone(
     }
 }
 
-// ── A1b: zone-init data + active-worker helper ───────────────────────────────
+// ── Zone-init data + active-worker helper ────────────────────────────────────
 
 /// Data threaded through `ngx_shm_zone_t.data` to our zone-init callbacks.
 ///
@@ -990,7 +990,7 @@ pub unsafe extern "C" fn otel_shm_zone_init(
         // location add/remove/reorder shifts the index, silently re-attributing old
         // counts to a different route/upstream name in the next export.
         //
-        // H3F4: zero ALL reserved slots, not just the new active count.  On a
+        // zero ALL reserved slots, not just the new active count.  On a
         // scale-down reload (e.g. worker_processes 4→1) the old higher-numbered
         // slots retain counts recorded under the OLD route-index assignment.  The
         // exporter always sums all reserved slots, so those stale counts get
@@ -1016,7 +1016,7 @@ pub unsafe extern "C" fn otel_shm_zone_init(
         return Status::NGX_OK.into();
     }
 
-    // A1b: zero only the ACTIVE WorkerSlots — reserved-but-inactive slots
+    // zero only the ACTIVE WorkerSlots — reserved-but-inactive slots
     // from the ncpu-headroom reservation are OS-zeroed anonymous pages and
     // must not be touched here (doing so would fault them in, wasting RAM).
     // SAFETY: nginx invokes this callback with a valid, non-null
@@ -1028,7 +1028,7 @@ pub unsafe extern "C" fn otel_shm_zone_init(
     }
 
     // Derive the active worker count from the ZoneInitData stored in zone->data.
-    // A1b: `cycle_addr` was written at postconfiguration from `cf->cycle`; the
+    // `cycle_addr` was written at postconfiguration from `cf->cycle`; the
     // same cycle pointer remains valid through the zone-init call (same
     // ngx_init_cycle invocation).
     // SAFETY: zone->data is either null (legacy / test) or points at a `ZoneInitData`
@@ -1057,11 +1057,11 @@ pub unsafe extern "C" fn otel_shm_zone_init(
     Status::NGX_OK.into()
 }
 
-// ── Logs shm zone (Phase 2.1) ─────────────────────────────────────────────
+// ── Logs shm zone ─────────────────────────────────────────────
 
 use crate::logs::ring::{ring_size_bytes, LogsWorkerRing, LogsWorkerRingHeader};
 
-// ── Compile-time alignment guards (A2) ───────────────────────────────────────
+// ── Compile-time alignment guards ───────────────────────────────────────
 //
 // The logs shm slot layout is:
 //   [0, ring_size_bytes(cap))                 — access ring header + payload
@@ -1141,10 +1141,10 @@ pub fn logs_n_workers_from_zone(zone_data_bytes: usize, cap: usize) -> usize {
 /// - The returned ring must not outlive the zone mapping.
 #[inline]
 pub unsafe fn logs_access_ring(base_addr: *mut u8, worker_id: usize, cap: usize) -> LogsWorkerRing {
-    // A2: cap must be a multiple of 8 so that ring headers and the coalescer
+    // cap must be a multiple of 8 so that ring headers and the coalescer
     // table land at 8-byte-aligned addresses within the slot.  Enforced at
     // config parse time by `cmd_set_log_ring_size`; catch stale callers here.
-    debug_assert_eq!(cap % 8, 0, "A2: ring cap must be a multiple of 8 for AtomicU64 alignment");
+    debug_assert_eq!(cap % 8, 0, "ring cap must be a multiple of 8 for AtomicU64 alignment");
     let slot_off = worker_id * logs_slot_size(cap);
     // SAFETY: per the fn contract `base_addr` is `shm.addr + data_offset()`,
     // `worker_id < n_workers`, and `cap` matches registration, so `slot_off` is
@@ -1158,8 +1158,8 @@ pub unsafe fn logs_access_ring(base_addr: *mut u8, worker_id: usize, cap: usize)
 /// Error ring follows immediately after the access ring within the same slot.
 #[inline]
 pub unsafe fn logs_error_ring(base_addr: *mut u8, worker_id: usize, cap: usize) -> LogsWorkerRing {
-    // A2: same cap alignment requirement as `logs_access_ring`.
-    debug_assert_eq!(cap % 8, 0, "A2: ring cap must be a multiple of 8 for AtomicU64 alignment");
+    // same cap alignment requirement as `logs_access_ring`.
+    debug_assert_eq!(cap % 8, 0, "ring cap must be a multiple of 8 for AtomicU64 alignment");
     let slot_off = worker_id * logs_slot_size(cap);
     let error_off = slot_off + ring_size_bytes(cap);
     // SAFETY: same contract as `logs_access_ring`; the error ring header begins
@@ -1174,7 +1174,7 @@ pub unsafe fn logs_error_ring(base_addr: *mut u8, worker_id: usize, cap: usize) 
 /// `OtelErrorWriterState::error_ring_ptr`.  The writer reconstructs a
 /// [`LogsWorkerRing`] view via `LogsWorkerRing::from_shm_ptr` on each hot-path call.
 ///
-/// Called by `init_process` (Step 2.3.5) once per worker after the logs zone is mapped.
+/// Called by `init_process` once per worker after the logs zone is mapped.
 ///
 /// # Safety
 /// Same as [`logs_error_ring`].
@@ -1195,7 +1195,7 @@ pub unsafe fn logs_error_ring_ptr(base_addr: *mut u8, worker_id: usize, cap: usi
 /// array; on fresh start the slot area is zeroed, giving `key_hash == 0` (empty) for
 /// every slot — the correct initial state.
 ///
-/// Called by `init_process` (Step 2.3.5) to pre-compute the table pointer and stash
+/// Called by `init_process` to pre-compute the table pointer and stash
 /// it in `OtelErrorWriterState::coalesce_table`, so the hot path is a single
 /// null-guarded dereference.
 ///
@@ -1291,7 +1291,7 @@ pub unsafe extern "C" fn logs_shm_zone_init(
     // `addr + offset` is within the mapped zone (past the slab-pool header).
     let base: *mut u8 = unsafe { zone.shm.addr.cast::<u8>().add(offset) };
 
-    // A1b: recover cap and cycle from ZoneInitData stored in zone->data.
+    // recover cap and cycle from ZoneInitData stored in zone->data.
     // `register_logs_zone` now stores `*mut ZoneInitData` instead of a tagged cap.
     // SAFETY: zone->data was written by `register_logs_zone` to point at a
     // `ZoneInitData` in amcf (nginx conf pool, outlives this callback); or null
@@ -1308,7 +1308,7 @@ pub unsafe extern "C" fn logs_shm_zone_init(
     }
 
     let n_reserved = zone_data_bytes / slot_sz;
-    // A1b: only initialise ACTIVE worker slots — reserved-but-inactive slots
+    // only initialise ACTIVE worker slots — reserved-but-inactive slots
     // are OS-zeroed anonymous pages and must not be touched here.
     // `wp_from_cycle` returns the final value after `ngx_core_module_init_conf`.
     // SAFETY: cycle is non-null (set from cf->cycle at postconfiguration) and
@@ -1340,7 +1340,7 @@ pub unsafe extern "C" fn logs_shm_zone_init(
     Status::NGX_OK.into()
 }
 
-// ── Spans shm zone (Phase 3.2) ───────────────────────────────────────────────
+// ── Spans shm zone ───────────────────────────────────────────────
 //
 // The spans shm zone holds one `LogsWorkerRing` per worker (one ring per slot,
 // unlike the logs zone which holds two rings + a coalescer table per slot).
@@ -1465,7 +1465,7 @@ pub unsafe extern "C" fn spans_shm_zone_init(
     // bytes, so `addr + offset` is within the zone.
     let base: *mut u8 = unsafe { zone.shm.addr.cast::<u8>().add(offset) };
 
-    // A1b: recover cap and cycle from ZoneInitData stored in zone->data.
+    // recover cap and cycle from ZoneInitData stored in zone->data.
     // SAFETY: zone->data was written by `register_spans_zone` to point at a
     // `ZoneInitData` in amcf (nginx conf pool, outlives this callback); or null
     // for a legacy caller — handled by the `else` branch.
@@ -1481,7 +1481,7 @@ pub unsafe extern "C" fn spans_shm_zone_init(
     }
 
     let n_reserved = zone_data_bytes / slot_sz;
-    // A1b: only initialise ACTIVE worker slots — same rationale as logs_shm_zone_init.
+    // only initialise ACTIVE worker slots — same rationale as logs_shm_zone_init.
     // SAFETY: cycle is non-null and valid (set from cf->cycle at postconfiguration).
     let n_active = unsafe { wp_from_cycle(cycle) }.unwrap_or(n_reserved).min(n_reserved).max(1);
 
@@ -1564,7 +1564,7 @@ mod tests {
         let (buckets1, _, _, _) = slot1.request_duration_combos[combo].snapshot();
 
         // Expected bucket indices — hand-computed above, NOT recomputed via the same
-        // formula under test (A1 anti-pattern: a self-referential helper never validates).
+        // formula under test (a self-referential helper never validates).
         const BUCKET_100: usize = 53;
         const BUCKET_500: usize = 71;
         const _: () = assert!(BUCKET_100 != BUCKET_500, "100 and 500 must be in distinct buckets");
@@ -1667,7 +1667,7 @@ mod tests {
         assert!(zone_size_for(1) >= slab + mem::size_of::<WorkerSlots>());
     }
 
-    /// A1 — `n_workers_from_zone_size` is the exact inverse of `zone_size_for`.
+    /// `n_workers_from_zone_size` is the exact inverse of `zone_size_for`.
     ///
     /// This test FAILS on the pre-fix code (before `n_workers_from_zone_size`
     /// existed) because that function did not exist.  After the fix it must
@@ -1694,14 +1694,14 @@ mod tests {
         let cap = n_workers_from_zone_size(size_1);
         assert_eq!(cap, 1, "zone sized for 1 worker → capacity 1");
 
-        // A1 hostile-ordering scenario: zone sized for 1 worker, actual
+        // Directive-ordering scenario: zone sized for 1 worker, actual
         // worker_id=3.  The bounds guard `worker_id >= n_workers_from_zone_size(size)`
         // must fire (3 >= 1).  Before the fix, no such check existed.
         let worker_id: usize = 3;
         assert!(
             worker_id >= cap,
             "worker_id {worker_id} must be >= zone capacity {cap} \
-             (bounds guard must fire for the hostile-ordering case)"
+             (bounds guard must fire for the over-count directive-ordering case)"
         );
     }
 
@@ -1770,9 +1770,9 @@ mod tests {
             (8, 24),
             (15, 31),
             (16, 32),
-            // near-octave (already correct before A1)
+            // near-octave (already correct before the bucketing fix)
             (90, 51),
-            // mid-octave divergence (wrong under old code, correct under A1 fix)
+            // mid-octave divergence (wrong under old code, correct after the fix)
             (100, 53),
             (200, 61),
             (400, 69),
@@ -1907,7 +1907,7 @@ mod tests {
         assert_eq!(snap2.len(), 3, "snapshot with k>count returns count entries");
     }
 
-    /// Guard (Phase 2.2 Step 2.2.5): verify that the histogram combo set remains
+    /// Guard: verify that the histogram combo set remains
     /// `method × status_class × protocol × route × upstream` and that url.path,
     /// user_agent, and client.address appear ONLY on tail/exemplar records —
     /// NOT as metric dimensions.
@@ -1972,9 +1972,9 @@ mod tests {
         let _ = combo_index(HttpMethod::Get, StatusClass::S2xx, ProtoVersion::Http11);
     }
 
-    /// A2 regression test — ring-size alignment: enforce, don't comment.
+    /// Ring-size alignment regression test: enforce, don't comment.
     ///
-    /// Before the A2 fix, `otel_log_ring_size 4097` was stored as-is.
+    /// Before this fix, `otel_log_ring_size 4097` was stored as-is.
     /// `ring_size_bytes(4097) = 32 + 4097 = 4129`; 4129 % 8 = 1 → the error
     /// ring header landed at an unaligned address (UB / SIGBUS on aarch64).
     /// The fix rounds cap up to the next multiple of 8 at config-parse time.
@@ -1993,7 +1993,7 @@ mod tests {
             "without rounding: error-ring header at offset rbs_raw is NOT 8-aligned (pre-fix bug)"
         );
 
-        // ── After the A2 fix: round up to next multiple of 8 ─────────────────
+        // ── After the fix: round up to next multiple of 8 ────────────────────
         let cap = cap_raw.next_multiple_of(8); // 4104
         assert_eq!(cap, 4104);
 
@@ -2094,9 +2094,9 @@ mod tests {
         );
     }
 
-    // ── H3F4: scale-down reload must zero ALL reserved slots ────────────────
+    // ── Scale-down reload must zero ALL reserved slots ──────────────────────
 
-    /// H3F4 regression: on a scale-down SIGHUP reload (worker_processes 2→1),
+    /// Regression: on a scale-down SIGHUP reload (worker_processes 2→1),
     /// slot indices above the new active count must be zeroed.
     ///
     /// Pre-fix: `otel_shm_zone_init` called `zero_route_upstream_histograms`
@@ -2158,18 +2158,18 @@ mod tests {
         };
         assert_eq!(ret, ngx_int_t::from(Status::NGX_OK), "reload must return NGX_OK");
 
-        // ── (3) Slot 1 must be zeroed by H3F4 fix ────────────────────────────────
+        // ── (3) Slot 1 must be zeroed by the scale-down fix ──────────────────────
         let (_, _, _, post_route) = slot1.route_duration_combos[0].snapshot();
         assert_eq!(
             post_route, 0,
-            "H3F4: slot 1 route_duration_combos[0] must be zeroed on scale-down reload — \
+            "slot 1 route_duration_combos[0] must be zeroed on scale-down reload — \
              pre-fix code only zeros n_active slots, leaving stale counts in slot 1 \
              that get misattributed to the new route owning index 0"
         );
         let (_, _, _, post_up) = slot1.upstream_duration_combos[0].snapshot();
         assert_eq!(
             post_up, 0,
-            "H3F4: slot 1 upstream_duration_combos[0] must be zeroed on scale-down reload — \
+            "slot 1 upstream_duration_combos[0] must be zeroed on scale-down reload — \
              pre-fix code only zeros n_active slots, leaving stale counts in slot 1"
         );
     }

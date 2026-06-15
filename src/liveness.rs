@@ -3,7 +3,7 @@
 // This source code is licensed under the Apache License, Version 2.0 license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! Exporter liveness detection — B4 follow-up 2 (heartbeat-stale alert).
+//! Exporter liveness detection (heartbeat-stale alert).
 //!
 //! Turns a *silent* exporter death (especially the gen-1 `daemon on` case,
 //! where the exporter's PPID is init and the master's crash-respawn never

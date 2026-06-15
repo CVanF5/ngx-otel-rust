@@ -23,14 +23,13 @@
 //! **Maintainer rule:** any NEW read of an `ngx_http_request_t` bitfield at or
 //! after `uri_changes` MUST go through a wrapper here, never a bindgen accessor.
 //!
-//! H3F10 completed the exhaustive audit of every bindgen bitfield accessor
-//! (getters AND setters AND `*_raw` forms) called anywhere in src/: four nginx
-//! structs are reached — `ngx_http_request_t` (BROKEN, shimmed here),
+//! An exhaustive audit of every bindgen bitfield accessor
+//! (getters AND setters AND `*_raw` forms) called anywhere in src/ found four
+//! nginx structs reached — `ngx_http_request_t` (BROKEN, shimmed here),
 //! `ngx_event_t`, `ngx_variable_value_t` (setters), and `ngx_buf_t`, the latter
 //! three all SAFE (bindgen layout matches the C ABI bit-for-bit). The full
-//! enumeration method, layout dumps, and per-field bindgen-vs-clang comparison
-//! are in `tests/RESULTS-h3f10-clang-record-layouts-2026-06-11.txt` and the
-//! audit block in `ngx_otel_bitfield_shim.c`.
+//! enumeration method and per-field bindgen-vs-clang comparison are recorded in
+//! the audit block in `ngx_otel_bitfield_shim.c`.
 
 use nginx_sys::ngx_http_request_t;
 
@@ -137,7 +136,7 @@ mod tests {
         None
     }
 
-    /// H3F10 mutation-anchor test.
+    /// Bitfield mutation-anchor test.
     ///
     /// Proves (1) the bindgen `header_only()` accessor and the C shim
     /// `r_header_only` read DIFFERENT bits, and (2) the shim follows the REAL

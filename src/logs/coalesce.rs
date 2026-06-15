@@ -3,18 +3,18 @@
 // This source code is licensed under the Apache License, Version 2.0 license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! Producer-side exact-hash coalescer for the OTel error-log writer (Phase 2.3, DP-A).
+//! Producer-side exact-hash coalescer for the OTel error-log writer.
 //!
 //! # Purpose
 //! Nginx error floods: one `connect() failed (111: Connection refused)` per failed
 //! request.  A naïve per-event ring would emit 1000 `LogRecord`s for a 1000-req
-//! flood — the same §6.5 serialisation-point hazard the access log had.  The
+//! flood — the same serialisation-point hazard the access log had.  The
 //! coalescer collapses them at the producer: *seen this (severity, core-hash) this
 //! interval? bump a count; else emit one verbatim sample to the ring and remember.*
 //!
-//! # DP-A decisions (ratified 2026-06-05)
+//! # Design decisions
 //! - **Exact-hash only.** No producer-side IP/number normalisation; that is an
-//!   optional backend enhancement (§6.4.6, undepended-on).
+//!   optional backend enhancement.
 //! - **Subsystem dim dropped.** Key = `(severity × stable_core_hash)` only.
 //! - **Stable-core extraction.** The writer's `buf` is the FULL formatted line
 //!   (`<cached-time> [<level>] <pid>#<tid>: [*<conn>] <msg>[, client:…]\n`);
@@ -217,7 +217,7 @@ pub fn coalesce_key(severity: u8, core: &[u8]) -> u64 {
 
 // ── Coalescer main entry point ────────────────────────────────────────────────
 
-/// High-severity threshold (DP-A): crit/alert/emerg (levels 1–3) always verbatim.
+/// High-severity threshold: crit/alert/emerg (levels 1–3) always verbatim.
 pub const HIGH_SEVERITY_THRESHOLD: u8 = nginx_sys::NGX_LOG_CRIT as u8; // 3
 
 /// Decide how to handle an incoming error message.
@@ -336,7 +336,7 @@ pub const fn coalesce_table_bytes() -> usize {
 /// Sweeps all occupied slots, atomically reads-and-resets `count`, and
 /// returns `(key_hash, severity, count)` for every slot that had `count > 0`.
 ///
-/// # F4 fix: per-drain eviction
+/// # Per-drain eviction
 /// Every occupied slot is **evicted** after its count is collected: `key_hash`,
 /// `severity`, and `sample_emitted` are all cleared (written to 0/false).  This
 /// prevents the table from accumulating lifetime templates that fill the 256-slot
@@ -383,7 +383,7 @@ pub unsafe fn drain_coalesce_table(table: *mut CoalesceSlot) -> std::vec::Vec<(u
         let key_hash = slot.key_hash.load(Ordering::Relaxed);
         let severity = slot.severity.load(Ordering::Relaxed);
 
-        // F4 fix: evict every slot on drain so the table doesn't fill permanently.
+        // Evict every slot on drain so the table doesn't fill permanently.
         // Release on key_hash ensures subsequent writer probes see the cleared slot.
         // Severity and sample_emitted use Relaxed — they are ordered by the
         // key_hash Release (a writer inserting in the next interval will first
@@ -407,7 +407,7 @@ mod tests {
 
     // ── stable_core tests ─────────────────────────────────────────────────────
 
-    /// THE load-bearing extraction test (DP-A).
+    /// THE load-bearing extraction test.
     ///
     /// Two raw `buf`s with the SAME core message but different timestamp, `*conn`,
     /// and `, client:/request:` context must hash to the **same** key.
@@ -606,14 +606,14 @@ mod tests {
         );
     }
 
-    /// F4 regression: after a drain, the table must be empty so new templates
-    /// can be inserted.  Pre-fix, `drain_coalesce_table()` never cleared `key_hash`
-    /// — after 256 distinct templates the table was permanently full, and every
-    /// subsequent novel template fell back to verbatim with `template_hash = 0`
-    /// (coalescing silently off forever).
+    /// After a drain, the table must be empty so new templates can be inserted.
+    /// If `drain_coalesce_table()` did not clear `key_hash`, then after 256
+    /// distinct templates the table would be permanently full, and every
+    /// subsequent novel template would fall back to verbatim with
+    /// `template_hash = 0` (coalescing silently off forever).
     ///
-    /// This test FAILS on pre-fix code: step 3 would see the post-drain table
-    /// still full (all slots occupied), so `coalesce()` returns `EmitVerbatim{
+    /// This test exercises that path: a post-drain table that was still full
+    /// (all slots occupied) makes `coalesce()` return `EmitVerbatim{
     /// template_hash: 0}` rather than a real slot assignment.
     #[test]
     fn f4_drain_evicts_all_slots_allowing_new_templates() {
@@ -635,7 +635,7 @@ mod tests {
         let pre_drain = unsafe { coalesce(ptr, 4, novel, true) };
         assert!(
             matches!(pre_drain, CoalesceResult::EmitVerbatim { template_hash: 0 }),
-            "F4 precondition: full table must return template_hash=0 (no slot assigned)"
+            "precondition: full table must return template_hash=0 (no slot assigned)"
         );
 
         // Step 3: Drain the table.
@@ -649,18 +649,17 @@ mod tests {
             assert_eq!(
                 table[i].key_hash.load(Ordering::Relaxed),
                 0,
-                "F4: slot {i} key_hash must be 0 after drain (pre-fix: never cleared)"
+                "slot {i} key_hash must be 0 after drain"
             );
         }
 
         // Step 5: A new novel message must now get a real slot (template_hash ≠ 0).
-        // Pre-fix: drain left table full → still returns template_hash=0.
-        // Post-fix: drain evicted all slots → novel template gets assigned.
+        // The drain evicted all slots, so the novel template gets assigned.
         // SAFETY: `ptr` from make_table(); satisfies coalesce() contract.
         let post_drain = unsafe { coalesce(ptr, 4, novel, true) };
         assert!(
             matches!(post_drain, CoalesceResult::EmitVerbatim { template_hash } if template_hash != 0),
-            "F4: post-drain novel message must get a real slot (template_hash != 0)"
+            "post-drain novel message must get a real slot (template_hash != 0)"
         );
     }
 

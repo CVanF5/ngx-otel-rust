@@ -12,12 +12,11 @@
 //! channels; it communicates only with master.
 //!
 //! The handler is registered via `nginx_sys::ngx_add_channel_event` in
-//! `otel_exporter_cycle` (Sub-item 4 / `src/exporter/mod.rs`).
+//! `otel_exporter_cycle` (`src/exporter/mod.rs`).
 //!
-//! See `PHASE_1_3_RESEARCH.md` §3.4 and §8 Q1 for the design rationale.
 //! Bindings for `ngx_channel_t`, `ngx_read_channel`, and
-//! `ngx_add_channel_event` come from `nginx_sys::*` via the pre-flight
-//! `ngx-rust/nginx-sys/build/wrapper.h` `#include <ngx_channel.h>` commit.
+//! `ngx_add_channel_event` come from `nginx_sys::*` via the
+//! `ngx-rust/nginx-sys/build/wrapper.h` `#include <ngx_channel.h>`.
 
 use core::mem;
 
@@ -39,7 +38,7 @@ use nginx_sys::{
 /// `ngx_channel_handler` at `nginx/src/os/unix/ngx_process_cycle.c:1022-1029`)
 /// and sets `ngx_terminate = 1` so the cycle loop exits immediately.
 ///
-/// **B2 fix:** the pre-fix code returned here without closing `c`, leaving the
+/// Closing `c` here is required: returning without closing it would leave the
 /// EOF-firing fd still registered on the level-triggered event queue → every
 /// subsequent `ngx_process_events_and_timers` call woke immediately and
 /// re-fired the handler → exporter at 100% CPU until manual SIGKILL.  With
@@ -73,7 +72,7 @@ pub unsafe extern "C" fn otel_exporter_channel_handler(ev: *mut ngx_event_t) {
             // Channel EOF or read error: master has closed its end (e.g.
             // master killed with SIGKILL) or the channel fd is broken.
             //
-            // B2 fix — mirror ngx_channel_handler
+            // Mirror ngx_channel_handler
             // (ngx_process_cycle.c:1022-1029):
             //   1. ngx_close_connection(c) — deregisters `c` from
             //      epoll/kqueue (calling ngx_del_conn internally with

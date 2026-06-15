@@ -18,10 +18,10 @@
 //!
 //! # Staged follow-on: remote reconfiguration
 //!
-//! **Static config only** in this phase — the processor config is read once at exporter
-//! startup and never reloaded.  The bidi control loop (Phase 5 / §1.2) will deliver a
-//! new config payload to the exporter via the control-shm channel (§1.3.3); the exporter
-//! will call [`Processor::from_config`] with the new blob and swap the processor.
+//! **Static config only** for now — the processor config is read once at exporter
+//! startup and never reloaded.  A future bidi control loop will deliver a
+//! new config payload to the exporter via the control-shm channel; the exporter
+//! will then call [`Processor::from_config`] with the new blob and swap the processor.
 //! The `from_config` API is designed for this: it is a pure function returning a new value,
 //! so the swap is a single assignment with no state migration.
 //!
@@ -439,7 +439,7 @@ mod tests {
 
     // ── ProbeDropProcessor tests ──────────────────────────────────────────────
 
-    /// S4 spec: 3 spans (/api/v1/users, /healthz, /metrics) with probe_drop
+    /// 3 spans (/api/v1/users, /healthz, /metrics) with probe_drop
     /// default paths → 1 span (/api/v1/users).
     #[test]
     fn probe_drop_drops_health_and_metrics_paths() {

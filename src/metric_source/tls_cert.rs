@@ -3,10 +3,10 @@
 // This source code is licensed under the Apache License, Version 2.0 license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! Serving-certificate metric source (TLS cert-metrics Phase C, item C3).
+//! Serving-certificate metric source.
 //!
 //! Emits three int64 gauges per TLS serving certificate from the config-time
-//! cert table built by [`crate::cert_table::build_cert_table`] (item C2):
+//! cert table built by [`crate::cert_table::build_cert_table`]:
 //!
 //!  - `ngx_otel.tls.certificate.not_after`           — notAfter, Unix epoch s
 //!  - `ngx_otel.tls.certificate.not_before`          — notBefore, Unix epoch s
@@ -22,8 +22,8 @@
 //!
 //! When the table is empty (nginx built without `http_ssl_module`, or no
 //! `ssl_certificate` configured) the three series are **absent** from the
-//! export entirely — not present-as-zero (the stub_status absent-not-zero
-//! precedent, H3F7).
+//! export entirely — not present-as-zero (matching how stub_status metrics are
+//! absent rather than reported as zero).
 
 use crate::cert_table::CertInfo;
 use crate::data_model::{
@@ -31,7 +31,7 @@ use crate::data_model::{
 };
 use crate::metric_source::MetricSource;
 
-/// Metric names (`ngx_otel.*` namespace per decision Q1 — deliberately NOT
+/// Metric names (`ngx_otel.*` namespace — deliberately NOT
 /// NGINX Agent's `nginx.certificate.time_to_expiration`).
 pub const NOT_AFTER: &str = "ngx_otel.tls.certificate.not_after";
 pub const NOT_BEFORE: &str = "ngx_otel.tls.certificate.not_before";
@@ -52,9 +52,9 @@ impl MetricSource for ServingCertSource<'_> {
         // is wall time, so `time_to_expiration` MUST be `notAfter − wall_now`.
         // Do NOT switch this to `ngx_current_msec`: that value is nginx's
         // cached *monotonic-ish* ms-since-boot timer, and mixing it with epoch
-        // values has bitten this project before — Phase 2.3 stamped error
-        // LogRecords with `ngx_current_msec`, which Loki rejected as 1970-era
-        // timestamps and 400'd whole batches (the error-log timestamp lesson).
+        // values has bitten this project before — error LogRecords once stamped
+        // with `ngx_current_msec` were rejected by Loki as 1970-era timestamps,
+        // 400'ing whole batches.
         // `now_unix_secs` is `std::time::SystemTime` wall clock; appropriate
         // here because `collect` runs only on the exporter process.
         let now_wall_secs = crate::util::now_unix_secs() as i64;
@@ -107,7 +107,7 @@ impl ServingCertSource<'_> {
 
 /// The per-certificate attribute set.
 ///
-/// Scope guard (RALPH_TLS_CERT_METRICS.md, binding): EXACTLY these seven
+/// Scope: EXACTLY these seven
 /// attributes — `file_path`, `tls.server.subject` (CN only),
 /// `tls.server.issuer` (CN only), `serial_number`, `public_key_algorithm`,
 /// `signature_algorithm`, `server.address`. Nothing else: no PEM, no keys,
@@ -170,7 +170,7 @@ mod tests {
     ];
 
     /// One cert → three int64 gauges with exact values, exact names, and
-    /// EXACTLY the seven allowed attributes (scope guard).
+    /// EXACTLY the seven allowed attributes.
     #[test]
     fn three_gauges_exact_values_and_attribute_set() {
         let certs = [mock_cert("/etc/ssl/a.crt", "a.example.test", 1_700_000_000, 1_893_456_000)];
@@ -220,7 +220,7 @@ mod tests {
             assert_eq!(val("server.address"), "www.example.test");
         }
 
-        // Decision Q1: our names live under ngx_otel.* ONLY — never NGINX
+        // Our names live under ngx_otel.* ONLY — never NGINX
         // Agent's `nginx.certificate.*` namespace.
         for m in &metrics {
             assert!(
@@ -253,8 +253,8 @@ mod tests {
         assert_eq!(tte_at(2_750), -750, "after expiry: negative, exact");
     }
 
-    /// Empty cert table → NO metrics at all (absent, not zero — the
-    /// stub_status absent-not-zero precedent).
+    /// Empty cert table → NO metrics at all (absent, not zero — matching how
+    /// stub_status metrics are absent rather than reported as zero).
     #[test]
     fn absent_when_table_empty() {
         let src = ServingCertSource { certs: &[] };

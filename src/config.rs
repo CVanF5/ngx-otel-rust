@@ -62,7 +62,8 @@ const DEFAULT_RETRY_BUFFER_DEPTH: usize = 4;
 /// Corresponds to the `otel_export_protocol` directive:
 /// - `otlp_http` (default): OTLP/HTTP over HTTP/1.1 (`POST /v1/metrics`).
 /// - `otlp_grpc`:           OTLP/gRPC over HTTP/2 (`MetricsService.Export`).
-/// - `arrow` is reserved for Phase 5 and is rejected at config parse time.
+/// - `arrow` is reserved for a future OTel Arrow transport and is rejected at
+///   config parse time.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ExportProtocol {
     /// OTLP/HTTP protobuf — the default.  Uses `HyperHttpTransport`.
@@ -220,7 +221,7 @@ pub(crate) fn validate_endpoint_tls(
     Ok(input.ssl_verify_off)
 }
 
-// ── Route and upstream tables (Phase 2.2 DP-E) ──────────────────────────────
+// ── Route and upstream tables ───────────────────────────────────────────────
 
 /// Maximum bytes stored per route name in the lookup table.
 pub const ROUTE_NAME_MAX: usize = 64;
@@ -290,18 +291,18 @@ pub struct MainConfig {
     /// UNSET_FLAG (-1) = not set (treated as on/default).
     pub status_code_class: ngx_flag_t,
     /// `otel_grpc_smoke_endpoint <url>` — TEST-ONLY trigger for the
-    /// Phase 1.2 Item 1 in-worker gRPC viability harness.  When set
+    /// in-worker unary gRPC viability harness.  When set
     /// (and the crate is built with the `test-support` feature),
     /// Worker 0's `init_process` fires one unary OTLP/gRPC export via
     /// `NgxExecutor` + `SendRequestService` + `NgxConnIo` to verify
-    /// the §7.3 pipeline works end-to-end on real nginx event-loop
+    /// the export pipeline works end-to-end on real nginx event-loop
     /// infrastructure under `--with-debug`.  In production (non-test)
     /// builds the directive is parsed but ignored; documented as such
     /// in `src/transport/grpc/smoke.rs`.
     pub grpc_smoke_endpoint: ngx_str_t,
     /// `otel_grpc_bidi_smoke_endpoint <url>` — TEST-ONLY trigger for the
-    /// Phase 1.2 Item 2 bidi gRPC viability harness.  Parallel to
-    /// `grpc_smoke_endpoint` (Item 1).  When set (and built with
+    /// bidi gRPC viability harness.  Parallel to
+    /// `grpc_smoke_endpoint`.  When set (and built with
     /// `test-support`), Worker 0's `init_process` fires one bidi
     /// `Echo.BidiEcho` call against the local echo server to verify that
     /// the send-half and receive-half are independently pollable through
@@ -309,8 +310,8 @@ pub struct MainConfig {
     /// `test-support`.
     pub bidi_smoke_endpoint: ngx_str_t,
     /// `otel_grpc_bidi_overload_endpoint <url>` — TEST-ONLY trigger for the
-    /// Phase 1.2 Item 3 backpressure / livelock integration test.  Parallel
-    /// to `bidi_smoke_endpoint` (Item 2).  When set (and built with
+    /// backpressure / livelock integration test.  Parallel
+    /// to `bidi_smoke_endpoint`.  When set (and built with
     /// `test-support`), Worker 0's `init_process` fires a sustained bidi
     /// overload against the echo server, exercising the give-up path and
     /// incrementing `BIDI_BACKPRESSURE_DROPS`.  Parsed in all builds; acted
@@ -318,14 +319,14 @@ pub struct MainConfig {
     pub bidi_overload_endpoint: ngx_str_t,
     /// `otel_export_protocol otlp_http | otlp_grpc;` — selects the export
     /// transport.  `None` means the directive was not set; treated as
-    /// `OtlpHttp` (default) by [`export_protocol`].
+    /// `OtlpHttp` (default) by the `export_protocol` accessor.
     pub export_protocol: Option<ExportProtocol>,
     /// The registered shared memory zone (set during postconfiguration).
     pub shm_zone: *mut nginx_sys::ngx_shm_zone_t,
     /// The registered control-plane shared memory zone (set during
     /// postconfiguration alongside `shm_zone`). Used by the exporter for
     /// the liveness heartbeat and by workers for the hot-path placeholder
-    /// load (Phase 1.3.3). Phase 5 wires the bidi control channel to it.
+    /// load. A future bidi control channel will also use this zone.
     pub control_shm_zone: *mut nginx_sys::ngx_shm_zone_t,
     /// The registered logs shm zone (set during postconfiguration when
     /// `is_access_sample_enabled() || error_log_enabled`).  Per-worker layout:
@@ -338,7 +339,7 @@ pub struct MainConfig {
     /// the exporter by checking `spans_shm_base()` is non-null.
     pub spans_shm_zone: *mut nginx_sys::ngx_shm_zone_t,
 
-    // ── A1b: zone-init data ──────────────────────────────────────────────────
+    // ── Zone-init data ───────────────────────────────────────────────────────
     //
     // Each zone registration stores a `ZoneInitData` in these fields and points
     // `ngx_shm_zone_t.data` at it.  Storing inside `MainConfig` (config pool)
@@ -354,7 +355,7 @@ pub struct MainConfig {
 
     /// Final active worker count set by `check_zone_sizing` in `init_module`.
     ///
-    /// Zones may be reserved for more capacity (ncpu-headroom from A1b); the
+    /// Zones may be reserved for more capacity (ncpu-headroom); the
     /// exporter drains only `n_active_workers` slots.
     /// `0` = not yet set; callers fall back to zone-size-derived count.
     pub n_active_workers: core::sync::atomic::AtomicUsize,
@@ -364,13 +365,13 @@ pub struct MainConfig {
     /// Presence ⇒ exception tail + exemplar sampling on; absent ⇒ off.
     /// The histogram is always-on regardless of this field.
     ///
-    /// Read via [`is_access_sample_enabled`] / [`access_sample_size`].
+    /// Read via the `is_access_sample_enabled` / `access_sample_size` accessors.
     pub access_sample_size: usize,
     /// `otel_log_ring_size <size>` — per-worker ring capacity in bytes.
     /// `0` = not configured (uses `DEFAULT_LOG_RING_CAP`).
     pub log_ring_size: usize,
 
-    // ── Phase 2.3: error-log export ──────────────────────────────────────────
+    // ── Error-log export ─────────────────────────────────────────────────────
     //
     /// `otel_error_log [<level>];` was seen.  `false` = not configured (default
     /// off).  When `true`, the `ngx_otel_error_writer` node is woven into the
@@ -395,11 +396,11 @@ pub struct MainConfig {
     /// **⚠️ WARNING:** `off` is explicitly NOT guaranteed delivery.  The ring
     /// drops-newest under load; lost lines are accounted in `dropped_records`
     /// but gone.  The only guaranteed full-fidelity transcript is nginx's own
-    /// (untouched) `error_log` file.  The companion error-rate metric (DP-B)
+    /// (untouched) `error_log` file.  The companion error-rate metric
     /// counts the true total in both modes.
     pub error_log_coalesce: bool,
 
-    // ── Phase 2.2 DP-E: route and upstream-zone dimension tables ─────────────
+    // ── Route and upstream-zone dimension tables ─────────────────────────────
     //
     // Populated once at `postconfiguration` time (before workers fork) by
     // walking the nginx location tree and upstream list.  Workers inherit the
@@ -440,7 +441,7 @@ pub struct MainConfig {
     /// http conf has no explicit `resolver_timeout` (matching nginx-acme).
     pub resolver_timeout: nginx_sys::ngx_msec_t,
 
-    // ── TLS cert-metrics (Phase C, item C2) ──────────────────────────────────
+    // ── TLS cert-metrics ─────────────────────────────────────────────────────
     //
     /// Serving-certificate table, populated ONCE at `postconfiguration` time by
     /// [`crate::cert_table::build_cert_table`] (master process, before workers
@@ -469,16 +470,16 @@ impl Default for MainConfig {
             control_shm_zone: ptr::null_mut(),
             logs_shm_zone: ptr::null_mut(),
             spans_shm_zone: ptr::null_mut(),
-            // A1b: filled in at zone registration time.
+            // filled in at zone registration time.
             metrics_zone_init_data: crate::shm::ZoneInitData { ring_cap: 0, cycle_addr: 0 },
             logs_zone_init_data: crate::shm::ZoneInitData { ring_cap: 0, cycle_addr: 0 },
             spans_zone_init_data: crate::shm::ZoneInitData { ring_cap: 0, cycle_addr: 0 },
-            // A1b: set by check_zone_sizing in init_module (0 = not yet set).
+            // set by check_zone_sizing in init_module (0 = not yet set).
             n_active_workers: core::sync::atomic::AtomicUsize::new(0),
             // 0 = not configured (off by default).
             access_sample_size: 0,
             log_ring_size: 0,
-            // Phase 2.3 error-log defaults.
+            // Error-log defaults.
             error_log_enabled: false,
             // Fixed NGX_LOG_ERR default; overwritten by cmd_set_error_log only when
             // error_log_enabled is set (otherwise the field is never read by the writer).
@@ -497,7 +498,7 @@ impl Default for MainConfig {
             // DNS resolver: None until postconfiguration wires it for DNS endpoints.
             resolver: None,
             resolver_timeout: 0,
-            // C2: populated at postconfiguration by build_cert_table.
+            // Populated at postconfiguration by build_cert_table.
             cert_table: std::vec::Vec::new(),
         }
     }
@@ -539,7 +540,7 @@ unsafe fn n_workers_from_cf(cf: *const ngx_conf_t) -> Option<usize> {
     }
 }
 
-/// Worker-slot count to reserve in shm zones at parse time (A1b).
+/// Worker-slot count to reserve in shm zones at parse time.
 ///
 /// When `worker_processes` is already known (≥ 1), returns that exact count.
 /// When still `NGX_CONF_UNSET` (directive appears after `http{}`), returns
@@ -623,8 +624,8 @@ impl MainConfig {
     ///
     /// Mirrors `AcmeMainConfig::old_config` in `nginx-acme/src/conf.rs:667-676`.
     ///
-    /// Phase 1.2 will use this hook for TLS connection reuse and related cross-cycle
-    /// state transfer. In Phase 1.1 the hook is read-only: we log and return.
+    /// This hook is currently read-only (we log and return); it is the intended
+    /// anchor for future cross-cycle state transfer such as TLS connection reuse.
     pub fn old_config<'a>(cf: &mut ngx_conf_t) -> Option<&'a MainConfig> {
         // SAFETY: `cf` is a live `&mut ngx_conf_t`; nginx keeps `cf.cycle` and the
         // chained `old_cycle` either null (handled by `as_ref()?`) or pointing at
@@ -690,8 +691,8 @@ impl MainConfig {
         module: *mut ngx_module_t,
     ) -> Result<(), Status> {
         // Check for SIGHUP reload: look for the previous cycle's config.
-        // Phase 1.2 will use this hook for TLS connection reuse and related
-        // cross-cycle state transfer. In Phase 1.1 we only log.
+        // Currently we only log here; this is the intended anchor for future
+        // cross-cycle state transfer such as TLS connection reuse.
         // SAFETY: nginx invokes `postconfiguration` with a valid non-null `cf`,
         // so `&mut *cf` is a sound exclusive borrow for the call to `old_config`.
         if let Some(old) = unsafe { Self::old_config(&mut *cf) } {
@@ -843,24 +844,24 @@ impl MainConfig {
         // Register the metrics shared memory zone.
         self.register_shm_zone(cf, module)?;
 
-        // Register the control-plane shared memory zone (Phase 1.3.3).
-        // This zone holds the ControlShm heartbeat counter and the
-        // Phase 5 flag word. Registered alongside the metrics zone so
-        // both are mapped before workers fork.
+        // Register the control-plane shared memory zone.
+        // This zone holds the ControlShm heartbeat counter and a reserved
+        // flag word for a future bidi control channel. Registered alongside
+        // the metrics zone so both are mapped before workers fork.
         self.register_control_shm_zone(cf, module)?;
 
         // Register the per-worker logs shm zone when the access exception-tail
-        // (Phase 2.2) or the OTel error-log writer (Phase 2.3) is enabled.
+        // or the OTel error-log writer is enabled.
         if self.is_access_sample_enabled() || self.error_log_enabled {
             self.register_logs_zone(cf, module)?;
         }
 
-        // Register the dedicated spans shm zone (Phase 3.2).  Always registered
+        // Register the dedicated spans shm zone.  Always registered
         // when the module is loaded so the exporter can drain it even before any
         // trace directive is configured (the ring is just empty in that case).
         self.register_spans_zone(cf, module)?;
 
-        // Build the route and upstream-zone lookup tables (Phase 2.2 DP-E).
+        // Build the route and upstream-zone lookup tables.
         // This walks the nginx location tree and upstream list ONCE before
         // workers fork, so all workers see identical tables.
         // Safety: cf is valid; nginx guarantees postconfiguration runs after
@@ -873,7 +874,7 @@ impl MainConfig {
         // `build_upstream_table`'s contract.
         unsafe { self.build_upstream_table(cf) };
 
-        // Build the TLS serving-certificate table (Phase C item C2).  Runs
+        // Build the TLS serving-certificate table.  Runs
         // after ngx_http_ssl_module's merge_srv_conf has loaded all config-time
         // certificates into each server's SSL_CTX (merges complete before any
         // postconfiguration handler), in the single-threaded master.
@@ -890,7 +891,7 @@ impl MainConfig {
         cf: *mut ngx_conf_t,
         module: *mut ngx_module_t,
     ) -> Result<(), Status> {
-        // A1b: reserve capacity for ngx_ncpu slots when worker_processes is UNSET
+        // reserve capacity for ngx_ncpu slots when worker_processes is UNSET
         // (directive appears after http{}); fall back to the known count otherwise.
         // SAFETY: `cf` is the valid non-null parse context at postconfiguration.
         let n_workers: usize = unsafe { n_workers_to_reserve(cf) };
@@ -920,7 +921,7 @@ impl MainConfig {
             return Err(Status::NGX_ERROR);
         };
 
-        // A1b: fill the ZoneInitData for the zone-init callback.
+        // fill the ZoneInitData for the zone-init callback.
         // SAFETY: `cf` is valid and non-null per the postconfiguration contract.
         let cycle_addr = unsafe { (*cf).cycle as usize };
         self.metrics_zone_init_data = crate::shm::ZoneInitData {
@@ -934,7 +935,7 @@ impl MainConfig {
         // `self` outlives the zone (it lives in the same conf pool).
         unsafe {
             (*zone).init = Some(shm::otel_shm_zone_init);
-            // A1b: point data at ZoneInitData (was: MainConfig*).
+            // point data at ZoneInitData (was: MainConfig*).
             // The reload-detection in otel_shm_zone_init only checks old_data.is_null()
             // so the type change is transparent to reload semantics.
             (*zone).data = ptr::from_mut(&mut self.metrics_zone_init_data).cast();
@@ -946,7 +947,7 @@ impl MainConfig {
 
     /// Register the control-plane shared memory zone with nginx.
     ///
-    /// Mirrors [`register_shm_zone`] but uses a fixed size
+    /// Mirrors `register_shm_zone` but uses a fixed size
     /// (`ControlShm::ZONE_SIZE`) and the control-zone init callback.
     /// Stores the resulting `*mut ngx_shm_zone_t` on
     /// `MainConfig::control_shm_zone`.
@@ -987,13 +988,13 @@ impl MainConfig {
     /// Must be called from `postconfiguration` when
     /// `is_access_sample_enabled() || error_log_enabled`.
     /// Sizes the zone for `n_workers` workers.
-    /// Parallels [`register_shm_zone`].
+    /// Parallels `register_shm_zone`.
     pub fn register_logs_zone(
         &mut self,
         cf: *mut ngx_conf_t,
         module: *mut ngx_module_t,
     ) -> Result<(), Status> {
-        // A1b: reserve capacity for ncpu slots when worker_processes is UNSET.
+        // reserve capacity for ncpu slots when worker_processes is UNSET.
         // SAFETY: `cf` is the valid non-null parse context at postconfiguration.
         let n_workers: usize = unsafe { n_workers_to_reserve(cf) };
 
@@ -1013,7 +1014,7 @@ impl MainConfig {
             return Err(Status::NGX_ERROR);
         };
 
-        // A1b: fill ZoneInitData for the zone-init callback.
+        // fill ZoneInitData for the zone-init callback.
         // SAFETY: `cf` is valid and non-null per the postconfiguration contract.
         let cycle_addr = unsafe { (*cf).cycle as usize };
         self.logs_zone_init_data = crate::shm::ZoneInitData { ring_cap: cap, cycle_addr };
@@ -1022,7 +1023,7 @@ impl MainConfig {
         // nginx in the conf pool; writing its `init`/`data` fields is sound.
         unsafe {
             (*zone).init = Some(shm::logs_shm_zone_init);
-            // A1b: store ZoneInitData* instead of tagged cap.
+            // store ZoneInitData* instead of tagged cap.
             (*zone).data = ptr::from_mut(&mut self.logs_zone_init_data).cast();
         }
 
@@ -1039,7 +1040,7 @@ impl MainConfig {
         cf: *mut ngx_conf_t,
         module: *mut ngx_module_t,
     ) -> Result<(), Status> {
-        // A1b: reserve capacity for ncpu slots when worker_processes is UNSET.
+        // reserve capacity for ncpu slots when worker_processes is UNSET.
         // SAFETY: `cf` is the valid non-null parse context at postconfiguration.
         let n_workers: usize = unsafe { n_workers_to_reserve(cf) };
 
@@ -1058,7 +1059,7 @@ impl MainConfig {
             return Err(Status::NGX_ERROR);
         };
 
-        // A1b: fill ZoneInitData for the zone-init callback.
+        // fill ZoneInitData for the zone-init callback.
         // SAFETY: `cf` is valid and non-null per the postconfiguration contract.
         let cycle_addr = unsafe { (*cf).cycle as usize };
         self.spans_zone_init_data = crate::shm::ZoneInitData { ring_cap: cap, cycle_addr };
@@ -1066,7 +1067,7 @@ impl MainConfig {
         // SAFETY: same contract as `register_logs_zone`.
         unsafe {
             (*zone).init = Some(shm::spans_shm_zone_init);
-            // A1b: store ZoneInitData* instead of tagged cap.
+            // store ZoneInitData* instead of tagged cap.
             (*zone).data = ptr::from_mut(&mut self.spans_zone_init_data).cast();
         }
 
@@ -1092,7 +1093,7 @@ impl MainConfig {
 
     /// Returns the base address of our LogsWorkerSlot data within the logs shm zone.
     ///
-    /// Parallels [`shm_base`].  Returns `None` if the logs zone was not
+    /// Parallels `shm_base`.  Returns `None` if the logs zone was not
     /// registered (access log disabled) or not yet mapped.
     pub fn logs_shm_base(&self) -> Option<*mut u8> {
         // SAFETY: `logs_shm_zone` is either null (handled by `as_ref()?`) or the
@@ -1556,7 +1557,7 @@ impl MainConfig {
     /// export loop to reset the counter after a healthy WINDOW-length run.
     ///
     /// The `ControlShm` fields are `AtomicU64`, so concurrent reads by workers
-    /// (via [`control_shm_ptr`]) are data-race-free even without the caller
+    /// (via `control_shm_ptr`) are data-race-free even without the caller
     /// holding any lock.
     ///
     /// Returns `None` when:
@@ -1603,7 +1604,7 @@ static mut NGX_HTTP_OTEL_EXPORTER_COMMANDS: [ngx_command_t; 9] = [
         offset: 0,
         post: ptr::null_mut(),
     },
-    // TLS Phase A (A2): mTLS client cert directives + server-verify toggle.
+    // mTLS client cert directives + server-verify toggle.
     ngx_command_t {
         name: ngx_string!("ssl_certificate"),
         type_: NGX_CONF_TAKE1 as ngx_uint_t,
@@ -1971,7 +1972,7 @@ macro_rules! production_commands {
                 offset: mem::offset_of!(MainConfig, status_code_class),
                 post: ptr::null_mut(),
             },
-            // otel_grpc_smoke_endpoint <url>;  TEST-ONLY (Phase 1.2 Item 1).
+            // otel_grpc_smoke_endpoint <url>;  TEST-ONLY (unary gRPC harness).
             // Parsed in all builds but only acted on with test-support feature.
             ngx_command_t {
                 name: ngx_string!("otel_grpc_smoke_endpoint"),
@@ -1981,7 +1982,7 @@ macro_rules! production_commands {
                 offset: mem::offset_of!(MainConfig, grpc_smoke_endpoint),
                 post: ptr::null_mut(),
             },
-            // otel_grpc_bidi_smoke_endpoint <url>;  TEST-ONLY (Phase 1.2 Item 2).
+            // otel_grpc_bidi_smoke_endpoint <url>;  TEST-ONLY (bidi gRPC harness).
             ngx_command_t {
                 name: ngx_string!("otel_grpc_bidi_smoke_endpoint"),
                 type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
@@ -1990,7 +1991,7 @@ macro_rules! production_commands {
                 offset: mem::offset_of!(MainConfig, bidi_smoke_endpoint),
                 post: ptr::null_mut(),
             },
-            // otel_grpc_bidi_overload_endpoint <url>;  TEST-ONLY (Phase 1.2 Item 3).
+            // otel_grpc_bidi_overload_endpoint <url>;  TEST-ONLY (bidi backpressure test).
             ngx_command_t {
                 name: ngx_string!("otel_grpc_bidi_overload_endpoint"),
                 type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
@@ -2002,7 +2003,7 @@ macro_rules! production_commands {
             // otel_export_protocol otlp_http | otlp_grpc;
             // Selects the OTLP wire transport.  Default: otlp_http (byte-identical
             // to the pre-existing behaviour when the directive is absent).
-            // "arrow" is rejected with a "not yet implemented (Phase 5)" message.
+            // "arrow" is rejected at parse time with a "not yet implemented" message.
             ngx_command_t {
                 name: ngx_string!("otel_export_protocol"),
                 type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
@@ -2011,7 +2012,7 @@ macro_rules! production_commands {
                 offset: 0,
                 post: ptr::null_mut(),
             },
-            // otel_access_log_sample <size>;  (Phase 2.2 DP-D)
+            // otel_access_log_sample <size>;
             // Enables the exception tail + exemplar reservoir and sizes the
             // per-worker exemplar reservoir to <size> entries.  Absent ⇒ off.
             // The histogram is always-on regardless of this directive.
@@ -2023,7 +2024,7 @@ macro_rules! production_commands {
                 offset: 0,
                 post: ptr::null_mut(),
             },
-            // otel_log_ring_size <size>;  (Phase 2.1)
+            // otel_log_ring_size <size>;
             // Per-worker ring capacity in bytes.  Memory = size × 2 × N workers.
             // Default: 512k (DEFAULT_LOG_RING_CAP).  Raise for high-RPS deployments.
             ngx_command_t {
@@ -2034,7 +2035,7 @@ macro_rules! production_commands {
                 offset: 0,
                 post: ptr::null_mut(),
             },
-            // otel_error_log [<level>];  (Phase 2.3 §6.6.2)
+            // otel_error_log [<level>];
             // Enables OTel error-log export via a ngx_log_writer_pt writer node.
             // NOARGS ⇒ fixed floor NGX_LOG_ERR (decoupled from core error_log);
             // TAKE1 ⇒ explicit level override.
@@ -2052,7 +2053,7 @@ macro_rules! production_commands {
                 offset: 0,
                 post: ptr::null_mut(),
             },
-            // otel_error_log_coalesce on|off;  (Phase 2.3 §6.6.2)
+            // otel_error_log_coalesce on|off;
             // Default: on.  `off` ⇒ bypass the coalescer and push every
             // level-passing line verbatim to the bounded ring.
             //
@@ -2060,7 +2061,7 @@ macro_rules! production_commands {
             // The ring drops-newest under load; lost lines are accounted in
             // dropped_records but gone.  The only guaranteed full-fidelity
             // transcript is nginx's own (untouched) error_log file.
-            // The companion error-rate metric (DP-B) counts the true total
+            // The companion error-rate metric counts the true total
             // in both modes; only the bodies are potentially lost.
             ngx_command_t {
                 name: ngx_string!("otel_error_log_coalesce"),
@@ -2070,7 +2071,7 @@ macro_rules! production_commands {
                 offset: 0,
                 post: ptr::null_mut(),
             },
-            // otel_trace <complex-value>;  (Phase 3.5 S3)
+            // otel_trace <complex-value>;
             // Per-location trace enable/disable.  The complex value allows
             // `split_clients`-based ratio sampling.  Absent ⇒ tracing disabled
             // for this location (zero cost — REWRITE handler exits immediately).
@@ -2084,7 +2085,7 @@ macro_rules! production_commands {
                 offset: 0,
                 post: ptr::null_mut(),
             },
-            // otel_trace_context ignore|extract|inject|propagate;  (Phase 3.5 S3)
+            // otel_trace_context ignore|extract|inject|propagate;
             // W3C traceparent propagation mode.  Default: extract (read inbound,
             // do not inject outbound).
             ngx_command_t {
@@ -2096,7 +2097,7 @@ macro_rules! production_commands {
                 offset: 0,
                 post: ptr::null_mut(),
             },
-            // otel_span_name <complex-value>;  (Phase 3.5 S3)
+            // otel_span_name <complex-value>;
             // Per-location span name override.  Absent ⇒ built-in
             // "METHOD route_name" format.
             ngx_command_t {
@@ -2108,7 +2109,7 @@ macro_rules! production_commands {
                 offset: 0,
                 post: ptr::null_mut(),
             },
-            // otel_span_attr <key> <value>;  (Phase 3.5 S3)
+            // otel_span_attr <key> <value>;
             // Add a custom attribute to every span emitted from this location.
             // Multiple directives accumulate; child location wins (no inheritance).
             ngx_command_t {
@@ -2311,7 +2312,7 @@ extern "C" fn cmd_set_metric_zone(
 /// Directive callback for `otel_export_protocol otlp_http | otlp_grpc;`.
 ///
 /// Accepts `otlp_http` and `otlp_grpc`.  Rejects `arrow` with a
-/// "not yet implemented (Phase 5)" message.  Rejects any other value with
+/// "not yet implemented" message.  Rejects any other value with
 /// an "unknown value" message listing the valid choices.
 extern "C" fn cmd_set_export_protocol(
     cf: *mut ngx_conf_t,
@@ -2409,7 +2410,7 @@ extern "C" fn cmd_set_log_ring_size(
     }
 }
 
-/// Directive callback for `otel_access_log_sample <size>;` (Phase 2.2 DP-D).
+/// Directive callback for `otel_access_log_sample <size>;`.
 ///
 /// Enables the exception-tail ring + exemplar reservoir and sizes the per-worker
 /// reservoir to `<size>` entries.  Must be ≥ 1.  Parsed as a plain integer
@@ -2450,7 +2451,7 @@ extern "C" fn cmd_set_access_sample(
     }
 }
 
-/// Directive callback for `otel_error_log [<level>];` (Phase 2.3 §6.6.2).
+/// Directive callback for `otel_error_log [<level>];`.
 ///
 /// Inserts a writer-only `ngx_log_t` node into `cycle->new_log` via
 /// `otel_log_insert`.  The node calls `ngx_otel_error_writer` for every error
@@ -2577,7 +2578,7 @@ extern "C" fn cmd_set_error_log(
     NGX_CONF_OK
 }
 
-/// Directive callback for `otel_error_log_coalesce on|off;` (Phase 2.3 §6.6.2).
+/// Directive callback for `otel_error_log_coalesce on|off;`.
 ///
 /// Sets `amcf.error_log_coalesce`.  The standard nginx flag handler
 /// (`ngx_conf_set_flag_slot`) is not used here because `error_log_coalesce`
@@ -2644,7 +2645,7 @@ extern "C" fn cmd_set_otel_status_endpoint(
     NGX_CONF_OK
 }
 
-/* ─────────────────── Phase 3.5 S3: trace directive handlers ────────────────── */
+/* ────────────────────────── trace directive handlers ───────────────────────── */
 
 /// Compile a directive argument into a `ngx_http_complex_value_t` on the conf pool.
 ///
@@ -2689,7 +2690,7 @@ unsafe fn compile_complex_value(
     cv_ptr
 }
 
-/// Directive callback for `otel_trace <complex-value>;` (Phase 3.5 S3).
+/// Directive callback for `otel_trace <complex-value>;`.
 ///
 /// The complex value is evaluated at request time: truthy (non-empty, not `"0"`,
 /// not `"off"`) ⇒ tracing enabled; falsy ⇒ disabled.  Absence of the directive
@@ -2725,8 +2726,7 @@ extern "C" fn cmd_set_otel_trace(
     NGX_CONF_OK
 }
 
-/// Directive callback for `otel_trace_context ignore|extract|inject|propagate;`
-/// (Phase 3.5 S3).
+/// Directive callback for `otel_trace_context ignore|extract|inject|propagate;`.
 extern "C" fn cmd_set_otel_trace_context(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
@@ -2760,7 +2760,7 @@ extern "C" fn cmd_set_otel_trace_context(
     NGX_CONF_OK
 }
 
-/// Directive callback for `otel_span_name <complex-value>;` (Phase 3.5 S3).
+/// Directive callback for `otel_span_name <complex-value>;`.
 ///
 /// Per-location span name override.  The complex value is evaluated at request
 /// time.  Absent ⇒ built-in `"METHOD route_name"` format.
@@ -2793,7 +2793,7 @@ extern "C" fn cmd_set_otel_span_name(
     NGX_CONF_OK
 }
 
-/// Directive callback for `otel_span_attr <key> <value>;` (Phase 3.5 S3).
+/// Directive callback for `otel_span_attr <key> <value>;`.
 ///
 /// Appends a static key/value pair to this location's span attribute list.
 /// Multiple directives accumulate; child locations define their own independent
@@ -2916,9 +2916,9 @@ mod tests {
         assert!(!cfg.is_configured());
         assert_eq!(cfg.interval_ms(), DEFAULT_INTERVAL_MS);
         assert!(cfg.status_code_class_enabled()); // UNSET treated as on
-                                                  // exception-tail / exemplar sampling is off by default (Phase 2.2)
+                                                  // exception-tail / exemplar sampling is off by default
         assert!(!cfg.is_access_sample_enabled(), "access sample must default to off");
-        // error-log export is off by default (Phase 2.3)
+        // error-log export is off by default
         assert!(!cfg.error_log_enabled, "error_log_enabled must default to false");
         assert!(cfg.error_log_coalesce, "error_log_coalesce must default to true (on)");
     }
@@ -3216,7 +3216,7 @@ mod tests {
         assert!(!has_authority(b""));
     }
 
-    // ── A2: TLS config surface ────────────────────────────────────────────────
+    // ── TLS config surface ─────────────────────────────────────────────────────
 
     /// `ExporterConfig::default()` initialises TLS fields to their zero/unset
     /// sentinel values: empty paths, `ssl_verify = UNSET_FLAG (-1)`.

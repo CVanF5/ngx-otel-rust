@@ -3,7 +3,7 @@
 // This source code is licensed under the Apache License, Version 2.0 license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! Per-location module configuration — Phase 3.5 (S3).
+//! Per-location module configuration.
 //!
 //! [`LocationConf`] is allocated by nginx at config-parse time via the
 //! `create_loc_conf` / `merge_loc_conf` hooks (wired in `lib.rs`) and is

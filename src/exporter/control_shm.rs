@@ -3,13 +3,13 @@
 // This source code is licensed under the Apache License, Version 2.0 license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! Control-plane shared-memory zone — Phase 1.3.3 scaffold.
+//! Control-plane shared-memory zone — scaffold.
 //!
-//! This zone is the plumbing for Phase 5's dynamic reconfiguration
-//! delivered via the bidi control channel from the collector side.
-//! Phase 1.3.3 establishes the zone registration, heartbeat counter,
-//! and hot-path load placeholder; Phase 5 wires the control channel
-//! into it for real dynamic-reconfig delivery.
+//! This zone is the plumbing for future dynamic reconfiguration delivered via
+//! a bidi control channel from the collector side. It currently establishes
+//! the zone registration, heartbeat counter, and a hot-path load placeholder;
+//! the control channel is not yet wired into it for real dynamic-reconfig
+//! delivery.
 //!
 //! Layout (relative to `ngx_shm_zone_t.shm.addr`):
 //!
@@ -27,9 +27,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use nginx_sys::{ngx_int_t, ngx_shm_zone_t};
 use ngx::core::Status;
 
-/// Control-plane shared-memory zone. Phase 1.3.3 establishes the
-/// plumbing; Phase 5 wires the bidi control channel to it for dynamic
-/// reconfiguration delivered from the collector side.
+/// Control-plane shared-memory zone. Establishes the plumbing for a future
+/// bidi control channel that will deliver dynamic reconfiguration from the
+/// collector side.
 ///
 /// Mapped at `data_offset()` bytes into the zone (after the slab-pool
 /// header that `ngx_init_zone_pool` writes — same pattern as
@@ -39,29 +39,28 @@ use ngx::core::Status;
 /// ```text
 /// offset  field               width   notes
 ///   0     version             8 B     monotonic heartbeat / reconfig sentinel
-///   8     flags               8 B     reserved (Phase 5 fast-path reconfiguration)
+///   8     flags               8 B     reserved (fast-path reconfiguration)
 ///  16     crash_count         8 B     exporter restarts within crash window
 ///  24     window_start_unix   8 B     UNIX seconds: start of the current crash window
-///  32     successor_gen       8 B     B1 reload successor generation counter
-///  40     last_beat_msec      8 B     B4 liveness beat (exporter ngx_current_msec)
-///  48     _reserved[0..2]    16 B     Phase 5 payload budget
+///  32     successor_gen       8 B     reload successor generation counter
+///  40     last_beat_msec      8 B     liveness beat (exporter ngx_current_msec)
+///  48     _reserved[0..2]    16 B     reserved payload budget
 /// ```
 /// Total: 8 × AtomicU64 = 64 bytes. `#[repr(C)]` layout is pinned by the
 /// `control_shm_struct_size` unit test.
 #[repr(C)]
 pub struct ControlShm {
     /// Monotonic version counter. Exporter increments once per drain
-    /// cycle as a liveness heartbeat AND as Phase 5's reconfig-delivery
+    /// cycle as a liveness heartbeat AND as a future reconfig-delivery
     /// sentinel (after applying a reconfig the exporter increments so
     /// the collector can observe convergence).
     pub version: AtomicU64,
-    /// Reserved flag word; layout TBD in Phase 5. Workers load this on
-    /// the hot path (Sub-item 2) but discard the value in Phase 1.3.3 —
-    /// it is the placeholder for Phase 5's dynamic-reconfig fast-path
-    /// checks.
+    /// Reserved flag word; layout to be defined. Workers load this on
+    /// the hot path but currently discard the value — it is the
+    /// placeholder for a future dynamic-reconfig fast-path check.
     pub flags: AtomicU64,
     /// Crash-loop backoff counter: number of times the exporter has started
-    /// within the current [`window_start_unix`] + `CRASH_WINDOW_SECS` window.
+    /// within the current `window_start_unix` + `CRASH_WINDOW_SECS` window.
     ///
     /// Written by the exporter at startup (before any risky init); read and
     /// compared against `MAX_CRASH_RESTARTS`. Cross-process: master maps the
@@ -73,7 +72,7 @@ pub struct ControlShm {
     /// clearing transient crash history for a long-lived healthy exporter.
     /// Zero means no window has been established yet (treat as "window expired").
     pub window_start_unix: AtomicU64,
-    /// B1 — Reload successor generation counter.
+    /// Reload successor generation counter.
     ///
     /// **Written exclusively by the master** in `ngx_otel_init_module` (which
     /// runs in the master process) via `fetch_add(1, Release)` on each SIGHUP
@@ -98,7 +97,7 @@ pub struct ControlShm {
     /// each exporter is sole consumer of its own zones (see
     /// `ngx_master_process_cycle` in nginx's `ngx_process_cycle.c`).
     pub successor_gen: AtomicU64,
-    /// B4 follow-up 2 — exporter liveness heartbeat timestamp.
+    /// Exporter liveness heartbeat timestamp.
     ///
     /// **Written by the exporter** from a dedicated, self-rearming
     /// `ngx_event_t` timer (`heartbeat_timer_handler` in `exporter/mod.rs`)
@@ -119,12 +118,12 @@ pub struct ControlShm {
     /// not-stale (startup grace: don't alert before the exporter's first beat).
     pub last_beat_msec: AtomicU64,
     /// Reserved padding for forward-compatible additions.
-    /// Phase 5 payload budget: 2 × AtomicU64 = 16 bytes.
+    /// Reserved payload budget: 2 × AtomicU64 = 16 bytes.
     pub _reserved: [AtomicU64; 2],
 }
 
 impl ControlShm {
-    /// Zone size: one OS page. Generous overhead; Phase 5 will not exceed.
+    /// Zone size: one OS page. Generous overhead for forward-compatible growth.
     pub const ZONE_SIZE: usize = 4096;
 }
 
@@ -297,11 +296,10 @@ mod tests {
         );
     }
 
-    /// B1 regression: abdication logic is driven by `successor_gen`.
+    /// Abdication logic is driven by `successor_gen`.
     ///
-    /// Pre-B1 code had no `successor_gen` field at all — this test would
-    /// not compile.  Post-B1: verify the sentinel semantics that drive
-    /// `graceful_drain` abdication decisions.
+    /// Verifies the sentinel semantics that drive `graceful_drain` abdication
+    /// decisions.
     #[test]
     fn b1_successor_gen_abdication_logic() {
         let buf = std::vec![0u8; mem::size_of::<ControlShm>()];

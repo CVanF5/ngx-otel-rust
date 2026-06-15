@@ -7,11 +7,11 @@
 //!
 //! This module is the top-level home for all log-emission infrastructure:
 //!
-//! - `severity` — nginx log level → OTel SeverityNumber mapping (Step 3).
-//! - `ring`     — per-worker SPSC lock-free byte ring (Step 5).
-//! - `access`   — access-record formatter (Step 7).
+//! - `severity` — nginx log level → OTel SeverityNumber mapping.
+//! - `ring`     — per-worker SPSC lock-free byte ring.
+//! - `access`   — access-record formatter.
 //! - [`LogProducer`] trait — the platform-axis API for pushing records into
-//!   the ring (Step 6).
+//!   the ring.
 //!
 //! # Architecture
 //! Workers push fixed-shape records into their own per-worker ring buffer
@@ -20,13 +20,13 @@
 //! encodes a [`crate::data_model::LogsBatch`], and sends it over the
 //! selected transport.
 //!
-//! This is the **central dedicated-exporter model** (proposal §6.5); do
+//! This is the **central dedicated-exporter model**; do
 //! NOT pivot to per-worker export.
 //!
 //! # Future — MPSC concern
-//! Phase 2 has two single-context producers (access: log-phase handler,
+//! There are two single-context producers (access: log-phase handler,
 //! error: `ngx_log_writer_pt` callback).  Each producer writes to its own
-//! ring.  Multi-module MPSC sharing (Phase N) would need a per-ring mutex
+//! ring.  Multi-module MPSC sharing would need a per-ring mutex
 //! or a lock-free MPSC ring; that complexity is deferred.
 
 pub mod access;
@@ -47,7 +47,7 @@ pub mod severity;
 /// - The caller does NOT hold any nginx mutex.
 /// - The caller may be a re-entrant context (signal handler); producers
 ///   must use their own re-entrancy guard if relevant (mandatory for the
-///   error-log writer; see Phase 2.2).
+///   error-log writer).
 ///
 /// # Wire format per record
 /// `[u8 ngx_level][u64 ts_unix_nano_be][u8 kind][payload...]`
@@ -65,8 +65,8 @@ pub trait LogProducer {
 
 /// A thin [`LogProducer`] wrapper around a [`ring::LogsWorkerRing`].
 ///
-/// Constructed by `LogPhaseHandler` on each request (Step 8) and by the
-/// error-log writer on each error event (Phase 2.2).  Zero cost: just an
+/// Constructed by `LogPhaseHandler` on each request and by the
+/// error-log writer on each error event.  Zero cost: just an
 /// opaque view (raw pointer) into the ring in shm.
 pub struct WorkerRingProducer {
     /// View of the calling worker's ring (a raw pointer into shm).

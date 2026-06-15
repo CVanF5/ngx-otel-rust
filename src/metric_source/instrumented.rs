@@ -6,7 +6,7 @@
 //! Log-phase handler that bumps per-worker shm slot counters per request
 //! and (when enabled) pushes an access log record into the per-worker ring.
 //!
-//! ## Hard constraints (verified in Step 6)
+//! ## Hard constraints
 //! - No `Vec::new()`, `Box::new()`, `String::from()`, or any heap allocation.
 //! - No syscalls beyond what the nginx log phase already incurs.
 //! - No locks; only atomic increments (`Ordering::Relaxed` on writes).
@@ -52,7 +52,7 @@ const NGX_MSEC_SENTINEL: u64 = usize::MAX as u64;
 /// Records a request into the base `{method × status_class × protocol}` combo
 /// histogram.
 ///
-/// F2: skips when `status == 0` — a client abort where nginx sent no response
+/// Skips when `status == 0` — a client abort where nginx sent no response
 /// headers.  Per OTel HTTP semconv, `http.response.status_code` is CONDITIONALLY
 /// REQUIRED only when a response was sent; it is ABSENT for aborted requests.
 /// Counting status-0 as 5xx inflated server-error-rate metrics on every
@@ -93,14 +93,14 @@ impl HttpRequestHandler for LogPhaseHandler {
             None => return Status::NGX_OK,
         };
 
-        // Phase 1.3.3 scaffold: prove the hot-path read is zero-cost.
+        // Scaffold: prove the hot-path read is zero-cost.
         // One Relaxed atomic load on control_shm.flags per request.
-        // The loaded value is intentionally discarded; Phase 5 will use
-        // it for dynamic-reconfig fast-path checks (sampling rate, dropped
-        // attributes, etc.). This load is inside the is_configured() gate
-        // (we returned above if amcf.main_conf returned None, i.e., the
-        // module is disabled) so module-loaded-but-disabled stays zero-cost.
-        // TODO(phase-5): act on the loaded flags value.
+        // The loaded value is intentionally discarded; a future dynamic-reconfig
+        // fast-path will use it (sampling rate, dropped attributes, etc.). This
+        // load is inside the is_configured() gate (we returned above if
+        // amcf.main_conf returned None, i.e., the module is disabled) so
+        // module-loaded-but-disabled stays zero-cost.
+        // TODO: act on the loaded flags value.
         if let Some(ctrl) = amcf.control_shm_ptr() {
             // SAFETY: `control_shm_ptr()` returns `Some` only when the control shm
             // zone is mapped, so `ctrl` points to a valid control struct in shm for
@@ -121,7 +121,7 @@ impl HttpRequestHandler for LogPhaseHandler {
         // it on the (single-threaded) request path is sound.
         let worker_id = unsafe { nginx_sys::ngx_worker };
 
-        // A1 bounds guard: if `check_zone_sizing` somehow didn't fire (e.g.
+        // Bounds guard: if `check_zone_sizing` somehow didn't fire (e.g.
         // the module was loaded without going through init_module), catch the
         // out-of-range index here rather than writing past the zone end.
         // `shm_n_workers()` derives the zone capacity from the registered zone
@@ -146,7 +146,7 @@ impl HttpRequestHandler for LogPhaseHandler {
             return Status::NGX_OK;
         }
 
-        debug_assert!(worker_id < n_workers, "A1: worker_id out of zone bounds");
+        debug_assert!(worker_id < n_workers, "worker_id out of zone bounds");
         // Get our slot. No allocation; pointer arithmetic only.
         // SAFETY: `worker_id < n_workers` (enforced by the bounds guard above);
         // `n_workers` is derived from the zone size so the slot is within the zone.
@@ -155,14 +155,14 @@ impl HttpRequestHandler for LogPhaseHandler {
         // Use AsRef to get a typed reference to the underlying ngx_http_request_t.
         let r = request.as_ref();
 
-        // ── Read SpanCtx early (§6.6.3 parse-once + D-2 dual-clock) ─────────
+        // ── Read SpanCtx early (parse-once + dual-clock) ───────────────────
         // Read BEFORE the duration computation so the monotonic anchor in
         // SpanCtx.start_mono can drive the µs histogram when tracing is on.
         // Set by SpanStartHandler in REWRITE.  None when tracing is not configured.
         // Re-used for:
         //   (1) µs histogram / duration_ms gate (this block).
-        //   (2) trace correlation on the access tail log / exemplar (Phase 2.2 below).
-        //   (3) span record emission when sampled (S2 block below).
+        //   (2) trace correlation on the access tail log / exemplar (below).
+        //   (3) span record emission when sampled (the span block below).
         let span_ctx: Option<&crate::traces::ctx::SpanCtx> = {
             use crate::traces::ctx::{recover_span_ctx, SpanCtx};
             // SAFETY: `ngx_http_otel_module` is a valid static module descriptor;
@@ -171,7 +171,7 @@ impl HttpRequestHandler for LogPhaseHandler {
             // from a pool-allocated `SpanCtx` that lives for the full request lifetime).
             let module = unsafe { &*core::ptr::addr_of!(crate::ngx_http_otel_module) };
             let slot = request.get_module_ctx::<SpanCtx>(module);
-            // H3F1: the LOG phase can run AFTER an internal redirect (error_page /
+            // The LOG phase can run AFTER an internal redirect (error_page /
             // try_files), where nginx has zeroed the module-ctx array.  Recover the
             // SpanCtx from the pool-cleanup anchor so the LOG phase sees pass-1's
             // span (one span per request).  The recovery walk runs ONLY when the
@@ -192,7 +192,7 @@ impl HttpRequestHandler for LogPhaseHandler {
         };
 
         // ── request duration in MICROSECONDS ─────────────────────────────────
-        // D-2 fix — OTel-SDK-idiomatic dual-clock:
+        // OTel-SDK-idiomatic dual-clock:
         //   When tracing is enabled (SpanCtx present): `start_mono.elapsed()` is
         //   one vDSO CLOCK_MONOTONIC read per request; always ≥ 0, NTP-immune.
         //   Makes the µs histogram, span (end−start), and the
@@ -213,7 +213,7 @@ impl HttpRequestHandler for LogPhaseHandler {
         // Keep a ms version for the is_interesting tail-latency gate (still ms-threshold).
         let duration_ms: u64 = duration_us / 1_000;
 
-        // ── request duration (Phase 2.2 DP-E — decomposed tables) ────────────
+        // ── request duration (decomposed tables) ─────────────────────────────
         // Three independent histogram bumps — each O(1) fetch_add, no alloc, no lock.
         let method = HttpMethod::from_bytes(r.method_name.as_bytes());
         let status = r.headers_out.status as u16;
@@ -225,7 +225,7 @@ impl HttpRequestHandler for LogPhaseHandler {
         // safe) because the exemplar block below also needs `base_idx` even for
         // status-0 latency outliers.
         //
-        // F2 fix: status 0 = client abort / no response sent.  `ngx_http_create_request`
+        // Status 0 = client abort / no response sent.  `ngx_http_create_request`
         // allocates the request struct with `ngx_pcalloc` (nginx src/http/ngx_http_request.c:588),
         // so `headers_out.status` starts as 0 and stays 0 when the client disconnects
         // before nginx sends response headers (port-scan SYN probe, TLS-to-plaintext
@@ -324,7 +324,7 @@ impl HttpRequestHandler for LogPhaseHandler {
                 // SAFETY: as above — non-null upstream state, plain field read.
                 let bytes_tx = unsafe { (*state).bytes_sent as u64 };
 
-                // C1 fix: nginx initialises all three timing fields to
+                // nginx initialises all three timing fields to
                 // (ngx_msec_t)-1 (= NGX_MSEC_SENTINEL) when the upstream
                 // attempt did not complete the corresponding phase (e.g.
                 // connect_time remains sentinel on a refused connection).
@@ -348,7 +348,7 @@ impl HttpRequestHandler for LogPhaseHandler {
             }
         }
 
-        // ── Phase 2.2: exception-tail / exemplar sampling ─────────────────
+        // ── exception-tail / exemplar sampling ────────────────────────────
         // Gate 1 (cheap config check): absent directive → is_access_sample_enabled()
         //   = false, this entire block is skipped.
         // Gate 2 (is_interesting predicate): the common 200/fast case falls through
@@ -393,7 +393,7 @@ impl HttpRequestHandler for LogPhaseHandler {
                     .saturating_mul(1_000_000_000)
                     .saturating_add(r.start_msec as u64 * 1_000_000);
 
-                // W3C trace correlation (§6.6.3 parse-once):
+                // W3C trace correlation (parse-once):
                 // SpanCtx was read once above; extract trace_id/span_id when sampled.
                 // Unsampled requests (ctx.sampled=false) still have a SpanCtx for
                 // W3C propagation but do not stamp the access tail.
@@ -412,9 +412,10 @@ impl HttpRequestHandler for LogPhaseHandler {
                 }
 
                 // url.path: r.uri (decoded path, WITHOUT query string / args).
-                // C2 fix: pre-fix code used r.unparsed_uri (= $request_uri, which
-                // includes '?args') — a semconv violation and a PII/credential-leak
-                // vector (e.g. ?token=SECRET ends up in exported tails + exemplars).
+                // Use r.uri, NOT r.unparsed_uri (= $request_uri, which includes
+                // '?args') — including args would be a semconv violation and a
+                // PII/credential-leak vector (e.g. ?token=SECRET ends up in
+                // exported tails + exemplars).
                 // r.uri is the normalised, args-stripped equivalent of $uri;
                 // the query string lives separately in r.args and is NOT recorded.
                 // High-cardinality — stays on the tail record ONLY, never a metric dim.
@@ -437,11 +438,10 @@ impl HttpRequestHandler for LogPhaseHandler {
                 };
 
                 // Sink 1: per-worker SPSC log ring (exception-tail LogRecord).
-                // B4: a `false` return is the ring-full drop path (already
-                // counted in the ring's `dropped`) — the TRIGGER for the
+                // A `false` return is the ring-full drop path (already counted
+                // in the ring's `dropped`) — the TRIGGER for the
                 // exporter-liveness check (heartbeat = the VERDICT).  Zero
-                // added cost on the healthy path (the bool was discarded
-                // pre-B4).
+                // added cost on the healthy path.
                 if !emit_access_record(&producer, &sampled) {
                     // SAFETY: `request.connection()` is the request's live
                     // connection pointer (may be null — handled inside);
@@ -458,14 +458,14 @@ impl HttpRequestHandler for LogPhaseHandler {
                     crate::liveness::check_exporter_liveness_on_drop(amcf, conn_log);
                 }
 
-                // Sink 2: exemplar reservoir (Phase 2.2 Steps 2.2.4 + 2.2.5).
+                // Sink 2: exemplar reservoir.
                 // One fetch_add + ≤ 9 Relaxed stores + 2 memcpy = within budget.
                 let effective_size = amcf.access_sample_size().max(1);
                 slot.exemplar_reservoir.write(effective_size, &sampled);
             }
         }
 
-        // ── S2: Span record emission (Phase 3.4) ──────────────────────────────
+        // ── Span record emission ──────────────────────────────────────────────
         // Gate 1: request must be sampled (ctx.sampled=true).
         // Gate 2: spans shm zone must be available (otel_spans_zone configured).
         // Both gates false → zero work, no ring push.
@@ -534,7 +534,7 @@ impl HttpRequestHandler for LogPhaseHandler {
                 };
 
                 // Build extra_attrs from otel_span_attr directives (up to
-                // MAX_SPAN_EXTRA_ATTRS pairs).  No heap alloc — stack buffer only.
+                // MAX_SPAN_EXTRA_ATTRS pairs).  No heap allocation — stack buffer only.
                 let mut attrs_buf: [(&[u8], &[u8]); MAX_SPAN_EXTRA_ATTRS] =
                     [(&[], &[]); MAX_SPAN_EXTRA_ATTRS];
                 let attrs_len = if let Some(lc) = loc_conf {
@@ -572,7 +572,7 @@ impl HttpRequestHandler for LogPhaseHandler {
                     name: &span_name_buf[..span_name_len],
                     method: r.method_name.as_bytes(),
                     http_status: status,
-                    url_path: r.uri.as_bytes(), // C2: uri = path only; unparsed_uri = path+args
+                    url_path: r.uri.as_bytes(), // uri = path only; unparsed_uri = path+args
                     duration_us,
                     extra_attrs: &attrs_buf[..attrs_len],
                 };
@@ -583,7 +583,7 @@ impl HttpRequestHandler for LogPhaseHandler {
                 // lifetime and outlives this handler invocation.
                 let spans = unsafe { spans_ring(spans_base, worker_id, DEFAULT_SPAN_RING_CAP) };
                 let producer = WorkerRingProducer { ring: spans };
-                // B4: ring-full drop path → liveness check (see the access-ring
+                // Ring-full drop path → liveness check (see the access-ring
                 // hook above for the trigger/verdict rationale).
                 if !emit_span_record(&producer, &rec) {
                     // SAFETY: same contract as the access-ring hook — null
@@ -614,7 +614,7 @@ pub const TAIL_STATUS_FLOOR: u16 = 400;
 /// are "interesting" regardless of status.  1000 ms = 1 s (latency outlier).
 pub const TAIL_LATENCY_MS: u64 = 1000;
 
-/// Predicate for the exception-tail / exemplar gate (Phase 2.2 Step 2.2.1).
+/// Predicate for the exception-tail / exemplar gate.
 ///
 /// Returns `true` when the request is "interesting" — an error status or a
 /// latency outlier.  The common 200/fast case returns `false` and skips the
@@ -786,7 +786,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
             for snap in slot.exemplar_reservoir.snapshot(effective_size) {
                 // Build filtered_attributes: url.path + user_agent.original.
                 // These are HIGH-CARDINALITY fields — they appear on exemplars ONLY,
-                // NEVER as metric dimensions (plan §DP-E, §2.2.5 guard).
+                // NEVER as metric dimensions.
                 let mut filtered_attrs: std::vec::Vec<KeyValue> = std::vec::Vec::new();
                 if snap.url_path_len > 0 {
                     if let Ok(s) =
@@ -825,7 +825,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
         let dur_bounds: std::vec::Vec<f64> = DURATION_BOUNDS_MS.iter().map(|&b| b as f64).collect();
         let byte_bounds: std::vec::Vec<f64> = BYTES_BOUNDS.iter().map(|&b| b as f64).collect();
 
-        // ── Build http.server.request.duration (Phase 2.2 DP-E) ─────────
+        // ── Build http.server.request.duration ──────────────────────────
         // All histograms are cumulative running totals.
         // amcf provides route/upstream name strings for the attribute values.
         let amcf_ref: Option<&crate::config::MainConfig> = amcf_ref_early;
@@ -1133,7 +1133,7 @@ mod tests {
         WorkerRingProducer,
     };
 
-    /// C1 regression: `(ngx_msec_t)-1` sentinel must NOT be recorded into
+    /// Regression: `(ngx_msec_t)-1` sentinel must NOT be recorded into
     /// upstream timing histograms.
     ///
     /// Pre-fix: `response_time`, `connect_time`, and `header_time` were cast
@@ -1323,7 +1323,7 @@ mod tests {
         assert!(!ring.pop_into(&mut out2), "ring must be empty after one record");
     }
 
-    /// C2 regression: `url.path` must use `r.uri` (path only) not `r.unparsed_uri`
+    /// Regression: `url.path` must use `r.uri` (path only) not `r.unparsed_uri`
     /// (which includes `?args`).
     ///
     /// Pre-fix: both call sites in `log_phase_handler` used `r.unparsed_uri.as_bytes()`.
@@ -1358,7 +1358,7 @@ mod tests {
         req.uri = ngx_str_t { len: path_only.len(), data: path_only.as_ptr() as *mut _ };
         req.unparsed_uri = ngx_str_t { len: with_args.len(), data: with_args.as_ptr() as *mut _ };
 
-        // POST-FIX (C2): r.uri.as_bytes() — path only, no query string.
+        // r.uri.as_bytes() — path only, no query string.
         let url_path = req.uri.as_bytes();
         assert!(
             !url_path.contains(&b'?'),
@@ -1377,7 +1377,7 @@ mod tests {
         );
     }
 
-    /// F2 regression: client-abort requests (status 0) must NOT be recorded into
+    /// Regression: client-abort requests (status 0) must NOT be recorded into
     /// `request_duration_combos`.
     ///
     /// Pre-fix: `StatusClass::from_status(0)` returns `S5xx` (catch-all), so every
@@ -1422,8 +1422,8 @@ mod tests {
             let (_, _, _, count) = slot.request_duration_combos[idx].snapshot();
             assert_eq!(
                 count, 0,
-                "F2: request_duration_combos[{idx}] must be 0 after status-0 request — \
-                 pre-fix code routes status 0 → S5xx and increments that combo"
+                "request_duration_combos[{idx}] must be 0 after status-0 request — \
+                 routing status 0 → S5xx would incorrectly increment that combo"
             );
         }
 
@@ -1432,14 +1432,14 @@ mod tests {
         let s5xx_idx = combo_index(method, StatusClass::S5xx, proto);
         assert_eq!(
             base_idx_0, s5xx_idx,
-            "F2 sanity: StatusClass::from_status(0) must resolve to the S5xx combo index"
+            "sanity: StatusClass::from_status(0) must resolve to the S5xx combo index"
         );
         // Directly record into S5xx to confirm the slot is otherwise functional.
         slot.request_duration_combos[s5xx_idx].record(duration_us);
         let (_, _, _, s5xx_count) = slot.request_duration_combos[s5xx_idx].snapshot();
         assert_eq!(
             s5xx_count, 1,
-            "F2 sanity: S5xx combo must be the one pre-fix would have incremented"
+            "sanity: S5xx combo must be the one that would otherwise be incremented"
         );
 
         // ── status 200: production record_base_combo must record into S2xx ──
@@ -1450,6 +1450,6 @@ mod tests {
         super::record_base_combo(slot, status200, base_idx_200, duration_us);
         let s2xx_idx = combo_index(method, StatusClass::S2xx, proto);
         let (_, _, _, s2xx_count) = slot.request_duration_combos[s2xx_idx].snapshot();
-        assert_eq!(s2xx_count, 1, "F2: status-200 request must be recorded into S2xx combo");
+        assert_eq!(s2xx_count, 1, "status-200 request must be recorded into S2xx combo");
     }
 }

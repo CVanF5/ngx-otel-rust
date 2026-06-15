@@ -5,14 +5,14 @@
 
 //! `MetricSource` trait and implementations.
 //!
-//! Phase 1.1 provides two implementations:
-//!  - `StubStatusSource`: reads `ngx_stat_*` atomics (Step 5)
-//!  - `InstrumentedSource`: reads per-worker shm slots (Step 6)
+//! Two implementations:
+//!  - `StubStatusSource`: reads `ngx_stat_*` atomics
+//!  - `InstrumentedSource`: reads per-worker shm slots
 
 pub mod instrumented;
 pub mod location_conf;
 pub mod span_start;
-// H3F7 option A: in a no-flag nginx build (`NGX_STAT_STUB` undefined →
+// In a no-flag nginx build (`NGX_STAT_STUB` undefined →
 // no `ngx_feature = "stat_stub"`) the stub_status source is never registered or
 // collected (see `export::collect_all_sources`), so its items are dead code.
 // We keep the module compiled (type/API coherence) but suppress the dead-code
