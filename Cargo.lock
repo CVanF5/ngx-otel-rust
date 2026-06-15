@@ -596,6 +596,7 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "httpdate",
  "hyper",
  "libc",
  "nginx-sys",

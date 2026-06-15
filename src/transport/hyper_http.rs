@@ -54,11 +54,10 @@ use std::net::TcpStream;
 #[cfg(any(test, feature = "test-support"))]
 use std::os::unix::net::UnixStream;
 use std::string::ToString;
-#[cfg(any(test, feature = "test-support"))]
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::Full;
+use http_body_util::{BodyExt as _, Full};
 use hyper::Request;
 use nginx_sys::{
     ngx_connection_t, ngx_create_pool, ngx_destroy_pool, ngx_event_connect_peer,
@@ -69,7 +68,157 @@ use nginx_sys::{
 use ngx::core::Pool;
 
 use super::tls::{SslCtx, TlsNgxConnIo};
-use super::TransportError;
+use super::{DeliveryOutcome, TransportError};
+
+// ──────────────────────────────────────────────────────────────────────────────
+// OTLP/HTTP status → DeliveryOutcome adapter (S2)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Which OTLP signal is being sent — used to select the correct
+/// `Export*ServiceResponse` protobuf for `partial_success` decoding.
+///
+/// The three signals have distinct response types (`ExportMetricsServiceResponse`,
+/// `ExportLogsServiceResponse`, `ExportTraceServiceResponse`) with different field
+/// names (`rejected_data_points`, `rejected_log_records`, `rejected_spans`).
+/// This enum lets us pick the right one without exposing HTTP specifics past the
+/// adapter boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OtlpSignal {
+    Metrics,
+    Logs,
+    Traces,
+}
+
+/// Decode the `rejected` count from an OTLP `Export*ServiceResponse` protobuf
+/// body for the given signal.
+///
+/// Returns 0 when:
+/// - the body is empty or malformed (best-effort; corrupted 2xx → treat as accepted),
+/// - `partial_success` is absent (fully accepted), or
+/// - `rejected_*` is 0 (all records accepted; server may still have a non-empty
+///   `error_message` for a warning, but we don't count that as a rejection).
+///
+/// Negative values from the proto `int64` field are clamped to 0 — the spec
+/// says "0 means fully accepted" and negative is not a defined signal.
+pub(crate) fn decode_partial_success_rejected(signal: OtlpSignal, body: &[u8]) -> u64 {
+    use prost::Message as _;
+
+    // Import the generated collector response types (same hierarchy as encoder/mod.rs).
+    use crate::encoder::opentelemetry::proto::collector::{
+        logs::v1 as logs_coll, metrics::v1 as metrics_coll, trace::v1 as trace_coll,
+    };
+
+    let rejected: i64 = match signal {
+        OtlpSignal::Metrics => match metrics_coll::ExportMetricsServiceResponse::decode(body) {
+            Ok(r) => r.partial_success.map(|ps| ps.rejected_data_points).unwrap_or(0),
+            Err(_) => 0,
+        },
+        OtlpSignal::Logs => match logs_coll::ExportLogsServiceResponse::decode(body) {
+            Ok(r) => r.partial_success.map(|ps| ps.rejected_log_records).unwrap_or(0),
+            Err(_) => 0,
+        },
+        OtlpSignal::Traces => match trace_coll::ExportTraceServiceResponse::decode(body) {
+            Ok(r) => r.partial_success.map(|ps| ps.rejected_spans).unwrap_or(0),
+            Err(_) => 0,
+        },
+    };
+    // Negative rejected count is not defined by the spec; treat as 0.
+    if rejected < 0 {
+        0
+    } else {
+        rejected as u64
+    }
+}
+
+/// Parse the `Retry-After` response header value into a `Duration`.
+///
+/// Supports two forms (RFC 7231 §7.1.3):
+/// - **delta-seconds**: a bare non-negative integer (`"120"` → 120 s).
+/// - **HTTP-date**: an RFC 7231 date-time string (`"Mon, 15 Jun 2026 12:00:00 GMT"`);
+///   the duration is computed as `date − now`, clamped to zero.
+///
+/// Returns `None` when the header is absent, unparseable, or in the past.
+pub(crate) fn parse_retry_after(value: &str) -> Option<Duration> {
+    let v = value.trim();
+
+    // Try delta-seconds first (most common in production).
+    if let Ok(secs) = v.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+
+    // Try HTTP-date via httpdate.
+    if let Ok(t) = httpdate::parse_http_date(v) {
+        let now = std::time::SystemTime::now();
+        return t.duration_since(now).ok();
+    }
+
+    None
+}
+
+/// Map an HTTP status code (and an optional parsed `Retry-After` duration) to
+/// a [`DeliveryOutcome`].
+///
+/// This function encodes the OTLP/HTTP classification table exactly as
+/// spec-mandated (see `DELIVERY_OUTCOME_DESIGN.md`):
+/// - **2xx** → caller is responsible for the body decode (→ `Accepted` or
+///   `PartialReject`); this function is NOT called for 2xx.
+/// - **EXACTLY 429, 502, 503, 504** → `Retryable { retry_after }` (the ONLY
+///   retryable HTTP codes; all other 4xx/5xx MUST NOT be retried per spec).
+/// - **401, 403** → `Unauthorized` (non-retryable auth failure; same drop
+///   action as `Permanent`, distinct counter).
+/// - **All other non-2xx** → `Permanent` (400, 404, 413, 501, etc.).
+///
+/// The function is `pub(crate)` so unit tests in this module and in the test
+/// suite can exercise the mapping table directly without a live HTTP server.
+pub(crate) fn map_http_status_to_outcome(
+    status: u16,
+    retry_after: Option<Duration>,
+) -> DeliveryOutcome {
+    match status {
+        // Retryable: EXACTLY this set per the OTLP spec. All others MUST NOT be retried.
+        429 | 502 | 503 | 504 => DeliveryOutcome::Retryable { retry_after },
+        // Auth failures: non-retryable, distinct counter + "check credentials" log.
+        401 | 403 => DeliveryOutcome::Unauthorized,
+        // Everything else (400, 404, 413, 501, 5xx not in the retryable set, ...) → Permanent.
+        _ => DeliveryOutcome::Permanent,
+    }
+}
+
+/// Derive a [`DeliveryOutcome`] from a complete HTTP response (status, headers,
+/// body).
+///
+/// This is the top-level adapter entry point called by `send` / `send_logs` /
+/// `send_traces`.  It combines:
+/// 1. **2xx path**: parse `partial_success` from the protobuf body using the
+///    signal-specific decoder → `Accepted` or `PartialReject { rejected }`.
+/// 2. **Non-2xx path**: extract and parse `Retry-After`, then call
+///    [`map_http_status_to_outcome`] → `Retryable`, `Unauthorized`, or
+///    `Permanent`.
+///
+/// `pub(crate)` for unit-test access.
+pub(crate) fn http_response_to_outcome(
+    status: hyper::StatusCode,
+    headers: &hyper::HeaderMap,
+    body: &[u8],
+    signal: OtlpSignal,
+) -> DeliveryOutcome {
+    if status.is_success() {
+        // Decode the OTLP partial_success from the protobuf body.
+        let rejected = decode_partial_success_rejected(signal, body);
+        if rejected > 0 {
+            DeliveryOutcome::PartialReject { rejected }
+        } else {
+            DeliveryOutcome::Accepted
+        }
+    } else {
+        // Parse Retry-After header for retryable codes.
+        let retry_after = headers
+            .get(hyper::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_retry_after);
+        map_http_status_to_outcome(status.as_u16(), retry_after)
+    }
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -1578,15 +1727,13 @@ where
     pub async fn send(
         &mut self,
         bytes: std::vec::Vec<u8>,
-    ) -> Result<crate::transport::DeliveryOutcome, TransportError> {
+    ) -> Result<DeliveryOutcome, TransportError> {
         let io = self.connect_io().await?;
         let authority = self.endpoint.authority();
         let path = self.metrics_path.clone();
-        // S1 default mapping: a successful exchange (today: any 2xx) → Accepted.
-        // S2 refines this into the full HTTP→DeliveryOutcome adapter.
-        http_post(io, &authority, &path, &self.headers, bytes)
-            .await
-            .map(|()| crate::transport::DeliveryOutcome::Accepted)
+        let (status, headers, body) =
+            http_post_raw(io, &authority, &path, &self.headers, bytes).await?;
+        Ok(http_response_to_outcome(status, &headers, &body, OtlpSignal::Metrics))
     }
 
     /// Send a batch of OTLP/HTTP log records to the derived logs path.
@@ -1596,13 +1743,13 @@ where
     pub async fn send_logs(
         &mut self,
         bytes: std::vec::Vec<u8>,
-    ) -> Result<crate::transport::DeliveryOutcome, TransportError> {
+    ) -> Result<DeliveryOutcome, TransportError> {
         let io = self.connect_io().await?;
         let authority = self.endpoint.authority();
         let path = self.logs_path.clone();
-        http_post(io, &authority, &path, &self.headers, bytes)
-            .await
-            .map(|()| crate::transport::DeliveryOutcome::Accepted)
+        let (status, headers, body) =
+            http_post_raw(io, &authority, &path, &self.headers, bytes).await?;
+        Ok(http_response_to_outcome(status, &headers, &body, OtlpSignal::Logs))
     }
 
     /// Send a batch of OTLP/HTTP spans to the derived traces path.
@@ -1612,13 +1759,13 @@ where
     pub async fn send_traces(
         &mut self,
         bytes: std::vec::Vec<u8>,
-    ) -> Result<crate::transport::DeliveryOutcome, TransportError> {
+    ) -> Result<DeliveryOutcome, TransportError> {
         let io = self.connect_io().await?;
         let authority = self.endpoint.authority();
         let path = self.traces_path.clone();
-        http_post(io, &authority, &path, &self.headers, bytes)
-            .await
-            .map(|()| crate::transport::DeliveryOutcome::Accepted)
+        let (status, headers, body) =
+            http_post_raw(io, &authority, &path, &self.headers, bytes).await?;
+        Ok(http_response_to_outcome(status, &headers, &body, OtlpSignal::Traces))
     }
 
     /// POST `bytes` to an explicit `path`, overriding any derived path.
@@ -1632,7 +1779,16 @@ where
     ) -> Result<(), TransportError> {
         let io = self.connect_io().await?;
         let authority = self.endpoint.authority();
-        http_post(io, &authority, path, &self.headers, bytes).await
+        let (status, _headers, _body) =
+            http_post_raw(io, &authority, path, &self.headers, bytes).await?;
+        if status.is_success() {
+            Ok(())
+        } else {
+            Err(TransportError::HttpStatus {
+                code: status.as_u16(),
+                message: std::string::String::from(status.canonical_reason().unwrap_or("unknown")),
+            })
+        }
     }
 }
 
@@ -1772,19 +1928,24 @@ fn set_alpn(ssl: *mut openssl_sys::SSL, proto: &[u8]) -> Result<(), TransportErr
 
 /// POST `body` to `http_path` via hyper's HTTP/1.1 client.
 ///
+/// Returns the HTTP status code, response headers, and fully-collected response
+/// body on success (for any status code — the caller interprets the outcome).
+/// Returns `Err(TransportError)` only when the exchange itself fails (connection
+/// error, timeout, body-read error) — i.e. the peer rendered *no* verdict.
+///
 /// The IO driver (`conn`) and the response future are co-driven in a single
 /// `poll_fn` so both share the same waker context.  With `NgxConnIo`:
 /// - `conn.poll()` internally calls `NgxConnIo::poll_read` / `poll_write`,
 ///   which store the waker and return `Pending` on `NGX_AGAIN`.
 /// - The C event handler wakes the task; the `poll_fn` is re-polled; progress
 ///   is made — no busy-spin, no blocking.
-async fn http_post(
+async fn http_post_raw(
     io: Box<dyn TlsOrPlain>,
     authority: &str,
     http_path: &str,
     extra_headers: &[(std::string::String, std::string::String)],
     body: std::vec::Vec<u8>,
-) -> Result<(), TransportError> {
+) -> Result<(hyper::StatusCode, hyper::HeaderMap, Bytes), TransportError> {
     let body_len = body.len();
     let full_body = Full::new(Bytes::from(body));
 
@@ -1839,14 +2000,21 @@ async fn http_post(
     .map_err(|e| TransportError::Connection { cause: e.to_string() })?;
 
     let status = resp.status();
-    if status.is_success() {
-        Ok(())
-    } else {
-        Err(TransportError::HttpStatus {
-            code: status.as_u16(),
-            message: std::string::String::from(status.canonical_reason().unwrap_or("unknown")),
-        })
-    }
+    let headers = resp.headers().clone();
+
+    // Collect the response body (needed for 2xx partial_success decode).
+    // Cap to 64 KiB — a valid OTLP partial_success protobuf is tiny (a few
+    // bytes); anything larger is a misconfigured proxy response we ignore.
+    const MAX_BODY: usize = 65_536;
+    let body_bytes = resp
+        .into_body()
+        .collect()
+        .await
+        .map(|b| b.to_bytes())
+        .map(|b| if b.len() > MAX_BODY { b.slice(..MAX_BODY) } else { b })
+        .map_err(|e| TransportError::BodyRead { cause: e.to_string() })?;
+
+    Ok((status, headers, body_bytes))
 }
 
 #[cfg(test)]
@@ -2625,6 +2793,307 @@ mod tests {
             assert!(
                 !got_str.contains("eborp-txetnialp"),
                 "https-without-ctx must not yield a plaintext round-trip (fail-closed); got {got_str:?}"
+            );
+        }
+    }
+
+    // ── S2: OTLP/HTTP adapter — DeliveryOutcome mapping ──────────────────────
+    //
+    // These tests exercise the pure mapping functions (no live server needed).
+    // Mutation evidence: the test names describe the code path; the assertions
+    // directly check the resulting `DeliveryOutcome` variant.
+
+    /// S2: 200 with no body (empty partial_success) → Accepted.
+    ///
+    /// Mutation evidence: change the `is_success()` branch to return
+    /// `PartialReject { rejected: 1 }` → assertion fails → test FAILS;
+    /// restore → PASS.
+    #[test]
+    fn s2_200_empty_body_accepted() {
+        let status = hyper::StatusCode::OK;
+        let headers = hyper::HeaderMap::new();
+        let outcome = http_response_to_outcome(status, &headers, b"", OtlpSignal::Metrics);
+        assert_eq!(outcome, DeliveryOutcome::Accepted);
+    }
+
+    /// S2: 200 + partial_success with rejected_data_points > 0 → PartialReject.
+    ///
+    /// Encodes a real `ExportMetricsServiceResponse` via prost, then verifies
+    /// the adapter decodes it correctly.
+    ///
+    /// Mutation evidence: change `decode_partial_success_rejected` to always
+    /// return 0 → assertion gets `Accepted` instead of `PartialReject` → FAILS;
+    /// restore → PASS.
+    #[test]
+    fn s2_200_partial_success_metrics_partial_reject() {
+        use crate::encoder::opentelemetry::proto::collector::metrics::v1::{
+            ExportMetricsPartialSuccess, ExportMetricsServiceResponse,
+        };
+        use prost::Message as _;
+
+        let resp = ExportMetricsServiceResponse {
+            partial_success: Some(ExportMetricsPartialSuccess {
+                rejected_data_points: 7,
+                error_message: std::string::String::from("too many"),
+            }),
+        };
+        let body = resp.encode_to_vec();
+
+        let status = hyper::StatusCode::OK;
+        let headers = hyper::HeaderMap::new();
+        let outcome = http_response_to_outcome(status, &headers, &body, OtlpSignal::Metrics);
+        assert_eq!(outcome, DeliveryOutcome::PartialReject { rejected: 7 });
+    }
+
+    /// S2: 200 + partial_success with rejected_log_records > 0 → PartialReject.
+    ///
+    /// Mutation evidence: same as metrics test.
+    #[test]
+    fn s2_200_partial_success_logs_partial_reject() {
+        use crate::encoder::opentelemetry::proto::collector::logs::v1::{
+            ExportLogsPartialSuccess, ExportLogsServiceResponse,
+        };
+        use prost::Message as _;
+
+        let resp = ExportLogsServiceResponse {
+            partial_success: Some(ExportLogsPartialSuccess {
+                rejected_log_records: 3,
+                error_message: std::string::String::new(),
+            }),
+        };
+        let body = resp.encode_to_vec();
+
+        let status = hyper::StatusCode::OK;
+        let headers = hyper::HeaderMap::new();
+        let outcome = http_response_to_outcome(status, &headers, &body, OtlpSignal::Logs);
+        assert_eq!(outcome, DeliveryOutcome::PartialReject { rejected: 3 });
+    }
+
+    /// S2: 200 + partial_success with rejected_spans > 0 → PartialReject.
+    ///
+    /// Mutation evidence: same as metrics test.
+    #[test]
+    fn s2_200_partial_success_traces_partial_reject() {
+        use crate::encoder::opentelemetry::proto::collector::trace::v1::{
+            ExportTracePartialSuccess, ExportTraceServiceResponse,
+        };
+        use prost::Message as _;
+
+        let resp = ExportTraceServiceResponse {
+            partial_success: Some(ExportTracePartialSuccess {
+                rejected_spans: 42,
+                error_message: std::string::String::new(),
+            }),
+        };
+        let body = resp.encode_to_vec();
+
+        let status = hyper::StatusCode::OK;
+        let headers = hyper::HeaderMap::new();
+        let outcome = http_response_to_outcome(status, &headers, &body, OtlpSignal::Traces);
+        assert_eq!(outcome, DeliveryOutcome::PartialReject { rejected: 42 });
+    }
+
+    /// S2: 429 with a `Retry-After: 60` header → Retryable{Some(60s)}.
+    ///
+    /// Mutation evidence: change the `429` arm to `DeliveryOutcome::Permanent`
+    /// → assertion fails → test FAILS; restore → PASS.
+    #[test]
+    fn s2_429_with_retry_after_delta_seconds() {
+        let status = hyper::StatusCode::TOO_MANY_REQUESTS;
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(hyper::header::RETRY_AFTER, hyper::header::HeaderValue::from_static("60"));
+        let outcome = http_response_to_outcome(status, &headers, b"", OtlpSignal::Metrics);
+        assert_eq!(
+            outcome,
+            DeliveryOutcome::Retryable { retry_after: Some(Duration::from_secs(60)) }
+        );
+    }
+
+    /// S2: 503 with no `Retry-After` header → Retryable{None}.
+    ///
+    /// Mutation evidence: change the `503` arm to `Permanent` → assertion fails
+    /// → test FAILS; restore → PASS.
+    #[test]
+    fn s2_503_no_retry_after_retryable_none() {
+        let status = hyper::StatusCode::SERVICE_UNAVAILABLE;
+        let headers = hyper::HeaderMap::new();
+        let outcome = http_response_to_outcome(status, &headers, b"", OtlpSignal::Metrics);
+        assert_eq!(outcome, DeliveryOutcome::Retryable { retry_after: None });
+    }
+
+    /// S2: 502 → Retryable (bad gateway is in the retryable set).
+    #[test]
+    fn s2_502_retryable() {
+        let status = hyper::StatusCode::BAD_GATEWAY;
+        let headers = hyper::HeaderMap::new();
+        let outcome = http_response_to_outcome(status, &headers, b"", OtlpSignal::Metrics);
+        assert_eq!(outcome, DeliveryOutcome::Retryable { retry_after: None });
+    }
+
+    /// S2: 504 → Retryable (gateway timeout is in the retryable set).
+    #[test]
+    fn s2_504_retryable() {
+        let status = hyper::StatusCode::GATEWAY_TIMEOUT;
+        let headers = hyper::HeaderMap::new();
+        let outcome = http_response_to_outcome(status, &headers, b"", OtlpSignal::Metrics);
+        assert_eq!(outcome, DeliveryOutcome::Retryable { retry_after: None });
+    }
+
+    /// S2: 400 → Permanent (MUST NOT retry per OTLP spec).
+    ///
+    /// Mutation evidence: change 400 to map to `Retryable` → assertion fails
+    /// → test FAILS; restore → PASS.
+    #[test]
+    fn s2_400_permanent() {
+        let status = hyper::StatusCode::BAD_REQUEST;
+        let headers = hyper::HeaderMap::new();
+        let outcome = http_response_to_outcome(status, &headers, b"", OtlpSignal::Metrics);
+        assert_eq!(outcome, DeliveryOutcome::Permanent);
+    }
+
+    /// S2: 404 → Permanent.
+    #[test]
+    fn s2_404_permanent() {
+        let status = hyper::StatusCode::NOT_FOUND;
+        let headers = hyper::HeaderMap::new();
+        let outcome = http_response_to_outcome(status, &headers, b"", OtlpSignal::Metrics);
+        assert_eq!(outcome, DeliveryOutcome::Permanent);
+    }
+
+    /// S2: 413 → Permanent (payload too large; the batch will never be accepted).
+    #[test]
+    fn s2_413_permanent() {
+        let status = hyper::StatusCode::PAYLOAD_TOO_LARGE;
+        let headers = hyper::HeaderMap::new();
+        let outcome = http_response_to_outcome(status, &headers, b"", OtlpSignal::Metrics);
+        assert_eq!(outcome, DeliveryOutcome::Permanent);
+    }
+
+    /// S2: 501 → Permanent (not implemented; no retry will change that).
+    #[test]
+    fn s2_501_permanent() {
+        let status = hyper::StatusCode::NOT_IMPLEMENTED;
+        let headers = hyper::HeaderMap::new();
+        let outcome = http_response_to_outcome(status, &headers, b"", OtlpSignal::Metrics);
+        assert_eq!(outcome, DeliveryOutcome::Permanent);
+    }
+
+    /// S2: 500 → Permanent (internal server error is NOT in the retryable set).
+    ///
+    /// Mutation evidence: change the match to treat 500 as `Retryable` → FAILS.
+    #[test]
+    fn s2_500_permanent_not_retryable() {
+        let status = hyper::StatusCode::INTERNAL_SERVER_ERROR;
+        let headers = hyper::HeaderMap::new();
+        let outcome = http_response_to_outcome(status, &headers, b"", OtlpSignal::Metrics);
+        assert_eq!(outcome, DeliveryOutcome::Permanent);
+    }
+
+    /// S2: 401 → Unauthorized (auth failure; same drop action as Permanent but
+    /// distinct variant for its own counter).
+    ///
+    /// Mutation evidence: change `401` arm to `Permanent` → assertion fails
+    /// → test FAILS; restore → PASS.
+    #[test]
+    fn s2_401_unauthorized() {
+        let status = hyper::StatusCode::UNAUTHORIZED;
+        let headers = hyper::HeaderMap::new();
+        let outcome = http_response_to_outcome(status, &headers, b"", OtlpSignal::Metrics);
+        assert_eq!(outcome, DeliveryOutcome::Unauthorized);
+    }
+
+    /// S2: 403 → Unauthorized (permission denied; same policy as 401).
+    ///
+    /// Mutation evidence: change `403` arm to `Permanent` → assertion fails
+    /// → test FAILS; restore → PASS.
+    #[test]
+    fn s2_403_unauthorized() {
+        let status = hyper::StatusCode::FORBIDDEN;
+        let headers = hyper::HeaderMap::new();
+        let outcome = http_response_to_outcome(status, &headers, b"", OtlpSignal::Metrics);
+        assert_eq!(outcome, DeliveryOutcome::Unauthorized);
+    }
+
+    /// S2: `parse_retry_after` parses delta-seconds correctly.
+    ///
+    /// Mutation evidence: remove the `parse::<u64>()` branch → returns `None`
+    /// → assertion fails → test FAILS; restore → PASS.
+    #[test]
+    fn s2_parse_retry_after_delta_seconds() {
+        assert_eq!(parse_retry_after("120"), Some(Duration::from_secs(120)));
+        assert_eq!(parse_retry_after("0"), Some(Duration::from_secs(0)));
+        assert_eq!(parse_retry_after("  30  "), Some(Duration::from_secs(30)));
+    }
+
+    /// S2: `parse_retry_after` returns `None` for garbage values.
+    #[test]
+    fn s2_parse_retry_after_garbage_returns_none() {
+        assert_eq!(parse_retry_after(""), None);
+        assert_eq!(parse_retry_after("not-a-number"), None);
+        assert_eq!(parse_retry_after("abc def"), None);
+    }
+
+    /// S2: `parse_retry_after` parses an HTTP-date form correctly.
+    ///
+    /// An HTTP-date in the future must produce a `Some(duration > 0)`.
+    /// We can't assert an exact value (wall-clock dependent), so we check
+    /// that it's `Some` and greater than zero.
+    ///
+    /// Mutation evidence: remove the `httpdate::parse_http_date` branch →
+    /// `parse_retry_after("Mon, ...")` returns `None` → `is_some()` fails
+    /// → test FAILS; restore → PASS.
+    #[test]
+    fn s2_parse_retry_after_http_date_future() {
+        // A date well in the future; parse_retry_after must return Some.
+        let future_date = "Sat, 01 Jan 2050 00:00:00 GMT";
+        let result = parse_retry_after(future_date);
+        assert!(result.is_some(), "HTTP-date in the future must parse to Some(duration); got None");
+        assert!(result.unwrap() > Duration::ZERO, "duration for a future HTTP-date must be > 0");
+    }
+
+    /// S2: `decode_partial_success_rejected` returns 0 for an empty body.
+    #[test]
+    fn s2_decode_partial_success_empty_body_is_zero() {
+        assert_eq!(decode_partial_success_rejected(OtlpSignal::Metrics, b""), 0);
+        assert_eq!(decode_partial_success_rejected(OtlpSignal::Logs, b""), 0);
+        assert_eq!(decode_partial_success_rejected(OtlpSignal::Traces, b""), 0);
+    }
+
+    /// S2: `decode_partial_success_rejected` returns 0 for a garbage body
+    /// (best-effort: corrupted 2xx is treated as accepted).
+    #[test]
+    fn s2_decode_partial_success_garbage_body_is_zero() {
+        let garbage = b"\xde\xad\xbe\xef\xff\x00";
+        // Garbage may or may not parse as valid proto; either way rejected == 0
+        // (either field absent or decode error → 0 per spec).
+        let n = decode_partial_success_rejected(OtlpSignal::Metrics, garbage);
+        // We only assert it doesn't panic; 0 if unparseable or no rejected field.
+        assert_eq!(n, 0);
+    }
+
+    /// S2: `map_http_status_to_outcome` — retryable set is exactly {429,502,503,504}.
+    ///
+    /// Mutation evidence: add 500 to the retryable match arm → `500` row gets
+    /// `Retryable` instead of `Permanent` → assertion fails → test FAILS;
+    /// restore → PASS.
+    #[test]
+    fn s2_retryable_set_exact() {
+        // Only these four must be Retryable.
+        for code in [429u16, 502, 503, 504] {
+            let outcome = map_http_status_to_outcome(code, None);
+            assert_eq!(
+                outcome,
+                DeliveryOutcome::Retryable { retry_after: None },
+                "HTTP {code} must be Retryable"
+            );
+        }
+        // These must NOT be Retryable.
+        for code in [400u16, 401, 403, 404, 413, 500, 501] {
+            let outcome = map_http_status_to_outcome(code, None);
+            assert_ne!(
+                outcome,
+                DeliveryOutcome::Retryable { retry_after: None },
+                "HTTP {code} must NOT be Retryable"
             );
         }
     }
