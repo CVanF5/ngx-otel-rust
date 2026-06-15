@@ -46,6 +46,7 @@ use crate::encoder::opentelemetry::proto::collector::trace::v1::{
 };
 use crate::transport::grpc::executor::NgxExecutor;
 use crate::transport::grpc::shim::SendRequestService;
+use crate::transport::grpc::status_adapter::grpc_status_to_outcome;
 use crate::transport::hyper_http::{
     strip_v6_brackets, wrap_tls_io, Connector, NgxConnector, ParsedEndpoint, TlsOrPlain,
 };
@@ -275,21 +276,40 @@ where
         let result = client.export(tonic::Request::new(req)).await;
 
         match result {
-            Ok(_resp) => {
+            Ok(resp) => {
                 // Connection still alive — store the client back for reuse.
                 self.client = Some(client);
-                // S1 default mapping: an OK RPC → Accepted. S3 refines this into
-                // the full gRPC-status→DeliveryOutcome adapter.
-                Ok(crate::transport::DeliveryOutcome::Accepted)
+                // S3: decode partial_success from the OK response.
+                // partial_success.rejected_data_points > 0 → PartialReject; else Accepted.
+                let rejected = resp
+                    .into_inner()
+                    .partial_success
+                    .map(|ps| {
+                        let n = ps.rejected_data_points;
+                        if n > 0 {
+                            n as u64
+                        } else {
+                            0
+                        }
+                    })
+                    .unwrap_or(0);
+                if rejected > 0 {
+                    Ok(crate::transport::DeliveryOutcome::PartialReject { rejected })
+                } else {
+                    Ok(crate::transport::DeliveryOutcome::Accepted)
+                }
             }
             Err(status) => {
                 // `client` is dropped here (not stored back), forcing a fresh
                 // reconnect on the next `send`.  This matches the reconnect-on-
                 // failure parity with HyperHttpTransport (which opens a new
                 // connection on every send).
-                Err(TransportError::Connection {
-                    cause: std::format!("gRPC Export RPC failed: {status}"),
-                })
+                //
+                // S3: map the gRPC status code to a protocol-neutral outcome
+                // instead of folding all errors into TransportError::Connection.
+                // The caller (drain loop) matches on DeliveryOutcome and applies
+                // the right policy (retry / drop / backoff / unauthorized).
+                Ok(grpc_status_to_outcome(&status))
             }
         }
     }
@@ -346,13 +366,28 @@ where
         let result = client.export(tonic::Request::new(req)).await;
 
         match result {
-            Ok(_resp) => {
+            Ok(resp) => {
                 self.logs_client = Some(client);
-                Ok(crate::transport::DeliveryOutcome::Accepted)
+                // S3: decode partial_success.rejected_log_records.
+                let rejected = resp
+                    .into_inner()
+                    .partial_success
+                    .map(|ps| {
+                        let n = ps.rejected_log_records;
+                        if n > 0 {
+                            n as u64
+                        } else {
+                            0
+                        }
+                    })
+                    .unwrap_or(0);
+                if rejected > 0 {
+                    Ok(crate::transport::DeliveryOutcome::PartialReject { rejected })
+                } else {
+                    Ok(crate::transport::DeliveryOutcome::Accepted)
+                }
             }
-            Err(status) => Err(TransportError::Connection {
-                cause: std::format!("gRPC LogsService/Export RPC failed: {status}"),
-            }),
+            Err(status) => Ok(grpc_status_to_outcome(&status)),
         }
     }
 
@@ -402,13 +437,28 @@ where
         let result = client.export(tonic::Request::new(req)).await;
 
         match result {
-            Ok(_resp) => {
+            Ok(resp) => {
                 self.traces_client = Some(client);
-                Ok(crate::transport::DeliveryOutcome::Accepted)
+                // S3: decode partial_success.rejected_spans.
+                let rejected = resp
+                    .into_inner()
+                    .partial_success
+                    .map(|ps| {
+                        let n = ps.rejected_spans;
+                        if n > 0 {
+                            n as u64
+                        } else {
+                            0
+                        }
+                    })
+                    .unwrap_or(0);
+                if rejected > 0 {
+                    Ok(crate::transport::DeliveryOutcome::PartialReject { rejected })
+                } else {
+                    Ok(crate::transport::DeliveryOutcome::Accepted)
+                }
             }
-            Err(status) => Err(TransportError::Connection {
-                cause: std::format!("gRPC TraceService/Export RPC failed: {status}"),
-            }),
+            Err(status) => Ok(grpc_status_to_outcome(&status)),
         }
     }
 }

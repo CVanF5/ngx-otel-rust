@@ -26,6 +26,7 @@
 
 pub mod executor;
 pub mod shim;
+pub mod status_adapter;
 pub mod transport;
 
 // Generated protobuf types for the local Echo bidi-streaming service.

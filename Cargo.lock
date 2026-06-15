@@ -604,6 +604,7 @@ dependencies = [
  "openssl-sys",
  "pin-project-lite",
  "prost",
+ "prost-types",
  "rand_chacha",
  "rand_core",
  "serde_json",
