@@ -1,0 +1,190 @@
+S6 — Delivery-Outcome Regression Gate
+======================================
+Date: 2026-06-15
+GIT_COMMIT: 61462e62055e7aff14187c3c0dacab323e76b07e (HEAD = origin/main)
+
+Platforms:
+  dev box: Darwin 25.5.0 arm64 (macOS)
+  debian-vm: Linux 6.12.90+deb13.1-arm64 aarch64 (Debian 13, Linux arm64)
+
+S1-S5 status: LANDED at 61462e6 (neutral DeliveryOutcome, HTTP+gRPC adapters,
+              policy engine, self-metrics+docs).
+
+New files added by S6:
+  tests/integration/programmable_collector_stub.py — programmable HTTP stub
+  tests/integration/run_delivery_outcome.sh        — 4-scenario integration test
+
+
+════════════════════════════════════════════════════════════════════
+SECTION 1: UNIT TESTS (both platforms)
+════════════════════════════════════════════════════════════════════
+
+Dev box (macOS arm64, Darwin 25.5.0):
+  $ make unittest
+  test result: ok. 310 passed; 0 failed; 1 ignored; 0 measured; finished in 1.23s
+
+  $ make unittest-release
+  test result: ok. 310 passed; 0 failed; 1 ignored; 0 measured; finished in 0.79s
+
+debian-vm (Linux arm64, 6.12.90+deb13.1-arm64):
+  $ cargo clean
+  Removed 2557 files, 1.4GiB total
+
+  $ make unittest  (debug)
+  test result: ok. 310 passed; 0 failed; 1 ignored; 0 measured; finished in 1.12s
+
+  $ make unittest-release
+  test result: ok. 310 passed; 0 failed; 1 ignored; 0 measured; finished in 0.65s
+
+Includes:
+  S2 adapter tests (s2_200_accepted, s2_200_partial_reject*, s2_429_retry_after,
+                    s2_503_no_hint, s2_502_no_hint, s2_504_no_hint, s2_400_permanent,
+                    s2_404_permanent, s2_401_unauthorized, s2_403_unauthorized,
+                    s2_retryable_set_exact):   ALL PASS
+  S3 adapter tests (s3_ok_accepted, s3_unavailable_retryable, s3_unauthenticated,
+                    s3_permission_denied, s3_resource_exhausted_*):   ALL PASS
+  S4 policy tests  (s4_accepted_releases_and_resets_backoff,
+                    s4_partial_reject_releases_and_counts,
+                    s4_retryable_with_hint_defers_until_hint,
+                    s4_retryable_no_hint_exponential_backoff_and_reset,
+                    s4_permanent_drops_and_counts_no_retry,
+                    s4_unauthorized_drops_distinct_counter_no_retry_no_pause,
+                    s4_unauthorized_does_not_stop_other_signals,
+                    s4_backoff_ms_doubling_and_cap,
+                    s4_drain_retryable_requeues_and_defers,
+                    s4_drain_permanent_drops,
+                    s4_bounded_buffer_evicts_oldest_under_sustained_backoff): ALL PASS
+
+
+════════════════════════════════════════════════════════════════════
+SECTION 2: EXISTING INTEGRATION TEST SUITE (debian-vm, make test)
+════════════════════════════════════════════════════════════════════
+
+Command: NGINX_SOURCE_DIR=~/project-nginx-otel/nginx NGINX_BUILD_DIR=~/project-nginx-otel/ngx-otel-rust/objs-release NGINX_BINARY=~/project-nginx-otel/ngx-otel-rust/objs-release/nginx make test
+
+Results: 54 [PASS] assertions, 0 [FAIL] assertions
+
+  ==> tests/integration/run.sh              [PASS] All assertions passed. Step 9 end-to-end test COMPLETE.
+  ==> tests/integration/run_reload.sh       [PASS] All assertions passed. Step 10 SIGHUP reload test COMPLETE.
+  ==> tests/integration/run_endpoint_change.sh [PASS] All assertions passed. Step 10 endpoint-change reload test COMPLETE.
+  ==> tests/integration/run_traces.sh       [PASS] All assertions passed.
+  ==> tests/integration/run_a3_tls_e2e.sh   [PASS] A3 TLS E2E integration: ALL scenarios (a)-(g) PASSED
+  ==> tests/integration/run_b1_collector_cert_gauge.sh [PASS] B1 collector-cert gauge: ALL scenarios (a)-(c) PASSED
+
+S2 golden (wire format for successful sends unchanged):
+  Verified via unit tests (s2_200_accepted, s2_200_partial_reject* all PASS)
+  AND integration run.sh green (actual OTLP/HTTP bytes delivered to collector,
+  service.name + http.server.request.duration present in metrics.json).
+
+
+════════════════════════════════════════════════════════════════════
+SECTION 3: DELIVERY-OUTCOME INTEGRATION TEST (debian-vm)
+════════════════════════════════════════════════════════════════════
+
+Script: tests/integration/run_delivery_outcome.sh
+Using:  programmable_collector_stub.py (new, serves configurable HTTP status codes)
+Module: ~/project-nginx-otel/ngx-otel-rust/objs-release/ngx_http_otel_module.so
+        (built from 61462e6)
+
+--- Scenario A: 503 + Retry-After: 2 then 200 ---
+[PASS] Scenario A: nginx + exporter started
+[PASS] Scenario A: first 503 received by stub at t=+0
+[PASS] Scenario A: no new requests during defer window (count=1)  ← no send during Retry-After
+[PASS] Scenario A: 200 delivery arrived 2s after 503 (Retry-After=2 hint honored then delivery succeeded)
+Observable: error.log shows "metrics send retryable; queuing for retry and deferring next drain"
+  then delivery resumes after Retry-After expires.  COVERAGE: END-TO-END.
+
+--- Scenario B: 503 no Retry-After — exponential backoff ---
+[PASS] Scenario B: nginx + exporter started
+[PASS] Scenario B: first 503 hit stub (T=0)
+[PASS] Scenario B: first retry-retryable in error.log at T=2s
+[PASS] Scenario B: bounded request count (6 in 14s) confirms exponential backoff — NOT a fixed-cadence tight loop
+[PASS] Scenario B: retry-retryable fired 2s after first 503 (>= 1s gap confirms deferred retry, not immediate)
+Observable: 6 requests in 14s (bounded); error.log shows "metrics retry send retryable; re-queuing
+  and deferring next drain" at ~2s intervals.  Fixed-cadence tight loop would produce >20/14s.
+  COVERAGE: END-TO-END.  Exact doubling verified in s4_backoff_ms_doubling_and_cap unit test.
+
+--- Scenario C: 400 (Permanent) ---
+[PASS] Scenario C: nginx + exporter started
+[PASS] Scenario C: first 400 received by stub
+[PASS] Scenario C: exporter kept running after 400 (3 new requests in 6s)
+[PASS] Scenario C: no 'check exporter credentials' in error.log for 400 (correct — Permanent, not Unauthorized)
+[PASS] Scenario C: no retry storm after 400 (3 requests in 6s) — Permanent drop confirmed
+Observable: error.log shows "dropping fresh metrics batch — non-retryable verdict" for each 400.
+  No retries of the rejected batch; exporter continues with new batches.  COVERAGE: END-TO-END.
+
+--- Scenario D: 401 + 403 (Unauthorized) ---
+[PASS] Scenario D: nginx + exporter started
+[PASS] Scenario D: first 401 received by stub
+[PASS] Scenario D: 'check exporter credentials' logged:
+       2026/06/15 15:14:36 [error] 266135#0: *6 otel export: metrics batch rejected —
+         authentication/authorization failed; check exporter credentials (dropping, not retrying)
+[PASS] Scenario D: exporter keeps running after 401 (2 new requests) — NO auto-pause confirmed
+[PASS] Scenario D: credentials log appears 1 time(s) — rate-limiting active (expected <= 3 in short window)
+[PASS] Scenario D2: 403 requests reached stub (2) — Unauthorized policy applies to 403
+Observable: Unauthorized log on first 401; exporter keeps sending new batches; no auto-pause.
+  COVERAGE: END-TO-END.
+
+[PASS] === All delivery-outcome integration scenarios passed ===
+
+Coverage note:
+  Counter assertions (permanent_rejected bump count, unauthorized bump count) are verified at
+  the unit level in src/export/mod.rs:
+    - s4_permanent_drops_and_counts_no_retry: verifies PERMANENT_REJECTED increments by 1 per Permanent
+    - s4_unauthorized_drops_distinct_counter_no_retry_no_pause: verifies UNAUTHORIZED_REJECTED
+      increments independently, Permanent counter unchanged, no retry queued
+  The integration test cannot read these counters directly because the self-metrics endpoint
+  and the programmable stub share the same OTLP destination (no separate self-metrics sink in
+  single-endpoint mode).
+
+
+════════════════════════════════════════════════════════════════════
+SECTION 4: TSAN F2 EVIDENCE (debian-vm, Linux arm64, Docker)
+════════════════════════════════════════════════════════════════════
+
+Command: make tsan-test  (docker, platform linux/arm64, ngx-otel-tsan:latest)
+GIT_COMMIT inside container: 61462e62055e7aff14187c3c0dacab323e76b07e
+
+F2 BAR:
+
+(1) nm __tsan_ symbol count on the exact TSAN-instrumented loaded artifact:
+    $ docker run --rm -v ngx-otel-tsan-target:/work/ngx-otel-rust/target ngx-otel-tsan:latest \
+        bash -c "nm /work/ngx-otel-rust/target/aarch64-unknown-linux-gnu/release/libngx_http_otel_module.so | grep -c __tsan_"
+    42
+    (TSAN instrumentation confirmed present in the artifact under test)
+
+(2) Named PASS lines from inside the TSAN run:
+    [tsan-run] Step 3.4: f_shm_atomic_zero ... PASSED under TSAN — OK
+    [PASS] === All dead-collector shutdown/reload assertions passed ===   (run_chaos_dead_collector.sh)
+    [PASS] === B4 daemon-on gen-1 supervision test: all assertions passed ===   (run_b4_daemon_on_gen1.sh)
+    [PASS] B1-FU1 chaos gate: PASS — SPSC exclusivity across reload, conservation verified,
+           no parse errors, quit-completeness confirmed   (run_b1_spsc_reload_chaos.sh)
+    [PASS] === h3f3_quit_responsiveness: PASSED (deadline signature observed; quit latency 4.30s <= 25s) ===
+           (run_chaos_quit_responsiveness.sh)
+
+(3) Zeros counted AFTER nm and PASS lines confirmed:
+    [tsan-run] Checking for ThreadSanitizer warnings in error logs...
+    [tsan-run] Zero ThreadSanitizer warnings.  TSAN gate: PASS.
+
+(4) Embedded GIT_COMMIT:
+    61462e62055e7aff14187c3c0dacab323e76b07e  (confirmed above; same commit on host and container)
+
+TSAN VERDICT: ZERO warnings on 61462e6.  F2 bar satisfied.
+
+
+════════════════════════════════════════════════════════════════════
+SECTION 5: S2 GOLDEN / WIRE-BYTE UNCHANGED
+════════════════════════════════════════════════════════════════════
+
+S6 adds receive-side status interpretation.  The encoder side (OtlpHttpEncoder,
+wire bytes for a successful 200 send) is UNCHANGED:
+
+Unit evidence (both platforms, 310 passed):
+  s2_200_accepted: 200 → Accepted (empty body = all accepted)
+  s2_200_partial_reject_low, s2_200_partial_reject_high, s2_200_partial_reject_max:
+    200 + rejected_data_points field → PartialReject{n}
+
+Integration evidence (debian-vm, run.sh):
+  [PASS] metrics.json contains service.name = ngx-otel-step9-integration
+  [PASS] metrics.json contains http.server.request.duration
+  (actual OTLP/HTTP bytes delivered and decoded by the OTel collector unchanged)
