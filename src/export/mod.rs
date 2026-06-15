@@ -122,6 +122,30 @@ pub static TRACES_DROPPED_RECORDS: AtomicU64 = AtomicU64::new(0);
 /// Cumulative traces transport send failures since exporter startup.
 pub static TRACES_SEND_FAILURES: AtomicU64 = AtomicU64::new(0);
 
+// ── Delivery-outcome self-metric atomics (S4) ────────────────────────────────
+//
+// These are the same single-writer exporter-local atomic pattern as the drop /
+// send-failure counters above (written only by the exporter task in the policy
+// engine, read later by `SelfMetricsSource`). S5 wires them to the
+// `ngx_otel.delivery.{permanent_rejected, partial_rejected, unauthorized}`
+// self-metrics — do NOT add those metric series again in S5; only read these.
+
+/// Cumulative count of batches the peer rejected as **permanently** unacceptable
+/// (`DeliveryOutcome::Permanent`). These batches are dropped, never retried.
+pub static PERMANENT_REJECTED: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative count of individual records the peer reported it dropped on an
+/// otherwise-accepted batch (`DeliveryOutcome::PartialReject { rejected }`).
+/// Accumulates the `rejected` count; the batch itself is released.
+pub static PARTIAL_REJECTED: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative count of batches dropped because the peer reported an
+/// authentication/authorization failure (`DeliveryOutcome::Unauthorized`).
+/// Same policy action as `Permanent` (drop, no retry/backoff/pause); kept in a
+/// distinct counter for observability plus a rate-limited "check credentials"
+/// log.
+pub static UNAUTHORIZED_REJECTED: AtomicU64 = AtomicU64::new(0);
+
 /// Number of prior exporter crashes observed in the crash-loop window when
 /// this exporter process started.  Set once by `otel_exporter_cycle` before
 /// `export_loop` runs; 0 on a clean first start.  Exposed as the
@@ -209,6 +233,21 @@ const PERIODIC_SEND_BUDGET: Duration = Duration::from_secs(15);
 /// configured `otel_metric_interval` — we never wait more than this between
 /// shutdown checks. The cost is one extra timer wake per chunk; negligible.
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// S4 — base interval for the no-hint exponential backoff applied to a
+/// `DeliveryOutcome::Retryable` that carried no peer hint. The OTLP spec
+/// `SHOULD`s exponential backoff for the no-hint retryable case. The base is
+/// the sub-interval drain cadence (`SHUTDOWN_POLL_INTERVAL`, 250 ms): the first
+/// no-hint retryable defers one drain tick, and each consecutive retryable
+/// doubles the deferral up to [`BACKOFF_CAP_MS`]. Reset to baseline on the next
+/// `Accepted`. No directive surface — hardcoded per the spec.
+const BACKOFF_BASE_MS: u64 = 250;
+
+/// S4 — ceiling for the no-hint exponential backoff (30 s). Doubling stops here
+/// so a sustained-overload peer is retried at most every 30 s rather than
+/// growing unbounded. A peer-supplied hint (`Retry-After`/`RetryInfo`/pushback)
+/// is honored verbatim and is NOT subject to this cap.
+const BACKOFF_CAP_MS: u64 = 30_000;
 
 /// Selects between the HTTP and gRPC production transports.
 ///
@@ -735,6 +774,16 @@ pub async fn export_loop(amcf: &'static MainConfig) {
     // Separate retry queue for span batches (Phase 3.2).
     let mut spans_retry_queue: VecDeque<(std::vec::Vec<u8>, u64)> = VecDeque::new();
 
+    // S4: per-signal backoff/defer state for the outcome-driven policy engine.
+    // Each lane carries a "not before" monotonic timestamp + a consecutive-
+    // `Retryable`-failure counter (reset on `Accepted`). These are exporter-task
+    // locals — never shared across threads. A `Retryable` verdict defers the
+    // NEXT DRAIN of that signal (it does NOT grow the bounded buffer); the
+    // defer gate is checked before each lane's drain/fresh-send below.
+    let mut metrics_backoff = SignalBackoff::default();
+    let mut logs_backoff = SignalBackoff::default();
+    let mut spans_backoff = SignalBackoff::default();
+
     // Processor stage: drain → [process] → encode → send.  Constructed once at
     // exporter startup from a JSON config blob.  Currently always empty (→ Noop
     // passthrough); wired to operator directives in a follow-on phase.
@@ -921,17 +970,30 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                 );
             }
 
+            // S4: monotonic basis for the per-signal backoff defer checks this
+            // tick (one read; reused across all lanes). Reuses nginx's cached
+            // CLOCK_MONOTONIC (`ngx_current_msec`) — no new clock.
+            let now_msec = now_monotonic_msec();
+
             // ── Log drain: every sub-interval wake ──────────────────────────
-            // Drain the logs retry queue first (best-effort; stop on failure).
-            drain_retry_queue_once(
-                &mut logs_retry_queue,
-                retry_buffer_depth,
-                log.as_ptr(),
-                &LOGS_SEND_FAILURES,
-                "logs",
-                &mut LogsRetry(&mut transport),
-            )
-            .await;
+            // S4: skip the entire logs lane (retry drain AND fresh send) while a
+            // `Retryable` backoff defers it. Deferring the DRAIN — not growing
+            // the buffer — is how a peer backoff hint / exponential backoff is
+            // honored. Other signals are unaffected.
+            let logs_deferred = logs_backoff.is_deferred(now_msec);
+            if !logs_deferred {
+                // Drain the logs retry queue first (best-effort; stop on failure).
+                drain_retry_queue_once(
+                    &mut logs_retry_queue,
+                    retry_buffer_depth,
+                    log.as_ptr(),
+                    &LOGS_SEND_FAILURES,
+                    "logs",
+                    &mut LogsRetry(&mut transport),
+                    &mut logs_backoff,
+                )
+                .await;
+            }
 
             // H3F3: inter-send shutdown check — a quit/terminate that arrived
             // while the logs-retry drain above was in flight is honoured now,
@@ -952,7 +1014,10 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             // Drain fresh log records from all workers' rings and ship them.
             // B1-FU1: skipped on abdication — new exporter is sole consumer.
             // Gate on access_sample OR error_log — either enables the logs shm path.
-            if !periodic_abdicated && (amcf.is_access_sample_enabled() || amcf.error_log_enabled) {
+            if !periodic_abdicated
+                && !logs_deferred
+                && (amcf.is_access_sample_enabled() || amcf.error_log_enabled)
+            {
                 if let Some(logs_base) = amcf.logs_shm_base() {
                     // SAFETY: `logs_shm_base()` returned `Some`, so the logs zone
                     // was registered and mapped; `amcf.logs_shm_zone` therefore
@@ -997,14 +1062,28 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                         )
                         .await
                         {
-                            // S1: any Ok(outcome) treated as release (S4 adds policy).
-                            Ok(Ok(_outcome)) => {
-                                ngx::ngx_log_error!(
-                                    NGX_LOG_INFO,
+                            // S4: outcome-driven policy (release / requeue+defer / drop).
+                            Ok(Ok(ref outcome)) => {
+                                if handle_fresh_send_outcome(
+                                    outcome,
+                                    &mut logs_backoff,
+                                    now_msec,
+                                    &mut logs_retry_queue,
+                                    logs_bytes,
+                                    n_logs,
+                                    retry_buffer_depth,
+                                    &LOGS_SEND_FAILURES,
                                     log.as_ptr(),
-                                    "otel export: sent {} log records to collector",
-                                    n_logs
-                                );
+                                    "logs",
+                                ) == OutcomeAction::Release
+                                {
+                                    ngx::ngx_log_error!(
+                                        NGX_LOG_INFO,
+                                        log.as_ptr(),
+                                        "otel export: sent {} log records to collector",
+                                        n_logs
+                                    );
+                                }
                             }
                             Ok(Err(ref e)) => {
                                 ngx::ngx_log_error!(
@@ -1055,16 +1134,23 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             }
 
             // ── Span drain: every sub-interval wake ─────────────────────────
-            // Drain the spans retry queue first (best-effort; stop on failure).
-            drain_retry_queue_once(
-                &mut spans_retry_queue,
-                retry_buffer_depth,
-                log.as_ptr(),
-                &TRACES_SEND_FAILURES,
-                "spans",
-                &mut SpansRetry(&mut transport),
-            )
-            .await;
+            // S4: skip the entire spans lane while a `Retryable` backoff defers
+            // it (deferring the DRAIN, not growing the buffer). Independent of
+            // the other lanes.
+            let spans_deferred = spans_backoff.is_deferred(now_msec);
+            if !spans_deferred {
+                // Drain the spans retry queue first (best-effort; stop on failure).
+                drain_retry_queue_once(
+                    &mut spans_retry_queue,
+                    retry_buffer_depth,
+                    log.as_ptr(),
+                    &TRACES_SEND_FAILURES,
+                    "spans",
+                    &mut SpansRetry(&mut transport),
+                    &mut spans_backoff,
+                )
+                .await;
+            }
 
             // H3F3: inter-send shutdown check before the fresh-span send.
             if shutdown_requested() && !defer_active {
@@ -1079,7 +1165,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
 
             // Drain fresh span records from all workers' rings and ship them.
             // B1-FU1: skipped on abdication — new exporter is sole consumer.
-            if !periodic_abdicated {
+            if !periodic_abdicated && !spans_deferred {
                 if let Some(spans_base) = amcf.spans_shm_base() {
                     // SAFETY: `spans_shm_base()` returned `Some`, so the spans zone
                     // was registered and mapped; `amcf.spans_shm_zone` therefore
@@ -1117,14 +1203,28 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                         )
                         .await
                         {
-                            // S1: any Ok(outcome) treated as release (S4 adds policy).
-                            Ok(Ok(_outcome)) => {
-                                ngx::ngx_log_error!(
-                                    NGX_LOG_INFO,
+                            // S4: outcome-driven policy (release / requeue+defer / drop).
+                            Ok(Ok(ref outcome)) => {
+                                if handle_fresh_send_outcome(
+                                    outcome,
+                                    &mut spans_backoff,
+                                    now_msec,
+                                    &mut spans_retry_queue,
+                                    spans_bytes,
+                                    n_spans,
+                                    retry_buffer_depth,
+                                    &TRACES_SEND_FAILURES,
                                     log.as_ptr(),
-                                    "otel export: sent {} span records to collector",
-                                    n_spans
-                                );
+                                    "spans",
+                                ) == OutcomeAction::Release
+                                {
+                                    ngx::ngx_log_error!(
+                                        NGX_LOG_INFO,
+                                        log.as_ptr(),
+                                        "otel export: sent {} span records to collector",
+                                        n_spans
+                                    );
+                                }
                             }
                             Ok(Err(ref e)) => {
                                 ngx::ngx_log_error!(
@@ -1260,15 +1360,23 @@ pub async fn export_loop(amcf: &'static MainConfig) {
         // Note: the per-retry-success INFO log ("queued batch sent successfully")
         // previously emitted only by this lane is intentionally omitted in the
         // shared helper — it was operational noise absent from the logs/spans lanes.
-        drain_retry_queue_once(
-            &mut retry_queue,
-            retry_buffer_depth,
-            log.as_ptr(),
-            &SEND_FAILURES,
-            "metrics",
-            &mut MetricsRetry(&mut transport),
-        )
-        .await;
+        // S4: skip the metrics lane (retry drain AND fresh send) while a
+        // `Retryable` backoff defers it — deferring the DRAIN, not growing the
+        // buffer. Independent of the logs/spans lanes.
+        let metrics_now_msec = now_monotonic_msec();
+        let metrics_deferred = metrics_backoff.is_deferred(metrics_now_msec);
+        if !metrics_deferred {
+            drain_retry_queue_once(
+                &mut retry_queue,
+                retry_buffer_depth,
+                log.as_ptr(),
+                &SEND_FAILURES,
+                "metrics",
+                &mut MetricsRetry(&mut transport),
+                &mut metrics_backoff,
+            )
+            .await;
+        }
 
         // H3F3: inter-send shutdown check between the metrics retry drain and the
         // fresh-metrics send. A quit/terminate arriving while the (deadline-bounded)
@@ -1296,7 +1404,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             Pdata::Metrics(collect_all_sources(amcf, worker_start_ns, &collector_host));
         processor.process(&mut metrics_pd);
         let n_pts = count_pdata_records(&metrics_pd);
-        if n_pts > 0 {
+        if n_pts > 0 && !metrics_deferred {
             let bytes = encode_pdata(&metrics_pd);
 
             // ── Send the fresh batch ──────────────────────────────────────
@@ -1308,14 +1416,28 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             )
             .await
             {
-                // S1: any Ok(outcome) treated as release (S4 adds policy).
-                Ok(Ok(_outcome)) => {
-                    ngx::ngx_log_error!(
-                        NGX_LOG_INFO,
+                // S4: outcome-driven policy (release / requeue+defer / drop).
+                Ok(Ok(ref outcome)) => {
+                    if handle_fresh_send_outcome(
+                        outcome,
+                        &mut metrics_backoff,
+                        metrics_now_msec,
+                        &mut retry_queue,
+                        bytes,
+                        n_pts,
+                        retry_buffer_depth,
+                        &SEND_FAILURES,
                         log.as_ptr(),
-                        "otel export: sent {} data points to collector",
-                        n_pts
-                    );
+                        "metrics",
+                    ) == OutcomeAction::Release
+                    {
+                        ngx::ngx_log_error!(
+                            NGX_LOG_INFO,
+                            log.as_ptr(),
+                            "otel export: sent {} data points to collector",
+                            n_pts
+                        );
+                    }
                 }
                 Ok(Err(ref e)) => {
                     ngx::ngx_log_error!(
@@ -1881,6 +2003,253 @@ fn is_permanent_rejection(e: &crate::transport::TransportError) -> bool {
     matches!(e, crate::transport::TransportError::HttpStatus { code, .. } if *code >= 400 && *code < 500)
 }
 
+// ── S4: outcome-driven policy engine ──────────────────────────────────────────
+//
+// The policy is written ONCE against the protocol-agnostic `DeliveryOutcome`
+// (the adapters in S2/S3 already mapped native HTTP/gRPC status into it). The
+// engine NEVER branches on an HTTP code or a gRPC code here.
+//
+// Defer mechanism (within the STOP-AND-ASK bound): a per-signal "not before"
+// monotonic timestamp + a per-signal consecutive-`Retryable`-failure counter.
+// Honoring a backoff DEFERS THE NEXT DRAIN of that signal — it does NOT grow the
+// buffer or add any unbounded store. The bounded per-signal retry buffer with
+// drop-oldest eviction remains the backstop, unchanged.
+
+/// Per-signal backoff/defer state. Lives in `export_loop` locals (one per
+/// signal lane) — single-task, exporter-local; never shared across threads.
+#[derive(Debug, Default, Clone, Copy)]
+struct SignalBackoff {
+    /// Monotonic `ngx_current_msec` value before which this signal must NOT be
+    /// drained again. `0` = no active deferral. The drain loop reuses nginx's
+    /// existing cached `CLOCK_MONOTONIC` millisecond basis (`ngx_current_msec`)
+    /// — no new clock is introduced.
+    not_before_msec: u64,
+    /// Count of consecutive `Retryable` verdicts for this signal since the last
+    /// `Accepted`. Drives the no-hint exponential backoff doubling; reset to 0
+    /// on the next `Accepted`.
+    consecutive_retryable: u32,
+}
+
+impl SignalBackoff {
+    /// Whether a drain of this signal is currently deferred at `now_msec`.
+    /// `not_before_msec == 0` means no deferral is active.
+    #[inline]
+    fn is_deferred(&self, now_msec: u64) -> bool {
+        self.not_before_msec != 0 && now_msec < self.not_before_msec
+    }
+}
+
+/// The action the policy engine prescribes for a drained/sent batch. The caller
+/// performs the buffer mutation (release = drop the in-hand batch; requeue =
+/// `enqueue_with_eviction`; drop = discard); the defer/backoff bookkeeping has
+/// already been applied to the `SignalBackoff` by [`apply_delivery_outcome`].
+#[derive(Debug, PartialEq, Eq)]
+enum OutcomeAction {
+    /// Release the batch (delivered). Backoff was reset.
+    Release,
+    /// Re-queue the batch into the bounded buffer; the next drain of this signal
+    /// is deferred (see the `SignalBackoff`).
+    Requeue,
+    /// Drop the batch permanently (Permanent / Unauthorized); do NOT retry.
+    Drop,
+}
+
+/// Compute the no-hint exponential backoff duration (ms) for the
+/// `consecutive_retryable`-th consecutive retryable failure: `base << (n-1)`,
+/// saturating at `cap`. `n == 0` is treated as the first failure.
+#[inline]
+fn backoff_ms(consecutive_retryable: u32, base_ms: u64, cap_ms: u64) -> u64 {
+    if base_ms == 0 {
+        return 0;
+    }
+    let shift = consecutive_retryable.saturating_sub(1);
+    // `<<` can both wrap (shift ≥ 64) and silently overflow the value (shift <
+    // 64 but `base << shift` exceeds u64). Guard both with a saturating shift:
+    // if the shift exceeds the headroom in `base_ms`, the product would exceed
+    // u64, so saturate straight to the cap.
+    if shift >= base_ms.leading_zeros() {
+        return cap_ms;
+    }
+    (base_ms << shift).min(cap_ms)
+}
+
+/// The outcome-driven policy, written ONCE against `DeliveryOutcome`. Updates
+/// `backoff` (defer timestamp + consecutive-failure counter) and the
+/// delivery-outcome self-metric counters, and returns the buffer action for the
+/// caller to perform.
+///
+/// `now_msec` is the current monotonic basis (`ngx_current_msec` in production;
+/// an injected value in tests). `signal` and `log` are used only for the
+/// rate-limited `Unauthorized` "check credentials" log.
+fn apply_delivery_outcome(
+    outcome: &crate::transport::DeliveryOutcome,
+    backoff: &mut SignalBackoff,
+    now_msec: u64,
+    log: *mut nginx_sys::ngx_log_t,
+    signal: &str,
+) -> OutcomeAction {
+    use crate::transport::DeliveryOutcome as DO;
+    match outcome {
+        DO::Accepted => {
+            // Success resets the backoff for this signal.
+            backoff.consecutive_retryable = 0;
+            backoff.not_before_msec = 0;
+            OutcomeAction::Release
+        }
+        DO::PartialReject { rejected } => {
+            // Accepted overall → release the batch + reset backoff; the peer
+            // dropped `rejected` records it could not store (counts only).
+            backoff.consecutive_retryable = 0;
+            backoff.not_before_msec = 0;
+            PARTIAL_REJECTED.fetch_add(*rejected, Ordering::Relaxed);
+            OutcomeAction::Release
+        }
+        DO::Retryable { retry_after } => {
+            // Transient: re-queue into the bounded buffer (caller) AND defer the
+            // next drain of this signal. Honor a peer hint verbatim; otherwise
+            // apply the hardcoded exponential backoff (doubling per consecutive
+            // retryable failure, capped). The defer NEVER grows the buffer.
+            backoff.consecutive_retryable = backoff.consecutive_retryable.saturating_add(1);
+            let defer_ms = match retry_after {
+                Some(hint) => {
+                    // Hint honored verbatim (NOT subject to the no-hint cap).
+                    // Round up sub-ms hints to at least one tick so a defer is
+                    // always observable.
+                    let ms = hint.as_millis();
+                    u64::try_from(ms).unwrap_or(u64::MAX).max(1)
+                }
+                None => backoff_ms(backoff.consecutive_retryable, BACKOFF_BASE_MS, BACKOFF_CAP_MS),
+            };
+            backoff.not_before_msec = now_msec.saturating_add(defer_ms).max(1);
+            OutcomeAction::Requeue
+        }
+        DO::Permanent => {
+            // Permanent rejection — drop + count, never retry. Backoff is not a
+            // factor (we are not deferring; the batch is gone).
+            PERMANENT_REJECTED.fetch_add(1, Ordering::Relaxed);
+            OutcomeAction::Drop
+        }
+        DO::Unauthorized => {
+            // SAME policy action as Permanent (drop + count, NO retry, NO
+            // backoff, NO auto-pause) — auth failures are a config/credential
+            // problem retrying cannot fix. Distinct counter + a rate-limited
+            // "check credentials" log so the real signal is not buried, and so
+            // we never silently stop the exporter or the other signals.
+            UNAUTHORIZED_REJECTED.fetch_add(1, Ordering::Relaxed);
+            maybe_log_unauthorized(log, signal);
+            OutcomeAction::Drop
+        }
+    }
+}
+
+/// S4 — apply the outcome-driven policy to a *fresh* (newly-collected) batch
+/// send result. Shared by the metrics/logs/spans fresh-send sites so the policy
+/// is written once. On `Requeue`/transient the batch is re-queued into the
+/// bounded buffer (drop-oldest backstop, unchanged) and `failure_counter` is
+/// bumped; on `Drop` the batch is discarded (the dedicated delivery counter was
+/// bumped inside [`apply_delivery_outcome`]); on `Release` nothing is queued.
+///
+/// Returns the [`OutcomeAction`] so the caller can emit its signal-specific
+/// success log with the original wording (the B1 chaos test parses those exact
+/// "sent N {log,span} records to collector" lines).
+///
+/// `now_msec` is the monotonic basis for the defer timestamp recorded in
+/// `backoff`. `bytes`/`n_records` are the fresh batch (consumed only when
+/// re-queued).
+#[allow(clippy::too_many_arguments)]
+fn handle_fresh_send_outcome(
+    outcome: &crate::transport::DeliveryOutcome,
+    backoff: &mut SignalBackoff,
+    now_msec: u64,
+    queue: &mut VecDeque<(std::vec::Vec<u8>, u64)>,
+    bytes: std::vec::Vec<u8>,
+    n_records: u64,
+    retry_buffer_depth: usize,
+    failure_counter: &AtomicU64,
+    log: *mut nginx_sys::ngx_log_t,
+    signal: &'static str,
+) -> OutcomeAction {
+    let action = apply_delivery_outcome(outcome, backoff, now_msec, log, signal);
+    match action {
+        // Caller logs the success line (signal-specific wording).
+        OutcomeAction::Release => {}
+        OutcomeAction::Requeue => {
+            if !log.is_null() {
+                ngx::ngx_log_error!(
+                    NGX_LOG_ERR,
+                    log,
+                    "otel export: {} send retryable; queuing for retry and deferring next drain",
+                    signal
+                );
+            }
+            enqueue_with_eviction(queue, bytes, n_records, retry_buffer_depth, log);
+            failure_counter.fetch_add(1, Ordering::Relaxed);
+        }
+        OutcomeAction::Drop => {
+            if !log.is_null() {
+                ngx::ngx_log_error!(
+                    NGX_LOG_ERR,
+                    log,
+                    "otel export: dropping fresh {} batch — non-retryable verdict",
+                    signal
+                );
+            }
+        }
+    }
+    action
+}
+
+/// Last `ngx_current_msec` at which the "check exporter credentials" line was
+/// emitted (0 = never). Rate-limits the `Unauthorized` log to at most once per
+/// [`UNAUTHORIZED_LOG_INTERVAL_MS`] so a per-batch 401/403 storm cannot hammer
+/// the error log. Exporter-local single-writer atomic (same pattern as the
+/// other counters); the read-modify-write is benign even if it ever raced.
+static UNAUTHORIZED_LOG_LAST_MSEC: AtomicU64 = AtomicU64::new(0);
+
+/// Minimum spacing between successive `Unauthorized` "check credentials" log
+/// lines (60 s).
+const UNAUTHORIZED_LOG_INTERVAL_MS: u64 = 60_000;
+
+/// Emit the "check exporter credentials" error line at most once per
+/// [`UNAUTHORIZED_LOG_INTERVAL_MS`]. Uses the same monotonic
+/// `ngx_current_msec` basis as the defer timestamps.
+fn maybe_log_unauthorized(log: *mut nginx_sys::ngx_log_t, signal: &str) {
+    if log.is_null() {
+        return;
+    }
+    // SAFETY: `ngx_current_msec` is an nginx global updated by the event loop
+    // in this single-threaded exporter process; a plain read is well-defined.
+    let now = unsafe { nginx_sys::ngx_current_msec } as u64;
+    let last = UNAUTHORIZED_LOG_LAST_MSEC.load(Ordering::Relaxed);
+    // First occurrence (last == 0) always logs; thereafter respect the interval.
+    if last != 0 && now.saturating_sub(last) < UNAUTHORIZED_LOG_INTERVAL_MS {
+        return;
+    }
+    UNAUTHORIZED_LOG_LAST_MSEC.store(now.max(1), Ordering::Relaxed);
+    ngx::ngx_log_error!(
+        NGX_LOG_ERR,
+        log,
+        "otel export: {} batch rejected — authentication/authorization failed; \
+         check exporter credentials (dropping, not retrying)",
+        signal
+    );
+}
+
+/// Read the current monotonic millisecond basis used for defer timestamps.
+/// Reuses nginx's cached `CLOCK_MONOTONIC` (`ngx_current_msec`, updated by the
+/// event loop the exporter runs on) — the SAME basis `liveness` uses. No new
+/// clock is introduced.
+///
+/// # Safety
+/// `ngx_current_msec` is an nginx global updated by the event loop in this
+/// single-threaded exporter process; a plain read is well-defined.
+#[inline]
+fn now_monotonic_msec() -> u64 {
+    // SAFETY: `ngx_current_msec` is an nginx global updated by the event loop
+    // in this single-threaded exporter process; a plain read is well-defined.
+    unsafe { nginx_sys::ngx_current_msec as u64 }
+}
+
 // ── Retry-drain abstraction ───────────────────────────────────────────────────
 // `RetrySend` is a minimal send-one-batch trait used exclusively by
 // `drain_retry_queue_once`.  The trait exists to make the helper testable
@@ -1952,6 +2321,7 @@ async fn drain_retry_queue_once<S: RetrySend>(
     failure_counter: &AtomicU64,
     signal: &'static str,
     sender: &mut S,
+    backoff: &mut SignalBackoff,
 ) {
     // Production timer: the NGINX-event-loop-driven sleep. Factored as a
     // closure so the inner generic helper can also be driven by a deterministic
@@ -1963,6 +2333,8 @@ async fn drain_retry_queue_once<S: RetrySend>(
         failure_counter,
         signal,
         sender,
+        backoff,
+        now_monotonic_msec(),
         || ngx::async_::sleep(PERIODIC_SEND_BUDGET),
     )
     .await;
@@ -1978,6 +2350,7 @@ async fn drain_retry_queue_once<S: RetrySend>(
 /// # Safety
 /// `log` must point to a valid `ngx_log_t` or be `null_mut()` (all log calls
 /// are null-guarded).
+#[allow(clippy::too_many_arguments)]
 async fn drain_retry_queue_once_with_timer<S, Mk, T>(
     queue: &mut VecDeque<(std::vec::Vec<u8>, u64)>,
     retry_buffer_depth: usize,
@@ -1985,6 +2358,8 @@ async fn drain_retry_queue_once_with_timer<S, Mk, T>(
     failure_counter: &AtomicU64,
     signal: &'static str,
     sender: &mut S,
+    backoff: &mut SignalBackoff,
+    now_msec: u64,
     mut mk_timer: Mk,
 ) where
     S: RetrySend,
@@ -2004,9 +2379,43 @@ async fn drain_retry_queue_once_with_timer<S, Mk, T>(
         // for the rest of this pass (the transport is likely wedged).
         let send = WithDeadline { fut: sender.send_batch(bytes.clone()), timer: mk_timer() };
         match send.await {
-            // S1: any Ok(outcome) is treated as release, exactly as Ok(()) was.
-            // S4 introduces the outcome-driven policy (release/requeue+defer/drop).
-            Ok(Ok(_outcome)) => {}
+            // S4: outcome-driven policy, written ONCE against `DeliveryOutcome`.
+            Ok(Ok(ref outcome)) => {
+                match apply_delivery_outcome(outcome, backoff, now_msec, log, signal) {
+                    // Accepted / PartialReject → release this batch; keep draining.
+                    OutcomeAction::Release => {}
+                    // Retryable → re-queue into the bounded buffer and stop the
+                    // pass; the next drain of this signal is deferred (the defer
+                    // is recorded in `backoff`, honored by the caller's gate).
+                    OutcomeAction::Requeue => {
+                        failure_counter.fetch_add(1, Ordering::Relaxed);
+                        if !log.is_null() {
+                            ngx::ngx_log_error!(
+                                NGX_LOG_ERR,
+                                log,
+                                "otel export: {} retry send retryable; re-queuing and \
+                                 deferring next drain",
+                                signal
+                            );
+                        }
+                        enqueue_with_eviction(queue, bytes, n, retry_buffer_depth, log);
+                        drain_failed = true;
+                    }
+                    // Permanent / Unauthorized → drop this batch (no retry); the
+                    // dedicated counter was bumped inside `apply_delivery_outcome`.
+                    // Keep draining: each batch carries its own verdict.
+                    OutcomeAction::Drop => {
+                        if !log.is_null() {
+                            ngx::ngx_log_error!(
+                                NGX_LOG_ERR,
+                                log,
+                                "otel export: dropping {} retry batch — non-retryable verdict",
+                                signal
+                            );
+                        }
+                    }
+                }
+            }
             Ok(Err(ref e)) => {
                 failure_counter.fetch_add(1, Ordering::Relaxed);
                 if is_permanent_rejection(e) {
@@ -3855,6 +4264,8 @@ mod tests {
             &failure_counter,
             "test",
             &mut MockAlwaysErr(413),
+            &mut super::SignalBackoff::default(),
+            0,
             || NeverTimer,
         )
         .await;
@@ -3883,6 +4294,8 @@ mod tests {
             &failure_counter2,
             "test",
             &mut MockAlwaysErr(503),
+            &mut super::SignalBackoff::default(),
+            0,
             || NeverTimer,
         )
         .await;
@@ -4020,6 +4433,8 @@ mod tests {
                 &failure_counter,
                 "test",
                 &mut MockNeverResolve,
+                &mut super::SignalBackoff::default(),
+                0,
                 || ReadyTimer,
             ),
             64,
@@ -4039,6 +4454,361 @@ mod tests {
             failure_counter.load(Ordering::Relaxed),
             1,
             "H3F3: a deadline expiry must bump the failure counter (transient-failure path)"
+        );
+    }
+
+    // ── S4: outcome-driven policy engine ───────────────────────────────────────
+
+    use crate::transport::DeliveryOutcome as Outcome;
+
+    /// Serializes the S4 tests that assert on the process-global delivery-outcome
+    /// counters (`PARTIAL_REJECTED` / `PERMANENT_REJECTED` / `UNAUTHORIZED_REJECTED`),
+    /// since cargo runs unit tests in parallel and another such test could bump
+    /// the same static between a before/after read.
+    static S4_COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A `RetrySend` that returns a fixed `Ok(DeliveryOutcome)` verdict for every
+    /// send — exercises the S4 policy match in `drain_retry_queue_once_with_timer`.
+    struct MockVerdict(Outcome);
+    impl super::RetrySend for MockVerdict {
+        async fn send_batch(
+            &mut self,
+            _bytes: std::vec::Vec<u8>,
+        ) -> Result<crate::transport::DeliveryOutcome, crate::transport::TransportError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// `Accepted` → release: batch is dropped (not re-queued), backoff reset.
+    #[test]
+    fn s4_accepted_releases_and_resets_backoff() {
+        let mut backoff = SignalBackoff { not_before_msec: 12_345, consecutive_retryable: 4 };
+        let action = apply_delivery_outcome(
+            &Outcome::Accepted,
+            &mut backoff,
+            1_000,
+            core::ptr::null_mut(),
+            "test",
+        );
+        assert_eq!(action, OutcomeAction::Release);
+        assert_eq!(backoff.consecutive_retryable, 0, "Accepted must reset the failure counter");
+        assert_eq!(backoff.not_before_msec, 0, "Accepted must clear any active defer");
+    }
+
+    /// `PartialReject{n}` → release + accumulate `n`; backoff reset.
+    #[test]
+    fn s4_partial_reject_releases_and_counts() {
+        let _g = S4_COUNTER_LOCK.lock().unwrap();
+        let before = PARTIAL_REJECTED.load(Ordering::Relaxed);
+        let mut backoff = SignalBackoff { not_before_msec: 9, consecutive_retryable: 2 };
+        let action = apply_delivery_outcome(
+            &Outcome::PartialReject { rejected: 7 },
+            &mut backoff,
+            1_000,
+            core::ptr::null_mut(),
+            "test",
+        );
+        assert_eq!(action, OutcomeAction::Release, "PartialReject must release the batch");
+        assert_eq!(
+            PARTIAL_REJECTED.load(Ordering::Relaxed) - before,
+            7,
+            "PartialReject must accumulate the rejected count"
+        );
+        assert_eq!(backoff.consecutive_retryable, 0);
+        assert_eq!(backoff.not_before_msec, 0);
+    }
+
+    /// `Retryable` WITH a hint → requeue + defer until the hint elapses (the
+    /// not-before timestamp equals now + hint, NOT subject to the no-hint cap).
+    #[test]
+    fn s4_retryable_with_hint_defers_until_hint() {
+        let mut backoff = SignalBackoff::default();
+        let now = 5_000;
+        let hint = Duration::from_millis(2_500);
+        let action = apply_delivery_outcome(
+            &Outcome::Retryable { retry_after: Some(hint) },
+            &mut backoff,
+            now,
+            core::ptr::null_mut(),
+            "test",
+        );
+        assert_eq!(action, OutcomeAction::Requeue, "Retryable must re-queue (bounded)");
+        assert_eq!(
+            backoff.not_before_msec,
+            now + 2_500,
+            "a hint must set the not-before timestamp to now + hint"
+        );
+        assert!(backoff.is_deferred(now), "drain must be deferred at now");
+        assert!(backoff.is_deferred(now + 2_499), "still deferred just before the hint");
+        assert!(!backoff.is_deferred(now + 2_500), "no longer deferred once the hint elapses");
+
+        // A hint LARGER than the no-hint cap is honored verbatim (not capped).
+        let mut b2 = SignalBackoff::default();
+        let big = Duration::from_millis(BACKOFF_CAP_MS + 120_000);
+        apply_delivery_outcome(
+            &Outcome::Retryable { retry_after: Some(big) },
+            &mut b2,
+            0,
+            core::ptr::null_mut(),
+            "test",
+        );
+        assert_eq!(
+            b2.not_before_msec,
+            BACKOFF_CAP_MS + 120_000,
+            "a peer hint is honored verbatim and is NOT clamped to the no-hint cap"
+        );
+    }
+
+    /// `Retryable` WITHOUT a hint → exponential backoff: doubling across
+    /// consecutive failures, capped, and RESET on the next `Accepted`.
+    #[test]
+    fn s4_retryable_no_hint_exponential_backoff_and_reset() {
+        let mut backoff = SignalBackoff::default();
+        let now = 0;
+
+        // 1st failure: base.
+        apply_delivery_outcome(
+            &Outcome::Retryable { retry_after: None },
+            &mut backoff,
+            now,
+            core::ptr::null_mut(),
+            "test",
+        );
+        assert_eq!(backoff.consecutive_retryable, 1);
+        assert_eq!(backoff.not_before_msec, BACKOFF_BASE_MS, "1st no-hint defer = base");
+
+        // 2nd failure: 2× base.
+        apply_delivery_outcome(
+            &Outcome::Retryable { retry_after: None },
+            &mut backoff,
+            now,
+            core::ptr::null_mut(),
+            "test",
+        );
+        assert_eq!(backoff.consecutive_retryable, 2);
+        assert_eq!(backoff.not_before_msec, BACKOFF_BASE_MS * 2, "2nd defer doubles");
+
+        // 3rd failure: 4× base.
+        apply_delivery_outcome(
+            &Outcome::Retryable { retry_after: None },
+            &mut backoff,
+            now,
+            core::ptr::null_mut(),
+            "test",
+        );
+        assert_eq!(backoff.not_before_msec, BACKOFF_BASE_MS * 4, "3rd defer doubles again");
+
+        // Doubling is capped at BACKOFF_CAP_MS.
+        let mut capped = SignalBackoff { not_before_msec: 0, consecutive_retryable: 60 };
+        apply_delivery_outcome(
+            &Outcome::Retryable { retry_after: None },
+            &mut capped,
+            now,
+            core::ptr::null_mut(),
+            "test",
+        );
+        assert_eq!(
+            capped.not_before_msec, BACKOFF_CAP_MS,
+            "sustained no-hint retryable must cap at BACKOFF_CAP_MS, never grow unbounded"
+        );
+
+        // An Accepted resets the backoff to baseline.
+        apply_delivery_outcome(
+            &Outcome::Accepted,
+            &mut backoff,
+            now,
+            core::ptr::null_mut(),
+            "test",
+        );
+        assert_eq!(backoff.consecutive_retryable, 0, "Accepted resets consecutive count");
+        assert_eq!(backoff.not_before_msec, 0, "Accepted clears the defer");
+        // The next no-hint retryable restarts at base, proving the reset.
+        apply_delivery_outcome(
+            &Outcome::Retryable { retry_after: None },
+            &mut backoff,
+            now,
+            core::ptr::null_mut(),
+            "test",
+        );
+        assert_eq!(
+            backoff.not_before_msec, BACKOFF_BASE_MS,
+            "after Accepted the backoff restarts at base, not where it left off"
+        );
+    }
+
+    /// `Permanent` → drop + count, NO retry, no defer.
+    #[test]
+    fn s4_permanent_drops_and_counts_no_retry() {
+        let _g = S4_COUNTER_LOCK.lock().unwrap();
+        let before = PERMANENT_REJECTED.load(Ordering::Relaxed);
+        let mut backoff = SignalBackoff::default();
+        let action = apply_delivery_outcome(
+            &Outcome::Permanent,
+            &mut backoff,
+            1_000,
+            core::ptr::null_mut(),
+            "test",
+        );
+        assert_eq!(action, OutcomeAction::Drop, "Permanent must drop, never retry");
+        assert_eq!(
+            PERMANENT_REJECTED.load(Ordering::Relaxed) - before,
+            1,
+            "Permanent must bump its own counter"
+        );
+        assert_eq!(backoff.not_before_msec, 0, "Permanent must NOT set a defer");
+    }
+
+    /// `Unauthorized` → drop + DISTINCT counter, NO retry, NO defer/pause.
+    #[test]
+    fn s4_unauthorized_drops_distinct_counter_no_retry_no_pause() {
+        let _g = S4_COUNTER_LOCK.lock().unwrap();
+        let before_unauth = UNAUTHORIZED_REJECTED.load(Ordering::Relaxed);
+        let before_perm = PERMANENT_REJECTED.load(Ordering::Relaxed);
+        let mut backoff = SignalBackoff::default();
+        let action = apply_delivery_outcome(
+            &Outcome::Unauthorized,
+            &mut backoff,
+            1_000,
+            core::ptr::null_mut(),
+            "test",
+        );
+        assert_eq!(action, OutcomeAction::Drop, "Unauthorized = same action as Permanent (drop)");
+        assert_eq!(
+            UNAUTHORIZED_REJECTED.load(Ordering::Relaxed) - before_unauth,
+            1,
+            "Unauthorized must bump its OWN distinct counter"
+        );
+        assert_eq!(
+            PERMANENT_REJECTED.load(Ordering::Relaxed) - before_perm,
+            0,
+            "Unauthorized must NOT bump the permanent counter"
+        );
+        assert_eq!(backoff.not_before_msec, 0, "Unauthorized must NOT defer/pause");
+        assert_eq!(backoff.consecutive_retryable, 0, "Unauthorized must NOT touch the retry count");
+    }
+
+    /// `Unauthorized` on one signal does NOT defer or stop the OTHER signals'
+    /// drains — each lane has its own independent backoff state.
+    #[test]
+    fn s4_unauthorized_does_not_stop_other_signals() {
+        let _g = S4_COUNTER_LOCK.lock().unwrap();
+        let mut logs_b = SignalBackoff::default();
+        let mut spans_b = SignalBackoff { not_before_msec: 0, consecutive_retryable: 0 };
+        // logs gets Unauthorized; spans gets Accepted in the same tick.
+        apply_delivery_outcome(
+            &Outcome::Unauthorized,
+            &mut logs_b,
+            500,
+            core::ptr::null_mut(),
+            "logs",
+        );
+        apply_delivery_outcome(
+            &Outcome::Accepted,
+            &mut spans_b,
+            500,
+            core::ptr::null_mut(),
+            "spans",
+        );
+        assert!(!logs_b.is_deferred(500), "Unauthorized lane is not deferred (drop, no pause)");
+        assert!(!spans_b.is_deferred(500), "the other lane keeps flowing — independent state");
+    }
+
+    /// `backoff_ms` doubling + cap + the `n == 0` edge.
+    #[test]
+    fn s4_backoff_ms_doubling_and_cap() {
+        assert_eq!(backoff_ms(0, 250, 30_000), 250, "n=0 treated as the first failure → base");
+        assert_eq!(backoff_ms(1, 250, 30_000), 250);
+        assert_eq!(backoff_ms(2, 250, 30_000), 500);
+        assert_eq!(backoff_ms(3, 250, 30_000), 1_000);
+        assert_eq!(backoff_ms(8, 250, 30_000), 30_000, "doubling saturates at the cap");
+        assert_eq!(backoff_ms(1_000, 250, 30_000), 30_000, "huge shift never overflows → cap");
+    }
+
+    /// End-to-end through the production drain helper: a `Retryable` verdict
+    /// re-queues the batch into the bounded buffer AND records a defer.
+    #[tokio::test]
+    async fn s4_drain_retryable_requeues_and_defers() {
+        let mut queue: VecDeque<(std::vec::Vec<u8>, u64)> = VecDeque::new();
+        queue.push_back((std::vec![1u8], 3));
+        let failure_counter = AtomicU64::new(0);
+        let mut backoff = SignalBackoff::default();
+        super::drain_retry_queue_once_with_timer(
+            &mut queue,
+            16,
+            core::ptr::null_mut(),
+            &failure_counter,
+            "test",
+            &mut MockVerdict(Outcome::Retryable { retry_after: None }),
+            &mut backoff,
+            1_000,
+            || NeverTimer,
+        )
+        .await;
+        assert_eq!(queue.len(), 1, "Retryable must re-queue into the bounded buffer");
+        assert!(backoff.is_deferred(1_000), "Retryable must defer the next drain");
+        assert_eq!(backoff.not_before_msec, 1_000 + BACKOFF_BASE_MS);
+    }
+
+    /// End-to-end: a `Permanent` verdict drops the batch via the drain helper
+    /// (queue empties; no re-queue).
+    #[tokio::test]
+    async fn s4_drain_permanent_drops() {
+        // Counter-delta assertion lives in `s4_permanent_drops_and_counts_no_retry`
+        // (sync, lock-guarded). Here we assert the buffer action through the
+        // production drain helper without touching the shared global counter, so
+        // no lock is held across the `.await`.
+        let mut queue: VecDeque<(std::vec::Vec<u8>, u64)> = VecDeque::new();
+        queue.push_back((std::vec![1u8], 3));
+        let failure_counter = AtomicU64::new(0);
+        let mut backoff = SignalBackoff::default();
+        super::drain_retry_queue_once_with_timer(
+            &mut queue,
+            16,
+            core::ptr::null_mut(),
+            &failure_counter,
+            "test",
+            &mut MockVerdict(Outcome::Permanent),
+            &mut backoff,
+            1_000,
+            || NeverTimer,
+        )
+        .await;
+        assert!(queue.is_empty(), "Permanent must drop the batch, not re-queue");
+        assert!(!backoff.is_deferred(1_000), "Permanent must not defer");
+    }
+
+    /// Bounded-buffer backstop holds under sustained backoff: requeue via the
+    /// policy never grows the buffer beyond `max_depth` (oldest evicted).
+    #[tokio::test]
+    async fn s4_bounded_buffer_evicts_oldest_under_sustained_backoff() {
+        // Fill the queue beyond the depth, then drain with a Retryable verdict.
+        // Each surviving batch that the helper re-queues is bounded by max_depth.
+        let max_depth = 4;
+        let mut queue: VecDeque<(std::vec::Vec<u8>, u64)> = VecDeque::new();
+        for i in 0..(max_depth as u64 + 5) {
+            queue.push_back((std::vec![i as u8], 1));
+        }
+        let failure_counter = AtomicU64::new(0);
+        let mut backoff = SignalBackoff::default();
+        // The helper takes a snapshot and re-queues on the first Retryable, then
+        // dumps the remainder back via enqueue_with_eviction — all bounded.
+        super::drain_retry_queue_once_with_timer(
+            &mut queue,
+            max_depth,
+            core::ptr::null_mut(),
+            &failure_counter,
+            "test",
+            &mut MockVerdict(Outcome::Retryable { retry_after: None }),
+            &mut backoff,
+            1_000,
+            || NeverTimer,
+        )
+        .await;
+        assert!(
+            queue.len() <= max_depth,
+            "bounded buffer must never exceed max_depth ({}); got {}",
+            max_depth,
+            queue.len()
         );
     }
 }
