@@ -173,6 +173,7 @@ export CARGO_UNSTABLE_BUILD_STD="std,panic_abort"
 export NGINX_BINARY="${PLAIN_OBJS}/nginx"
 export NGINX_SOURCE_DIR="${NGINX_SRC}"
 export NGINX_BUILD_DIR="${PLAIN_OBJS}"
+export NGX_OTEL_ALLOW_FLAVOR_MISMATCH=1  # harness fix: plain ASan nginx uses --with-debug
 
 # ASan runtime options.
 #   log_path        — write reports to ${RUNDIR}/asan.<pid> so a UAF is captured

@@ -156,6 +156,8 @@ export NGINX_BINARY="${PLAIN_OBJS}/nginx"
 export NGINX_SOURCE_DIR=/work/nginx
 export NGINX_BUILD_DIR="${PLAIN_OBJS}"
 
+export NGX_OTEL_ALLOW_FLAVOR_MISMATCH=1  # harness fix: plain TSAN nginx uses --with-debug
+
 echo "[tsan-run] TSAN nginx:  ${NGINX_BINARY}"
 echo "[tsan-run] RUSTFLAGS:   ${RUSTFLAGS}"
 

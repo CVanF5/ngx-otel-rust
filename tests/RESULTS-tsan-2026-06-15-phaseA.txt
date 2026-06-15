@@ -1,0 +1,242 @@
+TSAN GATE ARTIFACT — Phase A tip — ngx-otel-rust
+=================================================
+F2-bar evidence (4 elements, in order)
+Run date: 2026-06-15T10:54:27Z
+GIT_COMMIT: 76ec68fa37b104a9532efeec4dfa05234241db3d
+
+CONTEXT
+-------
+Phase A adds TLS (openssl-sys) to the module. Two harness fixes were required
+before this run succeeded:
+  1. Stale ngx-otel-tsan-objs Docker volume: nginx Makefile was generated before
+     --with-http_ssl_module was added to NGINX_CONFIGURE_BASE (Phase C). The
+     link line was missing -lssl/-lcrypto, causing undefined references to OpenSSL
+     symbols in the new TLS code. Fixed by removing the stale volumes so
+     auto/configure regenerated the Makefile with the correct link flags.
+  2. Build flavor guard: build.rs gained a flavor guard (A0.5) after tsan-run.sh
+     was written. The plain TSAN nginx uses --with-debug, and integration scripts
+     call cargo build --release against it — triggering the guard. Fixed by
+     exporting NGX_OTEL_ALLOW_FLAVOR_MISMATCH=1 in tsan-run.sh (and asan-run.sh)
+     Step 3, using the escape hatch the guard provides for intentional mismatches.
+Neither fix papers over a sanitizer finding. Source code was not modified.
+Harness fix committed alongside this artifact.
+
+── F2 ELEMENT 1: nm counts on the EXACT loaded artifact ──────────────────────
+
+Artifact path: target/aarch64-unknown-linux-gnu/release/libngx_http_otel_module.so
+nm run command: docker run --rm -v ngx-otel-tsan-target:/work/ngx-otel-rust/target
+                ngx-otel-tsan:latest bash -c
+                "nm .../libngx_http_otel_module.so | grep -c __tsan_"
+
+__tsan_* symbol count: 42
+
+Sample __tsan_* symbols (first 10):
+                 U __tsan_atomic32_compare_exchange_val
+                 U __tsan_atomic32_exchange
+                 U __tsan_atomic32_fetch_add
+                 U __tsan_atomic32_fetch_sub
+                 U __tsan_atomic32_load
+                 U __tsan_atomic32_store
+                 U __tsan_atomic64_compare_exchange_val
+                 U __tsan_atomic64_exchange
+                 U __tsan_atomic64_fetch_add
+                 U __tsan_atomic64_load
+
+── F2 ELEMENT 2: Named PASS lines from inside the run ────────────────────────
+
+f_shm_atomic_zero unit test (Step 3.4 — standalone TSAN runtime):
+  test shm::tests::f_shm_atomic_zero ... ok
+  test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 247 filtered out
+  [tsan-run] Step 3.4: f_shm_atomic_zero ... PASSED under TSAN — OK
+
+Step 3.5 nm-check:
+  [tsan-run] Step 3.5: __tsan_* symbol count in cdylib: 42
+  [tsan-run] Step 3.5: OK — 42 __tsan_* symbols confirmed in libngx_http_otel_module.so.
+
+run_grpc_smoke.sh:
+  [PASS] error.log: exactly 1 'grpc smoke: firing one unary' line (Worker 0 only)
+  [PASS] error.log: exactly 1 'grpc smoke: export complete' line (Ok(()) reached)
+  [PASS] error.log: zero 'grpc smoke: export failed' lines
+  [PASS] error.log: no panic / SIGSEGV / SIGABRT / unexpected worker exit signals
+  [PASS] metrics.json delta contains service.name = ngx-otel-grpc-smoke
+  [PASS] All assertions passed.  Phase 1.2 Item 1 in-worker gRPC smoke COMPLETE.
+
+run_grpc_bidi_smoke.sh:
+  [PASS] error.log: exactly 1 'grpc smoke: firing one unary' line
+  [PASS] error.log: exactly 1 'grpc smoke: export complete' line
+  [PASS] error.log: zero 'grpc smoke: export failed' lines
+  [PASS] error.log: no panic / SIGSEGV / SIGABRT / unexpected worker exit signals
+  [PASS] metrics.json delta contains service.name = ngx-otel-grpc-smoke
+  [PASS] error.log: exactly 1 'bidi smoke: firing one bidi stream' line
+  [PASS] error.log: exactly 1 'bidi smoke: bidi complete (sent=10, received=10)' line
+  [PASS] error.log: zero 'bidi smoke: bidi failed' lines
+  [PASS] All 8 assertions passed.  Phase 1.2 Item 2 bidi gRPC smoke COMPLETE.
+
+run_grpc_export.sh:
+  [PASS] Workers hold zero collector sockets (workers own no 4317/4318 fds)
+  [PASS] error.log: export loop started with protocol=otlp_grpc
+  [PASS] metrics.json delta contains service.name = ngx-otel-grpc-export-integration
+  [PASS] metrics.json delta contains http.server.request.duration
+  [PASS] error.log: exactly 1 'export loop started' line
+  [PASS] graceful drain integrity: 1 start(s), 1 complete(s)
+  [PASS] error.log: no panics / crashes
+  [PASS] All assertions passed.  Production gRPC export E2E test COMPLETE.
+
+run_access_log.sh:
+  [PASS] metrics.json: service.name = ngx-otel-access-log-test present
+  [PASS] metrics.json: http.server.request.duration present
+  [PASS] metrics.json: http.server.request.duration is exponentialHistogram (DP-F)
+  [PASS] metrics.json: http.route dimension present (DP-E)
+  [PASS] metrics.json: nginx.upstream.zone dimension present (DP-E, FU4)
+  [PASS] metrics.json: >= 2 distinct http.route data points
+  [PASS] metrics.json: '(other)' route bucket present
+  [PASS] logs.json: 200 flood blocked, interesting requests produced tail records (count=9)
+  [PASS] logs.json: at least 1 tail LogRecord present from error requests (got 9)
+  [PASS] logs.json: http.request.method attribute present
+  [PASS] logs.json: http.response.status_code attribute present
+  [PASS] logs.json: client.address attribute present
+  [PASS] logs.json: severity_number = 9 (INFO) present
+  [PASS] logs.json: event_name = http.access present
+  [PASS] metrics.json: trace_id 4bf92f3577b34da6a3ce929d0e0e4736 carried in exemplar
+  [PASS] logs.json: trace_id 4bf92f3577b34da6a3ce929d0e0e4736 carried on tail LogRecord
+  [PASS] logs.json: url.path attribute present on tail records (FU4b)
+  [PASS] logs.json: http.server.request.duration key present (S2)
+  [PASS] All assertions passed.
+
+run_error_log.sh:
+  [PASS] Stage A: new logs.json content arrived
+  [PASS] Stage A: event_name=nginx.error present
+  [PASS] Stage A: body contains 'connect() failed'
+  [PASS] Stage A: body contains 'upstream:' context
+  [PASS] Stage A: flood coalesced — 4 nginx.error records for 100 events (< 50)
+  [PASS] Stage A: nginx.error.coalesced_count attribute present
+  [PASS] Stage A: ngx_otel.error_log.events metric present
+  [PASS] Stage A: severity_class attribute present on error_log.events metric
+  [PASS] Stage A: no DEBUG-severity nginx.error records (floor=warn in effect)
+  [PASS] Stage A: service.name=ngx-otel-error-log-test present
+  [PASS] Stage B: new logs.json content arrived (coalesce-off)
+  [PASS] Stage B: coalesce-off produced 20 records (> 1, not collapsed)
+  [PASS] Stage B: no coalesced_count in coalesce-off mode
+  [PASS] Stage B: ngx_otel.error_log.events metric present (coalesce-off)
+  [PASS] Stage B: body contains 'connect() failed' (coalesce-off verbatim)
+
+run_signal_storm.sh:
+  [PASS] No ThreadSanitizer warnings in error.log
+
+run_traces.sh:
+  [PASS] logs.json: trace_id a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6 carried on tail LogRecord
+  [PASS] metrics.json: trace_id a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6 in metric exemplar
+  [PASS] metrics.json: no resourceSpans in new data (FU1 split holds)
+  [PASS] D1a: sampled parent -> span present in traces.json
+  [PASS] D1b: unsampled parent -> no span in traces.json
+  [PASS] All assertions passed.
+
+run_dns_dualstack.sh:
+  [PASS] TEST A: error.log contains 'export loop started'
+  [PASS] TEST A: no resolver-missing error in error.log
+  [PASS] TEST A: collector received +3 new metric record(s) (DNS -> v4 path confirmed)
+  [PASS] TEST B: v6 stub received 15420 bytes — IPv6 literal connect confirmed
+  [PASS] TEST C: v6 AAAA stub received 15450 bytes — DNS->v6 AAAA path confirmed (FU2)
+  [PASS] TEST D: nginx exited cleanly (no hang)
+  [PASS] TEST D: collector metric count unchanged (NXDOMAIN error path)
+  [PASS] All DNS + dual-stack integration assertions passed.
+
+run_chaos_kill9.sh:
+  [PASS] Exporter started, PID = 62895
+  [PASS] Workers have zero connections to :4317/:4318 (before kill)
+  [PASS] Workers return HTTP 200 while exporter is dead
+  [PASS] Master respawned exporter (architectural isolation confirmed)
+  [PASS] Workers have zero connections to :4317/:4318 (after respawn)
+  [PASS] error.log contains 'cycle entered' 2 times (initial + respawn)
+  [PASS] Master and exporter exited cleanly after SIGQUIT
+  [PASS] === All kill-9 containment assertions passed ===
+
+run_chaos_crashloop.sh:
+  [PASS] test-support module built
+  [PASS] nginx master started
+  [PASS] Initial exporter appeared
+  [PASS] Self-disable ALERT observed in error.log
+  [PASS] Backoff messages in error.log: 4 (exponential throttle active)
+  [PASS] No exporter process after self-disable
+  [PASS] ALERT message includes 'telemetry OFF'
+  [PASS] ALERT message includes 'nginx request handling UNAFFECTED'
+  [PASS] nginx master still responsive after exporter self-disable
+  [PASS] Workers return HTTP 200 after exporter self-disable
+  [PASS] nginx master exited cleanly on SIGQUIT
+  [PASS] === All crash-loop self-disable assertions passed ===
+
+run_chaos_dead_collector.sh:
+  [PASS] Exporter started with dead endpoint
+  [PASS] nginx exited 0s after SIGQUIT (budget 20s)
+  [PASS] No orphan exporter after SIGQUIT
+  [PASS] Part B: SIGHUP: new exporter PID confirmed (was + respawn)
+  [PASS] Workers return HTTP 200 after SIGHUP reload with dead collector
+  [PASS] New exporter still alive 3s after reload (crash counter reset on SIGHUP verified)
+  [PASS] Part B nginx exited cleanly
+  [PASS] Part C: no exporter running before SIGHUP (self-disable confirmed)
+  [PASS] Part C: first post-reload exporter appeared
+  [PASS] Part C: master still alive 3s after reload (not prematurely disabled)
+  [PASS] Part C nginx exited cleanly
+  [PASS] === All dead-collector shutdown/reload assertions passed ===
+
+run_b4_daemon_on_gen1.sh:
+  [PASS] Assertion 1: ALERT 'gen-1 exporter will be unsupervised after daemonize' present
+  [PASS] Assertion 2: gen-1 exporter has PPID=1 (orphaned to init)
+  [PASS] Assertion 3: master did NOT respawn gen-1 within 6s (supervision gap confirmed)
+  [PASS] Assertion 4: gen-2 exporter PPID=master (supervision restored by reload)
+  [PASS] Assertion 5: master respawned gen-2 -> gen-3 (SIGCHLD supervision confirmed)
+  [PASS] === B4 daemon-on gen-1 supervision test: all assertions passed ===
+
+run_b1_spsc_reload_chaos.sh:
+  [PASS] Round 1: old exporter exited
+  [PASS] Round 2: old exporter exited
+  [PASS] Round 3: old exporter exited
+  [PASS] assertion (a-i): no duplicate records across 3 SIGHUP rounds (75 unique paths)
+  [PASS] assertion (a-ii): conservation OK (75 arrived + 0 dropped = 75 sent)
+  [PASS] assertion (a-iii): zero parse/garbage-length errors
+  [PASS] nginx exited cleanly
+  [PASS] assertion (b): quit-completeness: all 8 pre-quit records arrived
+  [PASS] B1-FU1 chaos gate: PASS — SPSC exclusivity across reload, conservation verified
+
+run_chaos_quit_responsiveness.sh:
+  [PASS] h3f3_periodic_deadline: PERIODIC_SEND_BUDGET signature observed
+  [PASS] h3f3_quit_responsiveness: nginx exited 4.11s after SIGQUIT (ceiling 25s)
+  [PASS] No orphan exporter after SIGQUIT
+  [PASS] === h3f3_quit_responsiveness: PASSED (deadline signature observed; quit latency 4.11s <= 25s) ===
+
+── F2 ELEMENT 3: Zero race count (shown from actual run output) ───────────────
+
+From the final scan in tsan-run.sh Step 5:
+  [tsan-run] Checking for ThreadSanitizer warnings in error logs...
+  [tsan-run] Zero ThreadSanitizer warnings.  TSAN gate: PASS.
+
+From run_signal_storm.sh (its own scan):
+  [PASS] No ThreadSanitizer warnings in error.log
+
+grep -c 'WARNING: ThreadSanitizer' across all error.log files: 0
+
+── F2 ELEMENT 4: Embedded provenance ─────────────────────────────────────────
+
+GIT_COMMIT: 76ec68fa37b104a9532efeec4dfa05234241db3d
+RUN_DATE:   2026-06-15T10:54:27Z
+
+(Provenance line from tsan-run.sh inside the Docker container:
+[tsan-run] PROVENANCE: GIT_COMMIT=76ec68fa37b104a9532efeec4dfa05234241db3d DATE=2026-06-15T10:54:27Z)
+
+── CROSS-VERIFICATION: independent second run (2026-06-15 ~11:25–11:32 UTC) ────
+
+The result above was independently reproduced by a second monitored TSAN run at
+the SAME commit (76ec68f), driven as a detached job on debian-vm. Both runs agree:
+  - nm on the loaded target/aarch64-unknown-linux-gnu/release/libngx_http_otel_module.so
+    (mtime 11:27): __tsan_ symbols = 42  (re-verified by hand)
+  - grep -c "WARNING: ThreadSanitizer" = 0
+  - [tsan-run] Zero ThreadSanitizer warnings.  TSAN gate: PASS.
+Two independent runs, same commit, same instrumentation count, zero races → the
+race-free conclusion is corroborated, not single-sourced.
+
+Coverage note: in the second run, run_signal_storm.sh did not fully execute — its
+nginx hit a /tmp log-dir "Permission denied" under TSAN-in-Docker-as-root (a known
+harness perms nit, NOT a race). In the FIRST run (above) signal_storm DID execute
+and reported zero warnings (line "run_signal_storm.sh: [PASS] No ThreadSanitizer
+warnings"). Follow-up: chmod 0711 / `user` directive in the storm conf so the script
+runs deterministically under both setups.

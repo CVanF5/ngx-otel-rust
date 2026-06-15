@@ -1,0 +1,48 @@
+ASan GATE ARTIFACT — Phase A tip — ngx-otel-rust
+=================================================
+F2-bar evidence (4 elements, in order)
+GIT_COMMIT: 76ec68fa37b104a9532efeec4dfa05234241db3d
+Run:        2026-06-15 ~11:32–11:37 UTC, debian-vm (Linux aarch64), dockerized
+Build:      make asan-test  →  -Zsanitizer=address -Zbuild-std, rc=0
+
+CONTEXT
+-------
+Same two harness fixes as the TSAN artifact were required for the sanitizer
+harness after Phase A added --with-http_ssl_module:
+  1. Stale ngx-otel-asan-* Docker volumes carried a pre-ssl nginx Makefile
+     (link line missing -lssl/-lcrypto) → purged so auto/configure regenerated.
+  2. Build-flavor guard (A0.5) vs release-build-against-debug-tree → resolved with
+     the documented NGX_OTEL_ALLOW_FLAVOR_MISMATCH=1 escape hatch in asan-run.sh.
+Neither papers over a sanitizer finding. Source code was not modified.
+
+── F2 ELEMENT 1: nm count on the EXACT loaded artifact ───────────────────────
+Artifact: target/aarch64-unknown-linux-gnu/release/libngx_http_otel_module.so
+          (size 7,887,288 bytes, mtime 2026-06-15 11:34 UTC), in volume
+          ngx-otel-asan-target.
+  nm <so> | grep -c __asan_   =>   138
+138 > 0  →  the loaded module is genuinely AddressSanitizer-instrumented.
+
+── F2 ELEMENT 2: Named PASS lines from inside the run ────────────────────────
+  [PASS] h3f3_periodic_deadline: PERIODIC_SEND_BUDGET signature observed during chaos
+  [PASS] h3f3_quit_responsiveness: nginx exited 4.11s after SIGQUIT (ceiling 25s)
+  [PASS] No orphan exporter after SIGQUIT
+  [PASS] === h3f3_quit_responsiveness: PASSED ===
+
+── F2 ELEMENT 3: Zero report count (counted only after [1] and [2]) ──────────
+  grep -cE "ERROR: AddressSanitizer|LeakSanitizer|runtime error" => 0
+  [asan-run] Zero AddressSanitizer reports across:
+      run_grpc_export.sh run_grpc_bidi_smoke.sh run_dns_dualstack.sh run_reload.sh
+      run_traces.sh run_access_log.sh run_c2_cert_walk.sh run_c3_cert_metrics.sh
+      run_chaos_kill9.sh run_chaos_crashloop.sh run_chaos_dead_collector.sh
+      run_b4_daemon_on_gen1.sh run_b1_spsc_reload_chaos.sh run_chaos_quit_responsiveness.sh
+  [asan-run] ASan gate: PASS (no use-after-free / heap error on the exercised wake paths).
+
+── F2 ELEMENT 4: Embedded provenance ─────────────────────────────────────────
+GIT_COMMIT: 76ec68fa37b104a9532efeec4dfa05234241db3d
+RUN_DATE:   2026-06-15 (~11:37 UTC, DONE marker)
+
+VERDICT: ASan CLEAN at 76ec68f — zero use-after-free / heap errors across 14
+exercised scripts (incl. gRPC export, TLS cert walk/metrics, chaos kill9 /
+crashloop / dead-collector, B4 daemon-gen1, SPSC reload chaos). This run was
+driven as a monitored detached job; the killed first agent's ASan run reported
+the same (cert walk C2/C3 passed) before it was stopped.
