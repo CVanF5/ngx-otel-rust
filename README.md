@@ -270,7 +270,9 @@ design proposal to integrate. In brief:
   `ngx_otel.logs.access.dropped_records`, `ngx_otel.logs.error.dropped_records`,
   `ngx_otel.logs.send_failures`, `ngx_otel.traces.dropped_records`,
   `ngx_otel.bidi_backpressure_drops`, `ngx_otel.export_interval`,
-  `ngx_otel.exporter.restarts`. See
+  `ngx_otel.exporter.restarts`,
+  `ngx_otel.delivery.permanent_rejected`, `ngx_otel.delivery.partial_rejected`,
+  `ngx_otel.delivery.unauthorized`. See
   `TELEMETRY_MODEL.md` § "Exporter self-observability metrics".
 - **Serving-certificate metrics** (requires nginx built with
   `--with-http_ssl_module` — the default `make build` includes it):

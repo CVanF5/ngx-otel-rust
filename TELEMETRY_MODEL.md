@@ -73,21 +73,49 @@ signal:
   pipeline with a deduplication processor or backend-native dedup on
   `trace_id`/`span_id`.
 
-HTTP 4xx responses are **not retried indefinitely**: a fresh-send failure on
-any error (including 4xx) enqueues the batch in the per-signal retry queue
-(`enqueue_with_eviction`, `src/export/mod.rs`); the subsequent retry-drain
-then calls `is_permanent_rejection` (`src/export/mod.rs`) and drops the
-batch on a 4xx result rather than re-queuing it further. In practice a 4xx
-batch is exported at most twice before being discarded. The retry queue is
-bounded: when full, the oldest batch is evicted and counted in
-`ngx_otel.dropped_records`. Note that producer-side ring drops —
+The exporter applies a **status-aware delivery policy** driven by a
+protocol-neutral `DeliveryOutcome` verdict returned by each transport adapter
+(`src/export/mod.rs`, `src/transport/hyper_http.rs`,
+`src/transport/grpc/status_adapter.rs`):
+
+- **`Accepted`** — the peer accepted the batch; released from the retry queue.
+- **`PartialReject { rejected }`** — the peer accepted the batch but reported
+  it dropped `rejected` individual records (OTLP `partial_success` body /
+  gRPC partial-success response). The batch is released; the rejected count
+  accumulates in `ngx_otel.delivery.partial_rejected`.
+- **`Retryable { retry_after }`** — transient failure (HTTP exactly
+  `429/502/503/504`; gRPC `UNAVAILABLE`/`DEADLINE_EXCEEDED`/`ABORTED`/
+  `CANCELLED`/`OUT_OF_RANGE`/`DATA_LOSS`; `RESOURCE_EXHAUSTED` only when a
+  recoverability hint is present). The batch is re-queued and the next drain
+  of that signal is deferred: by the `Retry-After` / `RetryInfo` /
+  `grpc-retry-pushback-ms` hint when present, else by exponential backoff
+  (starting at the drain interval, doubling per consecutive retryable failure
+  of that signal, capped — spec `SHOULD` for no-hint case). All other `4xx`
+  and `5xx` responses that are not in the retryable set are treated as
+  `Permanent` (spec: "MUST NOT retry").
+- **`Permanent`** — non-retryable peer rejection (HTTP `400`, `404`, `413`,
+  `501`, and any non-retryable `4xx`/`5xx` not listed above; gRPC
+  `INVALID_ARGUMENT`/`INTERNAL`/`UNIMPLEMENTED`). The batch is dropped and
+  counted in `ngx_otel.delivery.permanent_rejected`.
+- **`Unauthorized`** — authentication or authorization failure (HTTP
+  `401`/`403`; gRPC `UNAUTHENTICATED`/`PERMISSION_DENIED`). Same policy
+  action as `Permanent` (drop, no retry, no backoff, no auto-pause), but kept
+  in a distinct counter (`ngx_otel.delivery.unauthorized`) for observability.
+  A rate-limited "check exporter credentials" log entry is emitted (at most
+  once per 60 s) to surface the problem without flooding the error log.
+
+The retry queue is bounded: when full, the oldest batch is evicted and
+counted in `ngx_otel.dropped_records`. Producer-side ring drops —
 `ngx_otel.logs.access.dropped_records`, `ngx_otel.logs.error.dropped_records`,
 and `ngx_otel.traces.dropped_records` (see the self-observability table
 below) — are a separate, upstream drop class that occurs before any batch
-reaches the exporter retry buffer. A planned evolution to a status-aware
-retry policy that distinguishes permanent from transient failures per
-protocol, with partial-success handling and back-off, is a deferred
-improvement not yet implemented.
+reaches the exporter retry buffer.
+
+> **OTAP (Phase 5).** The `DeliveryOutcome` type and the gRPC-code→outcome
+> mapping (`grpc_code_to_outcome`, `src/transport/grpc/status_adapter.rs`)
+> are designed for reuse: OTAP's `BatchStatus.StatusCode` uses the same gRPC
+> code space, so a future OTAP transport adapter maps into the existing policy
+> engine with near-zero new code. No OTAP transport exists today.
 
 ---
 
@@ -565,6 +593,9 @@ The exporter process emits its own health metrics every export interval
 | `ngx_otel.traces.dropped_records` | Sum (monotonic) | `{record}` | Span records dropped because the per-worker spans ring was full |
 | `ngx_otel.export_interval` | Gauge | `ms` | Configured metric export interval |
 | `ngx_otel.exporter.restarts` | Gauge | `crashes` | Prior exporter crashes observed in the current crash-loop window when this exporter process started (`0` = clean start; set once at exporter startup from the shared-memory crash counter). Not emitted after crash-loop give-up — no exporter process remains to emit it; the disable is announced by an ALERT in the error log. See `LIFECYCLE.md` |
+| `ngx_otel.delivery.permanent_rejected` | Sum (monotonic) | `{batch}` | Batches the peer rejected as permanently unacceptable (e.g. HTTP `400`/`413`/`501`/non-retryable `4xx`/`5xx`; gRPC `INVALID_ARGUMENT`/`INTERNAL`/`UNIMPLEMENTED`); dropped and never retried. A sustained non-zero rate indicates a payload or endpoint configuration problem. |
+| `ngx_otel.delivery.partial_rejected` | Sum (monotonic) | `{record}` | Individual records the peer reported it dropped on an otherwise-accepted batch (OTLP `partial_success.rejected_*` field / gRPC partial-success body). The batch is released; only the peer-reported rejected record count accumulates here. |
+| `ngx_otel.delivery.unauthorized` | Sum (monotonic) | `{batch}` | Batches dropped because the peer reported an authentication or authorization failure (HTTP `401`/`403`; gRPC `UNAUTHENTICATED`/`PERMISSION_DENIED`). Same drop policy as `permanent_rejected` (no retry, no backoff, no auto-pause); a rate-limited "check exporter credentials" log entry is emitted alongside. A non-zero value indicates a credential or permission problem on the exporter endpoint. |
 
 ---
 

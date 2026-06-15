@@ -387,6 +387,9 @@ impl MetricSource for SelfMetricsSource {
         let logs_send_failures = LOGS_SEND_FAILURES.load(Ordering::Acquire) as i64;
         let traces_dropped = TRACES_DROPPED_RECORDS.load(Ordering::Acquire) as i64;
         let exporter_restarts = EXPORTER_RESTARTS.load(Ordering::Acquire) as i64;
+        let permanent_rejected = PERMANENT_REJECTED.load(Ordering::Acquire) as i64;
+        let partial_rejected = PARTIAL_REJECTED.load(Ordering::Acquire) as i64;
+        let unauthorized_rejected = UNAUTHORIZED_REJECTED.load(Ordering::Acquire) as i64;
         std::vec![
             monotonic_sum_metric(
                 "ngx_otel.dropped_records",
@@ -467,6 +470,38 @@ impl MetricSource for SelfMetricsSource {
                 "Prior exporter crashes in the current crash-loop window at this process start (0 = clean start; nginx request handling is never affected by the exporter crash-loop state)",
                 "crashes",
                 exporter_restarts,
+                now,
+            ),
+            monotonic_sum_metric(
+                "ngx_otel.delivery.permanent_rejected",
+                "Batches the peer rejected as permanently unacceptable \
+                 (e.g. HTTP 400/413, gRPC INVALID_ARGUMENT/INTERNAL/UNIMPLEMENTED); \
+                 dropped and never retried",
+                "batches",
+                permanent_rejected,
+                self.start_time_unix_nano,
+                now,
+            ),
+            monotonic_sum_metric(
+                "ngx_otel.delivery.partial_rejected",
+                "Individual records the peer reported it dropped on an otherwise-accepted batch \
+                 (OTLP partial_success / gRPC partial-success body); the batch is released, \
+                 only the reported rejected count is accumulated here",
+                "records",
+                partial_rejected,
+                self.start_time_unix_nano,
+                now,
+            ),
+            monotonic_sum_metric(
+                "ngx_otel.delivery.unauthorized",
+                "Batches dropped because the peer reported an authentication or authorization \
+                 failure (HTTP 401/403, gRPC UNAUTHENTICATED/PERMISSION_DENIED); same drop \
+                 policy as permanent_rejected (no retry, no backoff, no auto-pause) but kept \
+                 in a distinct counter for observability — a non-zero value indicates a \
+                 credential or permission problem on the exporter endpoint",
+                "batches",
+                unauthorized_rejected,
+                self.start_time_unix_nano,
                 now,
             ),
         ]
@@ -3350,10 +3385,11 @@ mod tests {
         assert!(spans_q.is_empty(), "spans queue must be empty after drain abort");
     }
 
-    /// SelfMetricsSource must produce exactly 8 metrics with the right names.
+    /// SelfMetricsSource must produce exactly 13 metrics with the right names.
     /// (Updated in Phase 2.1 to include 3 new logs-path metrics;
     ///  updated in P3 pre-promote to include traces.dropped_records;
-    ///  updated in C1 to include ngx_otel.exporter.restarts.)
+    ///  updated in C1 to include ngx_otel.exporter.restarts;
+    ///  updated in S5 to include 3 delivery-outcome metrics.)
     #[test]
     fn self_metrics_source_produces_four_metrics() {
         let src = SelfMetricsSource {
@@ -3363,9 +3399,12 @@ mod tests {
         let metrics = src.collect();
         assert_eq!(
             metrics.len(),
-            10,
-            "SelfMetricsSource must emit 10 metrics \
-             (4 original + 4 log + 1 traces + 1 crash-loop)"
+            13,
+            "SelfMetricsSource must emit 13 metrics \
+             (4 original + 4 log + 1 traces + 1 crash-loop + 3 delivery-outcome); \
+             got {}: {names:?}",
+            metrics.len(),
+            names = metrics.iter().map(|m| m.name.as_str()).collect::<std::vec::Vec<_>>(),
         );
 
         let names: std::vec::Vec<&str> = metrics.iter().map(|m| m.name.as_str()).collect();
@@ -3388,6 +3427,19 @@ mod tests {
         assert!(
             names.contains(&"ngx_otel.exporter.restarts"),
             "exporter.restarts must appear in self-metrics; names = {names:?}"
+        );
+        // S5 — delivery-outcome monotonic Sums (read existing S4 atomics)
+        assert!(
+            names.contains(&"ngx_otel.delivery.permanent_rejected"),
+            "delivery.permanent_rejected must appear in self-metrics; names = {names:?}"
+        );
+        assert!(
+            names.contains(&"ngx_otel.delivery.partial_rejected"),
+            "delivery.partial_rejected must appear in self-metrics; names = {names:?}"
+        );
+        assert!(
+            names.contains(&"ngx_otel.delivery.unauthorized"),
+            "delivery.unauthorized must appear in self-metrics; names = {names:?}"
         );
     }
 
