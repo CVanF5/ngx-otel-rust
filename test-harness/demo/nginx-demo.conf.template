@@ -26,49 +26,91 @@ events {
 }
 
 http {
+    # ── OTLP exporter: where and how telemetry is shipped ───────────────────
     otel_exporter {
-        # gRPC receiver: host port 14317 (no /v1/metrics path for gRPC).
-        # @OTEL_ENDPOINT@ is https://127.0.0.1:14317 (TLS, default) or
-        # http://127.0.0.1:14317 (plaintext, DEMO_TLS=0).
+        # Base collector endpoint. OTLP/HTTP appends /v1/{metrics,logs,traces};
+        # OTLP/gRPC uses host:port only. @OTEL_ENDPOINT@ resolves to
+        # https://127.0.0.1:14317 (TLS, default) or http://127.0.0.1:14317
+        # (plaintext, when DEMO_TLS=0).
         endpoint @OTEL_ENDPOINT@;
-        # trusted_certificate is set to the demo CA path when DEMO_TLS=1.
-        # The demo CA is minted per-run; it signed the collector's server cert.
-        # The collector cert carries an IP SAN for 127.0.0.1, exercising the
-        # IP-literal verification branch (X509_VERIFY_PARAM_set1_ip_asc).
+
+        # CA bundle to verify the collector's TLS certificate (https:// only;
+        # defaults to the system trust store). Injected here as the per-run demo
+        # CA when DEMO_TLS=1 — the collector cert carries an IP SAN for 127.0.0.1.
 @TRUSTED_CA_LINE@
+        # mTLS — present a client certificate to the collector (both required
+        # together; unused in the demo):
+        #   ssl_certificate     /path/to/client.crt;
+        #   ssl_certificate_key /path/to/client.key;
+        # Collector-certificate verification; on by default. `off` is INSECURE
+        # (testing only):
+        #   ssl_verify on;
+        # Per-signal endpoint overrides, used as-is with no path appended
+        # (default: every signal goes to `endpoint` above):
+        #   metrics_endpoint https://127.0.0.1:14317;
+        #   logs_endpoint    https://127.0.0.1:14317;
+        #   traces_endpoint  https://127.0.0.1:14317;
     }
+
+    # ── General ─────────────────────────────────────────────────────────────
+    # OTel resource service.name stamped on every exported signal.
     otel_service_name nginx-otel;
-    otel_metric_interval 2s;
-    # Ship OTLP/gRPC to the collector (Phase 2 grpc_transport).
-    # Default is otlp_http; this directive promotes the demo to gRPC.
+    # Export wire protocol: otlp_http (HTTP/1.1, default) | otlp_grpc (HTTP/2).
     otel_export_protocol otlp_grpc;
-    # fix3b: break the request-duration histogram down by
-    # {method × status_class × protocol} as bounded semconv attributes,
-    # so the Grafana dashboard can split p99 / rate by those dimensions.
-    # The status attribute carries the CLASS representative (200/400/500…),
-    # not the exact code — bounded to 5 classes (§6.4 cardinality discipline).
+    # Extra OTel resource attributes, repeatable (unused in the demo):
+    #   otel_resource_attr deployment.environment demo;
+    # Static header on every export request, e.g. bearer auth to a hosted
+    # collector (unused in the demo):
+    #   otel_exporter_header authorization "Bearer <token>";
+
+    # ── Metrics (on by default) ─────────────────────────────────────────────
+    # Aggregation window: workers bump shared-memory slots continuously; the
+    # exporter emits one aggregated point per series each interval. 2s here for a
+    # lively demo dashboard; production is typically 10s or more.
+    otel_metric_interval 2s;
+    # Shared-memory zone backing the metric slots (a default zone is used when
+    # unset; unused in the demo):
+    #   otel_metric_zone otel_metrics 1m;
+    # Split the request-duration histogram by method × status-class × protocol
+    # (bounded, low-cardinality attributes) so the dashboard can break p99 and
+    # rate down by those dimensions. Status is the CLASS (2xx/4xx/5xx), not the
+    # exact code.
     otel_metric_status_code_class on;
 
-    # ── Phase 2 logs (populate the Grafana "Logs" section via Loki) ──────────
-    # Access log as summary + samples: emit a thin exception tail (status >= 4xx /
-    # latency outliers) + exemplars over OTLP. The reservoir size (64) sizes the
-    # exemplar set; the tail carries url.path / status / method / client.address.
+    # ── Logs (off unless set; orthogonal to nginx's own access_log/error_log) ─
+    # Access log as summary + samples: a thin exception tail (status >= 4xx /
+    # latency outliers) plus trace-linked exemplars. The argument is the exemplar
+    # reservoir size; tail records carry url.path / status / method / client.address.
     otel_access_log_sample 64;
-    # Error log over OTLP (coalesced LogRecords + companion rate metric); fixed
-    # NGX_LOG_ERR floor unless an explicit level is given.
+    # Per-worker logs ring capacity backing the tail + exemplars (default 512k;
+    # unused in the demo):
+    #   otel_log_ring_size 512k;
+    # Error log over OTLP: coalesced nginx.error LogRecords plus a companion error-
+    # rate metric. Optional argument sets the minimum severity (defaults to error).
     otel_error_log warn;
+    # Error coalescing is on by default; `off` streams verbatim (lossy under
+    # load; unused in the demo):
+    #   otel_error_log_coalesce off;
 
-    # ── Phase 3 traces (server spans → Tempo) ───────────────────────────────
-    # Emit an OTel server span per request. `ignore` = start a fresh ROOT span
-    # per request; do NOT inherit the traffic generator's synthetic inbound
-    # traceparent (that parent never reaches Tempo, which would leave every
-    # trace rootless / "root span not yet received"). So each nginx span is a
-    # clean, searchable trace root. With otel_access_log_sample above, the
-    # duration-histogram exemplars carry the span's trace_id — the
-    # metric → exemplar → Tempo trace → Loki log drill-down.
+    # ── Traces (one OTel server span per request → Tempo) ───────────────────
+    # Enable spans. Complex value: on | off | $var | split_clients (ratio
+    # sampling). Valid in http / server / location (innermost wins).
     otel_trace on;
+    # Inbound W3C traceparent handling: ignore | extract (default) | inject |
+    # propagate. `ignore` starts a fresh ROOT span per request — the demo load
+    # generator sends a synthetic parent that never reaches Tempo, so ignoring it
+    # keeps every trace a clean, searchable root. Duration-histogram exemplars
+    # carry the span's trace_id, enabling metric → exemplar → Tempo → Loki drill-down.
     otel_trace_context ignore;
+    # Custom span attribute(s), repeatable. Valid in http / server / location.
     otel_span_attr deployment.environment demo;
+    # Per-location span name override (default is the matched location/route;
+    # shown per location below):
+    #   otel_span_name "API $request_method";
+    #
+    # Module-provided nginx variables (usable in log_format, map, etc.):
+    #   $otel_trace_id        the current span's trace ID (or empty if unsampled)
+    #   $otel_parent_sampled  whether the inbound traceparent was sampled
 
     # Backend the front server proxies to (populates upstream.* metrics).
     upstream demo_backend {
@@ -88,8 +130,9 @@ http {
         location / {
             return 200 "ngx-otel-rust demo: ok\n";
         }
-        # Error endpoints so the fix3b status-class breakdown shows 4xx/5xx,
-        # not just 2xx — drives the "request rate by status class" panel.
+        # Error endpoints so the by-status-class metric split
+        # (otel_metric_status_code_class) shows 4xx/5xx, not just 2xx — drives
+        # the "request rate by status class" panel.
         location = /client-error {
             return 404 "not found\n";
         }
@@ -104,6 +147,9 @@ http {
         }
 
         location /api/ {
+            # Per-location span name override (otel_span_name) — uncomment to
+            # name these spans e.g. "API GET" instead of the default route:
+            #   otel_span_name "API $request_method";
             proxy_pass http://demo_backend/;
             proxy_http_version 1.1;
             proxy_set_header Connection "";
