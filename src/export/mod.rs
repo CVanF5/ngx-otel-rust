@@ -239,7 +239,7 @@ impl ExportTransport {
     async fn send(
         &mut self,
         bytes: std::vec::Vec<u8>,
-    ) -> Result<(), crate::transport::TransportError> {
+    ) -> Result<crate::transport::DeliveryOutcome, crate::transport::TransportError> {
         match self {
             Self::Http(t) => t.send(bytes).await,
             Self::Grpc(t) => t.send(bytes).await,
@@ -256,7 +256,7 @@ impl ExportTransport {
     async fn send_logs(
         &mut self,
         bytes: std::vec::Vec<u8>,
-    ) -> Result<(), crate::transport::TransportError> {
+    ) -> Result<crate::transport::DeliveryOutcome, crate::transport::TransportError> {
         match self {
             Self::Http(t) => t.send_logs(bytes).await,
             Self::Grpc(t) => t.send_logs(bytes).await,
@@ -273,7 +273,7 @@ impl ExportTransport {
     async fn send_traces(
         &mut self,
         bytes: std::vec::Vec<u8>,
-    ) -> Result<(), crate::transport::TransportError> {
+    ) -> Result<crate::transport::DeliveryOutcome, crate::transport::TransportError> {
         match self {
             Self::Http(t) => t.send_traces(bytes).await,
             Self::Grpc(t) => t.send_traces(bytes).await,
@@ -289,7 +289,7 @@ impl ExportTransport {
         &mut self,
         signal: &Pdata,
         bytes: std::vec::Vec<u8>,
-    ) -> Result<(), crate::transport::TransportError> {
+    ) -> Result<crate::transport::DeliveryOutcome, crate::transport::TransportError> {
         match signal {
             Pdata::Metrics(_) => self.send(bytes).await,
             Pdata::Logs(_) => self.send_logs(bytes).await,
@@ -997,7 +997,8 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                         )
                         .await
                         {
-                            Ok(Ok(())) => {
+                            // S1: any Ok(outcome) treated as release (S4 adds policy).
+                            Ok(Ok(_outcome)) => {
                                 ngx::ngx_log_error!(
                                     NGX_LOG_INFO,
                                     log.as_ptr(),
@@ -1116,7 +1117,8 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                         )
                         .await
                         {
-                            Ok(Ok(())) => {
+                            // S1: any Ok(outcome) treated as release (S4 adds policy).
+                            Ok(Ok(_outcome)) => {
                                 ngx::ngx_log_error!(
                                     NGX_LOG_INFO,
                                     log.as_ptr(),
@@ -1306,7 +1308,8 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             )
             .await
             {
-                Ok(Ok(())) => {
+                // S1: any Ok(outcome) treated as release (S4 adds policy).
+                Ok(Ok(_outcome)) => {
                     ngx::ngx_log_error!(
                         NGX_LOG_INFO,
                         log.as_ptr(),
@@ -1517,7 +1520,9 @@ async fn graceful_drain(
     // Flush metrics retry queue (one bounded attempt each, ignore errors).
     while let Some((bytes, n_pts)) = queues.metrics.pop_front() {
         match with_deadline(transport.send(bytes), GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET).await {
-            Ok(Ok(())) => {}
+            // S1: any Ok(outcome) is treated as release, exactly as Ok(()) was.
+            // S4 introduces the outcome-driven policy (release/requeue+defer/drop).
+            Ok(Ok(_outcome)) => {}
             Ok(Err(e)) => {
                 ngx::ngx_log_error!(
                     NGX_LOG_ERR,
@@ -1565,7 +1570,8 @@ async fn graceful_drain(
         )
         .await
         {
-            Ok(Ok(())) => {
+            // S1: any Ok(outcome) treated as release (S4 adds policy).
+            Ok(Ok(_outcome)) => {
                 ngx::ngx_log_error!(
                     NGX_LOG_NOTICE,
                     log.as_ptr(),
@@ -1595,7 +1601,9 @@ async fn graceful_drain(
     // Drain pending logs retry queue (one bounded attempt each).
     while let Some((bytes, n_logs)) = queues.logs.pop_front() {
         match with_deadline(transport.send_logs(bytes), GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET).await {
-            Ok(Ok(())) => {}
+            // S1: any Ok(outcome) is treated as release, exactly as Ok(()) was.
+            // S4 introduces the outcome-driven policy (release/requeue+defer/drop).
+            Ok(Ok(_outcome)) => {}
             Ok(Err(e)) => {
                 ngx::ngx_log_error!(
                     NGX_LOG_ERR,
@@ -1659,7 +1667,8 @@ async fn graceful_drain(
                 )
                 .await
                 {
-                    Ok(Ok(())) => {
+                    // S1: any Ok(outcome) treated as release (S4 adds policy).
+                    Ok(Ok(_outcome)) => {
                         ngx::ngx_log_error!(
                             NGX_LOG_NOTICE,
                             log.as_ptr(),
@@ -1690,7 +1699,9 @@ async fn graceful_drain(
     // Drain pending spans retry queue (one bounded attempt each).
     while let Some((bytes, n_spans)) = queues.spans.pop_front() {
         match with_deadline(transport.send_traces(bytes), GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET).await {
-            Ok(Ok(())) => {}
+            // S1: any Ok(outcome) is treated as release, exactly as Ok(()) was.
+            // S4 introduces the outcome-driven policy (release/requeue+defer/drop).
+            Ok(Ok(_outcome)) => {}
             Ok(Err(e)) => {
                 ngx::ngx_log_error!(
                     NGX_LOG_ERR,
@@ -1750,7 +1761,8 @@ async fn graceful_drain(
                 )
                 .await
                 {
-                    Ok(Ok(())) => {
+                    // S1: any Ok(outcome) treated as release (S4 adds policy).
+                    Ok(Ok(_outcome)) => {
                         ngx::ngx_log_error!(
                             NGX_LOG_NOTICE,
                             log.as_ptr(),
@@ -1882,7 +1894,7 @@ trait RetrySend {
     async fn send_batch(
         &mut self,
         bytes: std::vec::Vec<u8>,
-    ) -> Result<(), crate::transport::TransportError>;
+    ) -> Result<crate::transport::DeliveryOutcome, crate::transport::TransportError>;
 }
 
 /// Logs retry sender — wraps `ExportTransport::send_logs`.
@@ -1891,7 +1903,7 @@ impl RetrySend for LogsRetry<'_> {
     async fn send_batch(
         &mut self,
         bytes: std::vec::Vec<u8>,
-    ) -> Result<(), crate::transport::TransportError> {
+    ) -> Result<crate::transport::DeliveryOutcome, crate::transport::TransportError> {
         self.0.send_logs(bytes).await
     }
 }
@@ -1902,7 +1914,7 @@ impl RetrySend for SpansRetry<'_> {
     async fn send_batch(
         &mut self,
         bytes: std::vec::Vec<u8>,
-    ) -> Result<(), crate::transport::TransportError> {
+    ) -> Result<crate::transport::DeliveryOutcome, crate::transport::TransportError> {
         self.0.send_traces(bytes).await
     }
 }
@@ -1913,7 +1925,7 @@ impl RetrySend for MetricsRetry<'_> {
     async fn send_batch(
         &mut self,
         bytes: std::vec::Vec<u8>,
-    ) -> Result<(), crate::transport::TransportError> {
+    ) -> Result<crate::transport::DeliveryOutcome, crate::transport::TransportError> {
         self.0.send(bytes).await
     }
 }
@@ -1992,7 +2004,9 @@ async fn drain_retry_queue_once_with_timer<S, Mk, T>(
         // for the rest of this pass (the transport is likely wedged).
         let send = WithDeadline { fut: sender.send_batch(bytes.clone()), timer: mk_timer() };
         match send.await {
-            Ok(Ok(())) => {}
+            // S1: any Ok(outcome) is treated as release, exactly as Ok(()) was.
+            // S4 introduces the outcome-driven policy (release/requeue+defer/drop).
+            Ok(Ok(_outcome)) => {}
             Ok(Err(ref e)) => {
                 failure_counter.fetch_add(1, Ordering::Relaxed);
                 if is_permanent_rejection(e) {
@@ -3801,7 +3815,7 @@ mod tests {
         async fn send_batch(
             &mut self,
             _bytes: std::vec::Vec<u8>,
-        ) -> Result<(), crate::transport::TransportError> {
+        ) -> Result<crate::transport::DeliveryOutcome, crate::transport::TransportError> {
             Err(crate::transport::TransportError::HttpStatus {
                 code: self.0,
                 message: "mock".into(),
@@ -3891,11 +3905,14 @@ mod tests {
         fn send_batch(
             &mut self,
             _bytes: std::vec::Vec<u8>,
-        ) -> impl core::future::Future<Output = Result<(), crate::transport::TransportError>>
-        {
+        ) -> impl core::future::Future<
+            Output = Result<crate::transport::DeliveryOutcome, crate::transport::TransportError>,
+        > {
             // A future that is always `Poll::Pending` and never wakes.
             core::future::poll_fn(|_cx| {
-                core::task::Poll::<Result<(), crate::transport::TransportError>>::Pending
+                core::task::Poll::<
+                    Result<crate::transport::DeliveryOutcome, crate::transport::TransportError>,
+                >::Pending
             })
         }
     }

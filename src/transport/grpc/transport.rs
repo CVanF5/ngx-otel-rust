@@ -213,7 +213,10 @@ where
     C::Io: Send + 'static,
 {
     /// Send a batch of OTLP metrics (encoded protobuf) over OTLP/gRPC unary.
-    pub async fn send(&mut self, bytes: std::vec::Vec<u8>) -> Result<(), TransportError> {
+    pub async fn send(
+        &mut self,
+        bytes: std::vec::Vec<u8>,
+    ) -> Result<crate::transport::DeliveryOutcome, TransportError> {
         // ── Decode bytes → typed request ──────────────────────────────────
         //
         // The encoder (OtlpHttpEncoder) emits a bare ExportMetricsServiceRequest
@@ -275,7 +278,9 @@ where
             Ok(_resp) => {
                 // Connection still alive — store the client back for reuse.
                 self.client = Some(client);
-                Ok(())
+                // S1 default mapping: an OK RPC → Accepted. S3 refines this into
+                // the full gRPC-status→DeliveryOutcome adapter.
+                Ok(crate::transport::DeliveryOutcome::Accepted)
             }
             Err(status) => {
                 // `client` is dropped here (not stored back), forcing a fresh
@@ -306,7 +311,7 @@ where
     pub async fn send_logs(
         &mut self,
         bytes: std::vec::Vec<u8>,
-    ) -> Result<(), crate::transport::TransportError> {
+    ) -> Result<crate::transport::DeliveryOutcome, crate::transport::TransportError> {
         use crate::transport::TransportError;
 
         let req = ExportLogsServiceRequest::decode(bytes.as_slice()).map_err(|e| {
@@ -343,7 +348,7 @@ where
         match result {
             Ok(_resp) => {
                 self.logs_client = Some(client);
-                Ok(())
+                Ok(crate::transport::DeliveryOutcome::Accepted)
             }
             Err(status) => Err(TransportError::Connection {
                 cause: std::format!("gRPC LogsService/Export RPC failed: {status}"),
@@ -362,7 +367,7 @@ where
     pub async fn send_traces(
         &mut self,
         bytes: std::vec::Vec<u8>,
-    ) -> Result<(), crate::transport::TransportError> {
+    ) -> Result<crate::transport::DeliveryOutcome, crate::transport::TransportError> {
         use crate::transport::TransportError;
 
         let req = ExportTraceServiceRequest::decode(bytes.as_slice()).map_err(|e| {
@@ -399,7 +404,7 @@ where
         match result {
             Ok(_resp) => {
                 self.traces_client = Some(client);
-                Ok(())
+                Ok(crate::transport::DeliveryOutcome::Accepted)
             }
             Err(status) => Err(TransportError::Connection {
                 cause: std::format!("gRPC TraceService/Export RPC failed: {status}"),

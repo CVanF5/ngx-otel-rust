@@ -1575,33 +1575,50 @@ where
     /// Uses `self.metrics_path` (derived from the base endpoint as
     /// `base/v1/metrics`, or overridden via [`set_metrics_path`]).
     /// Maintains no cached connection; a failure leaves nothing to clean up.
-    pub async fn send(&mut self, bytes: std::vec::Vec<u8>) -> Result<(), TransportError> {
+    pub async fn send(
+        &mut self,
+        bytes: std::vec::Vec<u8>,
+    ) -> Result<crate::transport::DeliveryOutcome, TransportError> {
         let io = self.connect_io().await?;
         let authority = self.endpoint.authority();
         let path = self.metrics_path.clone();
-        http_post(io, &authority, &path, &self.headers, bytes).await
+        // S1 default mapping: a successful exchange (today: any 2xx) → Accepted.
+        // S2 refines this into the full HTTP→DeliveryOutcome adapter.
+        http_post(io, &authority, &path, &self.headers, bytes)
+            .await
+            .map(|()| crate::transport::DeliveryOutcome::Accepted)
     }
 
     /// Send a batch of OTLP/HTTP log records to the derived logs path.
     ///
     /// Uses `self.logs_path` (derived from the base endpoint as
     /// `base/v1/logs`, or overridden via [`set_logs_path`]).
-    pub async fn send_logs(&mut self, bytes: std::vec::Vec<u8>) -> Result<(), TransportError> {
+    pub async fn send_logs(
+        &mut self,
+        bytes: std::vec::Vec<u8>,
+    ) -> Result<crate::transport::DeliveryOutcome, TransportError> {
         let io = self.connect_io().await?;
         let authority = self.endpoint.authority();
         let path = self.logs_path.clone();
-        http_post(io, &authority, &path, &self.headers, bytes).await
+        http_post(io, &authority, &path, &self.headers, bytes)
+            .await
+            .map(|()| crate::transport::DeliveryOutcome::Accepted)
     }
 
     /// Send a batch of OTLP/HTTP spans to the derived traces path.
     ///
     /// Uses `self.traces_path` (derived from the base endpoint as
     /// `base/v1/traces`, or overridden via [`set_traces_path`]).
-    pub async fn send_traces(&mut self, bytes: std::vec::Vec<u8>) -> Result<(), TransportError> {
+    pub async fn send_traces(
+        &mut self,
+        bytes: std::vec::Vec<u8>,
+    ) -> Result<crate::transport::DeliveryOutcome, TransportError> {
         let io = self.connect_io().await?;
         let authority = self.endpoint.authority();
         let path = self.traces_path.clone();
-        http_post(io, &authority, &path, &self.headers, bytes).await
+        http_post(io, &authority, &path, &self.headers, bytes)
+            .await
+            .map(|()| crate::transport::DeliveryOutcome::Accepted)
     }
 
     /// POST `bytes` to an explicit `path`, overriding any derived path.
