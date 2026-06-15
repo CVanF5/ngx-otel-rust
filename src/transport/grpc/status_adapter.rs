@@ -3,18 +3,18 @@
 // This source code is licensed under the Apache License, Version 2.0 license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! OTLP/gRPC status → `DeliveryOutcome` adapter (S3).
+//! OTLP/gRPC status → `DeliveryOutcome` adapter.
 //!
 //! This module provides two reusable, testable free functions:
 //!
-//! - [`extract_grpc_retry_hint`] — reads both `RetryInfo` detail **and** the
+//! - `extract_grpc_retry_hint` — reads both `RetryInfo` detail **and** the
 //!   `grpc-retry-pushback-ms` trailer from a `tonic::Status`, returning the
 //!   strongest hint available as a `Duration`.
 //!
-//! - [`grpc_code_to_outcome`] — maps a `tonic::Code` + an optional retry hint
+//! - `grpc_code_to_outcome` — maps a `tonic::Code` + an optional retry hint
 //!   to a [`DeliveryOutcome`].
 //!
-//! They are kept separate so that OTAP's Phase-5 adapter can reuse
+//! They are kept separate so that a future OTAP adapter can reuse
 //! `grpc_code_to_outcome` with its own hint-extraction path (OTAP may surface
 //! the pushback hint differently from OTLP/gRPC).
 //!
@@ -206,9 +206,9 @@ fn proto_duration_to_std(d: prost_types::Duration) -> Option<Duration> {
 
 /// Map a `tonic::Code` + an optional retry hint to a [`DeliveryOutcome`].
 ///
-/// This function encodes the OTLP/gRPC classification table as spec-mandated
-/// (see `DELIVERY_OUTCOME_DESIGN.md` and `RALPH_DELIVERY_OUTCOME.md`
-/// "Normative basis"):
+/// This function encodes the OTLP/gRPC retry classification mandated by the
+/// OTLP specification's failure-handling rules
+/// (<https://opentelemetry.io/docs/specs/otlp/#failures-1>):
 ///
 /// - `OK` → `Accepted` (the caller handles `partial_success`; this function is
 ///   only called on error paths — see `grpc_status_to_outcome` for the full
@@ -231,10 +231,10 @@ fn proto_duration_to_std(d: prost_types::Duration) -> Option<Duration> {
 /// - All other codes (unknown, failed_precondition, not_found, etc.) →
 ///   `Permanent` (conservative: unknown codes are not retried).
 ///
-/// # Reusability (OTAP Phase 5)
+/// # Reusability for OTAP
 ///
 /// OTAP's `BatchStatus.StatusCode` uses the **same gRPC code space**
-/// (`arrow_service.proto:132`).  The Phase-5 OTAP adapter calls this function
+/// (`arrow_service.proto:132`).  A future OTAP adapter can call this function
 /// with the mapped `tonic::Code` and its own hint (e.g. from a different
 /// source), so no changes to this function are needed for OTAP.
 ///
@@ -280,7 +280,7 @@ pub(crate) fn grpc_code_to_outcome(code: tonic::Code, hint: Option<Duration>) ->
         //
         // Auth failures are NOT retried — the credential/config problem must
         // be fixed by an operator.  Distinct from `Permanent` only for its own
-        // counter + a "check exporter credentials" log message (S4).
+        // counter + a "check exporter credentials" log message.
         tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => {
             DeliveryOutcome::Unauthorized
         }

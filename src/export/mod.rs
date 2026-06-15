@@ -3,7 +3,7 @@
 // This source code is licensed under the Apache License, Version 2.0 license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! Phase 1.3.2: Export loop relocated from Worker 0 to the `nginx: otel exporter` process.
+//! Export loop running in the `nginx: otel exporter` process.
 //!
 //! [`export_loop`] runs inside the **exporter process**, spawned by
 //! `otel_exporter_cycle` in `src/exporter/mod.rs`. It:
@@ -12,27 +12,26 @@
 //!      (shm rings written by workers, mapped via fork-shared pages)
 //!   3. Encodes via [`OtlpHttpEncoder`].
 //!   4. Ships via [`HyperHttpTransport<NgxConnector>`] (production transport only;
-//!      [`SpinConnector`] is test-only and never used here).
+//!      `SpinConnector` is test-only and never used here).
 //!   5. On send failure: enqueues bytes in a bounded retry buffer; drops the
 //!      oldest entry when the buffer is full.
 //!   6. On `ngx_quit`: flushes the retry buffer and sends one final batch,
 //!      then sets [`EXPORT_LOOP_DONE`] and returns cleanly.
 //!   7. On `ngx_terminate`: returns immediately without any drain.
 //!
-//! # Phase 1.3.2 note
+//! # Config capture
 //! `MainConfig` is captured at spawn time (exporter startup). On SIGHUP
 //! reload nginx creates a new exporter process with a new cycle and config.
 //! The new exporter spawns its own `export_loop` task.
-//! `MainConfig::old_config` provides the hook for Phase 1.2 cross-cycle
+//! `MainConfig::old_config` provides the hook for cross-cycle
 //! state transfer (TLS connection reuse, etc.).
 //!
-//! # Phase 1.1 / 1.2 graceful-drain limitation — RESOLVED in Phase 1.3
-//! The documented SIGQUIT-during-sleep limitation (see [`graceful_drain`])
-//! is **resolved** in Phase 1.3.2: the exporter is not a worker and is not
-//! subject to `ngx_event_no_timers_left`. Cancelable timers fire normally
+//! # Graceful drain on SIGQUIT-during-sleep
+//! The exporter is not a worker and is not subject to
+//! `ngx_event_no_timers_left`. Cancelable timers fire normally
 //! when the exporter exits on `ngx_quit`, so the chunked sleep reliably
-//! detects shutdown and runs the drain. The `exit_process` flush path
-//! (formerly in `src/lib.rs`) is no longer needed on the worker side.
+//! detects shutdown and runs the drain (see [`graceful_drain`]). No separate
+//! `exit_process` flush path on the worker side is needed.
 
 use core::future::Future;
 use core::pin::Pin;
@@ -91,13 +90,13 @@ pub static SEND_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// test can verify the counter is non-zero via the collector's metrics.json.
 pub static BIDI_BACKPRESSURE_DROPS: AtomicU64 = AtomicU64::new(0);
 
-// ── Log-specific self-metric atomics (Phase 2.1) ─────────────────────────────
+// ── Log-specific self-metric atomics ─────────────────────────────────────────
 
 /// Access-log records dropped by the producer because the ring was full.
 /// Sum of per-worker `ring.drop_count()` snapshots at each drain cycle.
 pub static ACCESS_LOGS_DROPPED: AtomicU64 = AtomicU64::new(0);
 
-/// Error-log records dropped by the producer (Phase 2.2; kept here so the
+/// Error-log records dropped by the producer (kept here so the
 /// metric is exposed even before the error-log path is wired in).
 pub static ERROR_LOGS_DROPPED: AtomicU64 = AtomicU64::new(0);
 
@@ -113,7 +112,7 @@ pub static ERROR_LOGS_COALESCED_ORPHANED: AtomicU64 = AtomicU64::new(0);
 /// Cumulative logs transport send failures since exporter startup.
 pub static LOGS_SEND_FAILURES: AtomicU64 = AtomicU64::new(0);
 
-// ── Traces self-metric atomics (Phase 3.2) ───────────────────────────────────
+// ── Traces self-metric atomics ────────────────────────────────────────────────
 
 /// Span records dropped by the producer because the spans ring was full.
 /// Sum of per-worker `ring.drop_count()` snapshots at each drain cycle.
@@ -122,13 +121,13 @@ pub static TRACES_DROPPED_RECORDS: AtomicU64 = AtomicU64::new(0);
 /// Cumulative traces transport send failures since exporter startup.
 pub static TRACES_SEND_FAILURES: AtomicU64 = AtomicU64::new(0);
 
-// ── Delivery-outcome self-metric atomics (S4) ────────────────────────────────
+// ── Delivery-outcome self-metric atomics ──────────────────────────────────────
 //
 // These are the same single-writer exporter-local atomic pattern as the drop /
 // send-failure counters above (written only by the exporter task in the policy
-// engine, read later by `SelfMetricsSource`). S5 wires them to the
+// engine, read later by `SelfMetricsSource`). They back the
 // `ngx_otel.delivery.{permanent_rejected, partial_rejected, unauthorized}`
-// self-metrics — do NOT add those metric series again in S5; only read these.
+// self-metrics, which read these atomics rather than maintaining their own.
 
 /// Cumulative count of batches the peer rejected as **permanently** unacceptable
 /// (`DeliveryOutcome::Permanent`). These batches are dropped, never retried.
@@ -171,14 +170,14 @@ pub static MASTER_PID: AtomicI64 = AtomicI64::new(0);
 /// drain on `ngx_quit`. The exporter cycle polls this flag in its `ngx_quit`
 /// branch to know when the drain has completed and it is safe to exit.
 ///
-/// Phase 1.3.2: process-global; the exporter process is single-instance so
+/// Process-global; the exporter process is single-instance so
 /// there is exactly one export_loop per process lifetime.
 pub(crate) static EXPORT_LOOP_DONE: AtomicBool = AtomicBool::new(false);
 
 /// RAII guard that stores `true` to [`EXPORT_LOOP_DONE`] on every exit path of
 /// [`export_loop`], including early returns on startup failures.
 ///
-/// B3 fix: before this guard existed, early returns at the endpoint-parse and
+/// Before this guard existed, early returns at the endpoint-parse and
 /// transport-construction paths left `EXPORT_LOOP_DONE` unset. The drain-wait
 /// loop in `otel_exporter_cycle` then blocked indefinitely inside
 /// `ngx_process_events_and_timers` (no active fds or timers → epoll/kqueue
@@ -200,7 +199,7 @@ impl Drop for ExportLoopDoneGuard {
 /// stall exporter shutdown.
 const GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET: Duration = Duration::from_secs(2);
 
-/// H3F3: Per-attempt wall-clock budget for every *periodic* (non-drain) send —
+/// Per-attempt wall-clock budget for every *periodic* (non-drain) send —
 /// fresh metrics/logs/spans batches and their retry-queue drains.
 ///
 /// Why this is needed: periodic sends were previously awaited bare. The only
@@ -234,16 +233,17 @@ const PERIODIC_SEND_BUDGET: Duration = Duration::from_secs(15);
 /// shutdown checks. The cost is one extra timer wake per chunk; negligible.
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// S4 — base interval for the no-hint exponential backoff applied to a
+/// Base interval for the no-hint exponential backoff applied to a
 /// `DeliveryOutcome::Retryable` that carried no peer hint. The OTLP spec
-/// `SHOULD`s exponential backoff for the no-hint retryable case. The base is
+/// `SHOULD`s exponential backoff for the no-hint retryable case
+/// (<https://opentelemetry.io/docs/specs/otlp/#failures-1>). The base is
 /// the sub-interval drain cadence (`SHUTDOWN_POLL_INTERVAL`, 250 ms): the first
 /// no-hint retryable defers one drain tick, and each consecutive retryable
 /// doubles the deferral up to [`BACKOFF_CAP_MS`]. Reset to baseline on the next
 /// `Accepted`. No directive surface — hardcoded per the spec.
 const BACKOFF_BASE_MS: u64 = 250;
 
-/// S4 — ceiling for the no-hint exponential backoff (30 s). Doubling stops here
+/// Ceiling for the no-hint exponential backoff (30 s). Doubling stops here
 /// so a sustained-overload peer is retried at most every 30 s rather than
 /// growing unbounded. A peer-supplied hint (`Retry-After`/`RetryInfo`/pushback)
 /// is honored verbatim and is NOT subject to this cap.
@@ -345,7 +345,7 @@ enum ShutdownKind {
     Terminate,
 }
 
-/// H3F3: True if the master has signalled shutdown (`ngx_quit` graceful or
+/// True if the master has signalled shutdown (`ngx_quit` graceful or
 /// `ngx_terminate` immediate). Checked BETWEEN consecutive periodic sends within
 /// a single export wake so that a quit arriving mid-wake is honoured promptly
 /// rather than waiting for every remaining (possibly deadline-bounded) send to
@@ -512,14 +512,14 @@ impl MetricSource for SelfMetricsSource {
 
 /// Async export loop — spawned by `otel_exporter_cycle` inside the exporter process.
 ///
-/// Phase 1.3.2: runs in the `nginx: otel exporter` process, not Worker 0.
+/// Runs in the `nginx: otel exporter` process, not a worker.
 /// The shm rings (written by worker bumps) are read across the fork boundary
 /// via the same mapped pages — fork-shared memory is coherent for atomic reads.
 ///
 /// Takes `&'static MainConfig` because the loop task outlives the spawn call;
 /// NGINX allocates MainConfig from the cycle pool which has exporter lifetime.
 ///
-/// H2F5: decide which per-signal endpoint directives are silently ignored under
+/// Decide which per-signal endpoint directives are silently ignored under
 /// gRPC transport (path routing is not applicable to gRPC). Returns the signal
 /// names (in metrics/logs/traces order) whose endpoint field is non-empty — the
 /// caller logs one WARN per returned name. Extracted so the predicate is unit-
@@ -549,8 +549,8 @@ fn grpc_ignored_endpoint_names(
 pub async fn export_loop(amcf: &'static MainConfig) {
     let log = ngx::log::ngx_cycle_log();
 
-    // B3: RAII guard — ensures EXPORT_LOOP_DONE is set on every exit path of
-    // this function (early return, normal return). Pre-fix early returns at
+    // RAII guard — ensures EXPORT_LOOP_DONE is set on every exit path of
+    // this function (early return, normal return). Earlier, early returns at
     // the endpoint-parse and transport-construction paths left the flag unset,
     // so the drain-wait in otel_exporter_cycle blocked indefinitely.
     let _done_guard = ExportLoopDoneGuard;
@@ -568,7 +568,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
         }
     };
 
-    // ── Collector host for the B1 collector-cert gauge attribute ─────────
+    // ── Collector host for the collector-cert gauge attribute ────────────
     // Parsed once at startup; stable per exporter generation.  Plaintext
     // endpoints parse to a host string too — the gauge is gated on the
     // COLLECTOR_CERT_NOT_AFTER atomic (which is only written by TLS
@@ -689,7 +689,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
         }
     };
 
-    // ── Apply B2 per-signal endpoint overrides (HTTP transport only) ─────────
+    // ── Apply per-signal endpoint overrides (HTTP transport only) ────────────
     //
     // If `metrics_endpoint`, `logs_endpoint`, or `traces_endpoint` is set in
     // the `otel_exporter {}` block, use it as-is (no path appended) instead of
@@ -697,7 +697,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
     // bare paths (`/v1/metrics`); `extract_http_path` normalises to the path
     // component.  gRPC is unaffected (path routing is not applicable to gRPC).
     //
-    // H2F5: under gRPC transport the per-signal endpoint directives are silently
+    // Under gRPC transport the per-signal endpoint directives are silently
     // ignored.  Warn once at exporter startup so the operator knows the config
     // has no effect.
     if let ExportTransport::Grpc(_) = transport {
@@ -741,7 +741,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
     // panels and delta-conversion processors can anchor windows correctly.
     let worker_start_ns = crate::util::now_unix_nano();
 
-    // B1: Snapshot successor_gen at startup.  On QUIT, graceful_drain
+    // Snapshot successor_gen at startup.  On QUIT, graceful_drain
     // compares current_gen against my_gen to decide between:
     //   current_gen > my_gen → reload → abdicate ring pops (new exporter owns)
     //   current_gen == my_gen → shutdown → full drain (we are sole consumer)
@@ -752,13 +752,13 @@ pub async fn export_loop(amcf: &'static MainConfig) {
         .map(|p| unsafe { (*p).successor_gen.load(core::sync::atomic::Ordering::Acquire) })
         .unwrap_or(0);
 
-    // B1-FU1: One-way abdication latch for the periodic ring-pop path.
+    // One-way abdication latch for the periodic ring-pop path.
     // Set to `true` the first time `successor_announced()` returns true;
     // never reset.  Once abdicated the periodic drain skips log/span ring
     // pops for the remainder of this exporter's lifetime, leaving the rings
     // exclusively to the new (successor) exporter.
     // Cumulative-metrics READ snapshots are NOT gated — they are pure loads,
-    // safe across the overlap window (the valid-dedup case from B1).
+    // safe across the overlap window (cumulative counters dedup by timestamp).
     let mut periodic_abdicated = false;
 
     // test-support: QUIT-DEFER hook ──────────────────────────────────────────
@@ -806,10 +806,10 @@ pub async fn export_loop(amcf: &'static MainConfig) {
     // evict metric batches (and vice versa).
     let mut logs_retry_queue: VecDeque<(std::vec::Vec<u8>, u64)> = VecDeque::new();
 
-    // Separate retry queue for span batches (Phase 3.2).
+    // Separate retry queue for span batches.
     let mut spans_retry_queue: VecDeque<(std::vec::Vec<u8>, u64)> = VecDeque::new();
 
-    // S4: per-signal backoff/defer state for the outcome-driven policy engine.
+    // Per-signal backoff/defer state for the outcome-driven policy engine.
     // Each lane carries a "not before" monotonic timestamp + a consecutive-
     // `Retryable`-failure counter (reset on `Accepted`). These are exporter-task
     // locals — never shared across threads. A `Retryable` verdict defers the
@@ -823,7 +823,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
     // exporter startup from a JSON config blob.  Currently always empty (→ Noop
     // passthrough); wired to operator directives in a follow-on phase.
     // The `from_config` API is designed for future bidi-driven remote
-    // reconfiguration (control-shm §1.3.3 + bidi §1.2) — a staged follow-on.
+    // reconfiguration (control-shm + bidi channel) — a staged follow-on.
     let processor = Processor::from_config(&serde_json::Value::Object(Default::default()));
 
     let protocol_str = match amcf.export_protocol() {
@@ -840,7 +840,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
         retry_buffer_depth
     );
 
-    // H3F7 option A: in a no-flag build (nginx without --with-http_stub_status_module,
+    // In a no-flag build (nginx without --with-http_stub_status_module,
     // so `NGX_STAT_STUB` undefined → no `ngx_feature = "stat_stub"`) the stub_status
     // MetricSource is not registered in `collect_all_sources`. Emit a single
     // degraded-feature notice naming the missing flag and the affected series so the
@@ -871,7 +871,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
         }
 
         // ── Check for graceful SIGQUIT ────────────────────────────────────
-        // Phase 1.3.2: poll ngx_quit (not ngx_exiting). The exporter is not a
+        // Poll ngx_quit (not ngx_exiting). The exporter is not a
         // worker; master signals it to quit via ngx_quit on the channel handler
         // path (SIGQUIT → master → NGX_CMD_QUIT → ngx_quit). ngx_exiting is a
         // worker-specific flag set by the worker's SIGQUIT handler.
@@ -921,14 +921,14 @@ pub async fn export_loop(amcf: &'static MainConfig) {
         // ── Chunked sleep for the configured export interval ──────────────────
         // We must check ngx_quit at least every SHUTDOWN_POLL_INTERVAL so that
         // SIGQUIT during a long sleep doesn't delay the drain significantly.
-        // Phase 1.3.2: unlike workers, the exporter is not subject to
+        // Unlike workers, the exporter is not subject to
         // ngx_event_no_timers_left, so cancelable timers fire reliably on quit.
         //
         // Logs are drained on EVERY sub-interval wake (SHUTDOWN_POLL_INTERVAL,
         // default 250 ms), decoupled from the metric aggregation interval; metrics
         // aggregate and export only at the full otel_metric_interval boundary.
-        // Rationale (updated 2026-06-05): the original Phase 2.1 motive was draining a
-        // per-request log firehose before the ring saturated under high RPS. The §6.6
+        // Rationale: the original motive was draining a
+        // per-request log firehose before the ring saturated under high RPS. The
         // summary+samples redesign collapsed that volume (the ring now carries only the
         // thin exception tail + coalesced error samples), so the fast cadence now exists
         // for: (a) timeliness — ship the high-value tail/error records promptly instead
@@ -973,7 +973,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                 }
             }
 
-            // H3F3: whether a QUIT-DEFER overlap window is currently active.
+            // Whether a QUIT-DEFER overlap window is currently active.
             // When active (test-support only), shutdown is being deliberately
             // deferred to keep ring drains alive during a successor overlap, so
             // the inter-send shutdown short-circuits below must NOT fire — they
@@ -990,7 +990,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                 }
             };
 
-            // B1-FU1: Check for successor before periodic ring pops.
+            // Check for successor before periodic ring pops.
             // One Acquire load of successor_gen; sets the latch permanently on first
             // abdication.  The load is on the cold path (occurs only once per drain tick;
             // the latch short-circuits immediately after the first true result).
@@ -1005,13 +1005,13 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                 );
             }
 
-            // S4: monotonic basis for the per-signal backoff defer checks this
+            // Monotonic basis for the per-signal backoff defer checks this
             // tick (one read; reused across all lanes). Reuses nginx's cached
             // CLOCK_MONOTONIC (`ngx_current_msec`) — no new clock.
             let now_msec = now_monotonic_msec();
 
             // ── Log drain: every sub-interval wake ──────────────────────────
-            // S4: skip the entire logs lane (retry drain AND fresh send) while a
+            // Skip the entire logs lane (retry drain AND fresh send) while a
             // `Retryable` backoff defers it. Deferring the DRAIN — not growing
             // the buffer — is how a peer backoff hint / exponential backoff is
             // honored. Other signals are unaffected.
@@ -1030,7 +1030,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                 .await;
             }
 
-            // H3F3: inter-send shutdown check — a quit/terminate that arrived
+            // Inter-send shutdown check — a quit/terminate that arrived
             // while the logs-retry drain above was in flight is honoured now,
             // before chaining further (deadline-bounded) sends in this same tick.
             // Break out of the chunked sleep so the post-loop shutdown handling
@@ -1047,7 +1047,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             }
 
             // Drain fresh log records from all workers' rings and ship them.
-            // B1-FU1: skipped on abdication — new exporter is sole consumer.
+            // Skipped on abdication — new exporter is sole consumer.
             // Gate on access_sample OR error_log — either enables the logs shm path.
             if !periodic_abdicated
                 && !logs_deferred
@@ -1059,7 +1059,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                     // points to a live `ngx_shm_zone_t` valid for the exporter's
                     // lifetime (cycle-pool allocated). The `&*` borrow does not
                     // escape this block, and `shm.size` is a plain field read.
-                    // A1b: use n_active_workers to drain only active slots; the
+                    // Use n_active_workers to drain only active slots; the
                     // zone may be reserved for more (ncpu-headroom) but inactive
                     // slots are OS-zeroed pages — scanning them faults RAM in.
                     let n_workers = {
@@ -1089,7 +1089,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                     let n_logs = count_pdata_records(&logs_pd);
                     if n_logs > 0 {
                         let logs_bytes = encode_pdata(&logs_pd);
-                        // H3F3: cap at PERIODIC_SEND_BUDGET; deadline expiry is a
+                        // Cap at PERIODIC_SEND_BUDGET; deadline expiry is a
                         // transient failure taking the identical enqueue/counter/ERR path.
                         match with_deadline(
                             transport.send_pdata(&logs_pd, logs_bytes.clone()),
@@ -1097,7 +1097,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                         )
                         .await
                         {
-                            // S4: outcome-driven policy (release / requeue+defer / drop).
+                            // Outcome-driven policy (release / requeue+defer / drop).
                             Ok(Ok(ref outcome)) => {
                                 if handle_fresh_send_outcome(
                                     outcome,
@@ -1157,7 +1157,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                 }
             }
 
-            // H3F3: inter-send shutdown check before the span lane (see logs lane).
+            // Inter-send shutdown check before the span lane (see logs lane).
             if shutdown_requested() && !defer_active {
                 // SAFETY: nginx-owned `sig_atomic_t` global; single-threaded read.
                 shutdown_during_sleep = if unsafe { nginx_sys::ngx_terminate } != 0 {
@@ -1169,7 +1169,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             }
 
             // ── Span drain: every sub-interval wake ─────────────────────────
-            // S4: skip the entire spans lane while a `Retryable` backoff defers
+            // Skip the entire spans lane while a `Retryable` backoff defers
             // it (deferring the DRAIN, not growing the buffer). Independent of
             // the other lanes.
             let spans_deferred = spans_backoff.is_deferred(now_msec);
@@ -1187,7 +1187,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                 .await;
             }
 
-            // H3F3: inter-send shutdown check before the fresh-span send.
+            // Inter-send shutdown check before the fresh-span send.
             if shutdown_requested() && !defer_active {
                 // SAFETY: nginx-owned `sig_atomic_t` global; single-threaded read.
                 shutdown_during_sleep = if unsafe { nginx_sys::ngx_terminate } != 0 {
@@ -1199,7 +1199,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             }
 
             // Drain fresh span records from all workers' rings and ship them.
-            // B1-FU1: skipped on abdication — new exporter is sole consumer.
+            // Skipped on abdication — new exporter is sole consumer.
             if !periodic_abdicated && !spans_deferred {
                 if let Some(spans_base) = amcf.spans_shm_base() {
                     // SAFETY: `spans_shm_base()` returned `Some`, so the spans zone
@@ -1207,7 +1207,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                     // points to a live `ngx_shm_zone_t` valid for the exporter's
                     // lifetime. The `&*` borrow does not escape this block, and
                     // `shm.size` is a plain field read.
-                    // A1b: use n_active_workers (same rationale as logs above).
+                    // Use n_active_workers (same rationale as logs above).
                     let n_workers = {
                         use core::sync::atomic::Ordering;
                         let n = amcf.n_active_workers.load(Ordering::Relaxed);
@@ -1230,7 +1230,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                     let n_spans = count_pdata_records(&spans_pd);
                     if n_spans > 0 {
                         let spans_bytes = encode_pdata(&spans_pd);
-                        // H3F3: cap at PERIODIC_SEND_BUDGET; deadline expiry is a
+                        // Cap at PERIODIC_SEND_BUDGET; deadline expiry is a
                         // transient failure taking the identical enqueue/counter/ERR path.
                         match with_deadline(
                             transport.send_pdata(&spans_pd, spans_bytes.clone()),
@@ -1238,7 +1238,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                         )
                         .await
                         {
-                            // S4: outcome-driven policy (release / requeue+defer / drop).
+                            // Outcome-driven policy (release / requeue+defer / drop).
                             Ok(Ok(ref outcome)) => {
                                 if handle_fresh_send_outcome(
                                     outcome,
@@ -1345,11 +1345,11 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             return;
         }
 
-        // ── Control-shm heartbeat (Phase 1.3.3 Sub-item 1) ──────────────────
+        // ── Control-shm heartbeat ───────────────────────────────────────────
         // Bump version once per drain cycle as a liveness heartbeat.
-        // Phase 5 will reuse this increment after applying a reconfig to
-        // signal delivery convergence to the collector.
-        // TODO(phase-5): also write reconfig payload from control channel
+        // A future reconfig path will reuse this increment after applying a
+        // reconfig to signal delivery convergence to the collector.
+        // TODO: also write reconfig payload from the control channel
         // into control_shm.flags before/after this bump.
         if let Some(ctrl) = amcf.control_shm_ptr() {
             // SAFETY: `control_shm_ptr()` returned `Some`, so `ctrl` points to a
@@ -1395,7 +1395,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
         // Note: the per-retry-success INFO log ("queued batch sent successfully")
         // previously emitted only by this lane is intentionally omitted in the
         // shared helper — it was operational noise absent from the logs/spans lanes.
-        // S4: skip the metrics lane (retry drain AND fresh send) while a
+        // Skip the metrics lane (retry drain AND fresh send) while a
         // `Retryable` backoff defers it — deferring the DRAIN, not growing the
         // buffer. Independent of the logs/spans lanes.
         let metrics_now_msec = now_monotonic_msec();
@@ -1413,7 +1413,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             .await;
         }
 
-        // H3F3: inter-send shutdown check between the metrics retry drain and the
+        // Inter-send shutdown check between the metrics retry drain and the
         // fresh-metrics send. A quit/terminate arriving while the (deadline-bounded)
         // retry drain was in flight loops back to the top of the outer loop, which
         // immediately runs graceful_drain (quit) or returns (terminate) rather than
@@ -1443,7 +1443,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             let bytes = encode_pdata(&metrics_pd);
 
             // ── Send the fresh batch ──────────────────────────────────────
-            // H3F3: cap at PERIODIC_SEND_BUDGET; deadline expiry is a transient
+            // Cap at PERIODIC_SEND_BUDGET; deadline expiry is a transient
             // failure taking the identical enqueue/counter/ERR path.
             match with_deadline(
                 transport.send_pdata(&metrics_pd, bytes.clone()),
@@ -1451,7 +1451,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             )
             .await
             {
-                // S4: outcome-driven policy (release / requeue+defer / drop).
+                // Outcome-driven policy (release / requeue+defer / drop).
                 Ok(Ok(ref outcome)) => {
                     if handle_fresh_send_outcome(
                         outcome,
@@ -1537,13 +1537,13 @@ fn account_drops_and_clear(
     queue.clear();
 }
 
-/// B1-FU1: Returns `true` when a successor exporter generation has been
+/// Returns `true` when a successor exporter generation has been
 /// announced — `ControlShm::successor_gen > my_gen` — meaning this exporter
 /// must abdicate mutating ring pops (logs/spans).
 ///
 /// Used by both the periodic drain path (see `export_loop`) and
 /// [`graceful_drain`] — one definition, two call sites, no inline copy
-/// (connascence rule: a second copy would let the two callers drift apart).
+/// (a second copy would let the two callers drift apart).
 ///
 /// # Safety
 /// `control_shm_ptr()` returns `Some` only when the zone is registered and
@@ -1575,7 +1575,7 @@ struct DrainQueues<'a> {
 
 /// Called when `ngx_quit` is detected from inside [`export_loop`].
 ///
-/// Phase 1.3.2: runs on the **exporter's** `ngx_quit` path, not a worker's
+/// Runs on the **exporter's** `ngx_quit` path, not a worker's
 /// `ngx_exiting` path. The exporter receives SIGQUIT via master's channel
 /// write (`NGX_CMD_QUIT` → `ngx_quit`).
 ///
@@ -1593,29 +1593,25 @@ struct DrainQueues<'a> {
 /// teardown, which happens *after* this function returns. Awaiting
 /// `transport.send()` here is safe.
 ///
-/// # Documented Phase 1.1 limitation — RESOLVED in Phase 1.3
-///
-/// (Historical context retained; this section no longer describes a limitation.)
+/// # Why the chunked sleep timer fires on quit
 ///
 /// `ngx_event_no_timers_left()` returns `NGX_OK` (worker may exit) when the
 /// only pending timers are `cancelable`. The ngx-rust SDK marks every
 /// [`ngx::async_::sleep`] timer as cancelable
-/// (`ngx-rust/src/async_/sleep.rs:94: ev.set_cancelable(1)`), so when SIGQUIT
-/// arrived while Worker 0's [`export_loop`] was between intervals, nginx would
-/// treat the worker as idle and exit before the timer fired.
-///
-/// **RESOLVED in Phase 1.3.2**: the exporter is not a worker and is not
-/// subject to `ngx_event_no_timers_left`. When SIGQUIT arrives while the
-/// exporter is between intervals, nginx's event loop does NOT cancel the
-/// sleep timer — it fires normally, the export loop detects `ngx_quit`, and
-/// runs this drain. The chunked sleep ([`SHUTDOWN_POLL_INTERVAL`]) caps
-/// detection latency at 250 ms.
+/// (`ngx-rust/src/async_/sleep.rs:94: ev.set_cancelable(1)`), so a worker
+/// between intervals would be treated as idle and exit before its timer fired.
+/// The exporter, however, is not a worker and is not subject to
+/// `ngx_event_no_timers_left`. When SIGQUIT arrives while the exporter is
+/// between intervals, nginx's event loop does NOT cancel the sleep timer — it
+/// fires normally, the export loop detects `ngx_quit`, and runs this drain.
+/// The chunked sleep ([`SHUTDOWN_POLL_INTERVAL`]) caps detection latency at
+/// 250 ms.
 ///
 /// This async drain is the sole final-flush path. The exporter cycle waits
 /// for [`EXPORT_LOOP_DONE`] before calling `process::exit`, ensuring the
 /// drain always completes.
 ///
-/// B1 — Reload-safe graceful drain.
+/// # Reload-safe graceful drain.
 ///
 /// On SIGHUP reload the master announces a successor by incrementing
 /// `ControlShm::successor_gen` (with Release ordering) BEFORE forking the new
@@ -1632,13 +1628,13 @@ struct DrainQueues<'a> {
 /// When `current_gen == my_gen` (pure shutdown, no successor) the old exporter
 /// is the sole consumer and performs a full drain including ring pops.
 ///
-/// **Previous Q2 comment**: the old "Q2 RESOLVED — dedup via time_unix_nano"
-/// claim was correct ONLY for cumulative metrics (the collector can dedup
-/// identical counter data points by {start_time, time} range). It was FALSE for
-/// length-prefixed log/span rings: two concurrent `pop_into` callers race on
-/// `read_offset` (Relaxed load + Release store, no CAS) and can yield garbage
-/// record lengths (up to 4 GiB on a producer wrap-around). B1 restores the
-/// SPSC invariant by making the new exporter the sole ring consumer on reload.
+/// Note on dedup: deduping by `time_unix_nano` is safe ONLY for cumulative
+/// metrics (the collector can dedup identical counter data points by
+/// {start_time, time} range). It does NOT hold for length-prefixed log/span
+/// rings: two concurrent `pop_into` callers race on `read_offset` (Relaxed
+/// load + Release store, no CAS) and can yield garbage record lengths (up to
+/// 4 GiB on a producer wrap-around). Making the new exporter the sole ring
+/// consumer on reload restores the SPSC invariant.
 async fn graceful_drain(
     transport: &mut ExportTransport,
     queues: &mut DrainQueues<'_>,
@@ -1651,9 +1647,9 @@ async fn graceful_drain(
     let log = ngx::log::ngx_cycle_log();
     let queued = queues.metrics.len();
 
-    // B1: check whether a successor was announced (reload) or not (shutdown).
-    // B1-FU1: use the shared successor_announced() check (connascence rule —
-    // one definition for both the periodic drain path and graceful_drain).
+    // Check whether a successor was announced (reload) or not (shutdown).
+    // Use the shared successor_announced() check — one definition for both
+    // the periodic drain path and graceful_drain.
     let has_successor = successor_announced(amcf, my_gen);
 
     ngx::ngx_log_error!(
@@ -1664,7 +1660,7 @@ async fn graceful_drain(
         has_successor as u8
     );
     if has_successor {
-        // B1: abdication path — log/span ring pops are skipped (new exporter owns).
+        // Abdication path — log/span ring pops are skipped (new exporter owns).
         // Still flush in-process retry buffers and final cumulative-metrics batch.
         ngx::ngx_log_error!(
             NGX_LOG_NOTICE,
@@ -1677,8 +1673,8 @@ async fn graceful_drain(
     // Flush metrics retry queue (one bounded attempt each, ignore errors).
     while let Some((bytes, n_pts)) = queues.metrics.pop_front() {
         match with_deadline(transport.send(bytes), GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET).await {
-            // S1: any Ok(outcome) is treated as release, exactly as Ok(()) was.
-            // S4 introduces the outcome-driven policy (release/requeue+defer/drop).
+            // Any Ok(outcome) is treated as release; the outcome-driven policy
+            // (release/requeue+defer/drop) applies.
             Ok(Ok(_outcome)) => {}
             Ok(Err(e)) => {
                 ngx::ngx_log_error!(
@@ -1727,7 +1723,7 @@ async fn graceful_drain(
         )
         .await
         {
-            // S1: any Ok(outcome) treated as release (S4 adds policy).
+            // Any Ok(outcome) treated as release (the outcome-driven policy applies).
             Ok(Ok(_outcome)) => {
                 ngx::ngx_log_error!(
                     NGX_LOG_NOTICE,
@@ -1758,8 +1754,8 @@ async fn graceful_drain(
     // Drain pending logs retry queue (one bounded attempt each).
     while let Some((bytes, n_logs)) = queues.logs.pop_front() {
         match with_deadline(transport.send_logs(bytes), GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET).await {
-            // S1: any Ok(outcome) is treated as release, exactly as Ok(()) was.
-            // S4 introduces the outcome-driven policy (release/requeue+defer/drop).
+            // Any Ok(outcome) is treated as release; the outcome-driven policy
+            // (release/requeue+defer/drop) applies.
             Ok(Ok(_outcome)) => {}
             Ok(Err(e)) => {
                 ngx::ngx_log_error!(
@@ -1790,10 +1786,10 @@ async fn graceful_drain(
     }
 
     // Final freshly-collected logs batch (access + error rings).
-    // B1: skipped on abdication — new exporter is sole consumer of the rings.
+    // Skipped on abdication — new exporter is sole consumer of the rings.
     if !has_successor && (amcf.is_access_sample_enabled() || amcf.error_log_enabled) {
         if let Some(logs_base) = amcf.logs_shm_base() {
-            // A1b: use n_active_workers (same rationale as export path).
+            // Use n_active_workers (same rationale as export path).
             let n_workers = {
                 use core::sync::atomic::Ordering;
                 let n = amcf.n_active_workers.load(Ordering::Relaxed);
@@ -1824,7 +1820,7 @@ async fn graceful_drain(
                 )
                 .await
                 {
-                    // S1: any Ok(outcome) treated as release (S4 adds policy).
+                    // Any Ok(outcome) treated as release (the outcome-driven policy applies).
                     Ok(Ok(_outcome)) => {
                         ngx::ngx_log_error!(
                             NGX_LOG_NOTICE,
@@ -1856,8 +1852,8 @@ async fn graceful_drain(
     // Drain pending spans retry queue (one bounded attempt each).
     while let Some((bytes, n_spans)) = queues.spans.pop_front() {
         match with_deadline(transport.send_traces(bytes), GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET).await {
-            // S1: any Ok(outcome) is treated as release, exactly as Ok(()) was.
-            // S4 introduces the outcome-driven policy (release/requeue+defer/drop).
+            // Any Ok(outcome) is treated as release; the outcome-driven policy
+            // (release/requeue+defer/drop) applies.
             Ok(Ok(_outcome)) => {}
             Ok(Err(e)) => {
                 ngx::ngx_log_error!(
@@ -1886,10 +1882,10 @@ async fn graceful_drain(
     }
 
     // Final freshly-collected spans batch (Pdata pipeline, Step U2).
-    // B1: skipped on abdication — new exporter is sole consumer of the rings.
+    // Skipped on abdication — new exporter is sole consumer of the rings.
     if !has_successor {
         if let Some(spans_base) = amcf.spans_shm_base() {
-            // A1b: use n_active_workers (same rationale as export path).
+            // Use n_active_workers (same rationale as export path).
             let n_workers = {
                 use core::sync::atomic::Ordering;
                 let n = amcf.n_active_workers.load(Ordering::Relaxed);
@@ -1918,7 +1914,7 @@ async fn graceful_drain(
                 )
                 .await
                 {
-                    // S1: any Ok(outcome) treated as release (S4 adds policy).
+                    // Any Ok(outcome) treated as release (the outcome-driven policy applies).
                     Ok(Ok(_outcome)) => {
                         ngx::ngx_log_error!(
                             NGX_LOG_NOTICE,
@@ -2038,13 +2034,13 @@ fn is_permanent_rejection(e: &crate::transport::TransportError) -> bool {
     matches!(e, crate::transport::TransportError::HttpStatus { code, .. } if *code >= 400 && *code < 500)
 }
 
-// ── S4: outcome-driven policy engine ──────────────────────────────────────────
+// ── Outcome-driven policy engine ───────────────────────────────────────────────
 //
 // The policy is written ONCE against the protocol-agnostic `DeliveryOutcome`
-// (the adapters in S2/S3 already mapped native HTTP/gRPC status into it). The
+// (the transport adapters already mapped native HTTP/gRPC status into it). The
 // engine NEVER branches on an HTTP code or a gRPC code here.
 //
-// Defer mechanism (within the STOP-AND-ASK bound): a per-signal "not before"
+// Defer mechanism: a per-signal "not before"
 // monotonic timestamp + a per-signal consecutive-`Retryable`-failure counter.
 // Honoring a backoff DEFERS THE NEXT DRAIN of that signal — it does NOT grow the
 // buffer or add any unbounded store. The bounded per-signal retry buffer with
@@ -2177,7 +2173,7 @@ fn apply_delivery_outcome(
     }
 }
 
-/// S4 — apply the outcome-driven policy to a *fresh* (newly-collected) batch
+/// Apply the outcome-driven policy to a *fresh* (newly-collected) batch
 /// send result. Shared by the metrics/logs/spans fresh-send sites so the policy
 /// is written once. On `Requeue`/transient the batch is re-queued into the
 /// bounded buffer (drop-oldest backstop, unchanged) and `failure_counter` is
@@ -2185,7 +2181,7 @@ fn apply_delivery_outcome(
 /// bumped inside [`apply_delivery_outcome`]); on `Release` nothing is queued.
 ///
 /// Returns the [`OutcomeAction`] so the caller can emit its signal-specific
-/// success log with the original wording (the B1 chaos test parses those exact
+/// success log with the original wording (a chaos test parses those exact
 /// "sent N {log,span} records to collector" lines).
 ///
 /// `now_msec` is the monotonic basis for the defer timestamp recorded in
@@ -2408,13 +2404,13 @@ async fn drain_retry_queue_once_with_timer<S, Mk, T>(
             enqueue_with_eviction(queue, bytes, n, retry_buffer_depth, log);
             continue;
         }
-        // H3F3: cap each retry send at PERIODIC_SEND_BUDGET. A deadline expiry
+        // Cap each retry send at PERIODIC_SEND_BUDGET. A deadline expiry
         // (hung collector) is a TRANSIENT failure — identical path to a transport
         // error: bump the failure counter, ERR-log, re-enqueue, and stop draining
         // for the rest of this pass (the transport is likely wedged).
         let send = WithDeadline { fut: sender.send_batch(bytes.clone()), timer: mk_timer() };
         match send.await {
-            // S4: outcome-driven policy, written ONCE against `DeliveryOutcome`.
+            // Outcome-driven policy, written ONCE against `DeliveryOutcome`.
             Ok(Ok(ref outcome)) => {
                 match apply_delivery_outcome(outcome, backoff, now_msec, log, signal) {
                     // Accepted / PartialReject → release this batch; keep draining.
@@ -2601,7 +2597,7 @@ fn collect_all_sources(amcf: &MainConfig, worker_start_ns: u64, collector_host: 
     //    (i.e. `NGX_STAT_STUB` is defined → `ngx_feature = "stat_stub"`, set by
     //    `build.rs::detect_stat_stub`). In a no-flag build the `ngx_stat_*` symbols
     //    do not exist and the source would only ever yield permanent zeros, so we
-    //    skip registration entirely (H3F7 option A) — the 7 series become ABSENT
+    //    skip registration entirely — the 7 series become ABSENT
     //    rather than zero. The operator is told why via a one-shot WARN at export
     //    loop startup (see `export_loop`).
     #[cfg(ngx_feature = "stat_stub")]
@@ -2641,7 +2637,7 @@ fn collect_all_sources(amcf: &MainConfig, worker_start_ns: u64, collector_host: 
         .collect(),
     );
 
-    // 4. Error-log event rate metric (Phase 2.3 DP-B).
+    // 4. Error-log event rate metric.
     //    Collected from metrics shm when error_log is enabled and shm is mapped.
     if amcf.error_log_enabled {
         if let Some(base) = amcf.shm_base() {
@@ -2658,18 +2654,18 @@ fn collect_all_sources(amcf: &MainConfig, worker_start_ns: u64, collector_host: 
         }
     }
 
-    // 5. Serving-certificate gauges (TLS cert-metrics Phase C, item C3).
-    //    `cert_table` is populated once at postconfiguration (C2) and immutable
+    // 5. Serving-certificate gauges (TLS cert metrics).
+    //    `cert_table` is populated once at postconfiguration and immutable
     //    afterwards; the exporter inherited it at fork. When the table is empty
     //    (no-ssl nginx build, or no `ssl_certificate` configured) the source
     //    yields NO metrics, so the three `ngx_otel.tls.certificate.*` series
-    //    are ABSENT — not present-as-zero (stub_status H3F7 precedent).
+    //    are ABSENT — not present-as-zero.
     metrics.extend(ServingCertSource { certs: &amcf.cert_table }.collect());
 
-    // 6. B1 — Collector-cert gauge.
+    // 6. Collector-cert gauge.
     //    Emitted only once the first TLS handshake with the collector has
     //    completed (COLLECTOR_CERT_NOT_AFTER != 0).  Plaintext endpoints and
-    //    pre-handshake state → metric ABSENT (absent-not-zero precedent).
+    //    pre-handshake state → metric ABSENT rather than reported as zero.
     //    The value is stable per exporter generation (same cert per collector
     //    endpoint; each successful handshake writes the same epoch value).
     {
@@ -2696,7 +2692,7 @@ fn collect_all_sources(amcf: &MainConfig, worker_start_ns: u64, collector_host: 
 /// Updates `ACCESS_LOGS_DROPPED` from each ring's `drop_count()`.
 /// Updates `ERROR_LOGS_DROPPED` from the error ring's `drop_count()`.
 ///
-/// **F5 — orphaned coalesced counts:** after ring drain, any entry in the
+/// **Orphaned coalesced counts:** after ring drain, any entry in the
 /// coalescer `counts_vec` whose `template_hash` was NOT matched by a ring
 /// record (meaning the verbatim ring push failed — ring full) gets a
 /// synthetic `LogRecord` with `body = "(ring-full: verbatim sample dropped
@@ -2768,7 +2764,7 @@ fn collect_log_records(
     // Update the ACCESS_LOGS_DROPPED self-metric.
     ACCESS_LOGS_DROPPED.store(total_dropped, Ordering::Relaxed);
 
-    // Drain error rings (Step 2.3.3): only when error_log_enabled.
+    // Drain error rings: only when error_log_enabled.
     if amcf.error_log_enabled {
         let mut error_dropped: u64 = 0;
         for w in 0..n_workers {
@@ -2783,7 +2779,7 @@ fn collect_log_records(
             let counts_vec = unsafe { coalesce::drain_coalesce_table(coalesce_tbl) };
             // Build a lookup: key_hash → count (number of occurrences in this interval,
             // including the initial verbatim sample that was already pushed to the ring).
-            // Keep `counts_vec` alive for the F5 orphaned-count pass below.
+            // Keep `counts_vec` alive for the orphaned-count pass below.
             let counts_map: std::collections::HashMap<u64, u32> =
                 counts_vec.iter().map(|&(hash, _sev, count)| (hash, count)).collect();
 
@@ -2792,7 +2788,7 @@ fn collect_log_records(
             let ring = unsafe { logs_error_ring(logs_base, w, cap) };
             error_dropped += ring.drop_count();
 
-            // F5: track which template_hashes are consumed by ring records so we can
+            // Track which template_hashes are consumed by ring records so we can
             // detect orphaned coalesced counts (whose verbatim ring push failed).
             // template_hash lives at bytes [10..18] of each error ring record.
             let mut consumed_hashes: std::collections::HashSet<u64> =
@@ -2821,7 +2817,7 @@ fn collect_log_records(
                 drained += 1;
             }
 
-            // F5: emit a synthetic log record for every counts_vec entry whose
+            // Emit a synthetic log record for every counts_vec entry whose
             // verbatim ring push was dropped (ring full) — the template_hash was never
             // seen in any ring record consumed above.  The synthetic record carries
             // the coalesced_count so the backend receives the occurrence total even
@@ -2991,7 +2987,7 @@ fn parse_access_record(buf: &[u8], observed_now_ns: u64) -> Option<LogRecord> {
         std::string::String::new()
     };
 
-    // ── Phase 2.2.3 / 2.2.5: trace context + high-cardinality tail detail ─────
+    // ── Trace context + high-cardinality tail detail ─────────────────────────
     // These follow client_addr in the wire format (see `emit_access_record`).
     // Decode defensively — a truncated/legacy record simply omits them.
     let mut trace_id: std::vec::Vec<u8> = std::vec::Vec::new();
@@ -3011,7 +3007,7 @@ fn parse_access_record(buf: &[u8], observed_now_ns: u64) -> Option<LogRecord> {
     let url_path = read_u16_prefixed(buf, &mut pos);
     let user_agent = read_u16_prefixed(buf, &mut pos);
 
-    // Request duration in µs (Phase 2 S2 — decision #3).
+    // Request duration in µs.
     // Appended after high-cardinality fields; absent in legacy records → None.
     // Last field — `pos` is not incremented (no further reads use it).
     let duration_us: Option<u64> = if pos + 8 <= buf.len() {
@@ -3085,7 +3081,7 @@ fn parse_access_record(buf: &[u8], observed_now_ns: u64) -> Option<LogRecord> {
 /// in the map and `count > 1`, the `nginx.error.coalesced_count` attribute is
 /// attached to indicate that the verbatim sample represents N occurrences.
 ///
-/// # Decision #6 invariants (non-negotiable)
+/// # Error-record invariants (non-negotiable)
 /// - NO `trace_id` / `span_id` — request context is unreachable from the writer.
 /// - NO `http.route` or `nginx.upstream.zone` attributes.
 /// - `event_name = "nginx.error"`
@@ -3120,7 +3116,7 @@ fn parse_error_record(
 
     let (severity_number, severity_text) = nginx_to_otel(ngx_level);
 
-    // Build attributes.  Decision #6: NO route/zone/trace_id.
+    // Build attributes: NO route/zone/trace_id.
     let mut attributes: std::vec::Vec<KeyValue> = std::vec::Vec::new();
 
     // nginx.error.template_hash: carry the hash so backends can group by template.
@@ -3150,8 +3146,8 @@ fn parse_error_record(
         body: AnyValue::String(body_str),
         attributes,
         event_name: "nginx.error".into(),
-        trace_id: std::vec::Vec::new(), // decision #6: no trace context on error records
-        span_id: std::vec::Vec::new(),  // decision #6
+        trace_id: std::vec::Vec::new(), // no trace context on error records
+        span_id: std::vec::Vec::new(),  // no trace context on error records
     })
 }
 
@@ -3219,7 +3215,7 @@ fn gauge_metric(name: &str, desc: &str, unit: &str, value: i64, time_ns: u64) ->
     }
 }
 
-/// Build the B1 collector-cert Gauge with a single data point.
+/// Build the collector-cert Gauge with a single data point.
 ///
 /// `server_address` is the collector hostname or IP-literal (parsed from the
 /// configured `otel_exporter` endpoint).  Only one attribute is emitted — per
@@ -3246,7 +3242,7 @@ fn collector_cert_gauge(not_after: i64, time_ns: u64, server_address: &str) -> M
     }
 }
 
-/// Build the `ngx_otel.error_log.events` Sum metric (Phase 2.3 DP-B).
+/// Build the `ngx_otel.error_log.events` Sum metric.
 ///
 /// Sums `WorkerSlots::error_rate_counters` across all workers, producing one
 /// data point per severity class with attribute `severity_class = "fatal"|"error"|…`.
@@ -3385,11 +3381,8 @@ mod tests {
         assert!(spans_q.is_empty(), "spans queue must be empty after drain abort");
     }
 
-    /// SelfMetricsSource must produce exactly 13 metrics with the right names.
-    /// (Updated in Phase 2.1 to include 3 new logs-path metrics;
-    ///  updated in P3 pre-promote to include traces.dropped_records;
-    ///  updated in C1 to include ngx_otel.exporter.restarts;
-    ///  updated in S5 to include 3 delivery-outcome metrics.)
+    /// SelfMetricsSource must produce exactly 13 metrics with the right names
+    /// (4 original + 4 log + 1 traces + 1 crash-loop + 3 delivery-outcome).
     #[test]
     fn self_metrics_source_produces_four_metrics() {
         let src = SelfMetricsSource {
@@ -3413,22 +3406,22 @@ mod tests {
         assert!(names.contains(&"ngx_otel.send_failures"));
         assert!(names.contains(&"ngx_otel.bidi_backpressure_drops"));
         assert!(names.contains(&"ngx_otel.export_interval"));
-        // Phase 2.1 — 4 log metrics (3 original + F5 orphaned metric)
+        // 4 log metrics (3 original + orphaned-count metric)
         assert!(names.contains(&"ngx_otel.logs.access.dropped_records"));
         assert!(names.contains(&"ngx_otel.logs.error.dropped_records"));
         assert!(names.contains(&"ngx_otel.logs.error.coalesced_orphaned_records"));
         assert!(names.contains(&"ngx_otel.logs.send_failures"));
-        // P3 pre-promote — traces drop metric (was written but never emitted)
+        // Traces drop metric
         assert!(
             names.contains(&"ngx_otel.traces.dropped_records"),
             "traces.dropped_records must appear in self-metrics; names = {names:?}"
         );
-        // C1 — crash-loop restart gauge
+        // Crash-loop restart gauge
         assert!(
             names.contains(&"ngx_otel.exporter.restarts"),
             "exporter.restarts must appear in self-metrics; names = {names:?}"
         );
-        // S5 — delivery-outcome monotonic Sums (read existing S4 atomics)
+        // Delivery-outcome monotonic Sums (read the delivery-outcome atomics)
         assert!(
             names.contains(&"ngx_otel.delivery.permanent_rejected"),
             "delivery.permanent_rejected must appear in self-metrics; names = {names:?}"
@@ -3508,7 +3501,7 @@ mod tests {
         assert_eq!(dropped, 1 + 2);
     }
 
-    // ── service.instance.id tests (R1) ───────────────────────────────────────
+    // ── service.instance.id tests ────────────────────────────────────────────
 
     /// Helper: look up an attribute by key in a slice.
     fn find_attr<'a>(attrs: &'a [KeyValue], key: &str) -> Option<&'a AnyValue> {
@@ -3579,7 +3572,7 @@ mod tests {
         );
     }
 
-    /// H3F7 option A — inverse of `stub_status::tests::stub_status_produces_seven_metrics`.
+    /// Inverse of `stub_status::tests::stub_status_produces_seven_metrics`.
     /// In a no-flag build (nginx without `--with-http_stub_status_module`, so
     /// `NGX_STAT_STUB` undefined → no `ngx_feature = "stat_stub"`), the stub_status
     /// `MetricSource` is not registered in `collect_all_sources`, so none of its 7
@@ -3610,7 +3603,7 @@ mod tests {
         }
     }
 
-    /// C3 registration-level absent-not-zero: with an EMPTY cert table the
+    /// Registration-level absent-not-zero: with an EMPTY cert table the
     /// three `ngx_otel.tls.certificate.*` series are ABSENT from the real
     /// collection path; with a populated table all three appear. (Source-level
     /// arithmetic/attribute tests live in `metric_source::tls_cert`.)
@@ -3654,7 +3647,7 @@ mod tests {
         }
     }
 
-    /// H2F5: the gRPC per-signal-endpoint warn predicate (the PRODUCTION
+    /// The gRPC per-signal-endpoint warn predicate (the PRODUCTION
     /// `grpc_ignored_endpoint_names` fn that `export_loop` calls) returns exactly
     /// the names whose endpoint field is non-empty, in metrics/logs/traces order.
     /// Mutation evidence (commit msg): break the predicate (e.g. invert one
@@ -3738,7 +3731,7 @@ mod tests {
         assert_eq!(count, 1, "service.instance.id must appear exactly once");
     }
 
-    // ── Step 2.3.3 error-drain tests ─────────────────────────────────────────
+    // ── Error-drain tests ────────────────────────────────────────────────────
 
     /// Helper: build a one-worker logs shm slot with initialised ring headers.
     fn make_logs_slot(cap: usize) -> (std::vec::Vec<u8>, *mut u8) {
@@ -3763,7 +3756,7 @@ mod tests {
         (buf, ptr)
     }
 
-    /// Phase 2 S2: tail LogRecord carries `http.server.request.duration` (double, seconds).
+    /// Tail LogRecord carries `http.server.request.duration` (double, seconds).
     ///
     /// Push a synthetic access record with a known `duration_us`, drain it, and assert:
     /// (1) the attribute is present, (2) the value is `duration_us / 1_000_000.0` seconds,
@@ -3817,7 +3810,7 @@ mod tests {
             .attributes
             .iter()
             .find(|kv| kv.key == "http.server.request.duration")
-            .expect("http.server.request.duration must be present on tail LogRecord (S2)");
+            .expect("http.server.request.duration must be present on tail LogRecord");
 
         // Value must be a Double in seconds — 1_234_567 µs = 1.234567 s.
         let expected = dur_us as f64 / 1_000_000.0;
@@ -3903,11 +3896,11 @@ mod tests {
             "severity must be ERROR for ngx_level=4"
         );
 
-        // Decision #6: NO trace_id, span_id.
+        // NO trace_id, span_id.
         assert!(rec.trace_id.is_empty(), "trace_id must be empty on error records");
         assert!(rec.span_id.is_empty(), "span_id must be empty on error records");
 
-        // Decision #6: NO route / zone attributes.
+        // NO route / zone attributes.
         let has_route = rec.attributes.iter().any(|kv| kv.key == "http.route");
         let has_zone = rec.attributes.iter().any(|kv| kv.key == "nginx.upstream.zone");
         assert!(!has_route, "http.route must be absent from error records");
@@ -4123,7 +4116,7 @@ mod tests {
         );
     }
 
-    // ── Step 2.3.4 error-rate metric tests ───────────────────────────────────
+    // ── Error-rate metric tests ──────────────────────────────────────────────
 
     /// Error-rate metric has exactly N_SEVERITY_CLASSES data points, each with a
     /// distinct `severity_class` attribute, and no other attributes.
@@ -4257,7 +4250,7 @@ mod tests {
         assert_eq!(find_class("info"), 0, "info: no bumps");
         assert_eq!(find_class("debug"), 0, "debug: no bumps");
 
-        // Only severity_class is a metric dimension (DP-B: no route/zone/trace_id).
+        // Only severity_class is a metric dimension (no route/zone/trace_id).
         for dp in &sum.data_points {
             assert_eq!(
                 dp.attributes.len(),
@@ -4289,12 +4282,12 @@ mod tests {
     /// mock sender (`MockAlwaysErr`).  Neutering the `is_permanent_rejection`
     /// guard inside the helper makes this test fail.
     ///
-    /// Pre-fix shape (HOLLOW — fixed in FU1): the test re-implemented the drain
+    /// Earlier this test re-implemented the drain
     /// loop inline and never called production code; the reviewer removed all
     /// three production guard blocks and the test STILL PASSED.  This test calls
     /// the production helper directly — the test cannot pass if the guard is gone.
     ///
-    /// Mutation-evidence bar (FU1): neuter `drain_retry_queue_once`'s 4xx-drop
+    /// Mutation-evidence bar: neuter `drain_retry_queue_once`'s 4xx-drop
     /// branch (classify everything transient) → this test FAILS → restore → PASSES.
     #[tokio::test]
     async fn f_retry_drops_permanent_4xx() {
@@ -4305,7 +4298,7 @@ mod tests {
         let failure_counter = AtomicU64::new(0);
         // Removing is_permanent_rejection's guard classifies 413 as transient
         // → batch is re-queued → queue.len() == 1 → assertion FAILS.
-        // H3F3: use the `_with_timer` form with a never-firing timer so the
+        // Use the `_with_timer` form with a never-firing timer so the
         // mock's immediate error wins the deadline race — this exercises the
         // identical drain logic while avoiding the real `ngx::async_::sleep`
         // (which derefs the nginx cycle log, null in unit tests).
@@ -4324,14 +4317,14 @@ mod tests {
 
         assert!(
             queue.is_empty(),
-            "H2F4: 413-rejected batch must be dropped, not re-queued; \
+            "413-rejected batch must be dropped, not re-queued; \
              queue depth = {}",
             queue.len()
         );
         assert_eq!(
             failure_counter.load(Ordering::Relaxed),
             1,
-            "H2F4: failure_counter must be bumped on permanent rejection"
+            "failure_counter must be bumped on permanent rejection"
         );
 
         // ── 503 case: transient error → re-queued ─────────────────────────────────
@@ -4352,15 +4345,15 @@ mod tests {
         )
         .await;
 
-        assert_eq!(queue2.len(), 1, "H2F4 boundary: 503 is transient — batch must be re-queued");
+        assert_eq!(queue2.len(), 1, "boundary: 503 is transient — batch must be re-queued");
         assert_eq!(
             failure_counter2.load(Ordering::Relaxed),
             1,
-            "H2F4: failure_counter must be bumped on transient error"
+            "failure_counter must be bumped on transient error"
         );
     }
 
-    // ── H3F3 periodic-send deadline ───────────────────────────────────────────
+    // ── Periodic-send deadline ─────────────────────────────────────────────────
 
     /// A `RetrySend` whose send NEVER resolves — models a collector that
     /// accepts the connection but never responds (the hung-collector case the
@@ -4440,13 +4433,13 @@ mod tests {
             }
         }
         panic!(
-            "H3F3: future did not complete within {max_polls} polls — the \
+            "future did not complete within {max_polls} polls — the \
              periodic send was awaited without a deadline (a hung collector \
              would block the export loop, and thus `nginx -s quit`, indefinitely)"
         );
     }
 
-    /// H3F3 mutation-evidence: a periodic (retry-drain) send to a hung collector
+    /// Mutation-evidence: a periodic (retry-drain) send to a hung collector
     /// must be bounded by `PERIODIC_SEND_BUDGET` and the batch must land back in
     /// the retry queue with the failure counter bumped — i.e. a deadline expiry
     /// takes the EXACT transient-failure path.
@@ -4495,32 +4488,32 @@ mod tests {
         assert_eq!(
             queue.len(),
             1,
-            "H3F3: a deadline-expired (hung-collector) batch must be re-queued for retry"
+            "a deadline-expired (hung-collector) batch must be re-queued for retry"
         );
         assert_eq!(
             queue.front().map(|(_, n)| *n),
             Some(9),
-            "H3F3: the re-queued batch must preserve its record count"
+            "the re-queued batch must preserve its record count"
         );
         assert_eq!(
             failure_counter.load(Ordering::Relaxed),
             1,
-            "H3F3: a deadline expiry must bump the failure counter (transient-failure path)"
+            "a deadline expiry must bump the failure counter (transient-failure path)"
         );
     }
 
-    // ── S4: outcome-driven policy engine ───────────────────────────────────────
+    // ── Outcome-driven policy engine ────────────────────────────────────────────
 
     use crate::transport::DeliveryOutcome as Outcome;
 
-    /// Serializes the S4 tests that assert on the process-global delivery-outcome
+    /// Serializes the delivery-outcome tests that assert on the process-global
     /// counters (`PARTIAL_REJECTED` / `PERMANENT_REJECTED` / `UNAUTHORIZED_REJECTED`),
     /// since cargo runs unit tests in parallel and another such test could bump
     /// the same static between a before/after read.
     static S4_COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// A `RetrySend` that returns a fixed `Ok(DeliveryOutcome)` verdict for every
-    /// send — exercises the S4 policy match in `drain_retry_queue_once_with_timer`.
+    /// send — exercises the policy match in `drain_retry_queue_once_with_timer`.
     struct MockVerdict(Outcome);
     impl super::RetrySend for MockVerdict {
         async fn send_batch(

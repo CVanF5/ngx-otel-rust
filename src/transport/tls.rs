@@ -33,7 +33,7 @@
 //!
 //! 2. **The `Context` is published, not captured.** Before every `SSL_*`
 //!    invocation, the calling `poll_*` stores a raw pointer to its live
-//!    `Context` (and a pinned pointer to the inner IO) into a [`BioCtx`] that
+//!    `Context` (and a pinned pointer to the inner IO) into a `BioCtx` that
 //!    the BIO's `data` slot points at. The BIO callbacks dereference that
 //!    pointer to build the `Context` they hand to `inner.poll_*`. The pointer
 //!    is valid for exactly the duration of the `SSL_*` call (the `Context`
@@ -93,14 +93,14 @@ use openssl_sys as ssl;
 
 use super::TransportError;
 
-// ── B1 collector-cert gauge ───────────────────────────────────────────────────
+// ── Collector-cert gauge ──────────────────────────────────────────────────────
 
 /// `notAfter` of the peer certificate from the most recent successful TLS
 /// handshake with the collector, as Unix epoch seconds.
 ///
 /// `0`  = no successful TLS handshake yet in this exporter generation
 ///        (plaintext endpoint, or TLS not yet attempted) — the metric is
-///        **absent** (absent-not-zero precedent: stub_status H3F7) when this
+///        **absent** (absent rather than reported as zero) when this
 ///        value is zero.
 ///
 /// Written **once per successful handshake** by `TlsNgxConnIo::poll_handshake`
@@ -119,7 +119,7 @@ pub(crate) static COLLECTOR_CERT_NOT_AFTER: AtomicI64 = AtomicI64::new(0);
 
 /// TLS client configuration for the exporter connection.
 ///
-/// Built from the `otel_exporter { }` directives (wired in A2): `ca_file` from
+/// Built from the `otel_exporter { }` directives: `ca_file` from
 /// `trusted_certificate`, `client_cert`/`client_key` from `ssl_certificate` /
 /// `ssl_certificate_key`, `insecure` from `ssl_verify off`.
 #[derive(Debug, Clone, Default)]
@@ -279,8 +279,8 @@ impl TlsConfig {
         }
 
         // mTLS: load client cert + key only when BOTH are configured.
-        // Config-time validation (cert-without-key etc.) is A2's job; here we
-        // simply require both present before attempting mTLS.
+        // Config-time validation (cert-without-key etc.) happens at parse time;
+        // here we simply require both present before attempting mTLS.
         if let (Some(cert), Some(key)) = (&self.client_cert, &self.client_key) {
             {
                 let c_cert = to_cstring(cert)?;
@@ -740,7 +740,7 @@ impl<I: hyper::rt::Read + hyper::rt::Write + Unpin + 'static> TlsNgxConnIo<I> {
     ///
     /// Exposed for callers that need to perform additional per-connection
     /// `SSL_*` configuration after `new` but before the handshake (e.g.
-    /// `X509_VERIFY_PARAM_set1_ip_asc` for IP-literal endpoints — A2).
+    /// `X509_VERIFY_PARAM_set1_ip_asc` for IP-literal endpoints).
     ///
     /// The pointer is owned by this `TlsNgxConnIo` and freed in `Drop`.
     /// Callers MUST NOT free it themselves.
@@ -788,7 +788,7 @@ impl<I: hyper::rt::Read + hyper::rt::Write + Unpin + 'static> TlsNgxConnIo<I> {
         });
         if rc == 1 {
             self.handshake = HandshakeState::Done;
-            // B1 — Capture collector cert notAfter on first successful handshake.
+            // Capture collector cert notAfter on first successful handshake.
             //
             // `SSL_get_peer_certificate` returns an OWNED `X509*` (unlike the
             // get0 variants it increments the reference count); we MUST call

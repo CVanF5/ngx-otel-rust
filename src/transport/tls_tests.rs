@@ -349,9 +349,9 @@ fn build_ctx_variants() {
 /// handshake completes and a small write/read round-trip succeeds.
 ///
 /// We verify against the DNS name `localhost` (matching the cert's
-/// `DNS:localhost` SAN). NOTE for A2: `X509_VERIFY_PARAM_set1_host` matches
+/// `DNS:localhost` SAN). NOTE: `X509_VERIFY_PARAM_set1_host` matches
 /// DNS-name SANs only; an IP-literal endpoint (e.g. `https://127.0.0.1`) must
-/// instead use `X509_VERIFY_PARAM_set1_ip` — recorded as an A2 follow-up.
+/// instead use `X509_VERIFY_PARAM_set1_ip`.
 #[test]
 fn handshake_ok_and_roundtrip() {
     let certs = make_certs("DNS:localhost,IP:127.0.0.1");
@@ -502,10 +502,10 @@ fn connect_loopback_io() -> TestIo {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// B1 — collector-cert gauge: COLLECTOR_CERT_NOT_AFTER capture
+// Collector-cert gauge: COLLECTOR_CERT_NOT_AFTER capture
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// B1 unit: a successful handshake writes the peer-cert notAfter into
+/// A successful handshake writes the peer-cert notAfter into
 /// `COLLECTOR_CERT_NOT_AFTER` (the shared atomic that `collect_all_sources`
 /// reads to emit the `ngx_otel.tls.collector_cert.not_after` gauge).
 ///
@@ -585,7 +585,7 @@ fn successful_handshake_captures_cert_not_after() {
     );
 }
 
-/// B1 reuse-seam sanity: `crate::cert_table::asn1_time_to_unix` is callable
+/// Reuse-seam sanity: `crate::cert_table::asn1_time_to_unix` is callable
 /// from this module (i.e., it is `pub(crate)` and NOT duplicated here).
 /// This test calls the function directly — if it compiled with a private
 /// visibility the build would fail at this call site.

@@ -30,7 +30,7 @@ pub mod status_adapter;
 pub mod transport;
 
 // Generated protobuf types for the local Echo bidi-streaming service.
-// Phase 1.2 Item 2 mechanical exercise; not gated on test-support because the
+// A mechanical exercise of the bidi bridge; not gated on test-support because the
 // generated client types are used from smoke.rs (which IS gated), but the
 // proto types themselves (Ping, Pong) need to be reachable from examples/ too.
 // The server stub is used only from examples/bidi_echo_server.rs (dev-dep).

@@ -26,7 +26,7 @@
 //!
 //! `HyperHttpTransport<C: Connector>` is generic over the connector:
 //! - Tests use `HyperHttpTransport<SpinConnector>` via `::new()`.
-//! - Step 9's export loop uses `HyperHttpTransport<NgxConnector>` via
+//! - The export loop uses `HyperHttpTransport<NgxConnector>` via
 //!   `::with_ngx_log()`.
 //!
 //! # Precedent
@@ -71,7 +71,7 @@ use super::tls::{SslCtx, TlsNgxConnIo};
 use super::{DeliveryOutcome, TransportError};
 
 // ──────────────────────────────────────────────────────────────────────────────
-// OTLP/HTTP status → DeliveryOutcome adapter (S2)
+// OTLP/HTTP status → DeliveryOutcome adapter
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Which OTLP signal is being sent — used to select the correct
@@ -158,8 +158,9 @@ pub(crate) fn parse_retry_after(value: &str) -> Option<Duration> {
 /// Map an HTTP status code (and an optional parsed `Retry-After` duration) to
 /// a [`DeliveryOutcome`].
 ///
-/// This function encodes the OTLP/HTTP classification table exactly as
-/// spec-mandated (see `DELIVERY_OUTCOME_DESIGN.md`):
+/// This function encodes the OTLP/HTTP retry classification mandated by the
+/// OTLP specification's failure-handling rules
+/// (<https://opentelemetry.io/docs/specs/otlp/#failures-1>):
 /// - **2xx** → caller is responsible for the body decode (→ `Accepted` or
 ///   `PartialReject`); this function is NOT called for 2xx.
 /// - **EXACTLY 429, 502, 503, 504** → `Retryable { retry_after }` (the ONLY
@@ -244,7 +245,7 @@ pub(crate) enum ParsedEndpoint {
         port: u16,
         path: std::string::String,
     },
-    /// HTTPS (TLS) endpoint.  Introduced in A2 (TLS Phase A).
+    /// HTTPS (TLS) endpoint.
     ///
     /// Default port is 4317 (same as `http://` for gRPC) when the URL contains
     /// no explicit port — this matches OTel spec § `OTEL_EXPORTER_OTLP_ENDPOINT`
@@ -257,8 +258,8 @@ pub(crate) enum ParsedEndpoint {
         path: std::string::String,
     },
     Unix {
-        // Used by SpinConnector (test) and will be used by NgxConnector when
-        // Unix-socket support lands (Phase 1.2).
+        // Used by SpinConnector (test); NgxConnector will use it once
+        // Unix-socket support is implemented.
         #[allow(dead_code)]
         socket_path: std::string::String,
         http_path: std::string::String,
@@ -355,7 +356,7 @@ impl ParsedEndpoint {
     }
 
     /// Returns the port number.
-    // Used in A2 unit tests; production dispatch uses the host/port fields
+    // Used in unit tests; production dispatch uses the host/port fields
     // from the enum arms directly.
     #[allow(dead_code)]
     pub(crate) fn port(&self) -> Option<u16> {
@@ -750,8 +751,8 @@ impl hyper::rt::Read for NgxConnIo {
             // task contexts polling the same `NgxConnIo` (e.g., hyper's h2 client
             // spawning a `ConnTask` driver via `NgxExecutor`) — overwriting a
             // previously-stored waker silently loses a wakeup for the other task.
-            // The Phase 1.2 Item 1 investigation (`INVESTIGATION_h2_wake_stall.md`)
-            // used this exact log to rule out H1 (waker-overwrite race); the
+            // An investigation into an h2 wake stall used this exact log to rule
+            // out a waker-overwrite race; the
             // actual root cause turned out to be a deadlock during `_conn` drop
             // (h2's `Streams::drop` calls `Waker::wake()` while holding its
             // internal mutex, which ngx-rust's old `schedule()` would resolve
@@ -1104,7 +1105,7 @@ impl Unpin for SpinIo {}
 
 /// Provides a fresh IO connection to the configured endpoint.
 ///
-/// Tests inject [`SpinConnector`]; Step 9's export loop uses
+/// Tests inject `SpinConnector`; the export loop uses
 /// [`NgxConnector`].
 #[allow(async_fn_in_trait)]
 pub(crate) trait Connector: Send {
@@ -1565,8 +1566,8 @@ fn build_ipv6_sockaddr(
 
 /// HTTP/1.1 OTLP transport, generic over the IO connector.
 ///
-/// - Tests: `HyperHttpTransport<SpinConnector>` via [`HyperHttpTransport::new`].
-/// - Step 9: `HyperHttpTransport<NgxConnector>` via
+/// - Tests: `HyperHttpTransport<SpinConnector>` via `with_connector`.
+/// - Production: `HyperHttpTransport<NgxConnector>` via
 ///   [`HyperHttpTransport::with_ngx_log`].
 pub struct HyperHttpTransport<C> {
     endpoint: ParsedEndpoint,
@@ -1580,7 +1581,7 @@ pub struct HyperHttpTransport<C> {
     traces_path: std::string::String,
     /// TLS context for `https://` endpoints.  `None` for `http://` and `unix:`.
     /// When `Some`, each `send*` call wraps the raw TCP IO with a
-    /// [`TlsNgxConnIo`] before handing it to [`http_post`].
+    /// [`TlsNgxConnIo`] before handing it to `http_post`.
     ///
     /// `insecure = true` (from `ssl_verify off`) → `verify_hostname = false` on
     /// the `TlsNgxConnIo` constructor (verification disabled in the `SslCtx`
@@ -1618,7 +1619,7 @@ impl<C: Connector> HyperHttpTransport<C> {
     /// Derives the three per-signal HTTP paths from the configured base
     /// endpoint (OTel spec: normalize base to end with `/`, append
     /// `v1/{signal}`).  Callers may override individual paths afterwards
-    /// via [`set_metrics_path`], [`set_logs_path`], [`set_traces_path`].
+    /// via `set_metrics_path`, `set_logs_path`, `set_traces_path`.
     pub fn with_connector(
         endpoint_str: &str,
         headers: std::vec::Vec<(std::string::String, std::string::String)>,
@@ -1699,7 +1700,7 @@ where
 {
     /// Open a connection and optionally wrap it with TLS for `https://`
     /// endpoints.  Returns a boxed `IO` trait object so both the plain and TLS
-    /// paths share the same return type for use with [`http_post`].
+    /// paths share the same return type for use with `http_post`.
     ///
     /// The `SslCtx` is owned by `self.tls` for the transport's lifetime; the
     /// per-connection [`TlsNgxConnIo`] borrows a reference to it for the
@@ -1722,7 +1723,7 @@ where
     /// Send a batch of OTLP/HTTP protobuf metrics to the derived metrics path.
     ///
     /// Uses `self.metrics_path` (derived from the base endpoint as
-    /// `base/v1/metrics`, or overridden via [`set_metrics_path`]).
+    /// `base/v1/metrics`, or overridden via `set_metrics_path`).
     /// Maintains no cached connection; a failure leaves nothing to clean up.
     pub async fn send(
         &mut self,
@@ -1739,7 +1740,7 @@ where
     /// Send a batch of OTLP/HTTP log records to the derived logs path.
     ///
     /// Uses `self.logs_path` (derived from the base endpoint as
-    /// `base/v1/logs`, or overridden via [`set_logs_path`]).
+    /// `base/v1/logs`, or overridden via `set_logs_path`).
     pub async fn send_logs(
         &mut self,
         bytes: std::vec::Vec<u8>,
@@ -1755,7 +1756,7 @@ where
     /// Send a batch of OTLP/HTTP spans to the derived traces path.
     ///
     /// Uses `self.traces_path` (derived from the base endpoint as
-    /// `base/v1/traces`, or overridden via [`set_traces_path`]).
+    /// `base/v1/traces`, or overridden via `set_traces_path`).
     pub async fn send_traces(
         &mut self,
         bytes: std::vec::Vec<u8>,
@@ -2152,7 +2153,7 @@ mod tests {
         assert_eq!(strip_v6_brackets("::1"), "::1"); // already unbracketed
     }
 
-    // ── B1: base endpoint → per-signal path derivation ───────────────────────
+    // ── Base endpoint → per-signal path derivation ───────────────────────────
 
     /// `http://host:4318` (no trailing slash) → each signal gets `/v1/{signal}`.
     #[test]
@@ -2203,7 +2204,7 @@ mod tests {
         assert_eq!(t, "/prefix/v1/traces");
     }
 
-    // ── B2: per-signal path overrides ────────────────────────────────────────
+    // ── Per-signal path overrides ────────────────────────────────────────────
 
     /// `set_metrics_path` overrides the derived metrics path; logs/traces unchanged.
     #[test]
@@ -2311,7 +2312,7 @@ mod tests {
         }
     }
 
-    // ── A2: HTTPS endpoint parsing + dispatch ─────────────────────────────────
+    // ── HTTPS endpoint parsing + dispatch ─────────────────────────────────────
 
     /// `ParsedEndpoint::parse` accepts `https://` and returns the `Https` variant
     /// (no longer returns an error).
@@ -2451,7 +2452,7 @@ mod tests {
         assert_eq!(t.traces_path, "/v1/traces");
     }
 
-    /// `http://` and `unix:` paths continue to work after A2 changes (no regression).
+    /// `http://` and `unix:` paths continue to work alongside HTTPS (no regression).
     #[test]
     fn a2_existing_http_and_unix_paths_unaffected() {
         let t_http = HyperHttpTransport::<SpinConnector>::new("http://127.0.0.1:4318", vec![])
@@ -2463,11 +2464,11 @@ mod tests {
         assert_eq!(t_unix.metrics_path, "/v1/metrics");
     }
 
-    // ── F1: production TLS-dispatch coverage (connect_io) ─────────────────────
+    // ── Production TLS-dispatch coverage (connect_io) ─────────────────────────
     //
     // These tests drive the PRODUCTION `connect_io` path end-to-end against a
-    // real TLS server (`openssl s_server`). They are the regression coverage
-    // the A2 review found missing: forcing the `https` dispatch onto the
+    // real TLS server (`openssl s_server`). They are regression coverage for
+    // the `https` dispatch: forcing it onto the
     // plaintext branch (returning `Box::new(raw)` for an https endpoint) makes
     // `tls_dispatch_https_completes_tls_roundtrip` FAIL (plaintext bytes hit a
     // TLS-expecting server → the handshake/round-trip errors).
@@ -2797,13 +2798,13 @@ mod tests {
         }
     }
 
-    // ── S2: OTLP/HTTP adapter — DeliveryOutcome mapping ──────────────────────
+    // ── OTLP/HTTP adapter — DeliveryOutcome mapping ──────────────────────────
     //
     // These tests exercise the pure mapping functions (no live server needed).
     // Mutation evidence: the test names describe the code path; the assertions
     // directly check the resulting `DeliveryOutcome` variant.
 
-    /// S2: 200 with no body (empty partial_success) → Accepted.
+    /// 200 with no body (empty partial_success) → Accepted.
     ///
     /// Mutation evidence: change the `is_success()` branch to return
     /// `PartialReject { rejected: 1 }` → assertion fails → test FAILS;
@@ -2816,7 +2817,7 @@ mod tests {
         assert_eq!(outcome, DeliveryOutcome::Accepted);
     }
 
-    /// S2: 200 + partial_success with rejected_data_points > 0 → PartialReject.
+    /// 200 + partial_success with rejected_data_points > 0 → PartialReject.
     ///
     /// Encodes a real `ExportMetricsServiceResponse` via prost, then verifies
     /// the adapter decodes it correctly.
@@ -2845,7 +2846,7 @@ mod tests {
         assert_eq!(outcome, DeliveryOutcome::PartialReject { rejected: 7 });
     }
 
-    /// S2: 200 + partial_success with rejected_log_records > 0 → PartialReject.
+    /// 200 + partial_success with rejected_log_records > 0 → PartialReject.
     ///
     /// Mutation evidence: same as metrics test.
     #[test]
@@ -2869,7 +2870,7 @@ mod tests {
         assert_eq!(outcome, DeliveryOutcome::PartialReject { rejected: 3 });
     }
 
-    /// S2: 200 + partial_success with rejected_spans > 0 → PartialReject.
+    /// 200 + partial_success with rejected_spans > 0 → PartialReject.
     ///
     /// Mutation evidence: same as metrics test.
     #[test]
@@ -2893,7 +2894,7 @@ mod tests {
         assert_eq!(outcome, DeliveryOutcome::PartialReject { rejected: 42 });
     }
 
-    /// S2: 429 with a `Retry-After: 60` header → Retryable{Some(60s)}.
+    /// 429 with a `Retry-After: 60` header → Retryable{Some(60s)}.
     ///
     /// Mutation evidence: change the `429` arm to `DeliveryOutcome::Permanent`
     /// → assertion fails → test FAILS; restore → PASS.
@@ -2909,7 +2910,7 @@ mod tests {
         );
     }
 
-    /// S2: 503 with no `Retry-After` header → Retryable{None}.
+    /// 503 with no `Retry-After` header → Retryable{None}.
     ///
     /// Mutation evidence: change the `503` arm to `Permanent` → assertion fails
     /// → test FAILS; restore → PASS.
@@ -2921,7 +2922,7 @@ mod tests {
         assert_eq!(outcome, DeliveryOutcome::Retryable { retry_after: None });
     }
 
-    /// S2: 502 → Retryable (bad gateway is in the retryable set).
+    /// 502 → Retryable (bad gateway is in the retryable set).
     #[test]
     fn s2_502_retryable() {
         let status = hyper::StatusCode::BAD_GATEWAY;
@@ -2930,7 +2931,7 @@ mod tests {
         assert_eq!(outcome, DeliveryOutcome::Retryable { retry_after: None });
     }
 
-    /// S2: 504 → Retryable (gateway timeout is in the retryable set).
+    /// 504 → Retryable (gateway timeout is in the retryable set).
     #[test]
     fn s2_504_retryable() {
         let status = hyper::StatusCode::GATEWAY_TIMEOUT;
@@ -2939,7 +2940,7 @@ mod tests {
         assert_eq!(outcome, DeliveryOutcome::Retryable { retry_after: None });
     }
 
-    /// S2: 400 → Permanent (MUST NOT retry per OTLP spec).
+    /// 400 → Permanent (MUST NOT retry per OTLP spec).
     ///
     /// Mutation evidence: change 400 to map to `Retryable` → assertion fails
     /// → test FAILS; restore → PASS.
@@ -2951,7 +2952,7 @@ mod tests {
         assert_eq!(outcome, DeliveryOutcome::Permanent);
     }
 
-    /// S2: 404 → Permanent.
+    /// 404 → Permanent.
     #[test]
     fn s2_404_permanent() {
         let status = hyper::StatusCode::NOT_FOUND;
@@ -2960,7 +2961,7 @@ mod tests {
         assert_eq!(outcome, DeliveryOutcome::Permanent);
     }
 
-    /// S2: 413 → Permanent (payload too large; the batch will never be accepted).
+    /// 413 → Permanent (payload too large; the batch will never be accepted).
     #[test]
     fn s2_413_permanent() {
         let status = hyper::StatusCode::PAYLOAD_TOO_LARGE;
@@ -2969,7 +2970,7 @@ mod tests {
         assert_eq!(outcome, DeliveryOutcome::Permanent);
     }
 
-    /// S2: 501 → Permanent (not implemented; no retry will change that).
+    /// 501 → Permanent (not implemented; no retry will change that).
     #[test]
     fn s2_501_permanent() {
         let status = hyper::StatusCode::NOT_IMPLEMENTED;
@@ -2978,7 +2979,7 @@ mod tests {
         assert_eq!(outcome, DeliveryOutcome::Permanent);
     }
 
-    /// S2: 500 → Permanent (internal server error is NOT in the retryable set).
+    /// 500 → Permanent (internal server error is NOT in the retryable set).
     ///
     /// Mutation evidence: change the match to treat 500 as `Retryable` → FAILS.
     #[test]
@@ -2989,7 +2990,7 @@ mod tests {
         assert_eq!(outcome, DeliveryOutcome::Permanent);
     }
 
-    /// S2: 401 → Unauthorized (auth failure; same drop action as Permanent but
+    /// 401 → Unauthorized (auth failure; same drop action as Permanent but
     /// distinct variant for its own counter).
     ///
     /// Mutation evidence: change `401` arm to `Permanent` → assertion fails
@@ -3002,7 +3003,7 @@ mod tests {
         assert_eq!(outcome, DeliveryOutcome::Unauthorized);
     }
 
-    /// S2: 403 → Unauthorized (permission denied; same policy as 401).
+    /// 403 → Unauthorized (permission denied; same policy as 401).
     ///
     /// Mutation evidence: change `403` arm to `Permanent` → assertion fails
     /// → test FAILS; restore → PASS.
@@ -3014,7 +3015,7 @@ mod tests {
         assert_eq!(outcome, DeliveryOutcome::Unauthorized);
     }
 
-    /// S2: `parse_retry_after` parses delta-seconds correctly.
+    /// `parse_retry_after` parses delta-seconds correctly.
     ///
     /// Mutation evidence: remove the `parse::<u64>()` branch → returns `None`
     /// → assertion fails → test FAILS; restore → PASS.
@@ -3025,7 +3026,7 @@ mod tests {
         assert_eq!(parse_retry_after("  30  "), Some(Duration::from_secs(30)));
     }
 
-    /// S2: `parse_retry_after` returns `None` for garbage values.
+    /// `parse_retry_after` returns `None` for garbage values.
     #[test]
     fn s2_parse_retry_after_garbage_returns_none() {
         assert_eq!(parse_retry_after(""), None);
@@ -3033,7 +3034,7 @@ mod tests {
         assert_eq!(parse_retry_after("abc def"), None);
     }
 
-    /// S2: `parse_retry_after` parses an HTTP-date form correctly.
+    /// `parse_retry_after` parses an HTTP-date form correctly.
     ///
     /// An HTTP-date in the future must produce a `Some(duration > 0)`.
     /// We can't assert an exact value (wall-clock dependent), so we check
@@ -3051,7 +3052,7 @@ mod tests {
         assert!(result.unwrap() > Duration::ZERO, "duration for a future HTTP-date must be > 0");
     }
 
-    /// S2: `decode_partial_success_rejected` returns 0 for an empty body.
+    /// `decode_partial_success_rejected` returns 0 for an empty body.
     #[test]
     fn s2_decode_partial_success_empty_body_is_zero() {
         assert_eq!(decode_partial_success_rejected(OtlpSignal::Metrics, b""), 0);
@@ -3059,7 +3060,7 @@ mod tests {
         assert_eq!(decode_partial_success_rejected(OtlpSignal::Traces, b""), 0);
     }
 
-    /// S2: `decode_partial_success_rejected` returns 0 for a garbage body
+    /// `decode_partial_success_rejected` returns 0 for a garbage body
     /// (best-effort: corrupted 2xx is treated as accepted).
     #[test]
     fn s2_decode_partial_success_garbage_body_is_zero() {
@@ -3071,7 +3072,7 @@ mod tests {
         assert_eq!(n, 0);
     }
 
-    /// S2: `map_http_status_to_outcome` — retryable set is exactly {429,502,503,504}.
+    /// `map_http_status_to_outcome` — retryable set is exactly {429,502,503,504}.
     ///
     /// Mutation evidence: add 500 to the retryable match arm → `500` row gets
     /// `Retryable` instead of `Permanent` → assertion fails → test FAILS;

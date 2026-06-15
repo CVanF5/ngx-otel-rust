@@ -3,15 +3,15 @@
 // This source code is licensed under the Apache License, Version 2.0 license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! Production OTLP/gRPC transport: `GrpcTransport<C>` implements [`Transport`]
-//! by issuing a unary `MetricsService.Export` call over a persistent h2/tonic
+//! Production OTLP/gRPC transport: `GrpcTransport<C>` issues a unary
+//! `MetricsService.Export` call over a persistent h2/tonic
 //! connection driven by the NGINX event loop.  No Tokio runtime.
 //!
 //! # Connection lifecycle
 //!
-//! The h2 connection is established lazily on the first [`Transport::send`]
+//! The h2 connection is established lazily on the first `send`
 //! call and reused across subsequent calls.  If any call fails, the client
-//! is dropped so the next [`Transport::send`] reconnects fresh.  This matches
+//! is dropped so the next `send` reconnects fresh.  This matches
 //! the reconnect-on-failure parity expected of the HTTP transport.
 //!
 //! # No Tokio runtime
@@ -77,14 +77,14 @@ pub struct GrpcTransport<C: Connector> {
     /// Cached gRPC metrics client over the persistent h2 connection.
     /// `None` on construction and after any failed `send`; rebuilt lazily.
     client: Option<MetricsServiceClient<SendRequestService<tonic::body::Body>>>,
-    /// Cached gRPC logs client (Phase 2.1).  Uses a separate h2 connection;
+    /// Cached gRPC logs client.  Uses a separate h2 connection;
     /// a future optimisation could share the sender via `SendRequest::clone()`.
     logs_client: Option<LogsServiceClient<SendRequestService<tonic::body::Body>>>,
-    /// Cached gRPC traces client (Phase 3.1).  Uses a separate h2 connection.
+    /// Cached gRPC traces client.  Uses a separate h2 connection.
     traces_client: Option<TraceServiceClient<SendRequestService<tonic::body::Body>>>,
-    /// TLS context for `https://` endpoints (TLS Phase A — A2). `None` for
+    /// TLS context for `https://` endpoints. `None` for
     /// plaintext (`http://`) h2c. `bool` mirrors `ssl_verify off` (insecure).
-    /// One `TlsNgxConnIo` engine serves both transports (decision of record);
+    /// One `TlsNgxConnIo` engine serves both transports;
     /// the gRPC path additionally negotiates ALPN `h2`.
     tls: Option<(SslCtx, bool)>,
 }
@@ -279,7 +279,7 @@ where
             Ok(resp) => {
                 // Connection still alive — store the client back for reuse.
                 self.client = Some(client);
-                // S3: decode partial_success from the OK response.
+                // decode partial_success from the OK response.
                 // partial_success.rejected_data_points > 0 → PartialReject; else Accepted.
                 let rejected = resp
                     .into_inner()
@@ -305,7 +305,7 @@ where
                 // failure parity with HyperHttpTransport (which opens a new
                 // connection on every send).
                 //
-                // S3: map the gRPC status code to a protocol-neutral outcome
+                // map the gRPC status code to a protocol-neutral outcome
                 // instead of folding all errors into TransportError::Connection.
                 // The caller (drain loop) matches on DeliveryOutcome and applies
                 // the right policy (retry / drop / backoff / unauthorized).
@@ -315,7 +315,7 @@ where
     }
 }
 
-// ── Logs send (Phase 2.1) ─────────────────────────────────────────────────────
+// ── Logs send ─────────────────────────────────────────────────────
 
 #[allow(private_bounds)] // see note on the struct definition above
 impl<C: Connector + Send> GrpcTransport<C>
@@ -325,7 +325,7 @@ where
     /// Send an `ExportLogsServiceRequest` (already prost-encoded) to the
     /// `LogsService/Export` RPC.
     ///
-    /// Mirrors [`Transport::send`] but decodes `ExportLogsServiceRequest` and
+    /// Mirrors `send` but decodes `ExportLogsServiceRequest` and
     /// uses the `LogsServiceClient`.  Drops and re-creates the logs client on
     /// failure (same reconnect-on-failure parity as the metrics client).
     pub async fn send_logs(
@@ -368,7 +368,7 @@ where
         match result {
             Ok(resp) => {
                 self.logs_client = Some(client);
-                // S3: decode partial_success.rejected_log_records.
+                // decode partial_success.rejected_log_records.
                 let rejected = resp
                     .into_inner()
                     .partial_success
@@ -393,7 +393,7 @@ where
 
     /// Send an already-encoded `ExportTraceServiceRequest` over gRPC.
     ///
-    /// Decodes the bytes (the same encoding [`OtlpTracesEncoder`] produces)
+    /// Decodes the bytes (the same encoding `OtlpTracesEncoder` produces)
     /// and issues a unary `TraceService/Export` RPC.  The traces client uses
     /// its own h2 connection (same lazy-connect pattern as `logs_client`).
     ///
@@ -439,7 +439,7 @@ where
         match result {
             Ok(resp) => {
                 self.traces_client = Some(client);
-                // S3: decode partial_success.rejected_spans.
+                // decode partial_success.rejected_spans.
                 let rejected = resp
                     .into_inner()
                     .partial_success
@@ -496,12 +496,12 @@ mod tests {
         );
     }
 
-    /// HTTPS endpoints must be accepted by GrpcTransport (TLS Phase A — A2).
+    /// HTTPS endpoints must be accepted by `GrpcTransport`.
     ///
-    /// `ParsedEndpoint::parse("https://...")` now returns `Https { .. }` instead
+    /// `ParsedEndpoint::parse("https://...")` returns `Https { .. }` instead
     /// of an error; `GrpcTransport::with_connector` builds an `https://` origin
-    /// URI for tonic.  The TLS handshake is wired in the connector dispatch layer
-    /// (A2 / A3); construction itself must succeed here.
+    /// URI for tonic.  The TLS handshake is wired in the connector dispatch
+    /// layer; construction itself must succeed here.
     #[test]
     fn grpc_transport_accepts_https_endpoint() {
         let log_ptr = core::ptr::NonNull::dangling();
@@ -509,7 +509,7 @@ mod tests {
             GrpcTransport::<NgxConnector>::with_ngx_log("https://127.0.0.1:4317", log_ptr, None, 0);
         assert!(
             result.is_ok(),
-            "https:// endpoints must be accepted by GrpcTransport (TLS Phase A): {:?}",
+            "https:// endpoints must be accepted by GrpcTransport: {:?}",
             result.err()
         );
     }
@@ -523,7 +523,7 @@ mod tests {
     }
 
     /// A DNS-name endpoint must parse and construct a `GrpcTransport` without
-    /// error.  The transport inherits DNS resolution from `NgxConnector` (Item 3)
+    /// error.  The transport inherits DNS resolution from `NgxConnector`
     /// via the `Connector::connect` delegation — `GrpcTransport` has no own
     /// connect logic.  The resolver is `None` here; if `send` were called it
     /// would produce a clear `TransportError::Connection` ("configure nginx's

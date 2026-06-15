@@ -3,16 +3,14 @@
 // This source code is licensed under the Apache License, Version 2.0 license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! In-worker gRPC viability harness for Phase 1.2 Item 1.
+//! In-worker unary gRPC viability harness.
 //!
-//! Phase 1.2 Item 1 originally produced two correct code artifacts —
+//! The two reusable artifacts —
 //! [`NgxExecutor`](super::executor::NgxExecutor) and
-//! [`SendRequestService`](super::shim::SendRequestService) — but the
-//! freestanding `cargo test` smoke that was supposed to exercise them
-//! ended up driving its own non-production executor and `SpinTcpIo` rather
-//! than the real [`NgxConnIo`].  The review agent flagged this: the
-//! architectural pipeline `tonic → SendRequest → NgxConnIo → C event
-//! handlers` was never actually run.
+//! [`SendRequestService`](super::shim::SendRequestService) — must be exercised
+//! by the REAL production pipeline `tonic → SendRequest → NgxConnIo → C event
+//! handlers`, not by a freestanding `cargo test` smoke that drives its own
+//! non-production executor and `SpinTcpIo` instead of the real [`NgxConnIo`].
 //!
 //! This module is the fix.  When the `test-support` feature is enabled
 //! (set in `Cargo.toml`'s `[features]` block and passed to
@@ -63,8 +61,8 @@
 //! logic in `src/lib.rs::init_process` is `#[cfg]`-gated to match, so the
 //! directive becomes a silent no-op.  Production builds carry no gRPC
 //! code beyond the small `NgxExecutor` + `SendRequestService` types,
-//! which are themselves dead-code unless a future Phase 1.2 Item swaps
-//! the export loop's transport.
+//! which are themselves dead-code unless a future change swaps
+//! the export loop onto the gRPC transport.
 
 use core::ptr::NonNull;
 
@@ -148,9 +146,9 @@ pub enum SmokeError {
     InvalidOrigin(std::string::String),
     GrpcReady(std::string::String),
     GrpcCall(std::string::String),
-    /// A bidi gRPC call step failed (Phase 1.2 Item 2).
+    /// A bidi gRPC call step failed.
     BidiCall(std::string::String),
-    /// Sent/received ping counts diverged (Phase 1.2 Item 2).
+    /// Sent/received ping counts diverged.
     BidiSendMismatch {
         sent: u64,
         received: u64,
@@ -181,7 +179,7 @@ impl core::fmt::Display for SmokeError {
 /// be spawned from `init_process` via `ngx::async_::spawn` so the entire
 /// async chain runs on the NGINX worker's event loop, exercising the real
 /// [`NgxExecutor`] + [`SendRequestService`] + [`NgxConnIo`] stack the
-/// Phase 1.2 design depends on.
+/// gRPC transport depends on.
 ///
 /// Returns `Ok(())` if the collector accepted the request (any 2xx response
 /// in HTTP terms; tonic surfaces a successful gRPC `OK` status).  All
@@ -289,7 +287,7 @@ pub async fn fire_one_grpc_export(
     Ok(())
 }
 
-// ── Phase 1.2 Item 2: bidi smoke ─────────────────────────────────────────────
+// ── Bidi smoke ───────────────────────────────────────────────────────────────
 
 /// Async send-one helper for `futures_channel::mpsc::Sender<T>`.
 ///
@@ -314,9 +312,10 @@ async fn mpsc_send_one(
 /// pollable without deadlock, livelock, or a Tokio runtime.
 ///
 /// The asymmetric drain sequence (Phase A: send 3, drain 3; Phase B: send 7,
-/// drain 7; Phase C: close then confirm stream end) is the mechanical contract
-/// Phase 1.2 Item 2 establishes.  If the bridge serializes send and receive,
-/// Phase A-drain hangs — the function reports that via `BidiCall`.
+/// drain 7; Phase C: close then confirm stream end) is the mechanical contract.
+/// These A/B/C labels name the steps of this one test, not project milestones.
+/// If the bridge serializes send and receive,
+/// the Phase-A drain hangs — the function reports that via `BidiCall`.
 ///
 /// On success logs `"bidi smoke: bidi complete (sent=10, received=10)"` at
 /// NOTICE — the exact string `run_grpc_bidi_smoke.sh` asserts on.
@@ -474,7 +473,7 @@ pub async fn fire_one_bidi_stream(
     Ok(())
 }
 
-// ── Phase 1.2 Item 3: bidi backpressure / overload ───────────────────────────
+// ── Bidi backpressure / overload ─────────────────────────────────────────────
 
 use core::time::Duration;
 

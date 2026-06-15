@@ -5,9 +5,9 @@
 
 //! Generated code for the local Echo bidi-streaming proto.
 //!
-//! Phase 1.2 Item 2 mechanical exercise of the gRPC bridge.  The proto
-//! is a throwaway local definition; Phase 5 will replace it with OTAP's
-//! `arrow_service.proto` when that protocol firms up.
+//! A mechanical exercise of the bidi-streaming gRPC bridge.  The proto
+//! is a throwaway local definition; a future OTAP transport would replace it
+//! with OTAP's `arrow_service.proto` when that protocol firms up.
 
 pub mod ngx_otel_echo_v1 {
     // This file includes the CLIENT-ONLY generated code for the echo proto.
