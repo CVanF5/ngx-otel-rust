@@ -404,7 +404,9 @@ unsafe fn check_zone_sizing(
 /// allows nginx to honour it. With `daemon off` the exporter is a direct child
 /// of the master (no double-fork), so SIGCHLD and graceful-quit work correctly.
 ///
-/// See `PHASE_1_3_RESEARCH.md` §2.7–2.9, §5.2 and Q4 for design decisions.
+/// The exporter runs as a dedicated child process so that async I/O (tokio) is
+/// fully isolated from nginx's event loop; process separation means a tokio
+/// panic or network-stack freeze cannot stall nginx worker request handling.
 extern "C" fn ngx_otel_init_module(cycle: *mut nginx_sys::ngx_cycle_t) -> nginx_sys::ngx_int_t {
     // SAFETY: `ngx_process` is a nginx global written once by the master before
     // any module init hook runs and thereafter read-only within a process, so this

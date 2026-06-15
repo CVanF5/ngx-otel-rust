@@ -1382,9 +1382,8 @@ impl NgxConnector {
             {
                 let this = io.as_mut().get_mut();
                 // Install the ready sockaddr/socklen from the resolved addr.
-                // The plan: "each ngx_addr_t already carries a ready
-                // sockaddr + socklen + family — install it directly into pc"
-                // (TRANSPORT_DNS_DUALSTACK_PLAN.md Step 3).
+                // Each ngx_addr_t already carries a ready sockaddr + socklen +
+                // family; install it directly into pc.
                 this.pc.sockaddr = addr.sockaddr;
                 this.pc.socklen = addr.socklen;
                 // pc.name for debug logging under --with-debug.
@@ -1820,8 +1819,8 @@ pub(crate) fn is_ip_literal(host_str: &str) -> bool {
 /// class and (optionally) an ALPN protocol.
 ///
 /// One TLS engine ([`TlsNgxConnIo`]) serves BOTH transports (HTTP/1.1 and
-/// h2/tonic) — the decision of record. The two callers differ in exactly two
-/// parameters handled here:
+/// h2/tonic), avoiding duplicated certificate-verification logic. The two
+/// callers differ in exactly two parameters handled here:
 ///
 /// - **host class:** a DNS name verifies via `X509_VERIFY_PARAM_set1_host`
 ///   (inside `TlsNgxConnIo::new(…, verify_hostname=true)`); an IP literal

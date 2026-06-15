@@ -208,7 +208,7 @@ fn proto_duration_to_std(d: prost_types::Duration) -> Option<Duration> {
 ///
 /// This function encodes the OTLP/gRPC retry classification mandated by the
 /// OTLP specification's failure-handling rules
-/// (<https://opentelemetry.io/docs/specs/otlp/#failures-1>):
+/// (<https://opentelemetry.io/docs/specs/otlp/#failures>):
 ///
 /// - `OK` → `Accepted` (the caller handles `partial_success`; this function is
 ///   only called on error paths — see `grpc_status_to_outcome` for the full

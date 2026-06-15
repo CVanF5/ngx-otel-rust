@@ -13,8 +13,8 @@
 //! or after `uri_changes`** therefore reads 2 bits low (`internal()` reads bit
 //! 84, the real flag is bit 86).  This is the allocation-unit-sharing bug class
 //! (rust-bindgen #111 / #743 / #1132), reproduced on gcc-14, clang-19, and Apple
-//! clang — see `BINDGEN_BITFIELD_ISSUE_DRAFT.md` and
-//! `src/shim/ngx_otel_bitfield_shim.c` for the full evidence.
+//! clang.  The full evidence (DWARF layout vs. bindgen output, three-compiler
+//! comparison) is recorded in `src/shim/ngx_otel_bitfield_shim.c`.
 //!
 //! The shim functions are compiled by `build.rs` (via the `cc` crate) against
 //! the real nginx headers, so they read exactly the bits nginx itself reads —
