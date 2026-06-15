@@ -8,20 +8,20 @@
 //! Loading this module without an `otel_exporter { endpoint ... }` directive
 //! MUST impose zero per-request overhead.  The invariant is maintained at
 //! exactly two gating points — both checked against
-//! [`config::MainConfig::is_configured()`]:
+//! `config::MainConfig::is_configured()`:
 //!
 //! 1. **Log-phase handler gate** (`src/lib.rs` — `postconfiguration`):
 //!    `add_phase_handler` is called **only** when `amcf.is_configured()` is
 //!    true.  If the exporter is not configured the phase handler is never
 //!    registered and no per-request code runs.
-//!    See [`HttpOtelModule::postconfiguration`] — the `if amcf.is_configured()`
+//!    See `HttpOtelModule::postconfiguration` — the `if amcf.is_configured()`
 //!    block surrounding the `add_phase_handler` call.
 //!
 //! 2. **Export-task gate** (`src/lib.rs` — `ngx_otel_init_process`):
 //!    The async export loop is spawned **only** when `amcf.is_configured()` is
 //!    true.  If the exporter is not configured the process hook returns early
 //!    with no allocation, no task spawn, and no background activity.
-//!    See [`ngx_otel_init_process`] — the `if !amcf.is_configured()` early
+//!    See `ngx_otel_init_process` — the `if !amcf.is_configured()` early
 //!    return that precedes any `ngx::async_::spawn` or `Pool::allocate` call.
 //!
 //! **Invariant contract:**
@@ -29,12 +29,18 @@
 //! - No per-request locking on the disabled path.
 //! - No background tasks on the disabled path.
 //!
-//! This is the load-bearing claim for upstream acceptance; see
-//! `PHASE_1.1_IMPLEMENTATION_PLAN.md` §"Non-negotiable constraints" and
-//! the upstream proposal §2.  Step 11 contains the benchmark harness that
-//! proves this claim statistically.
+//! This is the load-bearing claim for upstream acceptance: a module that is
+//! loaded but unconfigured must be indistinguishable from one that is not
+//! loaded at all.
 
 #![no_std]
+// Doc-comment hygiene: every intra-doc link (`[`Type`]`) must resolve, so a
+// broken reference fails the `cargo doc` build instead of silently shipping a
+// dead link to docs.rs.  Enforced via `make doc-check`
+// (RUSTDOCFLAGS="-D warnings" cargo doc) — `cargo clippy` does not run rustdoc
+// lints.  Bare URLs are warned so they get wrapped in `<...>` for rendering.
+#![deny(rustdoc::broken_intra_doc_links)]
+#![warn(rustdoc::bare_urls)]
 // Require a 64-bit target: the shm rings use monotonically-increasing u64
 // byte offsets cast to `usize` on every push/pop, and stub_status treats
 // `ngx_atomic_t` (c_ulong) as `u64`. Both assumptions break silently on
@@ -201,9 +207,10 @@ fn spawn_exporter_for_cycle(
     Status::NGX_OK.into()
 }
 
-// ── A1: zone-sizing validation ────────────────────────────────────────────────
+// ── Zone-sizing validation ──────────────────────────────────────────────────
 
-/// B4 — Detect the pre-daemon context where the gen-1 exporter will be orphaned.
+/// Detect the pre-daemon context where the first-generation exporter will be
+/// orphaned.
 ///
 /// Returns `true` when ALL of:
 ///   - `ccf->daemon == 1` (the `daemon on` directive — default)
@@ -253,7 +260,8 @@ unsafe fn is_pre_daemon_initial_start(cycle: *const nginx_sys::ngx_cycle_t) -> b
 /// Read the final `worker_processes` from the fully-parsed nginx cycle.
 ///
 /// Called from `ngx_otel_init_module` (post-parse, so the value is final)
-/// and from `check_zone_sizing` to detect the hostile-ordering mismatch.
+/// and from `check_zone_sizing` to detect the directive-ordering mismatch
+/// where `worker_processes` exceeds the capacity reserved at zone registration.
 ///
 /// # Safety
 /// `cycle` must be a valid non-null `ngx_cycle_t` pointer.
@@ -278,7 +286,7 @@ unsafe fn worker_processes_from_cycle(cycle: *const nginx_sys::ngx_cycle_t) -> O
     }
 }
 
-/// A1/A1b — Zone-sizing validation at init_module time.
+/// Zone-sizing validation at init_module time.
 ///
 /// Computes the RESERVED capacity (from each zone's registered size) and
 /// compares it against the ACTUAL (post-parse, final) `worker_processes`.
@@ -289,7 +297,7 @@ unsafe fn worker_processes_from_cycle(cycle: *const nginx_sys::ngx_cycle_t) -> O
 ///   explicit large count appears after `http{}` on a box where ncpu < count.
 ///   The operator gets a clear error and nginx refuses to start/reload.
 ///
-/// A1b: zones are now sized for `max(ngx_ncpu, actual_workers)` at parse time,
+/// Zones are sized for `max(ngx_ncpu, actual_workers)` at parse time,
 /// so the typical `worker_processes N;` after `http{}` succeeds as long as
 /// N ≤ ncpu.
 ///
@@ -357,7 +365,7 @@ unsafe fn check_zone_sizing(
         return Ok(());
     }
 
-    // actual_workers > reserved — the residual A1b error case.
+    // actual_workers > reserved — the residual error case.
     // This happens when an explicit large count (e.g. `worker_processes 64`)
     // appears AFTER `http{}` on a box where ncpu (= reserved capacity) < 64.
     // Refuse to start so the operator gets a clear message.
@@ -424,8 +432,8 @@ extern "C" fn ngx_otel_init_module(cycle: *mut nginx_sys::ngx_cycle_t) -> nginx_
         return Status::NGX_OK.into();
     }
 
-    // A1 — Fail-fast: verify every shm zone was sized for the actual
-    // worker_processes count.  Catches the hostile ordering where
+    // Fail-fast: verify every shm zone was sized for the actual
+    // worker_processes count.  Catches the directive ordering where
     // `worker_processes N;` appears after `http{}` — postconfiguration sees
     // NGX_CONF_UNSET and sizes for 1, then workers 1..N-1 would write past the
     // zone end.  We refuse to start with a clear error instead.
@@ -446,7 +454,7 @@ extern "C" fn ngx_otel_init_module(cycle: *mut nginx_sys::ngx_cycle_t) -> nginx_
         !old.is_null() && !(*old).conf_ctx.is_null()
     };
 
-    // B1: On reload, announce the successor BEFORE forking the new exporter.
+    // On reload, announce the successor BEFORE forking the new exporter.
     // This runs in the master process, sequentially before `ngx_spawn_process`
     // is called.  The channel message (NGX_CMD_QUIT) sent to the old exporter
     // by the master AFTER this point provides the happens-before ordering: by
@@ -468,7 +476,7 @@ extern "C" fn ngx_otel_init_module(cycle: *mut nginx_sys::ngx_cycle_t) -> nginx_
         }
     }
 
-    // B4 — Warn when the gen-1 exporter will be orphaned after daemonize.
+    // Warn when the first-generation exporter will be orphaned after daemonize.
     //
     // nginx/src/core/nginx.c call order:
     //   line 293: ngx_init_cycle() → ngx_init_modules() → this callback
@@ -564,7 +572,7 @@ impl HttpModule for HttpOtelModule {
             return e.into();
         }
 
-        // Phase 3.3: register REWRITE-phase span-start handler when configured.
+        // Register the REWRITE-phase span-start handler when configured.
         // The handler checks `amcf.is_configured()` itself on every request (zero
         // cost when unconfigured), but registration is also gated here so the
         // handler is not even in the phase chain when the module is unconfigured.
@@ -622,7 +630,7 @@ unsafe extern "C" fn otel_var_get_trace_id(
     // SAFETY: `ngx_http_otel_module` is a `static` module descriptor valid for
     // the full process lifetime; `addr_of!` yields a valid pointer.
     let module = unsafe { &*::core::ptr::addr_of!(ngx_http_otel_module) };
-    // H3F1: recover the SpanCtx from the pool-cleanup anchor when the module-ctx
+    // Recover the SpanCtx from the pool-cleanup anchor when the module-ctx
     // slot was cleared by an internal redirect (recovery walks only on NULL slot
     // + r->internal/filter_finalize; otherwise this is a single pointer load).
     let ctx: Option<&SpanCtx> = match request.get_module_ctx::<SpanCtx>(module) {
@@ -686,7 +694,7 @@ unsafe extern "C" fn otel_var_get_parent_sampled(
     // SAFETY: `ngx_http_otel_module` is a `static` module descriptor valid for
     // the full process lifetime; `addr_of!` yields a valid pointer.
     let module = unsafe { &*::core::ptr::addr_of!(ngx_http_otel_module) };
-    // H3F1: recover the SpanCtx from the pool-cleanup anchor when the module-ctx
+    // Recover the SpanCtx from the pool-cleanup anchor when the module-ctx
     // slot was cleared by an internal redirect (see otel_var_get_trace_id).
     let ctx: Option<&SpanCtx> = match request.get_module_ctx::<SpanCtx>(module) {
         Some(c) => Some(c),
@@ -726,19 +734,15 @@ unsafe extern "C" fn otel_var_get_parent_sampled(
 
 /// Called by NGINX once per worker process after the process has forked.
 ///
-/// Phase 1.3.2: workers are no longer the owner of the export task.
-/// The `nginx: otel exporter` process (spawned in `ngx_otel_init_module`)
-/// owns the export task starting from Phase 1.3.2.2.
-///
-/// Q3 RESOLVED: callback kept registered (not `None`) for Phase 2.
-/// Phase 2 (logs) will populate this with per-worker LogProducer
-/// initialisation — one ring writer per worker.
+/// Workers do not own the export task; the `nginx: otel exporter` process
+/// (spawned in `ngx_otel_init_module`) owns it.  This callback stays registered
+/// so each worker can initialise its per-worker log ring writer.
 ///
 /// The `#[cfg(any(test, feature = "test-support"))]` gRPC smoke harnesses
-/// remain on Worker 0 for the Phase 1.2 gRPC integration tests. They do
+/// remain on Worker 0 for the gRPC integration tests. They do
 /// not run in production builds (no allocation, no task spawn).
 extern "C" fn ngx_otel_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
-    // ── Phase 2.3 Step 2.3.5: wire error-writer shm pointers (DP-C) ─────────
+    // ── Wire error-writer shm pointers ──────────────────────────────────────
     //
     // Gate: Worker only + logs shm mapped.  Exporter and master contexts must
     // fall through to core error_log; the process-role guard in
@@ -809,7 +813,7 @@ extern "C" fn ngx_otel_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
         }
     }
 
-    // ── H3F2: eager, fallible trace-DRBG seed (off the request path) ─────────
+    // ── Eager, fallible trace-DRBG seed (off the request path) ───────────────
     //
     // Seed this worker's ChaCha20 trace-ID DRBG here, at worker init, so the
     // single `getrandom(2)` syscall happens off the per-request hot path.  On a
@@ -836,12 +840,12 @@ extern "C" fn ngx_otel_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
         }
     }
 
-    // ── Phase 1.2 Item 1: in-worker gRPC viability harness ──────────────────
+    // ── In-worker unary gRPC viability harness ──────────────────────────────
     //
     // Only compiled when the `test-support` feature is enabled.  When set,
     // and the `otel_grpc_smoke_endpoint` directive carries a non-empty value,
     // fire one unary OTLP/gRPC export from Worker 0 via
-    // `NgxExecutor` + `SendRequestService` + `NgxConnIo` — the real Phase 1.2
+    // `NgxExecutor` + `SendRequestService` + `NgxConnIo` — the real
     // production stack — to verify viability on the nginx event loop under
     // `--with-debug`.  Result is logged at NOTICE; the integration test in
     // `tests/integration/run_grpc_smoke.sh` greps for the success line.
@@ -879,7 +883,7 @@ extern "C" fn ngx_otel_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
                     return Status::NGX_OK.into();
                 };
 
-                // Phase 1.2 Item 1: in-worker unary OTLP/gRPC viability harness.
+                // In-worker unary OTLP/gRPC viability harness.
                 run_grpc_smoke_harness(
                     GrpcSmokeSpec {
                         endpoint_bytes: amcf.grpc_smoke_endpoint.as_bytes(),
@@ -918,7 +922,7 @@ extern "C" fn ngx_otel_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
                     },
                 );
 
-                // Phase 1.2 Item 2: bidi gRPC viability harness (Echo.BidiEcho).
+                // Bidi gRPC viability harness (Echo.BidiEcho).
                 run_grpc_smoke_harness(
                     GrpcSmokeSpec {
                         endpoint_bytes: amcf.bidi_smoke_endpoint.as_bytes(),
@@ -956,7 +960,7 @@ extern "C" fn ngx_otel_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
                     },
                 );
 
-                // Phase 1.2 Item 3: bidi backpressure overload harness.
+                // Bidi backpressure overload harness.
                 run_grpc_smoke_harness(
                     GrpcSmokeSpec {
                         endpoint_bytes: amcf.bidi_overload_endpoint.as_bytes(),
@@ -1012,7 +1016,7 @@ struct GrpcSmokeSpec<'a> {
     alloc_fail_msg: &'a str,
 }
 
-/// Shared scaffold for the three Phase 1.2 gRPC smoke harnesses on the
+/// Shared scaffold for the three gRPC smoke harnesses on the
 /// designated worker: skip when the endpoint is unset, decode it, log the
 /// firing line, spawn `make_future` on the nginx event loop, and account a
 /// pool-allocation failure. The harness-specific task body — including the
@@ -1049,16 +1053,15 @@ fn run_grpc_smoke_harness<Fut>(
 /// Called by NGINX when the worker process is exiting (SIGQUIT, SIGHUP-induced
 /// shutdown, or natural exit).
 ///
-/// Phase 1.3.2: workers no longer own the export state, so there is no
+/// Workers do not own the export state, so there is no
 /// worker-side exit flush. The exporter's `graceful_drain` (called on its
 /// `ngx_quit` path) is the sole final-flush path for both transports.
 ///
-/// Q3 RESOLVED: callback kept registered (not `None`) for Phase 2.
-/// Phase 2 (logs) will populate this with producer-side final flush —
-/// drain the worker's local log buffer into the shared ring before exit
-/// so the exporter picks up the tail records.
+/// The callback stays registered so it can drain the worker's local log buffer
+/// into the shared ring before exit, ensuring the exporter picks up the tail
+/// records.
 unsafe extern "C" fn ngx_otel_exit_process(cycle: *mut ngx_cycle_t) {
-    // Step 2.3.3: set the cleanup flag on our error-log writer node so that any
+    // Set the cleanup flag on our error-log writer node so that any
     // late emissions after this point are dropped instead of touching the ring.
     // The ring itself is in shm; the exporter drains it on its next tick.
     //
@@ -1077,7 +1080,7 @@ unsafe extern "C" fn ngx_otel_exit_process(cycle: *mut ngx_cycle_t) {
 
 // ── otel_status_endpoint content handler ─────────────────────────────────────
 
-/// Content handler for `otel_status_endpoint;` (Phase 1.3.3 Sub-item 3).
+/// Content handler for `otel_status_endpoint;`.
 ///
 /// Returns the current `control_shm.version` as a decimal plain-text response.
 /// Registered by `cmd_set_otel_status_endpoint` when `otel_status_endpoint;`
@@ -1114,7 +1117,7 @@ pub(crate) unsafe extern "C" fn otel_status_content_handler(
         })
         .unwrap_or((0, 0, 0));
 
-    // B4 test-support introspection: ring drop counters summed across workers
+    // Test-support introspection: ring drop counters summed across workers
     // (drop evidence for the heartbeat-stale polarity tests) plus the
     // worker-local monotonic clock for staleness cross-checks.
     let mut access_dropped: u64 = 0;
@@ -1181,7 +1184,7 @@ pub(crate) unsafe extern "C" fn otel_status_content_handler(
     // HEAD requests need no body.
     // SAFETY: `r` is the valid request; `header_only` lives after `uri_changes`
     // in `ngx_http_request_t`, so the bindgen accessor reads 2 bits low — route
-    // through the C shim, which reads nginx's own layout (H3F10).
+    // through the C shim, which reads nginx's own layout.
     if unsafe { crate::shim::r_header_only(r) } != 0 {
         return nginx_sys::NGX_OK as nginx_sys::ngx_int_t;
     }
@@ -1309,8 +1312,8 @@ mod nginx_test_stubs {
     #[no_mangle]
     pub static mut ngx_test_config: nginx_sys::ngx_uint_t = 0;
 
-    // B4 discriminant: `is_pre_daemon_initial_start` reads these two globals to
-    // decide whether the gen-1 supervision ALERT should fire.  Unit tests never
+    // `is_pre_daemon_initial_start` reads these two globals to
+    // decide whether the orphaned-exporter warning should fire.  Unit tests never
     // exercise init_module, but the symbols must exist in the flat namespace on
     // macOS (dyld resolves all data symbols eagerly at load time).
     // Stub values: 0 = "not yet daemonized, not an inherited binary-upgrade
@@ -1322,7 +1325,7 @@ mod nginx_test_stubs {
     #[no_mangle]
     pub static mut ngx_inherited: nginx_sys::ngx_uint_t = 0;
 
-    // A1b: shm zone capacity uses ngx_ncpu as a headroom multiplier at parse
+    // shm zone capacity uses ngx_ncpu as a headroom multiplier at parse
     // time (src/config.rs).  macOS flat-namespace requires the symbol to exist
     // at load time; 0 is a safe sentinel (config parsing is never driven in
     // unit tests — pool alloc returns null before any zone-sizing call).
@@ -1482,7 +1485,7 @@ mod nginx_test_stubs {
 
     // `ngx_cycle` is already stubbed at line ~733 above — no duplicate needed.
 
-    // ── Phase 1.3.3 stubs — otel_status_endpoint content handler ─────────────
+    // ── Stubs for the otel_status_endpoint content handler ───────────────────
     //
     // Referenced in the #[cfg(any(test, feature = "test-support"))] content
     // handler. Never called in unit tests but must exist for macOS flat-namespace
@@ -1564,7 +1567,7 @@ mod nginx_test_stubs {
         core::ptr::null_mut()
     }
 
-    // ── Phase 1.3.1 stubs — exporter cycle / channel handler ─────────────────
+    // ── Stubs for the exporter cycle / channel handler ───────────────────────
     //
     // On macOS, flat-namespace dynamic linking resolves these at runtime.
     // On Linux (ELF), all referenced symbols must be resolved at link time
@@ -1688,7 +1691,7 @@ mod nginx_test_stubs {
         nginx_sys::NGX_OK as nginx_sys::ngx_int_t
     }
 
-    // ── Phase 3.5 S3 stubs — trace directives + variable registration ─────────
+    // ── Stubs for trace directives + variable registration ───────────────────
     //
     // These functions are called during config parsing (otel_trace / otel_span_name
     // complex value compilation) and by the preconfiguration variable registration

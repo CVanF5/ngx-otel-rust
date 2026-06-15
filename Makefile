@@ -98,7 +98,7 @@ TEST_ENV	+= NGINX_BUILD_DIR="$(NGINX_BUILD_DIR)"
 
 # Build targets
 
-.PHONY: help build check install-hooks unittest unittest-release test full-test clean
+.PHONY: help build check doc-check install-hooks unittest unittest-release test full-test clean
 
 help:
 	@echo "Available targets:"
@@ -141,6 +141,15 @@ build: $(TEST_NGINX_BINARY) ## Build the module
 check: $(NGINX_BUILD_DIR)/Makefile ## Check style and lint
 	$(BUILD_ENV) $(NGX_CARGO) fmt --all -- --check
 	$(BUILD_ENV) $(NGX_CARGO) clippy --all-targets --verbose -- -D warnings
+	$(MAKE) doc-check
+
+# `cargo clippy` does not run rustdoc lints, so the crate-root
+# `#![deny(rustdoc::broken_intra_doc_links)]` is only enforced by an actual
+# doc build. Treating rustdoc warnings as errors fails the build on any broken
+# intra-doc link or other doc warning. --document-private-items so links in
+# `//` -> `///` on non-pub items are checked too.
+doc-check: $(NGINX_BUILD_DIR)/Makefile ## Build rustdoc with warnings as errors (checks intra-doc links)
+	$(BUILD_ENV) RUSTDOCFLAGS="-D warnings" $(NGX_CARGO) doc --no-deps --document-private-items
 
 install-hooks: ## Install the local pre-commit gate (sets git core.hooksPath)
 	git config core.hooksPath .githooks
