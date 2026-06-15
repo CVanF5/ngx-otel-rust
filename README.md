@@ -315,8 +315,11 @@ the correct CA (via SIGHUP or restart) brings telemetry flowing again.  Use
 
 ### Requirements
 
-- NGINX sources, 1.22.0 or later (1.26.x recommended), as a sibling checkout
-  at `../nginx` (override with `NGINX_SOURCE_DIR`).
+- NGINX sources, 1.22.0 or later, as a sibling checkout at `../nginx`
+  (override with `NGINX_SOURCE_DIR`). The module is currently developed and
+  tested against **nginx 1.31.1**; any `1.22.0+` release built `--with-compat`
+  should work. Match the version (and any API-changing patches) to what you
+  plan to deploy.
 - The **patched `ngx-rust` fork** as a sibling checkout at `../ngx-rust`:
   ```sh
   git clone -b ngx-otel-rust-deadlock-fix git@github.com:CVanF5/ngx-rust.git
@@ -476,6 +479,15 @@ This path is faster to iterate on, omits NGINX's Makefile re-link
 step, and is what the existing bash integration scripts (under
 `tests/integration/`) currently load.
 
+> **macOS caveat:** the canonical `make` path auto-pins `openssl-sys` to the
+> same OpenSSL nginx links (`OPENSSL_DIR=/opt/homebrew/opt/openssl@3
+> OPENSSL_STATIC=0 OPENSSL_NO_VENDOR=1` on Darwin). The bare `cargo build`
+> above does **not**, so on macOS export those same vars before building —
+> otherwise the module statically embeds a different OpenSSL than nginx's,
+> giving two OpenSSL runtimes in one process and wrong `SSL_CTX` struct
+> layouts (cert metrics silently read zero certs). See
+> [`OPENSSL_SUPPORT.md`](OPENSSL_SUPPORT.md). The `make` path is unaffected.
+
 The `export-modules` cargo feature (on by default) injects the
 `ngx_modules` table the cdylib needs when built outside NGINX's
 autoconf system.  The canonical autoconf path passes
@@ -608,19 +620,20 @@ Key behaviours:
 
 ```sh
 make check       # rustfmt + clippy (zero warnings required)
-make unittest    # cargo test --lib (95 tests)
+make unittest    # cargo test --lib (library unit tests, debug profile)
 make test        # bash integration scripts (see below)
 make all         # build + check + test
 ```
 
-Race detection runs the integration scripts under **ThreadSanitizer**
-(Linux arm64, dockerized). Results are committed as evidence
-(`tests/RESULTS-tsan-*.txt`):
+Race and memory-safety detection run the integration scripts under
+**ThreadSanitizer** and **AddressSanitizer** (Linux arm64, dockerized).
+Results are committed as evidence (`tests/RESULTS-{tsan,asan}-*.txt`):
 
 ```sh
 make tsan-test        # full TSAN suite (all integration scripts under TSAN)
 make tsan-test-dns    # DNS / dual-stack resolver+connect path only
 make tsan-test-error  # §6.6.2 error-log path only (writer → ring → drain)
+make asan-test        # ASan use-after-free gate (executor wake/teardown paths)
 ```
 
 The path-scoped gates (`-dns`, `-error`) exist because some scripts are
@@ -628,11 +641,19 @@ timing-flaky inside the combined suite under TSAN's slowdown; running a
 single path in isolation gives a clean race signal.
 
 `make test` requires a running OTel collector on `127.0.0.1:4318`
-(OTLP/HTTP) and `127.0.0.1:4317` (OTLP/gRPC).  The integration scripts
-assert against metrics that arrive at the collector, so any OTLP
-receiver will work.  In development the project uses an
-`otel/opentelemetry-collector-contrib:0.152.0` Docker container with
-HTTP + gRPC receivers and debug + file exporters.
+(OTLP/HTTP) and `127.0.0.1:4317` (OTLP/gRPC).  Start (and stop) the
+project's collector with:
+
+```sh
+make collector-up      # start the local OTel collector container (idempotent)
+make collector-status  # show its status
+make collector-down    # stop it
+```
+
+The integration scripts assert against metrics that arrive at the
+collector, so any OTLP receiver will work.  In development the project
+uses an `otel/opentelemetry-collector-contrib:0.152.0` Docker container
+with HTTP + gRPC receivers and debug + file exporters.
 
 Direct bash invocation (for debugging a specific test):
 
@@ -757,8 +778,9 @@ ngx-otel-rust/
 ├── Makefile               # top-level entry: build / check / test / unittest
 ├── Cargo.toml
 ├── build.rs               # NGINX feature detection, prost-build for proto files
-├── proto/                 # vendored OpenTelemetry proto sources (common, resource,
-│                          # metrics, collector/metrics_service)
+├── proto/                 # vendored OpenTelemetry proto sources: common, resource,
+│                          # metrics, logs, trace + their collector service protos
+│                          # (metrics/logs/trace _service); echo/ for the gRPC bidi smoke
 ├── src/
 │   ├── lib.rs             # module declaration, init_process, exit_process, zero-cost-when-disabled invariant
 │   ├── config.rs          # directives, MainConfig, old_config accessor for SIGHUP reload
