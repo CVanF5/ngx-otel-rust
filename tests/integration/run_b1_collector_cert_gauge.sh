@@ -3,13 +3,17 @@
 #
 # Validates `ngx_otel.tls.collector_cert.not_after`:
 #
-#   (a) TLS endpoint  → gauge PRESENT in exported metrics; value == openssl-
-#       derived notAfter epoch; attribute server.address == collector hostname.
-#   (b) Plaintext endpoint (http://) → metric name ABSENT from exported metrics.
+#   (a) TLS HTTP endpoint (https://)   → gauge PRESENT; value == openssl-derived
+#       notAfter epoch; attribute server.address == collector hostname.
+#   (b) Plaintext endpoint (http://)   → metric name ABSENT from exported metrics.
+#   (c) gRPC-over-TLS endpoint         → gauge PRESENT; same cert, same epoch
+#       value; confirms transport-agnostic behaviour of poll_handshake /
+#       COLLECTOR_CERT_NOT_AFTER (the shared TLS layer writes the atomic for
+#       both HTTP and gRPC TLS connections).
 #
-# Mutation target: both halves are hard-asserted — break the capture call in
-# poll_handshake (e.g. skip the SSL_get1_peer_certificate block) → (a) FAILs
-# (gauge absent under TLS).  Restore → (a) passes, (b) still absent.
+# Mutation target: break the capture call in poll_handshake (e.g. skip the
+# SSL_get1_peer_certificate block) → (a) and (c) FAIL (gauge absent under TLS).
+# Restore → (a) and (c) pass, (b) still absent.
 #
 # Ground truth: openssl CLI reads the notAfter from the server cert PEM and
 # converts it to epoch with `date -d`; the gauge value must match exactly.
@@ -61,6 +65,7 @@ echo "[$(date -u +%T)] START run_b1_collector_cert_gauge.sh" > "${PROGRESS_LOG}"
 # ─── Ports ───────────────────────────────────────────────────────────────────
 
 TLS_HTTP_PORT=4329
+TLS_GRPC_PORT=4330
 PLAIN_HTTP_PORT=4318
 B1_COLLECTOR_NAME="ngx-otel-b1-cert-collector"
 
@@ -163,6 +168,11 @@ receivers:
         tls:
           cert_file: /certs/server.crt
           key_file:  /certs/server.key
+      grpc:
+        endpoint: 0.0.0.0:4330
+        tls:
+          cert_file: /certs/server.crt
+          key_file:  /certs/server.key
 
 processors:
   batch:
@@ -186,13 +196,14 @@ service:
       exporters: [file]
 YAMLEOF
 
-info "Starting TLS collector (HTTP=${TLS_HTTP_PORT})..."
+info "Starting TLS collector (HTTP=${TLS_HTTP_PORT}, gRPC=${TLS_GRPC_PORT})..."
 OTEL_HOST_UID="$(id -u)"
 OTEL_HOST_GID="$(id -g)"
 
 docker run -d --name "${B1_COLLECTOR_NAME}" \
     --user "${OTEL_HOST_UID}:${OTEL_HOST_GID}" \
     -p "127.0.0.1:${TLS_HTTP_PORT}:4329" \
+    -p "127.0.0.1:${TLS_GRPC_PORT}:4330" \
     -v "${TLS_COLLECTOR_CONFIG}:/etc/otelcol/config.yaml:ro" \
     -v "${CERTS}:/certs:ro" \
     -v "${B1_SCRATCH}/logs:/var/log/otel" \
@@ -213,7 +224,7 @@ for _ in $(seq 1 15); do
 done
 [[ "${TLS_READY}" -eq 1 ]] \
     || fail "TLS collector did not become ready within 15s (docker logs: $(docker logs ${B1_COLLECTOR_NAME} 2>&1 | tail -10))"
-pass "TLS collector ready on port ${TLS_HTTP_PORT}"
+pass "TLS collector ready on port ${TLS_HTTP_PORT}/${TLS_GRPC_PORT}"
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -400,10 +411,103 @@ CERT_GAUGE_COUNT="$(echo "${SVC_B_DATA}" | jq --slurp -r \
 
 pass "(b) Plaintext endpoint: metric ngx_otel.tls.collector_cert.not_after is ABSENT (absent-not-zero)"
 
+# ─── Scenario (c): gRPC-over-TLS → gauge PRESENT ─────────────────────────────
+#
+# Verifies transport-agnostic behaviour: COLLECTOR_CERT_NOT_AFTER is written by
+# TlsNgxConnIo::poll_handshake which is shared by both HTTP and gRPC TLS paths
+# (src/transport/tls.rs — the same atomic, the same poll_handshake code path).
+# The gRPC transport wraps the stream via wrap_tls_io (same as HTTP) before the
+# h2 handshake, so the collector-cert gauge must be PRESENT here exactly as in
+# scenario (a).
+
+info "=== Scenario (c): gRPC-over-TLS → ngx_otel.tls.collector_cert.not_after PRESENT ==="
+
+SVC_C="ngx-otel-b1-grpc-tls-gauge-$$"
+OFF_C="$(snapshot_log "${TLS_METRICS_LOG}")"
+
+cat > "${PREFIX}/nginx-c.conf" << CONFEOF
+daemon off;
+master_process on;
+worker_processes 1;
+worker_shutdown_timeout 3s;
+error_log ${PREFIX}/logs/error-c.log notice;
+pid       ${PREFIX}/logs/nginx-c.pid;
+
+load_module ${MODULE_PATH};
+events { worker_connections 64; }
+
+http {
+    otel_exporter {
+        endpoint https://127.0.0.1:${TLS_GRPC_PORT};
+        trusted_certificate ${CERTS}/ca.crt;
+    }
+    otel_export_protocol otlp_grpc;
+    otel_service_name ${SVC_C};
+    otel_metric_interval ${METRIC_INTERVAL_S}s;
+
+    server {
+        listen 127.0.0.1:9492;
+        location / { return 200 "ok\n"; }
+    }
+}
+CONFEOF
+
+"${NGINX_BINARY}" -e "${PREFIX}/logs/error-c.log" -p "${PREFIX}" -c "${PREFIX}/nginx-c.conf" &
+NGINX_PID=$!
+wait_nginx_up "${NGINX_PID}"
+
+curl -sf http://127.0.0.1:9492/ >/dev/null
+sleep "${FLUSH_WAIT_S}"
+
+stop_nginx "${NGINX_PID}"
+
+DELTA_C="$(delta_log "${TLS_METRICS_LOG}" "${OFF_C}")"
+[[ -n "${DELTA_C}" ]] || fail "(c) gRPC-over-TLS: no metrics received by collector"
+
+# Assert 1: metric name is present.
+GAUGE_C_PRESENT="$(echo "${DELTA_C}" | jq --slurp -r \
+    '[.[].resourceMetrics[]?.scopeMetrics[]?.metrics[]?.name
+      | select(. == "ngx_otel.tls.collector_cert.not_after")] | length' \
+    2>/dev/null || echo 0)"
+[[ "${GAUGE_C_PRESENT}" -gt 0 ]] \
+    || fail "(c) gRPC-over-TLS: metric ngx_otel.tls.collector_cert.not_after ABSENT — expected PRESENT (transport-agnostic TLS handshake must write COLLECTOR_CERT_NOT_AFTER regardless of HTTP vs gRPC)"
+
+pass "(c) gRPC-over-TLS: metric ngx_otel.tls.collector_cert.not_after is PRESENT"
+
+# Assert 2: value equals the same OpenSSL-derived notAfter epoch (same cert).
+GAUGE_C_VALUE="$(echo "${DELTA_C}" | jq --slurp -r \
+    '[.[].resourceMetrics[]?.scopeMetrics[]?.metrics[]?
+      | select(.name == "ngx_otel.tls.collector_cert.not_after")
+      | .gauge.dataPoints[]?.asInt] | first // empty' \
+    2>/dev/null || echo "")"
+[[ -n "${GAUGE_C_VALUE}" ]] \
+    || fail "(c) gRPC-over-TLS: could not extract gauge value from metric data"
+
+[[ "${GAUGE_C_VALUE}" == "${EXPECTED_EPOCH}" ]] \
+    || fail "(c) gRPC-over-TLS: gauge value ${GAUGE_C_VALUE} != expected epoch ${EXPECTED_EPOCH} (ground truth: openssl notAfter -> GNU date -d)"
+
+pass "(c) gRPC-over-TLS: gauge value ${GAUGE_C_VALUE} == openssl-derived epoch ${EXPECTED_EPOCH} (EXACT MATCH)"
+
+# Assert 3: server.address attribute equals the collector hostname.
+ADDR_C_ATTR="$(echo "${DELTA_C}" | jq --slurp -r \
+    '[.[].resourceMetrics[]?.scopeMetrics[]?.metrics[]?
+      | select(.name == "ngx_otel.tls.collector_cert.not_after")
+      | .gauge.dataPoints[]?.attributes[]?
+      | select(.key == "server.address")
+      | .value.stringValue] | first // empty' \
+    2>/dev/null || echo "")"
+[[ -n "${ADDR_C_ATTR}" ]] \
+    || fail "(c) gRPC-over-TLS: server.address attribute absent on ngx_otel.tls.collector_cert.not_after data point"
+
+[[ "${ADDR_C_ATTR}" == "127.0.0.1" ]] \
+    || fail "(c) gRPC-over-TLS: server.address='${ADDR_C_ATTR}' expected '127.0.0.1'"
+
+pass "(c) gRPC-over-TLS: server.address='${ADDR_C_ATTR}' CORRECT"
+
 # ─── All scenarios complete ───────────────────────────────────────────────────
 
 echo ""
 echo "============================================================"
-pass "B1 collector-cert gauge: ALL scenarios (a)-(b) PASSED"
+pass "B1 collector-cert gauge: ALL scenarios (a)-(c) PASSED"
 echo "============================================================"
 echo "[$(date -u +%T)] COMPLETE run_b1_collector_cert_gauge.sh" >> "${PROGRESS_LOG}"
