@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/integration/run.sh — Step 9 end-to-end integration test
+# tests/integration/run.sh — end-to-end integration test
 #
 # Builds the NGINX otel module, starts NGINX with worker_processes 4,
 # sends HTTP traffic, waits for a metrics flush, then checks that:
@@ -268,7 +268,7 @@ fi
 
 echo ""
 if [[ "${FAILED}" -eq 0 ]]; then
-    pass "All assertions passed. Step 9 end-to-end test COMPLETE."
+    pass "All assertions passed. End-to-end test COMPLETE."
     echo ""
     echo "  New metrics.json tail:"
     echo "${NEW_CONTENT}" | tail -3

@@ -238,7 +238,7 @@ run_one() {
         local after; after="$(collector_metric_count)"
         if (( after > recv_before )); then recv_delta=$(( after - recv_before ));
         elif (( after < recv_before )); then recv_delta=-1;
-        else fail "${cfg} r${round}: exporter delivered NO metrics. STOP-AND-ASK."; rm -rf "${prefix}"; trap - RETURN; exit 2; fi
+        else fail "${cfg} r${round}: exporter delivered NO metrics."; rm -rf "${prefix}"; trap - RETURN; exit 2; fi
         local lafter; lafter="$(collector_logs_count)"
         if (( lafter > logs_before )); then logs_delta=$(( lafter - logs_before ));
         elif (( lafter < logs_before )); then logs_delta=-1;  # logs.json rotated under heavy volume = tail firing

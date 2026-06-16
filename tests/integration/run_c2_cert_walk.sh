@@ -9,7 +9,7 @@
 #       path, subject CN and notAfter epoch (epoch independently derived from
 #       `openssl x509 -enddate` + GNU date, NOT from our own code);
 #   (b) DUAL RSA+ECDSA same server block → BOTH certs enumerated, one NOTICE
-#       each (THE Q5 full-enumeration acceptance test);
+#       each (full-enumeration acceptance test for dual-cert server blocks);
 #   (c) multi-server_name block          → the first NON-wildcard name is
 #       recorded (wildcard + dot-prefix names skipped);
 #   (d) `ssl_certificate $var`           → skipped with a NOTICE; nothing
@@ -178,7 +178,7 @@ http {
         location / { return 200 "a\n"; }
     }
 
-    # (b) DUAL RSA + ECDSA in ONE server block (Q5 acceptance)
+    # (b) DUAL RSA + ECDSA in ONE server block (dual-cert enumeration)
     server {
         listen 127.0.0.1:9444 ssl;
         server_name dual.example.test;
@@ -226,14 +226,14 @@ grep -qF "otel: cert metrics: certificate path=\"${CERTS}/a.crt\" server=\"cert-
     || fail "(a) expected NOTICE for a.crt (path/CN/not_after=${EXP_A}) not found"
 pass "(a) single cert: path + CN + not_after=${EXP_A} exact"
 
-# (b) Q5: BOTH certs of the dual block enumerated
+# (b) BOTH certs of the dual RSA+ECDSA block enumerated
 grep -qF "certificate path=\"${CERTS}/rsa.crt\" server=\"dual.example.test\" subject_cn=\"dual.example.test\" not_after=${EXP_RSA}" "${ERR}" \
     || fail "(b) RSA cert of dual block not enumerated"
 grep -qF "certificate path=\"${CERTS}/ecdsa.crt\" server=\"dual.example.test\" subject_cn=\"dual.example.test\" not_after=${EXP_EC}" "${ERR}" \
     || fail "(b) ECDSA cert of dual block not enumerated"
 DUAL_COUNT="$(grep -c "certificate path=.*server=\"dual.example.test\"" "${ERR}")"
 [[ "${DUAL_COUNT}" -eq 2 ]] || fail "(b) expected exactly 2 certs for dual block, got ${DUAL_COUNT}"
-pass "(b) Q5 dual RSA+ECDSA: both certs enumerated (rsa=${EXP_RSA}, ecdsa=${EXP_EC})"
+pass "(b) dual RSA+ECDSA: both certs enumerated (rsa=${EXP_RSA}, ecdsa=${EXP_EC})"
 
 # (c) first non-wildcard server_name recorded
 grep -qF "certificate path=\"${CERTS}/multi.crt\" server=\"real.example.test\" subject_cn=\"multi.example.test\" not_after=${EXP_MULTI}" "${ERR}" \

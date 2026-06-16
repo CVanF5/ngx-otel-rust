@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/integration/run_reload.sh — Step 10 SIGHUP reload integration test
+# tests/integration/run_reload.sh — SIGHUP reload integration test
 #
 # The otel exporter process (not Worker 0) owns the export task.
 #
@@ -364,7 +364,7 @@ fi
 
 echo ""
 if [[ "${FAILED}" -eq 0 ]]; then
-    pass "All assertions passed. Step 10 SIGHUP reload test COMPLETE."
+    pass "All assertions passed. SIGHUP reload test COMPLETE."
     echo ""
     echo "  New metrics.json tail (last 2 lines):"
     echo "${NEW_CONTENT}" | tail -2 | cut -c1-120

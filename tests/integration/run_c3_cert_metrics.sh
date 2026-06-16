@@ -15,7 +15,7 @@
 #   (4) the per-point attribute set is EXACTLY the 7 scope-guard keys —
 #       no extra attribute keys anywhere (privacy/cardinality guard);
 #   (5) NGINX Agent's metric name `nginx.certificate.time_to_expiration`
-#       does NOT appear anywhere in the collector output (decision Q1);
+#       does NOT appear anywhere in the collector output (our metric uses a distinct name);
 #   (6) reload with a swapped certificate → not_after updates to the new
 #       cert's epoch (serves-vs-disk cadence: values change AT reload);
 #   (7) no-ssl nginx binary → the module still exports (export_interval

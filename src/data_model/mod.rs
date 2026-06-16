@@ -6,7 +6,7 @@
 //! Internal OTel-abstract data model.
 //!
 //! These types are **independent** of the OTLP protobuf schema.  The encoder
-//! layer (Step 7) converts from these types into the OTLP proto types.
+//! layer (the encoder) converts from these types into the OTLP proto types.
 //!
 //! Rule: do NOT `use opentelemetry_proto::*` anywhere in this module.
 

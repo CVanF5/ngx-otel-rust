@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/integration/run_b4_heartbeat_stale.sh — B4-FU2: heartbeat-stale ALERT, both polarities
+# tests/integration/run_b4_heartbeat_stale.sh — heartbeat-stale ALERT, both polarities
 #
 # Phase A — SATURATION polarity (exporter ALIVE, ring saturated):
 #   A1. Heartbeat advances (dedicated beat timer is running).
@@ -7,7 +7,7 @@
 #       threshold produce ring-full DROPS (verified via otel_status access_dropped).
 #   A3. ZERO heartbeat-stale ALERTs — saturation must NOT look like death.
 #
-# Phase B — DEATH polarity (silent exporter death, the real B4 case):
+# Phase B — DEATH polarity (silent exporter death, the unsupervised-gen1 case):
 #   B1. daemon on → gen-1 exporter is unsupervised (PPID=init); heartbeat
 #       advances while it is alive.
 #   B2. kill -9 the exporter (NO reload): master never sees SIGCHLD, no

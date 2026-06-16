@@ -24,7 +24,7 @@
 #   6. Span's traceId appears in a metric exemplar in metrics.json
 #      (cross-signal metrics→trace drill-down, exemplar→Tempo pivot).
 #   7. New data in metrics.json contains no resourceSpans payloads
-#      (FU1 clean split: spans go only to traces.json).
+#      (traces are routed exclusively to traces.json, not the metrics pipeline).
 #   8. D1a: `otel_trace $otel_parent_sampled` + sampled parent → span present.
 #      Pre-fix: gate always declined (SpanCtx not set before Gate 2 evaluated
 #      $otel_parent_sampled → always not_found → always falsy → zero spans).
@@ -191,7 +191,7 @@ for i in $(seq 1 10); do
     curl -sf http://127.0.0.1:9102/ >/dev/null
 done
 
-# The gate-blocking request: 1 × GET /error with a KNOWN traceparent.
+# The key span-pipeline request: 1 × GET /error with a KNOWN traceparent.
 # flags=01 (sampled=true) → the module honours the W3C sampled bit and
 # emits a span.  The span's traceId and parentSpanId are derived from
 # the inbound header, making the assertion deterministic.
@@ -252,12 +252,11 @@ echo "=== Assertions ==="
 
 # ─── 1. A span arrives in traces.json ────────────────────────────────────────
 # HARD: the span pipeline must deliver at least one span to traces.json.
-# This is the gate-blocking finding from the Loop-2 review.
 
 if [[ -z "${NEW_TRACES}" ]]; then
     fail "traces.json: NO new data written — span did not reach the collector"
     echo ""
-    echo "STOP: span did not arrive; this is the gate-blocking defect. Check:"
+    echo "STOP: span did not arrive. Check:"
     echo "  - is file/traces wired in otel-collector-config.yaml?"
     echo "  - is the traces pipeline running? (docker logs ngx-otel-test-collector)"
     echo "  - did the exporter spawn? (check error.log)"
@@ -333,8 +332,8 @@ else
     fail "metrics.json: trace_id ${TRACE_ID} NOT in any exemplar — exemplar→trace link broken"
 fi
 
-# ─── 7. FU1 clean: no resourceSpans in new metrics data ──────────────────────
-# HARD: FU1 rerouted traces to traces.json; new metrics data must be clean.
+# ─── 7. No resourceSpans in new metrics data ─────────────────────────────────
+# HARD: traces are routed to traces.json only; new metrics data must be clean.
 
 if [[ -n "${NEW_METRICS}" ]] && echo "${NEW_METRICS}" | grep -q '"resourceSpans"'; then
     fail "metrics.json: new data contains resourceSpans — traces must not appear in the metrics pipeline"

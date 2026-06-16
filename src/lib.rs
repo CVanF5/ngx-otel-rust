@@ -584,7 +584,7 @@ impl HttpModule for HttpOtelModule {
             return Status::NGX_ERROR.into();
         }
 
-        // Step 6: register log-phase handler only when exporter is configured.
+        // Register the log-phase handler only when the exporter is configured.
         if amcf.is_configured()
             && add_phase_handler::<metric_source::instrumented::LogPhaseHandler>(cf_ref).is_err()
         {

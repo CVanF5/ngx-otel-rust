@@ -2254,7 +2254,7 @@ mod tests {
     /// a particular value is observed after the race (the race outcome is intentionally
     /// "stale counts vanish with old workers", which is accepted).
     ///
-    /// **TSAN-guard caveat (FU5):** This test is inert on non-sanitizer builds.
+    /// **TSAN-guard caveat:** This test is inert on non-sanitizer builds.
     /// `AtomicU64::store` makes no runtime assertion without `-Zsanitizer=thread`;
     /// the test will pass on macOS / release / debug builds whether the H2F2 fix
     /// is present or not.  A green macOS run is NOT race coverage.

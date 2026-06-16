@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/integration/run_endpoint_change.sh — Step 10 endpoint-change reload test
+# tests/integration/run_endpoint_change.sh — endpoint-change reload test
 #
 # Verifies that changing the OTLP collector endpoint across nginx -s reload
 # takes effect on the next export tick of the new worker generation.
@@ -320,7 +320,7 @@ fi
 
 echo ""
 if [[ "${FAILED}" -eq 0 ]]; then
-    pass "All assertions passed. Step 10 endpoint-change reload test COMPLETE."
+    pass "All assertions passed. Endpoint-change reload test COMPLETE."
     exit 0
 else
     echo -e "${RED}One or more assertions FAILED.${NC}" >&2

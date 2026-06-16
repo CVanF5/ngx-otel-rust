@@ -38,7 +38,7 @@ REPO_ROOT="$(cd "${CRATE_DIR}/.." && pwd)"
 RESULTS_DIR="${SCRIPT_DIR}/results"
 
 NGINX_SOURCE_DIR="${NGINX_SOURCE_DIR:-${REPO_ROOT}/nginx}"
-# FU5: bench must use the RELEASE binary (for accurate throughput measurement).
+# Bench must use the RELEASE binary (for accurate throughput measurement).
 # Prefer objs-release/nginx; fall back to objs-debug only if release is absent.
 if [[ -x "${CRATE_DIR}/objs-release/nginx" ]]; then
     NGINX_BUILD_DIR="${NGINX_BUILD_DIR:-${CRATE_DIR}/objs-release}"
@@ -265,14 +265,14 @@ REG_TA_INT=$(echo "${REG_TA}" | awk '{printf "%d", int($1 + 0.5)}')
 if (( REG_TA_INT < 20 )); then
     info "BL vs TA regression = ${REG_TA}% — functional smoke: output well-formed (timing verdict deferred to host-1)"
 else
-    fail "BL vs TA regression = ${REG_TA}% (>= 20%) — POSSIBLE STRUCTURAL REGRESSION — STOP-AND-ASK"
+    fail "BL vs TA regression = ${REG_TA}% (>= 20%) — POSSIBLE STRUCTURAL REGRESSION — investigate on production hardware"
 fi
 
 REG_TC_INT=$(echo "${REG_TC}" | awk '{printf "%d", int($1 + 0.5)}')
 if (( REG_TC_INT < 20 )); then
     info "BL vs TC regression = ${REG_TC}% — functional smoke: output well-formed (timing verdict deferred to host-1)"
 else
-    fail "BL vs TC regression = ${REG_TC}% (>= 20%) — POSSIBLE STRUCTURAL REGRESSION — STOP-AND-ASK"
+    fail "BL vs TC regression = ${REG_TC}% (>= 20%) — POSSIBLE STRUCTURAL REGRESSION — investigate on production hardware"
 fi
 
 echo ""

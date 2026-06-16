@@ -269,7 +269,7 @@ if (( TOTAL_REQUESTS > 0 )); then
         fi
     else
         # 0 records delivered. A working drain ALWAYS delivers something, even
-        # under saturation: post-FU2 the exporter drains every
+        # under saturation: the exporter drains every
         # SHUTDOWN_POLL_INTERVAL, so overload shows up as high DROPS, never as
         # zero DELIVERY. Zero delivery means the drain is broken, not merely
         # overloaded — so this is a HARD FAIL on Linux at EVERY RPS tier (no

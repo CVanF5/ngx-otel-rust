@@ -17,7 +17,7 @@
 #   Assertion: the stub's output file is non-empty (nginx connected over v6
 #   and delivered at least one OTLP POST body).
 #
-# TEST C — DNS name → v6 connect via AAAA (FU2 — headline dual-stack proof)
+# TEST C — DNS name → v6 connect via AAAA (headline dual-stack proof)
 #   dns_stub.py in "aaaa" mode answers AAAA queries with ::1 and A → NXDOMAIN.
 #   nginx resolver has ipv6=on (default; no ipv6=off flag) so it issues AAAA.
 #   The v6_http_stub.py listens on [::1]:14319.  Asserts records arrive at the
@@ -29,7 +29,7 @@
 #   than failing — the AAAA code path is verified on Linux/TSAN which is the
 #   canonical verification platform per the project's two-host discipline.
 #
-# TEST D — Unresolvable name clean error (FU2)
+# TEST D — Unresolvable name clean error
 #   dns_stub.py in "nxdomain" mode returns NXDOMAIN for all queries.  nginx is
 #   configured with the unresolvable name as the endpoint.  Asserts: no panic,
 #   no crash, nginx accepts -QUIT; error.log contains a connection-failure entry
@@ -346,7 +346,7 @@ else
     fail "TEST B: v6 stub output file is empty — nginx did not export to [::1]:${V6_STUB_PORT}"
 fi
 
-# ─── TEST C: DNS name → v6 via AAAA (FU2) ────────────────────────────────────
+# ─── TEST C: DNS name → v6 via AAAA ─────────────────────────────────────────
 
 info "=== TEST C: DNS name → v6 via AAAA (headline dual-stack proof) ==="
 
@@ -458,7 +458,7 @@ else
     fi
 fi  # end of platform check
 
-# ─── TEST D: Unresolvable name clean error (FU2) ─────────────────────────────
+# ─── TEST D: Unresolvable name clean error ───────────────────────────────────
 
 info "=== TEST D: Unresolvable name — clean error, no panic, no hang ==="
 

@@ -48,7 +48,7 @@ REPO_ROOT="$(cd "${CRATE_DIR}/.." && pwd)"
 # ngx_auto_config.h, and (b) NGINX_BUILD_DIR's default is the non-debug
 # ../nginx/objs.  Mixing NGX_DEBUG=1 nginx with a dylib built against
 # non-debug headers is the ABI-mismatch class of bug we already
-# documented in HANDOFF.md.  Both paths point at the sibling
+# documented in-tree.  Both paths point at the sibling
 # ../nginx/objs (the pre-built non-debug nginx) for this smoke test.
 NGINX_BINARY="${NGINX_BINARY:-${REPO_ROOT}/nginx/objs/nginx}"
 NGINX_SOURCE_DIR="${NGINX_SOURCE_DIR:-${REPO_ROOT}/nginx}"

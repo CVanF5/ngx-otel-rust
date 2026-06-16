@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/integration/run_exporter_binary_upgrade.sh — R2 USR2 live binary-upgrade gate
+# tests/integration/run_exporter_binary_upgrade.sh — USR2 live binary-upgrade test
 #
 # Verifies that a USR2 live binary upgrade produces:
 #   1. A second master (M2) and two otel exporters during the overlap window.
@@ -11,7 +11,7 @@
 #
 # Gate run: **debian-vm** (Linux process model for USR2/WINCH/QUIT signals).
 # macOS may also be used for development but the committed evidence MUST be
-# from a Linux run.  STOP-AND-ASK [R2-PLATFORM] applies.
+# from a Linux run.
 #
 # Prerequisites:
 #   - NGINX_BINARY set or auto-detected (release or debug build).
@@ -76,7 +76,7 @@ info "Module:       ${MODULE_PATH}"
 # macOS sends SIGUSR2 to the process but nginx does not implement the
 # binary upgrade logic on macOS (no execve of a new binary).
 if [[ "$(uname -s)" != "Linux" ]]; then
-    echo "STOP-AND-ASK [R2-PLATFORM]: USR2 live binary upgrade requires Linux." >&2
+    echo "ERROR: USR2 live binary upgrade requires Linux." >&2
     echo "This script must be run on the debian-vm (Linux aarch64)." >&2
     echo "The committed gate artifact MUST be the debian-vm run." >&2
     exit 1
@@ -421,7 +421,7 @@ OVERLAP_ID_COUNT="$(echo "${OVERLAP_IDS}" | grep -c . || echo 0)"
 
 # Assertion 2d: collector received BOTH instance ids during overlap.
 if [[ "${OVERLAP_ID_COUNT}" -lt 2 ]]; then
-    fail "STOP-AND-ASK [R2-HANDOFF-BUG]: Expected ≥ 2 distinct service.instance.id values
+    fail "Expected ≥ 2 distinct service.instance.id values
        during overlap (one per master), found ${OVERLAP_ID_COUNT}.
        Values seen: $(echo "${OVERLAP_IDS}" | tr '\n' ' ')
        This indicates the old exporter did not ship any telemetry during the
@@ -494,7 +494,7 @@ if [[ "${M1_EXITED}" -ne 1 ]]; then
     kill -0 "${EXP1_PID}" 2>/dev/null && echo "ALIVE" || echo "DEAD"
     info "=== error.log (last 20 non-debug lines before FAIL) ==="
     grep -v '\[debug\]' "${PREFIX}/logs/error.log" 2>/dev/null | tail -20 || true
-    fail "STOP-AND-ASK [R2-HANDOFF-BUG]: M1 master (${M1_PID}) did not exit within 40s after QUIT.
+    fail "M1 master (${M1_PID}) did not exit within 40s after QUIT.
        Process: ${PID_CMD}
        This is a lifecycle bug — M1 is orphaned."
 fi
@@ -511,7 +511,7 @@ while (( SECONDS < DEADLINE )); do
     sleep 0.5
 done
 if [[ "${EXP1_EXITED}" -ne 1 ]]; then
-    fail "STOP-AND-ASK [R2-HANDOFF-BUG]: M1's exporter (PID ${EXP1_PID}) did not exit
+    fail "M1's exporter (PID ${EXP1_PID}) did not exit
        after M1 quit.  Orphaned exporter — this is a lifecycle bug."
 fi
 pass "M1's exporter (PID ${EXP1_PID}) exited cleanly"
@@ -538,7 +538,7 @@ pass "M2's exporter (PID ${EXP2_PID}) still running"
 
 # Assertion 3d: No panic/abort/SIGSEGV in error.log.
 if grep -qE "panic|abort|SIGSEGV|SIGABRT|Segmentation fault" "${PREFIX}/logs/error.log" 2>/dev/null; then
-    fail "STOP-AND-ASK [R2-HANDOFF-BUG]: error.log contains panic/abort/SIGSEGV:
+    fail "error.log contains panic/abort/SIGSEGV:
        $(grep -E 'panic|abort|SIGSEGV|SIGABRT|Segmentation fault' "${PREFIX}/logs/error.log")"
 fi
 pass "error.log clean: no panic/abort/SIGSEGV"
@@ -546,13 +546,13 @@ pass "error.log clean: no panic/abort/SIGSEGV"
 # Assertion 3e: exactly 1 exporter remains total (M2's only; M1's must be gone).
 # EXP1_PID must be dead and EXP2_PID must be alive.
 if kill -0 "${EXP1_PID}" 2>/dev/null; then
-    fail "STOP-AND-ASK [R2-HANDOFF-BUG]: M1's exporter (PID ${EXP1_PID}) is still alive
+    fail "M1's exporter (PID ${EXP1_PID}) is still alive
        after M1 quit.  Orphaned exporter — this is a lifecycle bug."
 fi
 pass "M1's exporter (PID ${EXP1_PID}) is gone (no orphan)"
 REMAINING_EXP_COUNT="$(count_all_exporters)"
 if [[ "${REMAINING_EXP_COUNT}" -ne 1 ]]; then
-    fail "STOP-AND-ASK [R2-HANDOFF-BUG]: Expected exactly 1 exporter after M1 exit,
+    fail "Expected exactly 1 exporter after M1 exit,
        found ${REMAINING_EXP_COUNT}."
 fi
 pass "Exactly 1 exporter remaining (no orphans from M1)"

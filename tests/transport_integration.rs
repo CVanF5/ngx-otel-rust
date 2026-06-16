@@ -99,7 +99,7 @@ fn make_test_batch(service_name: &str) -> Batch {
         scope: Scope { name: "ngx-otel-step8".to_string(), version: "0.1.0".to_string() },
         metrics: vec![Metric {
             name: "test.http.server.request.duration".to_string(),
-            description: "Step 8 integration test metric".to_string(),
+            description: "transport integration test metric".to_string(),
             unit: "ms".to_string(),
             data: MetricData::Histogram(HistogramData {
                 aggregation_temporality: AggregationTemporality::Delta,

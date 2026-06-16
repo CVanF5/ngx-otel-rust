@@ -5,7 +5,7 @@
 # new exporter started) the collector receives a continuous timeline of
 # metrics with no gap larger than 2 × interval.
 #
-# Q2 RESOLVED — option (a): race the workers; dedup via time_unix_nano.
+# Design: race the exporters; dedup via time_unix_nano.
 # The cumulative-counter model absorbs trailing worker bumps.
 #
 # Assertions:
@@ -351,7 +351,7 @@ fi
 # Use the timeUnixNano values of all data points (any metric) and check
 # the maximum gap between consecutive timestamps.
 #
-# Q2 RESOLVED (option a): old and new exporter race; dedup via time_unix_nano.
+# Old and new exporter race; dedup via time_unix_nano.
 # A gap > 2s means the handoff window lost at least one collection window.
 # Note: we use grep -c (not grep -q) to avoid set -o pipefail SIGPIPE issue
 # with large NEW_CONTENT and grep's early exit.

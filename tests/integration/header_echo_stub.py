@@ -8,7 +8,7 @@ Listens on 127.0.0.1:<port> (TCP), accepts HTTP/1.1 requests, and appends the
 full raw request header block of each request to <output_file>, each delimited
 by a "===REQUEST===" marker line.  Responds 200 OK for every request.
 
-Used by run_redirect_safe.sh (H3F1) to assert that an upstream-bound request
+Used by run_redirect_safe.sh to assert that an upstream-bound request
 carries EXACTLY ONE `traceparent` header (the find-then-update injection must
 overwrite the inbound header in place, not append a duplicate).
 

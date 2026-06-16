@@ -155,14 +155,14 @@ for i in $(seq 1 "${N_ERR_REQUESTS}"); do
     curl -sf http://127.0.0.1:9101/error >/dev/null || true  # 500 exit ≠ 0
 done
 
-# FU4a: One error request WITH a traceparent header.
+# One error request WITH a traceparent header.
 # Assert: the emitted exemplar carries the trace_id from this header.
 TRACEPARENT="00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 TRACE_ID="4bf92f3577b34da6a3ce929d0e0e4736"
 info "Sending 1 GET with traceparent header to /error..."
 curl -sf -H "traceparent: ${TRACEPARENT}" http://127.0.0.1:9101/error >/dev/null || true
 
-# FU4b: A proxy request to trigger the upstream zone (→ 502 = interesting).
+# A proxy request to trigger the upstream zone (→ 502 = interesting).
 info "Sending 3 GET requests to /api (upstream → 502 = interesting)..."
 for i in $(seq 1 3); do
     curl -sf http://127.0.0.1:9101/api >/dev/null || true
@@ -248,7 +248,7 @@ else
     fail "metrics.json: nginx.upstream.zone NOT found — /api→upstream should produce per-upstream data point"
 fi
 
-# FU4c: Distinct http.route values: "/" and "/error" and "/api" should each produce a data point.
+# Distinct http.route values: "/" and "/error" and "/api" should each produce a data point.
 ROUTE_COUNT=$(echo "${NEW_METRICS}" | grep -o '"http.route"' | wc -l | tr -d ' ')
 info "metrics.json: http.route occurrences = ${ROUTE_COUNT}"
 if (( ROUTE_COUNT >= 2 )); then

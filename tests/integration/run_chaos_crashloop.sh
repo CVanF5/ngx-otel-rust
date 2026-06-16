@@ -14,7 +14,7 @@
 #   6. Workers return HTTP 200 throughout — data plane is UNAFFECTED.
 #   7. SIGQUIT shuts down cleanly (master exits, no orphan processes).
 #
-# STOP-AND-ASK gate: the crash hook is ENTIRELY behind
+# Note: the crash hook is ENTIRELY behind
 # `#[cfg(feature = "test-support")]` — zero code in production builds.
 # No non-test-gated production change is required.
 #

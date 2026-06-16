@@ -132,7 +132,7 @@ while (( SECONDS - START < LOOP_FOR )); do
         # and newer: panicked at hyper/src/common/time.rs:37: You must supply a timer
         if grep -qE "panicked at .*(hyper.src.common.time|You must supply a timer)" \
                 "${LOG}" 2>/dev/null; then
-            fail "iteration ${ITERATION}: Time::sleep panic detected — STOP-AND-ASK"
+            fail "iteration ${ITERATION}: Time::sleep panic detected"
             grep -E "panicked at .*(hyper.src.common.time|You must supply a timer)" "${LOG}" >&2
             exit 1
         fi

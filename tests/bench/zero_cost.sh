@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/bench/zero_cost.sh — Step 11 zero-cost-when-disabled benchmark
+# tests/bench/zero_cost.sh — zero-cost-when-disabled benchmark
 #
 # Runs three NGINX configs back-to-back under wrk to statistically prove
 # that loading the module without an otel_exporter directive imposes zero
@@ -28,7 +28,7 @@
 #
 # Exit codes:
 #   0  all configs completed; results written to tests/bench/results/
-#   1  pre-flight or build check failed (STOP-AND-ASK required)
+#   1  pre-flight or build check failed
 #   2  invariant violation (C2 log shows export task / phase handler)
 
 set -euo pipefail
@@ -104,7 +104,7 @@ info "nginx binary: ${NGINX_BINARY}"
 if ! command -v wrk >/dev/null 2>&1; then
     echo "ERROR: wrk is not installed." >&2
     echo "       Install with: brew install wrk  (macOS) or apt install wrk (Debian/Ubuntu)" >&2
-    echo "       STOP-AND-ASK: benchmark cannot proceed without wrk." >&2
+    echo "       Benchmark cannot proceed without wrk." >&2
     exit 1
 fi
 WRK_BIN="$(command -v wrk)"
@@ -449,7 +449,7 @@ for round in $(seq 1 "${BENCH_ITERATIONS}"); do
             sleep 2
             if ! assert_collector_received "${RECV_BEFORE}" "C3 r${round}"; then
                 echo "ERROR: C3 (module + exporter) produced NO telemetry at the collector." >&2
-                echo "       The C3-vs-C1 overhead number would be meaningless. STOP-AND-ASK." >&2
+                echo "       The C3-vs-C1 overhead number would be meaningless." >&2
                 sandbox_cleanup "${PREFIX}"
                 exit 2
             fi

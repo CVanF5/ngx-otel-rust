@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# tests/integration/run_b1_spsc_reload_chaos.sh — B1-FU1 chaos: SPSC ring
-# exclusivity across reload + quit-completeness
+# tests/integration/run_b1_spsc_reload_chaos.sh — SPSC ring exclusivity chaos
+# test: reload overlap + quit-completeness
 #
-# Verifies the FU1 fix (periodic drain abdicates ring pops on successor_gen
-# announcement) and the original B1 fix (graceful_drain also abdicates).
+# Verifies that the periodic drain abdicates ring pops on successor_gen
+# announcement, and that graceful_drain also abdicates.
 #
 # Assertions:
 #   a-i)  SIGHUP rounds: each unique /b1chaos/<N> path appears EXACTLY ONCE in
@@ -21,13 +21,13 @@
 # ── Mutation check (forcing technique) ──────────────────────────────────────
 #
 #   Mutation (a): in src/export/mod.rs export_loop, comment out the two
-#   `if !periodic_abdicated {` blocks that gate the periodic log/span drains
-#   (introduced by B1-FU1), rebuild, then run:
+#   `if !periodic_abdicated {` blocks that gate the periodic log/span drains,
+#   rebuild, then run:
 #
 #       USE_SLOW_SINK=1 bash tests/integration/run_b1_spsc_reload_chaos.sh
 #
 #   The slow sink (port 4399, 2 s response delay) stalls the old exporter's
-#   send-future.  With the FU1 gating removed:
+#   send-future.  With the abdication gating removed:
 #     1. Old exporter send stalls for 2 s (slow sink).
 #     2. New exporter spawns; its first 250 ms periodic tick pops the log ring.
 #     3. Old exporter's 250 ms periodic timer also fires during the 2 s stall
@@ -60,7 +60,7 @@
 #
 #       USE_SLOW_SINK=1 bash tests/integration/run_b1_spsc_reload_chaos.sh
 #
-#   Mutation (b) verification on debian-vm is part of the FU4 sanitizer re-run.
+#   Mutation (b) is most reliably verified on Linux (debian-vm) with USE_SLOW_SINK=1.
 #
 # ── Exit codes ──────────────────────────────────────────────────────────────
 # 0 = all assertions passed, 1 = preflight, 2 = assertion failed.
@@ -115,7 +115,7 @@ info "Module:       ${MODULE_PATH}"
 # delays all POST responses by SLOW_SINK_DELAY_S seconds (default: 2).  This
 # keeps the old exporter's send-future stalled through the reload overlap,
 # giving its 250 ms periodic timer time to fire against the rings while the
-# new exporter is also draining — the classic B1-FU1 scenario.
+# new exporter is also draining — the SPSC exclusivity violation scenario.
 SLOW_SINK_PID=""
 SLOW_SINK_PORT=4399
 SLOW_SINK_DELAY_S="${SLOW_SINK_DELAY_S:-2}"
@@ -209,7 +209,7 @@ http {
 
     # Enable access-log sampling: every status >= 400 is "interesting" and
     # produces a tail LogRecord written to the log ring (the SPSC ring whose
-    # exclusivity the FU1 fix restores).
+    # exclusivity that the abdication gate enforces).
     otel_access_log_sample 64;
 
     server {
@@ -325,7 +325,7 @@ for round in $(seq 1 "${N_ROUNDS}"); do
     sleep 0.1
 
     # Overlap-window traffic: both old exporter (periodic drain still running
-    # unless FU1 fix gates it) and new exporter can pop rings here.
+    # unless abdication gate is active) and new exporter can pop rings here.
     send_batch "${N_OVERLAP}"
     info "Round ${round}: overlap-window done (SEQ=${SEQ})"
 
@@ -410,7 +410,7 @@ pass "assertion (a-i): no duplicate records across ${N_ROUNDS} SIGHUP rounds \
 # (content since PRE_METRICS_SIZE).  Takes the max() — the gauge is a
 # cumulative sum of per-worker ring.drop_count() values, so later reports
 # always dominate earlier ones.
-# A conservation failure means unaccounted lost records — STOP-AND-ASK.
+# A conservation failure means unaccounted lost records — investigate before continuing.
 
 info "Assertion (a-ii): checking conservation (sent=${SEQ_AFTER_ROUNDS} unique_arrived=${UNIQUE_FOUND})..."
 
@@ -446,7 +446,7 @@ info "Conservation: ${UNIQUE_FOUND} arrived + ${ACCESS_DROPS} dropped = ${CONSER
 
 if [[ "${CONSERVATION_CHECK}" -ne "${SEQ_AFTER_ROUNDS}" ]]; then
     fail "assertion (a-ii): conservation FAILED: ${UNIQUE_FOUND} arrived + ${ACCESS_DROPS} drops = ${CONSERVATION_CHECK} != ${SEQ_AFTER_ROUNDS} sent
-         Unaccounted records — this is a real lost-records bug; STOP-AND-ASK."
+         Unaccounted records — this is a real lost-records bug."
 fi
 
 pass "assertion (a-ii): conservation OK (${UNIQUE_FOUND} arrived + ${ACCESS_DROPS} dropped = ${SEQ_AFTER_ROUNDS} sent)"
@@ -496,11 +496,11 @@ pass "assertion (a-iii): zero parse/garbage-length errors in error.log and colle
 #
 # After successor_announced() fires the old exporter logs:
 #   "otel export: successor announced — abdicating periodic ring pops (my_gen=N)"
-# The FIXED code (B1-FU1 gate present) then STOPS draining the rings, so NO
+# The fixed code (abdication gate active) then STOPS draining the rings, so NO
 # "otel export: sent N log|span records to collector" lines from the old
 # exporter's PID should appear AFTER the abdication log line.
 #
-# With the B1-FU1 gate REMOVED (mutation), the old exporter keeps draining
+# With the abdication gate REMOVED (mutation), the old exporter keeps draining
 # during the QUIT-DEFER window → sends appear after abdication → FAIL.
 #
 # The check is pid-keyed (PID#0: in nginx error.log format) and filtered by

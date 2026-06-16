@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # tests/bench/analyse.sh — analyse a wrk benchmark run JSON and assert
-# the Step 11 zero-cost-when-disabled tolerance check.
+# the zero-cost-when-disabled tolerance check.
 #
 # Usage:
 #   bash tests/bench/analyse.sh [path-to-run-*.json]
@@ -13,7 +13,7 @@
 #     and throughput (the headline zero-cost assertion)
 #
 # C3 operational cost (C3 vs C1) is reported but not asserted — that number
-# gets quoted in the proposal and characterised properly in Step 12.
+# gets quoted in the proposal and characterised properly on production hardware.
 #
 # Exit codes:
 #   0  all checks pass
@@ -21,8 +21,8 @@
 #   3  input file missing, malformed, or has unequal iteration counts
 #
 # Designed to be re-runnable on any committed run-*.json file so re-analysis
-# is reproducible without re-executing the benchmark itself.  Step 12's soak
-# run will reuse this for its own tolerance check (with a per-run threshold).
+# is reproducible without re-executing the benchmark itself.  A follow-on soak
+# run can reuse this for its own tolerance check (with a per-run threshold).
 
 set -euo pipefail
 
@@ -176,9 +176,8 @@ printf "  %-40s %s%%\n" "p99 latency (C3 vs C1)"    "$(signed_pct "$C1_P99" "$C3
 printf "  %-40s %s%%\n" "throughput (C3 vs C1)"     "$(signed_pct "$C1_RPS" "$C3_RPS")"
 echo ""
 echo "(Signed deltas; throughput negative = C3 slower than C1.  C3 numbers"
-echo " from a local laptop are a sanity check, not the proposal's"
-echo " operational characterisation — Step 12 covers that on production-shape"
-echo " hardware.)"
+echo " from a local laptop are a sanity check, not the definitive"
+echo " operational characterisation — run on production-shape hardware for that.)"
 
 # ─── Summary ─────────────────────────────────────────────────────────────────
 

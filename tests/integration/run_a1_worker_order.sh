@@ -29,7 +29,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CRATE_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 REPO_ROOT="$(cd "${CRATE_DIR}/.." && pwd)"
 
-HOSTILE_CONF="${SCRIPT_DIR}/nginx_worker_processes_after_http.conf"
+WORKER_AFTER_HTTP_CONF="${SCRIPT_DIR}/nginx_worker_processes_after_http.conf"
 A1B_POSITIVE_CONF="${SCRIPT_DIR}/nginx_wp_after_http_under_ncpu.conf"
 NORMAL_CONF="${SCRIPT_DIR}/nginx.conf"
 
@@ -177,7 +177,7 @@ sed \
     -e "s|@MODULE_PATH@|${MODULE_PATH}|g" \
     -e "s|@PREFIX@|${PREFIX2}|g" \
     -e "s|@WORKER_PROCESSES@|${ABOVE_NCPU}|g" \
-    "${HOSTILE_CONF}" > "${PREFIX2}/nginx.conf"
+    "${WORKER_AFTER_HTTP_CONF}" > "${PREFIX2}/nginx.conf"
 
 NGINX_EXIT2=0
 "${NGINX_BINARY}" \

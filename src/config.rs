@@ -1528,7 +1528,7 @@ impl MainConfig {
     ///   mapped — window between `ngx_shared_memory_add` and
     ///   `ngx_init_zone`).
     ///
-    /// # Hot-path note (Sub-item 2)
+    /// # Hot-path note
     /// Workers call this from `LogPhaseHandler` on every request. The
     /// `None`-returning path (module disabled) is a null pointer check,
     /// which is a single branch — zero allocations, zero syscalls.
@@ -2556,7 +2556,7 @@ extern "C" fn cmd_set_error_log(
         // Fill the state (pcalloc gave us zeros; only non-zero fields needed).
         (*state).level_floor = level_floor;
         // busy, cleanup, logs_zone, coalesce_table stay zero/null — correct defaults.
-        // coalesce_enabled is false until init_process (Step 2.3.5) sets it from
+        // coalesce_enabled is false until init_process sets it from
         // MainConfig::error_log_coalesce; the coalescer path is gated on
         // coalesce_table != null anyway, so false here is harmless.
     }
@@ -3193,14 +3193,14 @@ mod tests {
     /// predicate (replacing `value.windows(3).any(…)` with `false`) makes every
     /// `assert!` below fail.
     ///
-    /// Pre-fix shape (HOLLOW — fixed in FU2): the test defined its own local
-    /// `fn has_authority` (identical copy of the inline predicate in
-    /// `warn_if_has_authority`).  The reviewer replaced the production predicate
-    /// with `if false` and the test STILL PASSED because it was calling its own
-    /// copy.  This test calls `super::has_authority` — the single production
-    /// definition — so it cannot pass if the predicate is neutered.
+    /// Pre-fix shape (now fixed): an earlier version of this test defined its own
+    /// local `fn has_authority` (identical copy of the inline predicate in
+    /// `warn_if_has_authority`).  Replacing the production predicate with `if false`
+    /// made the test STILL PASS because it called its own copy.  This test calls
+    /// `super::has_authority` — the single production definition — so it cannot
+    /// pass if the predicate is neutered.
     ///
-    /// Mutation-evidence bar (FU2): replace `value.windows(3).any(…)` in
+    /// Mutation-evidence bar: replace `value.windows(3).any(…)` in
     /// `has_authority` with `false` → this test FAILS → restore → PASSES.
     #[test]
     fn h2f5_per_signal_endpoint_host_detection() {

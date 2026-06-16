@@ -338,7 +338,7 @@ if (( ${#REPORTS[@]} > 0 )); then
         echo "----- ${r} -----" >&2
         sed -n '1,40p' "${r}" >&2
     done
-    log "STOP-AND-ASK: AddressSanitizer findings present — surface the full reports for review." >&2
+    log "AddressSanitizer findings present — surface the full reports for review." >&2
     exit 1
 fi
 

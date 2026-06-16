@@ -67,7 +67,7 @@ FLOOD_COUNT_OFF=20    # Stage B: flood count for coalesce-off
 LISTEN_PORT_A=9104
 LISTEN_PORT_B=9105
 LISTEN_PORT_C=9106
-LISTEN_PORT_E=9108   # Stage E: fixed-default floor proof (FU2)
+LISTEN_PORT_E=9108   # Stage E: fixed-default floor proof
 FAKE_WARN_PORT=9591  # Stage E: nc fake upstream that triggers WARN (Content-Length mismatch)
 
 # ─── Colour helpers ──────────────────────────────────────────────────────────
@@ -476,7 +476,7 @@ fi
 trap - EXIT
 _cleanup_dp_c
 
-# ─── Stage E: Fixed-default floor proof (FU2) ────────────────────────────────
+# ─── Stage E: Fixed-default floor proof ──────────────────────────────────────
 #
 # Proves bare `otel_error_log;` (NOARGS) uses a FIXED floor of NGX_LOG_ERR,
 # NOT the core error_log level (no mirroring).

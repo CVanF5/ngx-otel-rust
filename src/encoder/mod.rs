@@ -3,7 +3,7 @@
 // This source code is licensed under the Apache License, Version 2.0 license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! Step 7: `Encoder` trait + OTLP/HTTP protobuf encoder.
+//! `Encoder` trait + OTLP/HTTP protobuf encoder.
 //!
 //! Converts the internal [`crate::data_model::Batch`] into
 //! `ExportMetricsServiceRequest` protobuf bytes via prost.

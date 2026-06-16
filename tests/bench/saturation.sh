@@ -294,7 +294,7 @@ run_one() {
         elif (( after < recv_before )); then
             recv_delta=-1   # METRICS_LOG rotated (10MB cap) => heavy export confirmed
         else
-            fail "C3 (${cfg} r${round}) exported NOTHING to the collector (count unchanged at ${after}). Comparison meaningless. STOP-AND-ASK."
+            fail "C3 (${cfg} r${round}) exported NOTHING to the collector (count unchanged at ${after}). Comparison meaningless."
             rm -rf "${prefix}"; trap - RETURN; exit 2
         fi
     fi
