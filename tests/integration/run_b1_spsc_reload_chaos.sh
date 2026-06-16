@@ -399,7 +399,7 @@ if [[ "${TOTAL_FOUND}" -ne "${UNIQUE_FOUND}" ]]; then
     DUPS=$(echo "${FOUND_PATHS}" | sort | uniq -d | tr '\n' ' ')
     fail "assertion (a): SPSC duplicate records detected: ${TOTAL_FOUND} total, ${UNIQUE_FOUND} unique
          Duplicate seq numbers: ${DUPS}
-         (B1-FU1 periodic-drain abdication missing, or mutation applied)"
+         (periodic-drain abdication missing, or mutation applied)"
 fi
 
 pass "assertion (a-i): no duplicate records across ${N_ROUNDS} SIGHUP rounds \
@@ -531,10 +531,10 @@ if [[ -n "${NGX_OTEL_QUIT_DEFER_TICKS:-}" && "${NGX_OTEL_QUIT_DEFER_TICKS:-0}" -
     done
     if [[ "${POST_ABD_TOTAL}" -gt 0 ]]; then
         fail "assertion (a-iv): SPSC exclusivity violated — ${POST_ABD_TOTAL} ring-record send(s) \
-from old exporter(s) after abdication (FU1 gate missing → concurrent drains in defer window)"
+from old exporter(s) after abdication (abdication gate missing → concurrent drains in defer window)"
     fi
     pass "assertion (a-iv): old exporter(s) sent zero ring records post-abdication \
-(SPSC exclusivity confirmed — FU1 gate held during QUIT-DEFER overlap)"
+(SPSC exclusivity confirmed — abdication gate held during QUIT-DEFER overlap)"
 fi
 
 # ── Assertion (b): quit-completeness ─────────────────────────────────────────
@@ -619,4 +619,4 @@ fi
 pass "assertion (b): quit-completeness: all ${N_QUIT_RECORDS} pre-quit records arrived"
 
 echo ""
-pass "B1-FU1 chaos gate: PASS — SPSC exclusivity across reload, conservation verified, no parse errors, quit-completeness confirmed"
+pass "SPSC reload chaos gate: PASS — SPSC exclusivity across reload, conservation verified, no parse errors, quit-completeness confirmed"

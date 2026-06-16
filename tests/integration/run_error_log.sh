@@ -415,7 +415,7 @@ fi
 # The error must appear in the sandbox error.log (core) but NOT in LOGS_LOG.
 # This verifies that the process-role guard blocks the writer in config-load context.
 
-info "=== Stage D: DP-C — config-load error goes to core log, not LOGS_LOG ==="
+info "=== Stage D: config-load error goes to core log, not LOGS_LOG ==="
 
 DP_C_PREFIX="$(mktemp -d /tmp/ngx-otel-dp-c.XXXXXX)"
 _cleanup_dp_c() {
@@ -464,13 +464,13 @@ if (( POST_LOGS_SIZE_D > PRE_LOGS_SIZE_D )); then
     # New content appeared — check if it's from this test.
     NEW_LOGS_D=$(tail -c "+$(( PRE_LOGS_SIZE_D + 1 ))" "${LOGS_LOG}")
     if echo "${NEW_LOGS_D}" | grep -q "this_is_not_valid"; then
-        hard_fail "Stage D: config-load error appeared in LOGS_LOG — DP-C guard not firing in config-load"
+        hard_fail "Stage D: config-load error appeared in LOGS_LOG — process-role guard not firing in config-load"
     else
         info "Stage D: new LOGS_LOG content unrelated to this config-load test (OK)"
-        pass "Stage D: config-load error NOT in LOGS_LOG (DP-C guard working)"
+        pass "Stage D: config-load error NOT in LOGS_LOG (process-role guard working)"
     fi
 else
-    pass "Stage D: no new LOGS_LOG content during config-load test (DP-C guard working)"
+    pass "Stage D: no new LOGS_LOG content during config-load test (process-role guard working)"
 fi
 
 trap - EXIT
@@ -623,9 +623,9 @@ _cleanup_stage_e
 
 echo ""
 if [[ "${FAILED}" -eq 0 ]]; then
-    pass "All Phase 2.3 + FU2 error-log assertions passed."
+    pass "All error-log assertions passed."
     exit 0
 else
-    fail "One or more Phase 2.3 + FU2 error-log assertions FAILED."
+    fail "One or more error-log assertions FAILED."
     exit 2
 fi

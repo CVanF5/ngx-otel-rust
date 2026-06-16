@@ -148,9 +148,9 @@ cat > "${PREFIX}/nginx.conf" <<EOF
 daemon off;
 master_process on;
 # Single worker keeps the smoke test focused: Worker 0 is the only
-# worker and IS the designated worker.  Phase 1.2 will revisit
-# multi-worker behaviour when the gRPC bridge becomes a real
-# production transport rather than a one-shot smoke test.
+# worker and IS the designated worker.  Multi-worker behaviour will be
+# revisited when the gRPC bridge becomes a real production transport
+# rather than a one-shot smoke test.
 worker_processes 1;
 # Without this, a hanging async task can keep a worker alive forever after
 # nginx -s quit; the script's wait-for-exit loop then times out and leaks
@@ -166,7 +166,7 @@ events {
 }
 
 http {
-    # The Phase 1.1 OTLP/HTTP exporter — needs to be configured so the
+    # The OTLP/HTTP exporter — needs to be configured so the
     # is_configured() gate lets init_process run.  Long interval so the
     # HTTP exporter doesn't fire during this test window.
     otel_exporter {
@@ -175,7 +175,7 @@ http {
     otel_service_name ngx-otel-grpc-smoke-http;
     otel_metric_interval 60s;
 
-    # Phase 1.2 Item 1 trigger: fire one unary OTLP/gRPC export via the
+    # Unary gRPC smoke trigger: fire one unary OTLP/gRPC export via the
     # real NgxExecutor + SendRequestService + NgxConnIo stack.
     otel_grpc_smoke_endpoint ${GRPC_ENDPOINT};
 
@@ -307,7 +307,7 @@ fi
 
 echo ""
 if [[ "${FAILED}" -eq 0 ]]; then
-    pass "All assertions passed.  Phase 1.2 Item 1 in-worker gRPC smoke COMPLETE."
+    pass "All assertions passed.  In-worker unary gRPC smoke COMPLETE."
     exit 0
 else
     echo -e "${RED}One or more assertions FAILED.${NC}" >&2

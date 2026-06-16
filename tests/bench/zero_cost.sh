@@ -433,7 +433,7 @@ for round in $(seq 1 "${BENCH_ITERATIONS}"); do
             SPAWN_COUNT="$(grep -c "spawning export task" "${PREFIX}/logs/error.log" 2>/dev/null)" || SPAWN_COUNT=0
             if [[ "${SPAWN_COUNT}" -gt 0 ]]; then
                 echo "ERROR: C2 error.log contains 'spawning export task' — export task gating is BROKEN!" >&2
-                echo "       This is a Phase 1.1 invariant failure. STOP-AND-ASK." >&2
+                echo "       This is a hard invariant failure — investigate before continuing." >&2
                 echo "       Relevant log lines:" >&2
                 grep "spawning export task" "${PREFIX}/logs/error.log" >&2
                 sandbox_cleanup "${PREFIX}"

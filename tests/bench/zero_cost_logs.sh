@@ -189,7 +189,7 @@ run_config() {
 # ─── Run all three configs ────────────────────────────────────────────────────
 
 {
-    echo "# Phase 2.2 zero-cost-logs bench — $(date)"
+    echo "# zero-cost-logs bench — $(date)"
     echo "# nginx: ${NGINX_BINARY}"
     echo "# iterations: ${BENCH_ITERATIONS}, duration: ${WRK_DURATION}s, threads: ${WRK_THREADS}"
 } >> "${LOGFILE}"
@@ -232,12 +232,12 @@ echo "BL vs TD regression: ${REG_TD}% (error_log flood — active path, informat
 # Append summary to RESULTS.md
 {
     echo ""
-    echo "## Phase 2.2 + 2.3 Zero-cost logs bench — $(date +%Y-%m-%d)"
+    echo "## Zero-cost logs bench — $(date +%Y-%m-%d)"
     echo ""
     echo "> ⚠️ **DEV-BOX SMOKE ONLY** — these numbers are INFORMATIONAL."
     echo "> The ±1% zero-cost gate and the 'enabled path is cheaper' proof"
     echo "> run **only on host-1** (the dedicated c7a EPYC), N≥50."
-    echo "> See RALPH_PHASE_2_2.md Step 2.2.6 and RALPH_PHASE_2_3.md Step 2.3.8."
+    echo "> Full validation (N≥50) must run on the dedicated isolated benchmark host."
     echo ""
     echo "| Config | Median (req/s) | p95 (req/s) | Regression vs BL |"
     echo "|--------|---------------|-------------|-----------------|"

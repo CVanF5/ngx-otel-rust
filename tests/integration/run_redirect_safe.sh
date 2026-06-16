@@ -283,12 +283,12 @@ fi
 if [[ -z "${DECLINE_TID}" ]]; then
     pass "(c) declined+redirected request → \$otel_trace_id is EMPTY (no stale pre-gate ctx recovered)"
 else
-    fail "(c) declined+redirected request leaked \$otel_trace_id='${DECLINE_TID}' — stale pre-gate cleanup anchor recovered (H3F9(f) regression)"
+    fail "(c) declined+redirected request leaked \$otel_trace_id='${DECLINE_TID}' — stale pre-gate cleanup anchor recovered (regression: otel_trace_id must be empty after gate decline)"
 fi
 
 echo ""
 if [[ "${FAILED}" -eq 0 ]]; then
-    echo -e "${GREEN}[PASS]${NC} All H3F1 redirect-safe assertions passed."
+    echo -e "${GREEN}[PASS]${NC} All redirect-safe assertions passed."
 else
     echo -e "${RED}[FAIL]${NC} ${FAILED} assertion(s) failed." >&2
     exit 2

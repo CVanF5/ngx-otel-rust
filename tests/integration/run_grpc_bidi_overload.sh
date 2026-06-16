@@ -217,14 +217,14 @@ events {
 }
 
 http {
-    # Phase 1.1 OTLP/HTTP exporter — keeps is_configured() gate open.
+    # OTLP/HTTP exporter — keeps is_configured() gate open.
     otel_exporter {
         endpoint http://127.0.0.1:4318;
     }
     otel_service_name ngx-otel-bidi-overload;
     otel_metric_interval 60s;
 
-    # Phase 1.2 Item 3: bidi overload endpoint.
+    # Bidi overload endpoint — exercises backpressure via the overload path.
     otel_grpc_bidi_overload_endpoint http://127.0.0.1:${ECHO_PORT};
 
     server {
@@ -454,7 +454,7 @@ fi
 echo ""
 info "sent=${SENT_VAL} received=${RECEIVED_VAL} dropped=${DROPPED_VAL}"
 if [[ "${FAILED}" -eq 0 ]]; then
-    pass "All assertions passed.  Phase 1.2 Item 3 bidi backpressure overload COMPLETE."
+    pass "All assertions passed.  Bidi backpressure overload smoke COMPLETE."
     exit 0
 else
     echo -e "${RED}One or more assertions FAILED.${NC}" >&2

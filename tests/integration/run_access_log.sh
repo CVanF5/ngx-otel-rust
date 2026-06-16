@@ -223,27 +223,27 @@ fi
 
 # §6.6.1: histogram must be exponential (EXP_HISTOGRAM_DATA_POINTS / exponentialHistogram)
 if echo "${NEW_METRICS}" | grep -qE '"exponentialHistogram"|"exponential_histogram"|EXP_HISTOGRAM'; then
-    pass "metrics.json: http.server.request.duration is exponentialHistogram (DP-F)"
+    pass "metrics.json: http.server.request.duration is exponentialHistogram"
 else
     # Collector may format with different capitalization; check the attribute marker instead.
     # All exp histograms have a "scale" field.
     if echo "${NEW_METRICS}" | grep -q '"scale"'; then
-        pass "metrics.json: exponential histogram scale field present (DP-F)"
+        pass "metrics.json: exponential histogram scale field present"
     else
-        fail "metrics.json: exponentialHistogram NOT found — DP-F may be broken"
+        fail "metrics.json: exponentialHistogram NOT found — exponential histogram type not emitted"
     fi
 fi
 
 # §6.6.1: http.route attribute must be present in the histogram data points
 if echo "${NEW_METRICS}" | grep -q '"http.route"'; then
-    pass "metrics.json: http.route dimension present (DP-E)"
+    pass "metrics.json: http.route dimension present"
 else
-    fail "metrics.json: http.route NOT found in histogram data points — DP-E may be broken"
+    fail "metrics.json: http.route NOT found in histogram data points — per-route dimension missing"
 fi
 
 # nginx.upstream.zone must be present — /api→upstream proxy_pass adds the upstream dimension.
 if echo "${NEW_METRICS}" | grep -q '"nginx.upstream.zone"'; then
-    pass "metrics.json: nginx.upstream.zone dimension present (DP-E, FU4)"
+    pass "metrics.json: nginx.upstream.zone dimension present"
 else
     fail "metrics.json: nginx.upstream.zone NOT found — /api→upstream should produce per-upstream data point"
 fi
@@ -260,7 +260,7 @@ fi
 # The regex location is unregistered → its requests land in the "(other)" route
 # bucket, which must surface as an http.route value.
 if echo "${NEW_METRICS}" | grep -qF '(other)'; then
-    pass "metrics.json: '(other)' route bucket present (regex/unregistered → overflow, DP-E)"
+    pass "metrics.json: '(other)' route bucket present (regex/unregistered → overflow bucket)"
 else
     fail "metrics.json: '(other)' route bucket NOT found — unregistered-route overflow path broken"
 fi
@@ -341,7 +341,7 @@ if [[ -n "${NEW_LOGS}" ]]; then
     # handful of 5xx requests in the combo, the reservoir keeps them all, so this
     # is deterministic — absence is a real failure.
     if echo "${NEW_METRICS}" | grep -q "${TRACE_ID}"; then
-        pass "metrics.json: trace_id ${TRACE_ID} carried in exemplar (FU4a traceparent)"
+        pass "metrics.json: trace_id ${TRACE_ID} carried in exemplar (inbound traceparent propagated)"
     else
         fail "metrics.json: trace_id ${TRACE_ID} NOT carried in any exemplar — traceparent→exemplar broken"
     fi
@@ -357,7 +357,7 @@ if [[ -n "${NEW_LOGS}" ]]; then
     # HARD: tail records carry url.path. The /error tail records have
     # url.path="/error"; assert the attribute key is present.
     if echo "${NEW_LOGS}" | grep -q '"url.path"'; then
-        pass "logs.json: url.path attribute present on tail records (FU4b)"
+        pass "logs.json: url.path attribute present on tail records"
     else
         fail "logs.json: url.path attribute NOT found on tail records — high-cardinality detail missing"
     fi
@@ -372,15 +372,15 @@ if [[ -n "${NEW_LOGS}" ]]; then
             DURATION_VAL="${DURATION_LINE#*:}"
             # Duration must be a positive number (> 0).
             if [[ "${DURATION_VAL}" =~ ^[0-9] ]] && (( $(echo "${DURATION_VAL} > 0" | bc -l 2>/dev/null || echo 0) )); then
-                pass "logs.json: http.server.request.duration present with plausible value ${DURATION_VAL}s (S2)"
+                pass "logs.json: http.server.request.duration present with plausible value ${DURATION_VAL}s"
             else
-                pass "logs.json: http.server.request.duration key present (value format varies by collector) (S2)"
+                pass "logs.json: http.server.request.duration key present (value format varies by collector)"
             fi
         else
-            pass "logs.json: http.server.request.duration key present (S2)"
+            pass "logs.json: http.server.request.duration key present"
         fi
     else
-        fail "logs.json: http.server.request.duration NOT found on tail LogRecord — S2 duration attribute missing"
+        fail "logs.json: http.server.request.duration NOT found on tail LogRecord — duration attribute missing"
     fi
 else
     fail "logs.json: no new content — exception-tail records did not arrive at the collector"

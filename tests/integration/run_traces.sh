@@ -337,9 +337,9 @@ fi
 # HARD: FU1 rerouted traces to traces.json; new metrics data must be clean.
 
 if [[ -n "${NEW_METRICS}" ]] && echo "${NEW_METRICS}" | grep -q '"resourceSpans"'; then
-    fail "metrics.json: new data contains resourceSpans — FU1 pipeline split is broken"
+    fail "metrics.json: new data contains resourceSpans — traces must not appear in the metrics pipeline"
 else
-    pass "metrics.json: no resourceSpans in new data (FU1 split holds)"
+    pass "metrics.json: no resourceSpans in new data (traces routed to traces.json only)"
 fi
 
 # ─── 8. D1a: sampled parent → span present ───────────────────────────────────

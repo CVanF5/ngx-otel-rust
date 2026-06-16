@@ -211,7 +211,7 @@ events {
 }
 
 http {
-    # Phase 1.1 OTLP/HTTP exporter — keeps is_configured() gate open.
+    # OTLP/HTTP exporter — keeps is_configured() gate open.
     # Long interval so it doesn't fire during the test window.
     otel_exporter {
         endpoint http://127.0.0.1:4318;
@@ -219,10 +219,10 @@ http {
     otel_service_name ngx-otel-grpc-bidi-smoke-http;
     otel_metric_interval 60s;
 
-    # Phase 1.2 Item 1 (regression gate): unary OTLP/gRPC export.
+    # Unary gRPC smoke (regression gate): unary OTLP/gRPC export.
     otel_grpc_smoke_endpoint ${GRPC_ENDPOINT};
 
-    # Phase 1.2 Item 2: bidi Echo.BidiEcho call against local echo server.
+    # Bidi gRPC smoke: Echo.BidiEcho call against local echo server.
     otel_grpc_bidi_smoke_endpoint ${BIDI_ENDPOINT};
 
     server {
@@ -383,7 +383,7 @@ fi
 
 echo ""
 if [[ "${FAILED}" -eq 0 ]]; then
-    pass "All 8 assertions passed.  Phase 1.2 Item 2 bidi gRPC smoke COMPLETE."
+    pass "All 8 assertions passed.  Bidi gRPC smoke COMPLETE."
     exit 0
 else
     echo -e "${RED}One or more assertions FAILED.${NC}" >&2

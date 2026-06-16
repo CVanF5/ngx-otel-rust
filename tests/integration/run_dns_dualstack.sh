@@ -348,7 +348,7 @@ fi
 
 # ─── TEST C: DNS name → v6 via AAAA (FU2) ────────────────────────────────────
 
-info "=== TEST C: DNS name → v6 via AAAA (FU2 — headline dual-stack proof) ==="
+info "=== TEST C: DNS name → v6 via AAAA (headline dual-stack proof) ==="
 
 # Platform check: skip gracefully if ::1 can't be bound (rare CI edge-case).
 # Document the skip so it's visible; don't silently pass.
@@ -452,7 +452,7 @@ else
     # path end-to-end.
     if [[ -s "${V6_AAAA_OUTPUT}" ]]; then
         RECEIVED_BYTES="$(wc -c < "${V6_AAAA_OUTPUT}" | tr -d ' ')"
-        pass "TEST C: v6 AAAA stub received ${RECEIVED_BYTES} bytes — DNS→v6 AAAA path confirmed (FU2)"
+        pass "TEST C: v6 AAAA stub received ${RECEIVED_BYTES} bytes — DNS→v6 AAAA path confirmed"
     else
         fail "TEST C: v6 AAAA stub output empty — nginx did not export to [::1]:${V6_AAAA_STUB_PORT} via AAAA resolution"
     fi
@@ -460,7 +460,7 @@ fi  # end of platform check
 
 # ─── TEST D: Unresolvable name clean error (FU2) ─────────────────────────────
 
-info "=== TEST D: Unresolvable name — clean error, no panic, no hang (FU2) ==="
+info "=== TEST D: Unresolvable name — clean error, no panic, no hang ==="
 
 # 1. Start the DNS stub in nxdomain mode.
 python3 "${SCRIPT_DIR}/dns_stub.py" "${NXDOMAIN_STUB_PORT}" nxdomain &
