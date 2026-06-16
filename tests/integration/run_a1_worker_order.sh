@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# tests/integration/run_a1_worker_order.sh — A1 / A1b regression test
+# tests/integration/run_a1_worker_order.sh — worker-processes-order regression test
 #
 # Covers three assertions:
 #
-#   CASE 1 — A1b POSITIVE (would FAIL on pre-A1b code):
-#     worker_processes == ncpu placed AFTER http{}.  Before A1b, zones were
+#   CASE 1 — ncpu-headroom POSITIVE (would FAIL without the ncpu-headroom fix):
+#     worker_processes == ncpu placed AFTER http{}.  Without the fix, zones were
 #     reserved for 1 slot (UNSET → 1), so check_zone_sizing would refuse any
-#     count > 1.  After A1b, zones are reserved for ngx_ncpu slots, so this
-#     starts cleanly.  Skipped on single-CPU machines where ncpu == 1 (pre/post
-#     A1b indistinguishable: both succeed).
+#     count > 1.  With the fix, zones are reserved for ngx_ncpu slots, so this
+#     starts cleanly.  Skipped on single-CPU machines where ncpu == 1 (before/after
+#     the fix indistinguishable: both succeed).
 #
-#   CASE 2 — A1b RESIDUAL ERROR:
+#   CASE 2 — residual worker-count error:
 #     worker_processes == ncpu+1 placed AFTER http{}.  init_module must refuse
 #     and log "shm zones were reserved for".  Operator instruction: move
 #     worker_processes before http{} or reduce it.
@@ -82,20 +82,20 @@ info "Module built: ${MODULE_PATH}"
 NCPU="$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1)"
 info "Detected ncpu=${NCPU}"
 
-# ─── CASE 1: A1b positive ─────────────────────────────────────────────────────
-# worker_processes == ncpu AFTER http{} → must START (A1b: ncpu-headroom fix).
-# Pre-A1b: reserved = 1 < ncpu → check_zone_sizing would refuse (FAIL).
-# Post-A1b: reserved = ncpu ≥ ncpu → init_module accepts (PASS).
+# ─── CASE 1: ncpu-headroom positive ───────────────────────────────────────────
+# worker_processes == ncpu AFTER http{} → must START (ncpu-headroom fix).
+# Without the fix: reserved = 1 < ncpu → check_zone_sizing would refuse (FAIL).
+# With the fix: reserved = ncpu ≥ ncpu → init_module accepts (PASS).
 
-info "--- CASE 1: A1b positive (worker_processes=${NCPU} after http{}) ---"
+info "--- CASE 1: ncpu-headroom positive (worker_processes=${NCPU} after http{}) ---"
 
 if [[ "${NCPU}" -lt 2 ]]; then
-    skip "CASE 1: ncpu=${NCPU} — single-CPU machine, pre/post A1b indistinguishable; skipping"
+    skip "CASE 1: ncpu=${NCPU} — single-CPU machine, before/after the fix indistinguishable; skipping"
 else
     PREFIX1="$(mktemp -d /tmp/ngx-otel-a1b-pos.XXXXXX)"
     cleanup1() {
         [[ -n "${NGINX_PID1:-}" ]] && kill "${NGINX_PID1}" 2>/dev/null || true
-        echo "=== error.log (A1b positive) ==="
+        echo "=== error.log (ncpu-headroom positive) ==="
         cat "${PREFIX1}/logs/error.log" 2>/dev/null || echo "(not found)"
         rm -rf "${PREFIX1}"
     }
@@ -116,39 +116,39 @@ else
     sleep 1
 
     if kill -0 "${NGINX_PID1}" 2>/dev/null; then
-        pass "A1b CASE 1: nginx starts with worker_processes=${NCPU} after http{}"
+        pass "CASE 1: nginx starts with worker_processes=${NCPU} after http{}"
     else
-        echo "=== error.log (A1b positive) ==="
+        echo "=== error.log (ncpu-headroom positive) ==="
         cat "${PREFIX1}/logs/error.log" 2>/dev/null || echo "(not found)"
-        fail "A1b CASE 1: nginx exited — worker_processes=${NCPU} after http{} should have started"
+        fail "CASE 1: nginx exited — worker_processes=${NCPU} after http{} should have started"
     fi
 
     # ── Telemetry check: verify requests succeed on all NCPU workers ─────────
-    # The A1b fix reserves ngx_ncpu WorkerSlots at shm-init time.  If any
+    # The ncpu-headroom fix reserves ngx_ncpu WorkerSlots at shm-init time.  If any
     # worker had an out-of-bounds slot index it would crash on the first
     # instrumented request, causing a non-200 response below.
     # We also check that the exporter produced metrics visible at the collector.
     REQ_COUNT=$(( NCPU * 3 ))
-    info "A1b CASE 1: sending ${REQ_COUNT} requests to exercise all ${NCPU} worker slots..."
+    info "CASE 1: sending ${REQ_COUNT} requests to exercise all ${NCPU} worker slots..."
     for i in $(seq 1 "${REQ_COUNT}"); do
         HTTP_STATUS="$(curl -sf -o /dev/null -w '%{http_code}' --max-time 2 http://127.0.0.1:9201/ 2>/dev/null || echo 000)"
         if [[ "${HTTP_STATUS}" != "200" ]]; then
-            fail "A1b CASE 1: request ${i}/${REQ_COUNT} returned ${HTTP_STATUS} — a worker may have crashed (bad slot index with ${NCPU} workers after http{})"
+            fail "CASE 1: request ${i}/${REQ_COUNT} returned ${HTTP_STATUS} — a worker may have crashed (bad slot index with ${NCPU} workers after http{})"
         fi
     done
-    pass "A1b CASE 1: all ${REQ_COUNT} HTTP requests returned 200 (all ${NCPU} worker slots correctly reserved)"
+    pass "CASE 1: all ${REQ_COUNT} HTTP requests returned 200 (all ${NCPU} worker slots correctly reserved)"
 
     # Give the exporter at least one 250ms tick + export round-trip.
     sleep 0.6
 
     if _collector_endpoint_reachable; then
         if grep -q "ngx-otel-a1b-test" "${METRICS_LOG}" 2>/dev/null; then
-            pass "A1b CASE 1: metrics.json contains ngx-otel-a1b-test — exporter running with ${NCPU} workers reached the collector"
+            pass "CASE 1: metrics.json contains ngx-otel-a1b-test — exporter running with ${NCPU} workers reached the collector"
         else
-            info "A1b CASE 1: collector reachable but ngx-otel-a1b-test not yet in metrics.json; skipping (metrics pipeline may not have flushed)"
+            info "CASE 1: collector reachable but ngx-otel-a1b-test not yet in metrics.json; skipping (metrics pipeline may not have flushed)"
         fi
     else
-        info "A1b CASE 1: collector not reachable at ${COLLECTOR_HTTP_ENDPOINT:-http://127.0.0.1:4318} — skipping telemetry-arrival check (run with collector up to assert full pipeline)"
+        info "CASE 1: collector not reachable at ${COLLECTOR_HTTP_ENDPOINT:-http://127.0.0.1:4318} — skipping telemetry-arrival check (run with collector up to assert full pipeline)"
     fi
 
     kill "${NGINX_PID1}" 2>/dev/null || true
@@ -157,16 +157,16 @@ else
     rm -rf "${PREFIX1}"
 fi
 
-# ─── CASE 2: A1b residual error ───────────────────────────────────────────────
+# ─── CASE 2: residual worker-count error ──────────────────────────────────────
 # worker_processes == ncpu+1 AFTER http{} → init_module must REFUSE.
 # (reserved = ncpu, actual = ncpu+1 > reserved → error)
 
 ABOVE_NCPU=$(( NCPU + 1 ))
-info "--- CASE 2: A1b residual error (worker_processes=${ABOVE_NCPU} after http{}) ---"
+info "--- CASE 2: residual worker-count error (worker_processes=${ABOVE_NCPU} after http{}) ---"
 
 PREFIX2="$(mktemp -d /tmp/ngx-otel-a1b-err.XXXXXX)"
 cleanup2() {
-    echo "=== error.log (A1b residual error) ==="
+    echo "=== error.log (residual worker-count error) ==="
     cat "${PREFIX2}/logs/error.log" 2>/dev/null || echo "(not found)"
     rm -rf "${PREFIX2}"
 }
@@ -187,16 +187,16 @@ NGINX_EXIT2=0
     || NGINX_EXIT2=$?
 
 if [[ "${NGINX_EXIT2}" -eq 0 ]]; then
-    fail "A1b CASE 2: nginx exited 0 with worker_processes=${ABOVE_NCPU} after http{} — expected refusal"
+    fail "CASE 2: nginx exited 0 with worker_processes=${ABOVE_NCPU} after http{} — expected refusal"
 fi
-pass "A1b CASE 2: nginx exited ${NGINX_EXIT2} (non-zero) with worker_processes=${ABOVE_NCPU} after http{}"
+pass "CASE 2: nginx exited ${NGINX_EXIT2} (non-zero) with worker_processes=${ABOVE_NCPU} after http{}"
 
 if grep -q "shm zones were reserved for" "${PREFIX2}/logs/error.log" 2>/dev/null; then
-    pass "A1b CASE 2: error.log contains expected A1b ncpu-headroom message"
+    pass "CASE 2: error.log contains expected ncpu-headroom refusal message"
 else
     echo "=== error.log tail ==="
     tail -20 "${PREFIX2}/logs/error.log" 2>/dev/null
-    fail "A1b CASE 2: error.log missing 'shm zones were reserved for' — A1b message not emitted"
+    fail "CASE 2: error.log missing 'shm zones were reserved for' — ncpu-headroom refusal message not emitted"
 fi
 
 trap - EXIT
@@ -228,11 +228,11 @@ NGINX_PID3=$!
 sleep 1
 
 if kill -0 "${NGINX_PID3}" 2>/dev/null; then
-    pass "A1b CASE 3: nginx starts correctly with normal ordering"
+    pass "CASE 3: nginx starts correctly with normal ordering"
 else
     echo "=== error.log (normal ordering) ==="
     cat "${PREFIX3}/logs/error.log" 2>/dev/null || echo "(not found)"
-    fail "A1b CASE 3: nginx exited with normal ordering — unexpected failure"
+    fail "CASE 3: nginx exited with normal ordering — unexpected failure"
 fi
 
 kill "${NGINX_PID3}" 2>/dev/null || true
@@ -243,4 +243,4 @@ rm -rf "${PREFIX3}"
 # ─── Summary ─────────────────────────────────────────────────────────────────
 
 echo ""
-pass "A1b worker_processes-order regression test: all assertions passed"
+pass "worker_processes-order regression test: all assertions passed"
