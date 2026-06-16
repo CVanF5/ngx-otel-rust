@@ -3288,7 +3288,7 @@ fn collect_error_rate_metric(base: *mut u8, n_workers: usize, start_time_ns: u64
 
     Metric {
         name: "ngx_otel.error_log.events".into(),
-        description: "Error log events counted by severity class (DP-B)".into(),
+        description: "Error log events counted by severity class".into(),
         unit: "{error}".into(),
         data: MetricData::Sum(SumData {
             aggregation_temporality: AggregationTemporality::Cumulative,

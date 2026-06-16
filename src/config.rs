@@ -2342,7 +2342,7 @@ extern "C" fn cmd_set_export_protocol(
         ngx_conf_log_error!(
             NGX_LOG_EMERG,
             &raw mut *cf,
-            "otel_export_protocol: \"arrow\" is not yet implemented (Phase 5)"
+            "otel_export_protocol: \"arrow\" is not yet implemented"
         );
         NGX_CONF_ERROR
     } else {

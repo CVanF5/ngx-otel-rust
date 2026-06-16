@@ -1291,9 +1291,7 @@ impl Connector for NgxConnector {
                 Ok(io)
             }
             ParsedEndpoint::Unix { .. } => Err(TransportError::Connection {
-                cause: std::string::String::from(
-                    "Unix sockets not supported for NgxConnIo in Phase 1.1",
-                ),
+                cause: std::string::String::from("Unix sockets are not supported for NgxConnIo"),
             }),
         }
     }
