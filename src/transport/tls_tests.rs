@@ -166,7 +166,7 @@ fn run_openssl(args: &[&str], cwd: &std::path::Path) {
 /// server cert's SAN so the hostname-mismatch test can request a wrong name.
 fn make_certs(san: &str) -> Certs {
     let dir = std::env::temp_dir().join(format!(
-        "ngx-otel-a1-{}-{}",
+        "ngx-otel-tls-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::SeqCst)
     ));

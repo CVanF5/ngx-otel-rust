@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/integration/run_a1_worker_order.sh — worker-processes-order regression test
+# tests/integration/run_worker_order.sh — worker-processes-order regression test
 #
 # Covers three assertions:
 #
@@ -92,7 +92,7 @@ info "--- CASE 1: ncpu-headroom positive (worker_processes=${NCPU} after http{})
 if [[ "${NCPU}" -lt 2 ]]; then
     skip "CASE 1: ncpu=${NCPU} — single-CPU machine, before/after the fix indistinguishable; skipping"
 else
-    PREFIX1="$(mktemp -d /tmp/ngx-otel-a1b-pos.XXXXXX)"
+    PREFIX1="$(mktemp -d /tmp/ngx-otel-worker-order-pos.XXXXXX)"
     cleanup1() {
         [[ -n "${NGINX_PID1:-}" ]] && kill "${NGINX_PID1}" 2>/dev/null || true
         echo "=== error.log (ncpu-headroom positive) ==="
@@ -142,10 +142,10 @@ else
     sleep 0.6
 
     if _collector_endpoint_reachable; then
-        if grep -q "ngx-otel-a1b-test" "${METRICS_LOG}" 2>/dev/null; then
-            pass "CASE 1: metrics.json contains ngx-otel-a1b-test — exporter running with ${NCPU} workers reached the collector"
+        if grep -q "ngx-otel-worker-order-ncpu-test" "${METRICS_LOG}" 2>/dev/null; then
+            pass "CASE 1: metrics.json contains ngx-otel-worker-order-ncpu-test — exporter running with ${NCPU} workers reached the collector"
         else
-            info "CASE 1: collector reachable but ngx-otel-a1b-test not yet in metrics.json; skipping (metrics pipeline may not have flushed)"
+            info "CASE 1: collector reachable but ngx-otel-worker-order-ncpu-test not yet in metrics.json; skipping (metrics pipeline may not have flushed)"
         fi
     else
         info "CASE 1: collector not reachable at ${COLLECTOR_HTTP_ENDPOINT:-http://127.0.0.1:4318} — skipping telemetry-arrival check (run with collector up to assert full pipeline)"
@@ -164,7 +164,7 @@ fi
 ABOVE_NCPU=$(( NCPU + 1 ))
 info "--- CASE 2: residual worker-count error (worker_processes=${ABOVE_NCPU} after http{}) ---"
 
-PREFIX2="$(mktemp -d /tmp/ngx-otel-a1b-err.XXXXXX)"
+PREFIX2="$(mktemp -d /tmp/ngx-otel-worker-order-err.XXXXXX)"
 cleanup2() {
     echo "=== error.log (residual worker-count error) ==="
     cat "${PREFIX2}/logs/error.log" 2>/dev/null || echo "(not found)"
@@ -207,7 +207,7 @@ rm -rf "${PREFIX2}"
 
 info "--- CASE 3: normal ordering (worker_processes before http{}) ---"
 
-PREFIX3="$(mktemp -d /tmp/ngx-otel-a1b-norm.XXXXXX)"
+PREFIX3="$(mktemp -d /tmp/ngx-otel-worker-order-norm.XXXXXX)"
 cleanup3() {
     [[ -n "${NGINX_PID3:-}" ]] && kill "${NGINX_PID3}" 2>/dev/null || true
     rm -rf "${PREFIX3}"
