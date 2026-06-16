@@ -2,7 +2,7 @@
 # tests/bench/zero_cost_logs.sh — zero-cost-when-disabled + rebalanced access/error-log benchmark
 #
 # Runs three NGINX configs back-to-back under wrk to measure the per-request
-# overhead of the §6.6.1 rebalanced access-log path.
+# overhead of the rebalanced access-log path.
 #
 # Config layout:
 #   BL (Baseline):   module loaded + otel_exporter + access sample OFF

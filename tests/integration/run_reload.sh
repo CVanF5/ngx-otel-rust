@@ -7,14 +7,14 @@
 # asserts that:
 #   1. Exactly 2 "export loop started" lines appear in error.log
 #      (one per exporter generation across the reload cycle).
-#   2. At least 2 "graceful drain complete" lines appear (§6.3 race RESOLVED —
-#      the exporter is not a worker and is not subject to ngx_event_no_timers_left).
-#   3. "otel: SIGHUP reload detected" appears exactly once (from Item 1's
-#      postconfiguration hook in the master).
+#   2. At least 2 "graceful drain complete" lines appear (the exporter is not a worker
+#      and is not subject to ngx_event_no_timers_left, so drain fires reliably on quit).
+#   3. "otel: SIGHUP reload detected" appears exactly once (from
+#      MainConfig::postconfiguration in the master on reload).
 #   4. metrics.json shows service.name from the new exporter in new content.
 #   5. metrics.json shows ≥ 2 unique startTimeUnixNano values for
 #      ngx_otel.dropped_records (start_time advances on each new exporter
-#      generation, per the proposal §6 design call).
+#      generation; start_time_unix_nano advances when a new exporter generation starts).
 #   6. For every ngx_otel.dropped_records data point, timeUnixNano >=
 #      startTimeUnixNano (cumulative semantics are honest across reload;
 #      a backend computing rates by diffing same-stream samples will not
@@ -285,14 +285,15 @@ $(grep 'export loop started\|otel exporter\|otel export' "${PREFIX}/logs/error.l
 fi
 
 # 2. At least 2 "graceful drain complete" lines.
-# Each exporter runs a graceful drain on ngx_quit (§6.3 race RESOLVED).
+# Each exporter runs a graceful drain on ngx_quit (the exporter is not subject to
+# ngx_event_no_timers_left so drain fires reliably).
 # Drain complete from generation-1 exporter (SIGHUP quit) + generation-2 (final quit).
 FLUSH_COUNT=$(grep -c "graceful drain complete" "${PREFIX}/logs/error.log" 2>/dev/null) || FLUSH_COUNT=0
 if [[ "${FLUSH_COUNT}" -ge 2 ]]; then
     pass "error.log: ${FLUSH_COUNT} 'graceful drain complete' lines (≥ 2 expected)"
 else
     fail "error.log: expected ≥ 2 'graceful drain complete' lines, got ${FLUSH_COUNT}.
-       Note: §6.3 RESOLVED — the exporter is not subject to ngx_event_no_timers_left.
+       Note: the exporter is not subject to ngx_event_no_timers_left; drain fires reliably.
        Relevant lines:
 $(grep 'graceful drain\|ngx_quit' "${PREFIX}/logs/error.log" | head -20)"
 fi
@@ -335,7 +336,7 @@ else
 $(echo "${NEW_CONTENT}" | head -2 | cut -c1-200)"
 fi
 
-# 6. Item 5: for every ngx_otel.dropped_records data point, time_unix_nano >= start_time_unix_nano.
+# 6. For every ngx_otel.dropped_records data point, time_unix_nano >= start_time_unix_nano.
 #
 # NOTE: Cumulative semantics across reload are honest. Backends that compute
 # rates by diffing same-stream samples will not see a spurious decrement when

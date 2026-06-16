@@ -303,7 +303,7 @@ fi
 
 info "Running assertions..."
 
-# 1. Unary smoke trigger fired exactly once (Item 1 regression gate).
+# 1. Unary smoke trigger fired exactly once (regression gate: init-process unary path fires on startup).
 FIRING_COUNT=$(grep -c "grpc smoke: firing one unary" "${PREFIX}/logs/error.log" 2>/dev/null) || FIRING_COUNT=0
 if [[ "${FIRING_COUNT}" -eq 1 ]]; then
     pass "error.log: exactly 1 'grpc smoke: firing one unary' line"

@@ -20,7 +20,7 @@ fn main() {
     // accessors) against the real nginx headers.
     compile_c_shims();
 
-    // Compile proto files for OTLP encoding (used in Step 7)
+    // Compile proto files for OTLP encoding.
     compile_protos();
 }
 
@@ -290,9 +290,9 @@ fn compile_protos() {
         }
     }
 
-    // Phase 1.2 Item 2: compile the local echo proto used for bidi smoke
-    // testing.  This proto is a throwaway local definition; Phase 5 will
-    // replace it with OTAP's arrow_service.proto.
+    // Compile the local echo proto used for bidi gRPC smoke testing.
+    // This proto is a throwaway local definition; a future OTAP transport
+    // will replace it with OTAP's arrow_service.proto.
     //
     // Two separate compilations are required because the main library is
     // no_std, and the tonic-generated server stub uses bare `Box::pin` which

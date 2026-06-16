@@ -1193,9 +1193,9 @@ impl Connector for SpinConnector {
 /// connection via NGINX's event machinery.  Requires a running NGINX event loop.
 ///
 /// Supports:
-/// - Literal IPv4 and IPv6 addresses (Item 2).
-/// - DNS-name endpoints via nginx's async resolver (Item 3).  The resolver
-///   pointer is stored at config-parse time (Item 1) and driven by the
+/// - Literal IPv4 and IPv6 addresses.
+/// - DNS-name endpoints via nginx's async resolver.  The resolver
+///   pointer is stored at config-parse time and driven by the
 ///   exporter's nginx event loop.  Addresses are tried sequentially.
 pub struct NgxConnector {
     log: core::ptr::NonNull<ngx_log_t>,
@@ -1249,7 +1249,7 @@ impl Connector for NgxConnector {
                 let host_str = strip_v6_brackets(host.as_str());
 
                 // Branch on address family.  DNS names fall through to the
-                // error arm below; resolution is wired in Item 3 (transport_dns).
+                // error arm below; DNS names fall through to the resolution path.
                 let (sockaddr_ptr, socklen) = match host_str.parse::<std::net::IpAddr>() {
                     Ok(std::net::IpAddr::V4(v4)) => (
                         build_ipv4_sockaddr(&io.pool, v4, *port)?,
@@ -2019,7 +2019,7 @@ async fn http_post_raw(
 mod tests {
     use super::*;
 
-    // ── Item 2: IPv6 sockaddr + dual-stack literal branch ─────────────────────
+    // ── IPv6 sockaddr + dual-stack literal branch ────────────────────────────
 
     /// socklen_t values for the two address families must match the plan spec
     /// (sockaddr_in = 16, sockaddr_in6 = 28) and must agree with libc's sizes.

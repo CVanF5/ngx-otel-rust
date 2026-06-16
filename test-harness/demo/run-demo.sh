@@ -226,7 +226,7 @@ start_traffic() {
     # Light, varied background load so every histogram populates.
     #
     # Each request carries a UNIQUE W3C `traceparent` so the trace_id propagates
-    # to BOTH the request-duration histogram exemplar (Phase 2.2.4) and the
+    # to BOTH the request-duration histogram exemplar and the
     # access tail LogRecord — that shared trace_id is the join key behind the
     # Grafana exemplar→Loki drill-down (click an exemplar diamond → its tail log).
     (

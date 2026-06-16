@@ -230,7 +230,7 @@ impl<const BUCKETS: usize> Histogram<BUCKETS> {
 
 // ── Closed cardinality dimension enums ──────────────────────────────────────
 //
-// Attribute keys MUST be drawn from OTel HTTP semconv ONLY (proposal §6.4).
+// Attribute keys MUST be drawn from OTel HTTP semconv ONLY (see TELEMETRY_MODEL.md).
 // All variants are WithinU8 cardinality so the OTAP classifier can
 // dictionary-encode every per-point column at u8 key width.
 

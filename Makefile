@@ -17,11 +17,11 @@ TESTS		?= tests/integration/run.sh \
 		   tests/integration/run_b1_collector_cert_gauge.sh
 NGX_CARGO	?= cargo
 
-# nginx configure base flags. Phase 1.1 needs --with-compat (for loading a
-# separately-built dynamic module) and --with-http_stub_status_module (for
-# the ngx_stat_* atomics our StubStatusSource reads). Phase C adds
-# --with-http_ssl_module so bindgen sees the real ngx_ssl_s layout and
-# ngx_http_ssl_module is emitted (required for cert-metrics in C2/C3).
+# nginx configure base flags. --with-compat is required for loading a
+# separately-built dynamic module; --with-http_stub_status_module provides
+# the ngx_stat_* atomics our StubStatusSource reads. The TLS-enabled build
+# adds --with-http_ssl_module so bindgen sees the real ngx_ssl_s layout and
+# ngx_http_ssl_module is emitted (required for cert-metrics in the TLS tests).
 NGINX_CONFIGURE_BASE	= \
 	auto/configure \
 		--with-compat \
@@ -235,17 +235,17 @@ build-%: ## Build with the specified configuration. E.g. make build-sanitize.
 test-%: ## Test with the specified configuration.
 	$(MAKE) test BUILD="$*"
 
-# ── Phase 1.2 Item 3 stress gates ───────────────────────────────────────────
+# ── Stress gates ────────────────────────────────────────────────────────────
 
-# Sub-item 3.2: Time::sleep() panic-path 1-hour watch loop.
+# Time::sleep() panic-path 1-hour watch loop.
 # Default LOOP_FOR=3600 for the formal gate; override to 60 for ad-hoc runs.
 
 .PHONY: timer-panic-watch
 
-timer-panic-watch: ## Sub-item 3.2: 1-hour Time::sleep panic watch
+timer-panic-watch: ## 1-hour Time::sleep panic watch (LOOP_FOR=3600 default; override to 60 for ad-hoc)
 	LOOP_FOR=$${LOOP_FOR:-3600} bash tests/bench/timer_panic_watch.sh
 
-# Sub-item 3.1: build nginx + module under ThreadSanitizer inside Docker and
+# TSAN: build nginx + module under ThreadSanitizer inside Docker and
 # run both gRPC smoke integration scripts.  Linux arm64 only.
 # Prerequisites on the host: Docker available; collector running (collector-up).
 # macOS operators: `make build BUILD=tsan` still works for flag-validity checks;
@@ -253,7 +253,7 @@ timer-panic-watch: ## Sub-item 3.2: 1-hour Time::sleep panic watch
 
 .PHONY: tsan-test tsan-test-dns tsan-test-error
 
-tsan-test: ## Sub-item 3.1: TSAN build + smoke scripts in Docker (Linux arm64 only)
+tsan-test: ## TSAN build + smoke scripts in Docker (Linux arm64 only)
 tsan-test: collector-up
 	DOCKER_ARCH="$$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"; \
 	docker build \
@@ -298,7 +298,7 @@ tsan-test-dns: collector-up
 	    ngx-otel-tsan:latest \
 	    bash /work/ngx-otel-rust/build/tsan-run-dns-only.sh
 
-tsan-test-error: ## Error-log-only TSAN gate: exercises the §6.6.2 error-log path under TSAN (Linux arm64 only)
+tsan-test-error: ## Error-log-only TSAN gate: exercises the coalesced error-log path under TSAN (Linux arm64 only)
 tsan-test-error: collector-up
 	DOCKER_ARCH="$$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"; \
 	docker build \

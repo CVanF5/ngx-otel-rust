@@ -38,7 +38,7 @@ p99 314µs and 299µs).
 - ours_all − ours_ml = **+0.1pp worker** (≈ 0.13 µs-cpu/req) **+1.5pp exporter** (off-path)
   ≈ 1.9 µs-cpu/span total.
 - **Total CPU is comparable (~2 µs/span); the difference is *where* it is spent.** Ours keeps the
-  request path at ≈ baseline cost (consistent with the earlier §3.8 characterization: +0.10 vs
+  request path at ≈ baseline cost (consistent with the earlier micro-bench in RESULTS.md: +0.10 vs
   +1.21 µs-cpu/req worker marginal); the cold cost moves to the dedicated core.
 
 ### Phase B — saturating, 10% sampling

@@ -40,7 +40,7 @@ exporters:
   # classic scrape exporter can only render as a single le="+Inf" bucket (it
   # also DROPS the exemplars). Remote-write carries the exp-histograms as
   # Prometheus NATIVE histograms AND ships their EXEMPLARS (trace_id + url.path,
-  # Phase 2.2.4), so Grafana can overlay exemplar diamonds and drill to the
+  # access-log exemplars), so Grafana can overlay exemplar diamonds and drill to the
   # Loki tail log. Pairs with Prometheus --web.enable-remote-write-receiver +
   # --enable-feature=native-histograms,exemplar-storage.
   prometheusremotewrite:

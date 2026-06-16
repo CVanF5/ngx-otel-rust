@@ -27,7 +27,7 @@
 | worker RSS | **7.9 MB** | 23.1 MB | −66 % |
 | exporter RSS | 15.0 MB (flat) | n/a | no growth over 60 h |
 
-Interpretation: the result corroborates and strengthens the §3.8 micro-bench (`RESULTS.md`,
+Interpretation: the result corroborates and strengthens the micro-bench (`RESULTS.md`,
 commit `88dd57d`) under sustained TLS load + injected chaos. The central-exporter design
 keeps the worker hot path ~21 CPU points lighter and the worker RSS ~3× smaller than the
 per-worker C++ model, while delivering higher throughput and a dramatically tighter tail

@@ -2,9 +2,8 @@ syntax = "proto3";
 
 package ngx.otel.echo.v1;
 
-// Local-only bidi test proto.  Phase 1.2 Item 2 mechanical-only
-// exercise of the gRPC bridge.  NOT an OTel protocol; will be
-// replaced when OTAP firms up.
+// Local-only bidi test proto.  Mechanical exercise of the gRPC bridge.
+// NOT an OTel protocol; will be replaced when OTAP firms up.
 service Echo {
     // Client streams Ping messages; server streams Pong replies.
     // Server emits one Pong per Ping received, with seq == ping.seq.

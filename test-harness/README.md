@@ -5,8 +5,8 @@ tests target.  Self-contained: one `docker compose up -d` and you're ready.
 
 ## What you get
 
-- OTLP/HTTP receiver on `127.0.0.1:4318` (used by Phase 1.1).
-- OTLP/gRPC receiver on `127.0.0.1:4317` (used by Phase 1.2).
+- OTLP/HTTP receiver on `127.0.0.1:4318` (used by the OTLP/HTTP transport tests).
+- OTLP/gRPC receiver on `127.0.0.1:4317` (used by the OTLP/gRPC transport tests).
 - **Debug exporter** with `verbosity: detailed` — every received payload
   is printed to the collector container logs.
 - **File exporter** writing JSON-encoded payloads to

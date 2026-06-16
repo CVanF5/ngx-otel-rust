@@ -2,8 +2,7 @@
 # tests/integration/run_exporter_crash_respawn.sh — exporter crash-respawn gate
 #
 # Verifies that master auto-respawns the `nginx: otel exporter` child after a
-# SIGKILL (crash).  Gate from proposal §3: "exporter restart on crash works
-# with bounded telemetry loss".
+# SIGKILL (crash).  Gate: "exporter restart on crash works with bounded telemetry loss".
 #
 # Assertions:
 #   1. nginx starts with one exporter child (PID #1).
@@ -11,8 +10,8 @@
 #   3. PID #2 != PID #1.
 #   4. error.log contains "otel exporter: cycle entered" at least twice
 #      (once for original spawn, once for respawn).
-#   5. ngx_otel.dropped_records > 0 in metrics.json (proposal §3 bounded-loss
-#      gate): nginx is started BEFORE the collector so Worker 0's export loop
+#   5. ngx_otel.dropped_records > 0 in metrics.json (bounded-loss gate):
+#      nginx is started BEFORE the collector so Worker 0's export loop
 #      immediately gets ECONNREFUSED and fills its retry buffer (retry_depth=4).
 #      After 5+ failed intervals (5s) DROPPED_RECORDS accumulates; the
 #      collector is then started so the SAME Worker 0 exports the drops.
@@ -252,15 +251,14 @@ if (( CYCLE_ENTERED_COUNT < 2 )); then
 fi
 pass "error.log contains 'otel exporter: cycle entered' ${CYCLE_ENTERED_COUNT} time(s) (>= 2)"
 
-# Assertion 5: dropped_records > 0 in metrics.json delta (proposal §3 gate).
+# Assertion 5: dropped_records > 0 in metrics.json delta (bounded-loss gate).
 #
 # The retry buffer overflow increments DROPPED_RECORDS in Worker 0's process.
 # Once the collector is available, the next successful export includes
 # ngx_otel.dropped_records = N > 0 in the self-metrics payload.
 #
-# This is the load-bearing claim from proposal §3: "exporter restart on crash
-# works with bounded telemetry loss" — measured by the dropped_records metric
-# reaching the collector, not just by log lines.
+# The load-bearing claim: "exporter restart on crash works with bounded telemetry loss"
+# — measured by the dropped_records metric reaching the collector, not just by log lines.
 NEW_CONTENT=""
 if [[ -f "${METRICS_LOG}" ]]; then
     POST_SIZE=$(wc -c < "${METRICS_LOG}")
@@ -296,7 +294,7 @@ print(max_dropped)
 fi
 
 if (( DROPPED_VALUE > 0 )); then
-    pass "ngx_otel.dropped_records = ${DROPPED_VALUE} > 0 (proposal §3 bounded-loss gate)"
+    pass "ngx_otel.dropped_records = ${DROPPED_VALUE} > 0 (bounded-loss gate)"
 else
     fail "ngx_otel.dropped_records not > 0 in metrics.json delta (got ${DROPPED_VALUE:-0}).
        Expected retry buffer (depth=4) to overflow after 5+ failed 1s-interval exports.

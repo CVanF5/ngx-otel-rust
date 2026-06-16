@@ -3084,7 +3084,7 @@ mod tests {
         );
     }
 
-    // ── DNS resolver wiring (transport DNS/dual-stack, Item 1) ────────────────
+    // ── DNS resolver wiring (transport DNS/dual-stack) ───────────────────────
 
     /// `endpoint_needs_resolver` correctly classifies every endpoint form.
     ///
@@ -3161,7 +3161,7 @@ mod tests {
     /// `ngx_conf_t`); instead it manually sets the fields the way
     /// `postconfiguration` would and verifies the accessors are consistent.
     /// The real wiring is exercised by the integration tests in
-    /// `tests/integration/run_dns_dualstack.sh` (Item 6).
+    /// `tests/integration/run_dns_dualstack.sh`.
     #[test]
     fn resolver_field_simulation_dns_endpoint() {
         let mut cfg = MainConfig::default();

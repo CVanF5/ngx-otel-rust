@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tests/integration/run_error_log.sh — error-log integration test
 #
-# Tests the §6.6.2 coalesced error-log + companion error-rate metric.
+# Tests the coalesced error-log + companion error-rate metric.
 # Runs FOUR stages + two standalone checks (each a fresh nginx):
 #
 #   Stage A: Coalesce-on flood (default)

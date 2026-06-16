@@ -2,7 +2,7 @@
 # tests/integration/run_access_log.sh — access-log integration test
 #
 # Starts NGINX with `otel_access_log_sample 16;`, sends HTTP requests, waits for
-# the export interval, then verifies the §6.6.1 rebalanced shape:
+# the export interval, then verifies the rebalanced access-log shape:
 #
 # Assertions:
 #   1. 200 flood produces ZERO per-request LogRecords (is_interesting gate blocks them).
@@ -221,7 +221,7 @@ else
     fail "metrics.json: http.server.request.duration NOT found"
 fi
 
-# §6.6.1: histogram must be exponential (EXP_HISTOGRAM_DATA_POINTS / exponentialHistogram)
+# Access-log path: histogram must be exponential (EXP_HISTOGRAM_DATA_POINTS / exponentialHistogram)
 if echo "${NEW_METRICS}" | grep -qE '"exponentialHistogram"|"exponential_histogram"|EXP_HISTOGRAM'; then
     pass "metrics.json: http.server.request.duration is exponentialHistogram"
 else
@@ -234,7 +234,7 @@ else
     fi
 fi
 
-# §6.6.1: http.route attribute must be present in the histogram data points
+# Access-log path: http.route attribute must be present in the histogram data points
 if echo "${NEW_METRICS}" | grep -q '"http.route"'; then
     pass "metrics.json: http.route dimension present"
 else

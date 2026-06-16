@@ -64,7 +64,7 @@ prost = "0.14"
 # from first-class import paths.
 prost-types = "0.14"
 # serde_json: used by the Processor trait's `from_config(&serde_json::Value)` API
-# (Phase 3.6).  The crate is no_std + `extern crate std`, so std-backed crates work.
+# (used by the Processor trait's `from_config` API in the future OTAP transport adapter).  The crate is no_std + `extern crate std`, so std-backed crates work.
 serde_json = "1"
 thiserror = { version = "2.0.12", default-features = false }
 tonic = { version = "0.14", default-features = false, features = ["codegen"] }
@@ -109,7 +109,7 @@ path = "tests/grpc_smoke.rs"
 required-features = ["test-support"]
 
 [dev-dependencies]
-# Test-only echo server for Phase 1.2 Item 2 bidi smoke.  Dev-deps do NOT
+# Test-only echo server for the bidi gRPC smoke test (see examples/bidi_echo_server.rs).  Dev-deps do NOT
 # propagate into release builds of the module dylib; `cargo tree --edges normal`
 # must show no tokio at the crate root.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync"] }

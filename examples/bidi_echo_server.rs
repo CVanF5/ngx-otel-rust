@@ -3,18 +3,18 @@
 // This source code is licensed under the Apache License, Version 2.0 license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! Phase 1.2 Item 2 — bidi echo server (test-only stand-alone binary).
+//! Bidi echo server — test-only stand-alone binary.
 //!
 //! Implements the `Echo.BidiEcho` gRPC service: streams Ping messages back
 //! as Pong replies (one-per-ping, seq copied from the ping).  Used by the
 //! `run_grpc_bidi_smoke.sh` integration test as the in-process target for
 //! the bidi bridge exercise.
 //!
-//! Phase 1.2 Item 3 extension: the `BIDI_ECHO_DELAY_MS` environment variable
-//! introduces an artificial per-pong delay (default: 0 — no delay, byte-identical
-//! behaviour to Item 2).  The overload integration test sets this to 10ms to
-//! cap server throughput at ~100 msg/sec, creating a 10× rate mismatch against
-//! the client's 1 000 msg/sec target and driving the backpressure give-up path.
+//! The `BIDI_ECHO_DELAY_MS` environment variable introduces an artificial
+//! per-pong delay (default: 0 — no delay, byte-identical base behaviour).
+//! The overload integration test sets this to 10ms to cap server throughput
+//! at ~100 msg/sec, creating a 10× rate mismatch against the client's
+//! 1 000 msg/sec target and driving the backpressure give-up path.
 //!
 //! This binary:
 //! - Uses Tokio (added as a dev-dependency; NEVER linked into the module dylib).
@@ -45,7 +45,7 @@ use tonic::{Request, Response, Status, Streaming};
 
 struct EchoSvc {
     /// Per-pong artificial delay in milliseconds.  0 = no delay (default;
-    /// byte-identical behaviour to Item 2).  Set via `BIDI_ECHO_DELAY_MS`.
+    /// byte-identical base behaviour).  Set via `BIDI_ECHO_DELAY_MS`.
     delay_ms: u64,
 }
 
@@ -74,7 +74,7 @@ impl Echo for EchoSvc {
                     Ok(ping) => {
                         // Simulate a slow consumer when BIDI_ECHO_DELAY_MS > 0.
                         // With delay_ms = 0 (default) the branch is never taken;
-                        // behaviour is byte-identical to the original Item 2 binary.
+                        // behaviour is byte-identical to the no-delay (base) binary.
                         if delay_ms > 0 {
                             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                         }
@@ -105,9 +105,9 @@ impl Echo for EchoSvc {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // BIDI_ECHO_DELAY_MS: artificial per-pong delay in milliseconds.
-    // Default 0 → no delay, byte-identical to the original Item 2 server.
+    // Default 0 → no delay (byte-identical base behaviour).
     // Set to a positive value (e.g. 10) to simulate a slow consumer for the
-    // Phase 1.2 Item 3 backpressure overload test.
+    // bidi backpressure overload test.
     let delay_ms: u64 =
         std::env::var("BIDI_ECHO_DELAY_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
 

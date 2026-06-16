@@ -243,7 +243,7 @@ fi
 
 # 4. Graceful-drain integrity check.
 #
-# The §6.3 SIGQUIT-during-sleep race is RESOLVED. The exporter is not a worker
+# The SIGQUIT-during-sleep race is resolved. The exporter is not a worker
 # and is not subject to ngx_event_no_timers_left. The drain fires reliably when
 # ngx_quit is set. The exporter cycle waits for EXPORT_LOOP_DONE before calling
 # process::exit, so the drain always completes.

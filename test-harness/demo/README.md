@@ -62,7 +62,7 @@ One dashboard, four collapsible rows:
 
 ## Exemplars: the metric → log drill-down
 
-The request-duration histogram carries **exemplars** (Phase 2.2.4): each is one
+The request-duration histogram carries **exemplars**: each is one
 sampled real request, tagged with its `trace_id`, `url.path`, and value. The
 access tail **LogRecord** carries the **same `trace_id`**. So a point on the
 latency graph and a log line are two views of one request, joined by `trace_id`.

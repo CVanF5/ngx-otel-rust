@@ -189,8 +189,8 @@ so per-signal differences stay confined to the shared-memory shape while
 one process owns all collector I/O.  The per-worker-export alternative (the model the production
 C++ `nginx/nginx-otel` module uses: a background thread and its own connection
 in every worker) was weighed across all three signals and declined; the
-reasoning and the conditions that would reverse it are recorded in the proposal
-§6.5.
+reasoning and the conditions that would reverse it are recorded in the design
+proposal (Confluence link below).
 
 When `otel_exporter` is not configured the Log-phase handler is not
 registered and the exporter process is not spawned — no work runs on the
@@ -264,8 +264,7 @@ design proposal to integrate. In brief:
   sampling; per-location span name + custom attrs; `$otel_trace_id` /
   `$otel_parent_sampled` nginx variables. Exemplars on the duration histogram
   carry `trace_id` and `span_id` from the module's own spans, completing the
-  drill-down from a metric, through its exemplar, to the Tempo trace
-  (proposal §6.6.5).
+  drill-down from a metric, through its exemplar, to the Tempo trace.
 - **Exporter self-metrics**: `ngx_otel.dropped_records`, `ngx_otel.send_failures`,
   `ngx_otel.logs.access.dropped_records`, `ngx_otel.logs.error.dropped_records`,
   `ngx_otel.logs.send_failures`, `ngx_otel.traces.dropped_records`,
@@ -634,7 +633,7 @@ Results are committed as evidence (`tests/RESULTS-{tsan,asan}-*.txt`):
 ```sh
 make tsan-test        # full TSAN suite (all integration scripts under TSAN)
 make tsan-test-dns    # DNS / dual-stack resolver+connect path only
-make tsan-test-error  # §6.6.2 error-log path only (writer → ring → drain)
+make tsan-test-error  # error-log path only (writer → ring → drain)
 make asan-test        # ASan use-after-free gate (executor wake/teardown paths)
 ```
 
@@ -673,8 +672,8 @@ bash tests/integration/run_exporter_lifecycle.sh     # exporter process spawn/li
 bash tests/integration/run_exporter_crash_respawn.sh # exporter crash + respawn + dropped_records
 bash tests/integration/run_exporter_reload_overlap.sh # SIGHUP exporter overlap
 bash tests/integration/run_exporter_heartbeat.sh     # control-shm heartbeat (needs test-support)
-bash tests/integration/run_access_log.sh             # §6.6.1 access exception tail + exemplars
-bash tests/integration/run_error_log.sh              # §6.6.2 coalesced error log + rate metric
+bash tests/integration/run_access_log.sh             # access exception tail + exemplars
+bash tests/integration/run_error_log.sh              # coalesced error log + rate metric
 bash tests/integration/run_dns_dualstack.sh          # DNS + IPv6 dual-stack transport
 bash tests/integration/run_signal_storm.sh           # error-writer re-entrancy under signals
 bash tests/bench/zero_cost.sh                        # zero-cost-when-disabled (~10 min)
@@ -838,7 +837,7 @@ ngx-otel-rust/
 - **Tokio appears in `Cargo.lock`** transitively via hyper 1.x.  It is
   present at the type level but never instantiated at runtime — the
   module's "no Tokio" rule reads as "no Tokio runtime use".  See the
-  Confluence proposal §4.2.
+  design proposal (Confluence link below) for the architectural rationale.
 
 ## Related
 
