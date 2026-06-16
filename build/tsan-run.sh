@@ -192,9 +192,9 @@ fi
 
 # ── Step 3.5: nm-verification — confirm __tsan_* symbols in the cdylib ───────
 #
-# FU4: the previous TSAN artifact contained only a "Step 1 OK" compile-sanity
-# note and no evidence that __tsan_* instrumentation symbols are actually
-# present in the .so files the test nginx loads.  This step counts __tsan_*
+# A compile-sanity pass alone gives no evidence that __tsan_* instrumentation
+# symbols are actually present in the .so files the test nginx loads.
+# This step counts __tsan_*
 # symbols in the exact release cdylib produced under the TSAN RUSTFLAGS above
 # and fails the run if zero are found (= the module was NOT instrumented).
 #
@@ -270,7 +270,7 @@ echo "# to confirm no data races on the production gRPC export loop."
 _run_integration run_grpc_export.sh
 
 echo ""
-echo "[tsan-run] === Running run_access_log.sh under TSAN (Phase 2.2 §6.6.1 rebalanced path) ==="
+echo "[tsan-run] === Running run_access_log.sh under TSAN (access-log path) ==="
 echo "# Exercises: ExpHistogramSlot::record(), ExemplarReservoir::write(), SPSC logs ring."
 echo "# Note: FU4a exemplar timing assertion may be flaky in Docker/macOS VirtioFS"
 echo "# environments (exemplar data sync delay). Passes on debian-vm (native I/O)."
@@ -436,11 +436,11 @@ if [[ "${DEADCOLL_RC}" -ne 0 ]]; then
     echo "[tsan-run] run_chaos_dead_collector.sh: NON-ZERO exit ${DEADCOLL_RC}" >&2
 fi
 
-# FU4: run_b4_daemon_on_gen1.sh — gen-1 exporter orphan + reload remedy.
-# Added in FU4 to close the gap identified in the hostile-fixes gate review:
-# B4 test was absent from the prior TSAN artifact.
+# run_b4_daemon_on_gen1.sh — gen-1 exporter orphan + reload remedy.
+# Verifies: daemonized start (daemon on) does not orphan the gen-1 exporter
+# before ngx_daemon() forks; gen-1 crash-respawn works after SIGHUP.
 echo ""
-echo "[tsan-run] == run_b4_daemon_on_gen1.sh under TSAN (FU4: was missing from prior artifact) =="
+echo "[tsan-run] == run_b4_daemon_on_gen1.sh under TSAN (daemon-on gen-1 orphan test) =="
 B4_RC=0
 ( bash tests/integration/run_b4_daemon_on_gen1.sh ) || B4_RC=$?
 if [[ "${B4_RC}" -ne 0 ]]; then
@@ -518,7 +518,7 @@ done
 
 if [[ "${TSAN_WARNINGS}" -gt 0 ]]; then
     echo "[tsan-run] FAIL: ${TSAN_WARNINGS} ThreadSanitizer warning(s) detected." >&2
-    echo "[tsan-run] STOP-AND-ASK: surface the full TSAN report for review." >&2
+    echo "[tsan-run] Review the full TSAN report in the error.log files listed above." >&2
     exit 1
 fi
 

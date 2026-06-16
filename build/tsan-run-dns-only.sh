@@ -96,7 +96,7 @@ done
 
 if [[ "${TSAN_WARNINGS}" -gt 0 ]]; then
     echo "[tsan-dns] FAIL: ${TSAN_WARNINGS} ThreadSanitizer warning(s) detected." >&2
-    echo "[tsan-dns] STOP-AND-ASK: surface the full TSAN report for review." >&2
+    echo "[tsan-dns] Review the full TSAN report in the error.log files listed above." >&2
     exit 1
 fi
 

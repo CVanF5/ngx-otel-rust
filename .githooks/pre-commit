@@ -12,7 +12,7 @@
 # Skipped automatically when a commit touches no Rust/Cargo files (doc-only
 # commits stay instant). Bypass in an emergency with `git commit --no-verify`.
 #
-# Heavier gates stay manual / dedicated-host (see HANDOFF.md): `make unittest`,
+# Heavier checks stay manual / dedicated-host: `make unittest`,
 # the integration suite, TSAN on debian-vm, benches on host-1, and
 # `cargo deny check` (network-dependent advisory DB) against deny.toml.
 set -e

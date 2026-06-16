@@ -1,9 +1,9 @@
-# Phase 3 §3.8 — head-to-head trace hot-path bench (host-1, AMD EPYC 9R14)
+# Trace hot-path bench — head-to-head comparison (host-1, AMD EPYC 9R14)
 
 ## Provenance
 
-- Code: tree of commit `4562dd8` (origin/main tip, post-H3 hostile-fixes loop incl. the
-  redirect-safe guard, bitfield shim read, and eager DRBG seed — all on the trace hot path).
+- Code: tree of commit `4562dd8` (origin/main tip, incl. the redirect-safe guard,
+  bitfield shim read, and eager DRBG seed — all on the trace hot path).
 - Run: 2026-06-11 20:24 → 2026-06-12 07:24 UTC, unattended; launched + smoke-validated
   (both arms loaded + exported) before walking away. Raw per-cell data: host-1
   `~/bench38/rounds.jsonl` (1,773 cells).

@@ -1311,11 +1311,11 @@ impl NgxConnector {
     /// kernel copies the address at `connect(2)` time), so dropping the pool
     /// on return is safe.
     ///
-    /// # STOP-AND-ASK if:
-    /// - The resolver returns a UAF/panic (would surface as a crash here).
-    /// - `ngx_inet_set_port` corrupts the address on a non-v4/v6 family.
-    ///
-    /// These are the resolver-lifetime / UAF concerns from the loop doc.
+    /// # Safety considerations
+    /// - If the resolver returns a UAF/panic it will surface as a crash here.
+    /// - `ngx_inet_set_port` may corrupt the address on an unrecognised address
+    ///   family (non-v4/v6); callers should ensure the resolved addresses are
+    ///   IPv4 or IPv6 before reaching this point.
     async fn connect_dns(
         &self,
         host: &str,     // original host string (may have brackets for v6)

@@ -10,7 +10,7 @@
 # TSAN's slowdown — see commit f169a77, which added the analogous DNS-only
 # target). Running it in isolation gives the race signal for the error-log path
 # (writer -> error ring -> drain) without the combined-suite flakiness. Used to
-# re-verify the Phase 2.3 path after the wall-clock timestamp fix (ngx_cached_time).
+# re-verify the error-log path after the wall-clock timestamp fix (ngx_cached_time).
 #
 # Usage (inside the TSAN Docker container, same mounts as tsan-run.sh):
 #   bash build/tsan-run-error-only.sh 2>&1 | tee /tmp/tsan-error-only.txt
@@ -79,7 +79,7 @@ echo "[tsan-err] RUSTFLAGS:   ${RUSTFLAGS}"
 # ── Step 4: Error-log integration test ───────────────────────────────────────
 
 echo ""
-echo "[tsan-err] === Running run_error_log.sh under TSAN (Phase 2.3 §6.6.2 error-log path) ==="
+echo "[tsan-err] === Running run_error_log.sh under TSAN (error-log path) ==="
 bash tests/integration/run_error_log.sh
 
 # ── Step 5: ThreadSanitizer warning scan (error-log prefixes only) ───────────
@@ -102,7 +102,7 @@ done
 
 if [[ "${TSAN_WARNINGS}" -gt 0 ]]; then
     echo "[tsan-err] FAIL: ${TSAN_WARNINGS} ThreadSanitizer warning(s) detected." >&2
-    echo "[tsan-err] STOP-AND-ASK: surface the full TSAN report for review." >&2
+    echo "[tsan-err] Review the full TSAN report in the error.log files listed above." >&2
     exit 1
 fi
 

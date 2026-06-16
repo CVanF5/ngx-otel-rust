@@ -5,7 +5,7 @@ planned overnight run). **Characterization, not a gate** — single run, 240s ce
 
 - **Host:** host-1 (c7a EPYG 9R14, 4 cores, no SMT, isolated). Worker pinned core 3, exporter +
   otelcol core 2, loadgen cores 0–1.
-- **Code under test:** `dc89fb1` — **mid-hostile-fixes loop** (A1–E2 landed: shm sizing/alignment,
+- **Code under test:** `dc89fb1` — A1–E2 fixes landed (shm sizing/alignment,
   exporter lifecycle B1–B3, sentinel + url.path fixes, D1 traceparent-gate reorder, transport E1–E2).
   **Sanitizer batch (loop part H) NOT yet run on these commits.** F1–F5 landed after the bench build.
 - **Arms:** `baseline` (no module) · `cpp` (C++ nginx-otel, traces only) · `ours_ml` (metrics+logs,
