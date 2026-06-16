@@ -30,6 +30,27 @@ Both transports support `https://` (TLS; configured via `ssl_certificate`,
 endpoints. OTLP/gRPC over `https://` negotiates HTTP/2 via ALPN `h2`; over
 `http://` it uses plaintext h2c.
 
+## Feature summary
+
+Status: **Shipped** = emitted by the current module; **Planned** = designed, not yet
+emitted; **Roadmap** = later phase. Nothing in the "Logs" rows is exported by default —
+log export is opt-in (privacy).
+
+| Feature | What it does | Status |
+|---|---|---|
+| Core + HTTP metrics | nginx connection/request gauges + per-request latency as an exponential histogram (µs) | Shipped |
+| Trace-linked exemplars | `trace_id` on the duration histogram for metric → trace drill-down | Shipped |
+| Distributed traces | one OTel server span per request; W3C `traceparent` propagation (`otel_trace`) | Shipped |
+| **Logs: nothing exported by default** | no request-level log data leaves nginx unless configured (privacy) | Shipped |
+| Access exception-tail logs | full `LogRecord`s for selected requests + exemplars (`otel_access_log_sample`) | Shipped *(selection is a built-in predicate today)* |
+| Error logs | template-coalesced error `LogRecord`s + companion rate metric (`otel_error_log`) | Shipped |
+| **Selectable logs** | operator chooses *which* requests export, via an nginx `if=$cond` (status/latency/anything); nothing hardcoded | **Planned** |
+| Tunable metric cardinality | `otel_metric_status_code_class on\|off` — rich per-status-class vs lean series | Shipped |
+| TLS exporter transport | HTTPS / mTLS + OTLP-gRPC-over-TLS (ALPN `h2`) | Shipped |
+| Collector & serving-cert metrics | expiry / validity gauges | Shipped |
+| Status-aware delivery | retry / backoff honoring `Retry-After`/`RetryInfo`; stop-on-permanent; surface auth failures | Shipped |
+| Sketch attributes (Theta) · OTAP transport · NGINX Plus signals | fleet-scale unique-counts/top-N; Arrow columnar transport; Plus metrics | Roadmap |
+
 ## Resource and scope
 
 | Field | Value | Source |
@@ -343,6 +364,24 @@ things, never a per-request log:
   | `http.server.request.duration` | double | request duration **in seconds** (OTel semconv unit; derived from µs measurement, sub-ms precision) |
 
 A common (2xx, fast) request produces **neither** — only the histogram `fetch_add`.
+
+**Exemplars vs exported log records** — both are "samples," but they are different
+signals with different purposes:
+
+| | Exemplars | Exported log records (exception tail) |
+|---|---|---|
+| Signal family | Metrics (attached to the duration histogram) | Logs |
+| Carries | measured value + `trace_id`/`span_id` + filtered high-cardinality attrs | full per-request `LogRecord` (attributes above + duration) |
+| Selection | reservoir-sampled across *all* requests (size = `otel_access_log_sample <n>`) | the is-interesting gate (status ≥ 4xx, latency outliers) — see note |
+| Purpose | metric → trace drill-down pivot | the actual log line for the requests you care about |
+| Authoritative? | best-effort hint (can be torn — see above) | yes |
+
+> **Planned — user-defined export selection.** The is-interesting gate is currently a
+> built-in predicate (status ≥ 4xx, or a latency outlier). A planned change replaces it
+> with an operator-defined condition — an nginx `if=$cond` built with `map`, over
+> `$status`, `$request_time`, or anything — so *which* requests export as log records is
+> fully the operator's decision and nothing is hardcoded. With no such directive, no log
+> records are exported (privacy default).
 
 > **Exemplars are best-effort hints, not an authoritative record.** Each exemplar
 > slot is written lock-free from the worker hot path with no per-field commit

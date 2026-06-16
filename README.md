@@ -53,6 +53,28 @@ The README covers all shipped signals (metrics, logs, traces — Phases 1–3).
 **NGINX Plus (Phase 4)** and **OTAP (Phase 5)** remain roadmap.  See the
 Confluence proposal (link below) for the full phase plan.
 
+## Highlights
+
+**One module, the full OpenTelemetry picture — rich metrics, trace-linked exemplars,
+operator-selected logs, and spans.** The signals reinforce each other: aggregate metrics
+across the fleet, exemplars and logs to drill into the requests that matter, spans to
+follow them across services.
+
+- **Rich request metrics.** Per-request latency as a full distribution (microsecond
+  precision), plus connection/request gauges and an optional per-status-class breakdown
+  (2xx/4xx/5xx) you can toggle to trade detail for fewer metric series — covering every
+  request, not a sampled subset.
+- **Trace-linked exemplars.** Sampled requests carry a `trace_id` alongside their
+  latency, so you pivot from a latency spike straight to a representative trace.
+- **Selectable logs.** Log export is opt-in — you decide which requests become log
+  records (*planned:* via an nginx `if=$condition` over status, latency, or anything).
+  With nothing configured, no log records are emitted.
+- **Distributed traces.** OTel server spans with W3C `traceparent` propagation and
+  per-location span naming and attributes.
+
+→ Full feature table and the exemplars-vs-exported-logs distinction:
+**[`TELEMETRY_MODEL.md`](TELEMETRY_MODEL.md#feature-summary)**.
+
 ## Architecture
 
 <!-- The diagram is a pipeline read left to right: requests enter on the left,
