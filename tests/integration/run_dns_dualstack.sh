@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # tests/integration/run_dns_dualstack.sh — DNS resolution + dual-stack integration test
 #
-# Exercises Items 2 + 3 of the transport_dns work (Phase 1.x) and FU1/FU2
-# follow-up items:
+# Exercises DNS name resolution and dual-stack connectivity:
 #
 # TEST A — DNS name → v4 connect
 #   A local Python DNS stub (dns_stub.py) answers A queries for a synthetic

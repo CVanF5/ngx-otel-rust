@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/integration/run_signal_storm.sh — Phase 2.3 signal-storm re-entrancy test
+# tests/integration/run_signal_storm.sh — signal-storm re-entrancy test
 #
 # Exercises the busy-flag + lock-free coalescer under signal delivery:
 #

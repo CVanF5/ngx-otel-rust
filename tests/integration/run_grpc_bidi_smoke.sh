@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
-# tests/integration/run_grpc_bidi_smoke.sh — Phase 1.2 Item 2 bidi gRPC
-# viability harness.
+# tests/integration/run_grpc_bidi_smoke.sh — bidi gRPC viability harness.
 #
 # Builds the module with `--features test-support` so BOTH smoke directives'
 # init_process triggers are compiled in.  Starts the bidi echo server
 # (examples/bidi_echo_server.rs, 127.0.0.1:4319) then nginx with BOTH the
 # unary and bidi directives set.  Worker 0 fires:
-#   - one unary  OTLP/gRPC export (Phase 1.2 Item 1 regression gate)
-#   - one bidi   Echo.BidiEcho call against the echo server (Item 2)
+#   - one unary  OTLP/gRPC export (regression gate for unary path)
+#   - one bidi   Echo.BidiEcho call against the echo server
 #
 # Assertions:
 #   1. error.log contains exactly 1 "grpc smoke: firing one unary" line.

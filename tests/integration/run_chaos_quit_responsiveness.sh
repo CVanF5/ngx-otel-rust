@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # tests/integration/run_chaos_quit_responsiveness.sh
-#   — H3F3 chaos gate: h3f3_quit_responsiveness
+#   — chaos gate: quit-responsiveness + periodic-send deadline
 #
-# PREMISE CORRECTED (H3F3 follow-up): the original "blocks quit for minutes"
+# NOTE: the original "blocks quit for minutes"
 # framing was FALSE. The pre-existing GRACEFUL_DRAIN_BACKSTOP (15 s,
 # src/exporter/mod.rs) already bounds SIGQUIT-to-exit independently of the
 # PERIODIC_SEND_BUDGET wrap, so a hung send never blocks quit for "a minute or
@@ -32,7 +32,7 @@
 # write, then the backstop tears the exporter down at quit). So we let the
 # exporter sit on the hung collector longer than PERIODIC_SEND_BUDGET and assert
 # the signature appears — this FAILS on the unwrapped build and PASSES on the
-# fixed build. Verified both polarities in the H3F3 follow-up (mutation: the
+# fixed build. Verified both polarities via mutation testing (mutation: the
 # deadline wrap removed → signature absent → this gate fails).
 #
 # This differs from run_chaos_dead_collector.sh, which uses a black-hole port
@@ -132,7 +132,7 @@ else
     echo "ERROR: module not found. Run 'make build-release' first." >&2; exit 1
 fi
 
-# ─── H3F9(h): artifact-freshness guard ───────────────────────────────────────
+# ─── artifact-freshness guard ────────────────────────────────────────────────
 # The chaos test LOADS an existing cdylib but does NOT build it; a mutation
 # cycle once silently ran against a STALE artifact (edit a src file, forget to
 # rebuild → the test exercised the old binary).  Refuse to run if the loaded

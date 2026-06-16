@@ -6,7 +6,7 @@
 #   1. metrics.json contains entries with service.name = ngx-otel-step9-integration
 #   2. At least one histogram data point for http.server.request.duration arrived
 #   3. error.log contains exactly one "export loop started" line (exporter process only)
-#      Phase 1.3.2: the export task runs in the otel exporter process, not Worker 0.
+#      The export task runs in the otel exporter process, not Worker 0.
 #
 # Prerequisites
 # ─────────────
@@ -227,9 +227,9 @@ else
 fi
 
 # 3. Exactly one "export loop started" in error.log (otel exporter process only)
-# Phase 1.3.2: the export task is spawned inside the otel exporter process, not
-# Worker 0. The "otel export: export loop started" line is logged once per
-# exporter cycle, confirming the async task is running in the correct process.
+# The export task is spawned inside the otel exporter process, not Worker 0.
+# The "otel export: export loop started" line is logged once per exporter cycle,
+# confirming the async task is running in the correct process.
 # (Previously this checked for "spawning export task" on Worker 0.)
 SPAWN_COUNT=$(grep -c "export loop started" "${PREFIX}/logs/error.log" 2>/dev/null) || SPAWN_COUNT=0
 if [[ "${SPAWN_COUNT}" -eq 1 ]]; then
@@ -243,10 +243,10 @@ fi
 
 # 4. Graceful-drain integrity check.
 #
-# Phase 1.3.2: the §6.3 SIGQUIT-during-sleep race is RESOLVED. The exporter is
-# not a worker and is not subject to ngx_event_no_timers_left. The drain fires
-# reliably when ngx_quit is set. The exporter cycle waits for EXPORT_LOOP_DONE
-# before calling process::exit, so the drain always completes.
+# The §6.3 SIGQUIT-during-sleep race is RESOLVED. The exporter is not a worker
+# and is not subject to ngx_event_no_timers_left. The drain fires reliably when
+# ngx_quit is set. The exporter cycle waits for EXPORT_LOOP_DONE before calling
+# process::exit, so the drain always completes.
 #
 # We assert the drain must complete if it started. A regression where the drain
 # begins but hangs would leave a "graceful drain starting" line with no matching

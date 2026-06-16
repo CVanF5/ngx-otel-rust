@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/integration/run_exporter_reload_overlap.sh — Phase 1.3.2 SIGHUP overlap gate
+# tests/integration/run_exporter_reload_overlap.sh — SIGHUP overlap gate
 #
 # Verifies that during the SIGHUP overlap window (old exporter draining,
 # new exporter started) the collector receives a continuous timeline of

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tests/integration/run_reload.sh — Step 10 SIGHUP reload integration test
 #
-# Phase 1.3.2: the otel exporter process (not Worker 0) owns the export task.
+# The otel exporter process (not Worker 0) owns the export task.
 #
 # Sends a SIGHUP to nginx, verifies a clean exporter-generation transition, and
 # asserts that:
@@ -273,7 +273,7 @@ fi
 info "Running assertions..."
 
 # 1. Exactly 2 "export loop started" lines (one per exporter generation).
-# Phase 1.3.2: the export task runs in the otel exporter process, not Worker 0.
+# The export task runs in the otel exporter process, not Worker 0.
 # One exporter per nginx generation → 2 export loop starts across a reload cycle.
 SPAWN_COUNT=$(grep -c "export loop started" "${PREFIX}/logs/error.log" 2>/dev/null) || SPAWN_COUNT=0
 if [[ "${SPAWN_COUNT}" -eq 2 ]]; then
@@ -285,7 +285,7 @@ $(grep 'export loop started\|otel exporter\|otel export' "${PREFIX}/logs/error.l
 fi
 
 # 2. At least 2 "graceful drain complete" lines.
-# Phase 1.3.2: each exporter runs a graceful drain on ngx_quit (§6.3 race RESOLVED).
+# Each exporter runs a graceful drain on ngx_quit (§6.3 race RESOLVED).
 # Drain complete from generation-1 exporter (SIGHUP quit) + generation-2 (final quit).
 FLUSH_COUNT=$(grep -c "graceful drain complete" "${PREFIX}/logs/error.log" 2>/dev/null) || FLUSH_COUNT=0
 if [[ "${FLUSH_COUNT}" -ge 2 ]]; then

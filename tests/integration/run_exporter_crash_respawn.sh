@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/integration/run_exporter_crash_respawn.sh — Phase 1.3.1 crash-respawn gate
+# tests/integration/run_exporter_crash_respawn.sh — exporter crash-respawn gate
 #
 # Verifies that master auto-respawns the `nginx: otel exporter` child after a
 # SIGKILL (crash).  Gate from proposal §3: "exporter restart on crash works

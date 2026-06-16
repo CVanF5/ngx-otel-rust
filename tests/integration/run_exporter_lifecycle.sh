@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/integration/run_exporter_lifecycle.sh — Phase 1.3.1 exporter lifecycle gate
+# tests/integration/run_exporter_lifecycle.sh — exporter lifecycle gate
 #
 # Verifies that the `nginx: otel exporter` child process:
 #   1. Appears in the process tree when otel_exporter is configured.

@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# tests/integration/run_grpc_smoke.sh — Phase 1.2 Item 1 in-worker gRPC
-# viability harness.
+# tests/integration/run_grpc_smoke.sh — in-worker gRPC viability harness.
 #
 # Builds the module with `--features test-support` so the
 # `otel_grpc_smoke_endpoint` directive's init_process trigger is compiled

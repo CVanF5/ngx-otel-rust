@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/integration/run_error_log.sh — Phase 2.3 error-log integration test
+# tests/integration/run_error_log.sh — error-log integration test
 #
 # Tests the §6.6.2 coalesced error-log + companion error-rate metric.
 # Runs FOUR stages + two standalone checks (each a fresh nginx):
@@ -16,11 +16,11 @@
 #     - HARD-assert: arrives as multiple LogRecords (no coalesced_count collapse)
 #     - HARD-assert: metric still present (counts true volume regardless of coalescing)
 #
-#   Stage C: Severity-floor + DP-C
+#   Stage C: Severity-floor
 #     - "error" floor: only err/crit/alert/emerg → "connect() failed" passes
-#     - DP-C: bad nginx config → parse error lands in core error.log,
+#     - config-load guard: bad nginx config → parse error lands in core error.log,
 #             NOT in LOGS_LOG (writer not active in config-load context)
-#   Stage E: Fixed-default floor proof (FU2 corrective)
+#   Stage E: Fixed-default floor proof
 #     - Bare `otel_error_log;` + core error_log=notice
 #     - nc fake upstream triggers "upstream sent more data" at WARN (5)
 #     - HARD: "upstream sent more data" (WARN/5) IN core error.log (WARN was generated)
@@ -409,7 +409,7 @@ else
     pass "Stage C: 'connect() failed' blocked by crit floor (floor filtering OK)"
 fi
 
-# ─── Stage D: DP-C verification (bad config → core only, not LOGS_LOG) ───────
+# ─── Stage D: config-load guard verification (bad config → core only, not LOGS_LOG) ──
 # Run nginx -t with a deliberately broken config: invalid directive.
 # nginx will exit with an error during config-load.
 # The error must appear in the sandbox error.log (core) but NOT in LOGS_LOG.

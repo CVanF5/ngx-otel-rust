@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# tests/integration/run_delivery_outcome.sh — S6 delivery-outcome integration gate
+# tests/integration/run_delivery_outcome.sh — delivery-outcome integration gate
 #
 # Exercises the delivery-outcome policy end-to-end using a programmable HTTP
 # stub collector that serves configurable HTTP status codes.  Each scenario
-# verifies one behavioral invariant of the S4 policy engine:
+# verifies one behavioral invariant of the policy engine:
 #
 #   Scenario A: 503 + Retry-After then 200
 #     Assert: the exporter defers (no new request before Retry-After expires)

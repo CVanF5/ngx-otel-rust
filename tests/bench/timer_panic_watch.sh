@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/bench/timer_panic_watch.sh — Phase 1.2 sub-item 3.2
+# tests/bench/timer_panic_watch.sh — regression watchpoint: hyper timer panic
 #
 # Regression watchpoint for the hyper Time::sleep() panic path.
 # Invokes run_grpc_smoke.sh in a bounded loop and checks each iteration's

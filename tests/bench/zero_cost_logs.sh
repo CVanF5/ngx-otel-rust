@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/bench/zero_cost_logs.sh — Phase 2.2 zero-cost-when-disabled + rebalanced benchmark
+# tests/bench/zero_cost_logs.sh — zero-cost-when-disabled + rebalanced access/error-log benchmark
 #
 # Runs three NGINX configs back-to-back under wrk to measure the per-request
 # overhead of the §6.6.1 rebalanced access-log path.
@@ -197,7 +197,7 @@ run_config() {
 run_config "BL" "${SCRIPT_DIR}/nginx_logs_bl.conf" "${WRK_CONNECTIONS}"
 run_config "TA" "${SCRIPT_DIR}/nginx_logs_ta.conf" "${WRK_CONNECTIONS}"
 run_config "TB" "${SCRIPT_DIR}/nginx_logs_tb.conf" "${WRK_CONNECTIONS_TB}"
-# Phase 2.3 error-log treatments:
+# Error-log treatments (TC/TD):
 # TC: otel_error_log on, no errors → idle writer (zero-cost claim for error path)
 # TD: otel_error_log on, /flood → every request generates proxy error (flood cost)
 run_config "TC" "${SCRIPT_DIR}/nginx_logs_tc.conf" "${WRK_CONNECTIONS}"

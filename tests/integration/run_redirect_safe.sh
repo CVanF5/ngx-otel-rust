@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# tests/integration/run_redirect_safe.sh — H3F1 redirect-safe E2E integration test.
+# tests/integration/run_redirect_safe.sh — redirect-safe E2E integration test.
 #
-# Proves the three-part H3F1 design end-to-end (mirroring the C++ nginx-otel
+# Proves the redirect-safe design end-to-end (mirroring the C++ nginx-otel
 # module's redirect-safe handling):
 #
 #   Test (a) — update-don't-append injection:
@@ -137,7 +137,7 @@ curl -sf -H "traceparent: ${PROXY_TRACEPARENT}" http://127.0.0.1:9103/proxy >/de
 info "(b) GET /redir with inbound traceparent (error_page → /recover)..."
 curl -s -H "traceparent: ${REDIR_TRACEPARENT}" http://127.0.0.1:9103/redir >/dev/null || true
 
-# ─── Test (c) [H3F9(f)]: DECLINED + redirected → $otel_trace_id must be empty ─
+# ─── Test (c): DECLINED + redirected → $otel_trace_id must be empty ──────────
 # Inbound traceparent (so the pre-gate SpanCtx is allocated) but Gate 2 declines
 # (otel_trace = empty header), then an internal redirect.  Capture the
 # X-Otel-Trace-Id response header emitted by /decline_recover.
@@ -193,7 +193,7 @@ fi
 
 # ─── (b1) EXACTLY ONE span survived the redirect ─────────────────────────────
 # Count the spans (by spanId) whose traceId == REDIR_TRACE_ID across new traces.
-# This is the load-bearing assertion for the H3F1 design:
+# This is the load-bearing assertion for the redirect-safe design:
 #   • Pre-fix (no cleanup-anchor recovery): ZERO spans — the SpanCtx is orphaned
 #     when the redirect zeroes the module-ctx array, so LOG emits nothing.
 #   • No r->internal guard: TWO spans — both the intercepted (500) pass and the
@@ -231,11 +231,11 @@ else
 fi
 
 # ─── (b2) Span's parentSpanId is the genuine inbound parent ──────────────────
-# H3F9(g): STRUCTURED field check (mirrors (b1)'s python) instead of a
-# grep-anywhere for the dddd… string.  A bare `grep "dddd…"` would also match
-# the id appearing in ANY other JSON field (traceId, spanId, an attribute
-# value, …) — it cannot prove the id is specifically the parentSpanId.  Walk
-# the spans for the REDIR_TRACE_ID and confirm at least one has
+# STRUCTURED field check (mirrors (b1)'s python) instead of a grep-anywhere
+# for the dddd… string.  A bare `grep "dddd…"` would also match the id
+# appearing in ANY other JSON field (traceId, spanId, an attribute value, …)
+# — it cannot prove the id is specifically the parentSpanId.  Walk the spans
+# for the REDIR_TRACE_ID and confirm at least one has
 # parentSpanId == REDIR_PARENT_SPAN_ID.
 REDIR_PARENT_MATCH=$(echo "${NEW_TRACES}" | python3 -c '
 import sys, json
@@ -263,7 +263,7 @@ else
     fail "(b) no span for trace ${REDIR_TRACE_ID} has parentSpanId field == ${REDIR_PARENT_SPAN_ID} — span lost its parent across redirect (or id only appears in a non-parentSpanId field)"
 fi
 
-# ─── (c) [H3F9(f)] DECLINED + redirected request → $otel_trace_id EMPTY ──────
+# ─── (c) DECLINED + redirected request → $otel_trace_id EMPTY ───────────────
 # The X-Otel-Trace-Id response header from /decline_recover must be empty:
 # a Gate-2-declined request must NOT recover a stale pre-gate SpanCtx after an
 # internal redirect.  `add_header ... always` emits the header even with an

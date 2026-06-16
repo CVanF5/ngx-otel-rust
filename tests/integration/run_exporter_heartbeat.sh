@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/integration/run_exporter_heartbeat.sh — Phase 1.3.3 Sub-item 3 gate
+# tests/integration/run_exporter_heartbeat.sh — exporter liveness heartbeat gate
 #
 # Verifies that the exporter liveness heartbeat (control_shm.version) increments
 # on schedule by reading it via the test-support `otel_status_endpoint` directive.

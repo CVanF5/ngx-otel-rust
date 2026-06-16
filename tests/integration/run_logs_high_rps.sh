@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/integration/run_logs_high_rps.sh — Phase 2.2 high-RPS stress test
+# tests/integration/run_logs_high_rps.sh — high-RPS access-log stress test
 #
 # Fires sustained high-RPS traffic at nginx with otel_access_log_sample 16 and
 # verifies that:

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# tests/integration/run_grpc_bidi_overload.sh — Phase 1.2 Item 3 bidi
-# backpressure / livelock integration test.
+# tests/integration/run_grpc_bidi_overload.sh — bidi backpressure / livelock
+# integration test.
 #
 # Sets up a 10× rate mismatch:
 #   - Echo server: 127.0.0.1:4320 with BIDI_ECHO_DELAY_MS=10 (~100 pong/s)

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/integration/run_access_log.sh — Phase 2.2 access-log integration test
+# tests/integration/run_access_log.sh — access-log integration test
 #
 # Starts NGINX with `otel_access_log_sample 16;`, sends HTTP requests, waits for
 # the export interval, then verifies the §6.6.1 rebalanced shape:
@@ -143,7 +143,7 @@ info "nginx running (PID ${NGINX_PID})"
 
 # ─── Send HTTP traffic ───────────────────────────────────────────────────────
 
-# Phase 2.2: 200 flood — is_interesting gate should block all of these.
+# 200 flood — is_interesting gate should block all of these.
 info "Sending ${N_OK_REQUESTS} GET requests (200) to http://127.0.0.1:9101/..."
 for i in $(seq 1 "${N_OK_REQUESTS}"); do
     curl -sf http://127.0.0.1:9101/ >/dev/null
@@ -234,14 +234,14 @@ else
     fi
 fi
 
-# §6.6.1 DP-E: http.route attribute must be present in the histogram data points
+# §6.6.1: http.route attribute must be present in the histogram data points
 if echo "${NEW_METRICS}" | grep -q '"http.route"'; then
     pass "metrics.json: http.route dimension present (DP-E)"
 else
     fail "metrics.json: http.route NOT found in histogram data points — DP-E may be broken"
 fi
 
-# FU4c: nginx.upstream.zone must be present — FU4 adds /api→upstream proxy_pass.
+# nginx.upstream.zone must be present — /api→upstream proxy_pass adds the upstream dimension.
 if echo "${NEW_METRICS}" | grep -q '"nginx.upstream.zone"'; then
     pass "metrics.json: nginx.upstream.zone dimension present (DP-E, FU4)"
 else
@@ -257,15 +257,15 @@ else
     fail "metrics.json: expected ≥ 2 distinct http.route data points, got ${ROUTE_COUNT}"
 fi
 
-# Re-review FU (DP-E "other"): the regex location is unregistered → its requests
-# land in the "(other)" route bucket, which must surface as an http.route value.
+# The regex location is unregistered → its requests land in the "(other)" route
+# bucket, which must surface as an http.route value.
 if echo "${NEW_METRICS}" | grep -qF '(other)'; then
     pass "metrics.json: '(other)' route bucket present (regex/unregistered → overflow, DP-E)"
 else
     fail "metrics.json: '(other)' route bucket NOT found — unregistered-route overflow path broken"
 fi
 
-# ── logs.json: Phase 2.2 assertions ──────────────────────────────────────────
+# ── logs.json: access-log assertions ─────────────────────────────────────────
 NEW_LOGS=""
 if [[ -f "${LOGS_LOG}" ]]; then
     POST_LOGS_SIZE=$(wc -c < "${LOGS_LOG}")
@@ -336,7 +336,7 @@ if [[ -n "${NEW_LOGS}" ]]; then
         fail "logs.json: event_name=http.access NOT found"
     fi
 
-    # FU4a (HARD): the exemplar on the matching base combo carries the 32-char
+    # HARD: the exemplar on the matching base combo carries the 32-char
     # trace_id from the traceparent request. With sample size 16 and only a
     # handful of 5xx requests in the combo, the reservoir keeps them all, so this
     # is deterministic — absence is a real failure.
@@ -346,7 +346,7 @@ if [[ -n "${NEW_LOGS}" ]]; then
         fail "metrics.json: trace_id ${TRACE_ID} NOT carried in any exemplar — traceparent→exemplar broken"
     fi
 
-    # FU4a (HARD): the tail LogRecord for the traceparent request must also carry
+    # HARD: the tail LogRecord for the traceparent request must also carry
     # the trace_id natively (LogRecord trace context, decision #4).
     if echo "${NEW_LOGS}" | grep -q "${TRACE_ID}"; then
         pass "logs.json: trace_id ${TRACE_ID} carried on tail LogRecord (traceparent → LogRecord)"
@@ -354,7 +354,7 @@ if [[ -n "${NEW_LOGS}" ]]; then
         fail "logs.json: trace_id ${TRACE_ID} NOT on any tail LogRecord — traceparent not propagated to the tail"
     fi
 
-    # FU4b (HARD): tail records carry url.path. The /error tail records have
+    # HARD: tail records carry url.path. The /error tail records have
     # url.path="/error"; assert the attribute key is present.
     if echo "${NEW_LOGS}" | grep -q '"url.path"'; then
         pass "logs.json: url.path attribute present on tail records (FU4b)"
@@ -362,7 +362,7 @@ if [[ -n "${NEW_LOGS}" ]]; then
         fail "logs.json: url.path attribute NOT found on tail records — high-cardinality detail missing"
     fi
 
-    # S2 (HARD): tail records carry http.server.request.duration (double seconds).
+    # HARD: tail records carry http.server.request.duration (double seconds).
     # The value must be present and plausible (> 0).
     if echo "${NEW_LOGS}" | grep -q '"http.server.request.duration"'; then
         # Extract the numeric value that immediately follows the key.

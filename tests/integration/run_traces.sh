@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
-# tests/integration/run_traces.sh — Phase 3 FU2: E2E span-arrival integration test
+# tests/integration/run_traces.sh — E2E span-arrival integration test
 #
-# Gate-blocking closure from the Loop-2 independent review: proves that a
-# sampled request actually produces a span at the collector — asserting the
-# full path: emit_span_record → spans ring → drain → OtlpTracesEncoder →
-# /v1/traces → collector file/traces exporter → traces.json.
+# Proves that a sampled request actually produces a span at the collector —
+# asserting the full path: emit_span_record → spans ring → drain →
+# OtlpTracesEncoder → /v1/traces → collector file/traces exporter → traces.json.
 #
-# Also asserts the cross-signal trace_id match (FU2 criterion b):
+# Also asserts the cross-signal trace_id match:
 #   the span's traceId == the tail LogRecord's trace_id (logs.json)
 #                       == the metric exemplar's trace_id (metrics.json)
 #

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# tests/integration/run_grpc_export.sh — Phase 2 (grpc_transport) production
-# OTLP/gRPC export end-to-end integration test.
+# tests/integration/run_grpc_export.sh — production OTLP/gRPC export
+# end-to-end integration test.
 #
 # Builds the module WITHOUT --features test-support (production path).
 # Starts nginx with `otel_export_protocol otlp_grpc;` pointing at the
