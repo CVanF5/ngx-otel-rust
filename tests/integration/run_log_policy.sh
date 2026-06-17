@@ -108,7 +108,7 @@ start_nginx_scenario() {
     local prefix="$1" conf="$2"
     "${NGINX_BINARY}" -p "${prefix}" -c "${conf}" &
     SCENARIO_PID=$!
-    sleep 1
+    sleep 1 || true
     if ! kill -0 "${SCENARIO_PID}" 2>/dev/null; then
         echo "ERROR: nginx exited immediately. Check ${prefix}/logs/error.log" >&2
         tail -30 "${prefix}/logs/error.log" >&2
@@ -163,8 +163,8 @@ http {
 }
 EOF
 
-PRE_C_LOGS=0;   [[ -f "${LOGS_LOG}" ]]    && PRE_C_LOGS=$(wc -c < "${LOGS_LOG}")
-PRE_C_METRICS=0; [[ -f "${METRICS_LOG}" ]] && PRE_C_METRICS=$(wc -c < "${METRICS_LOG}")
+PRE_C_LOGS=0; if [[ -f "${LOGS_LOG}" ]]; then PRE_C_LOGS=$(wc -c < "${LOGS_LOG}"); fi
+PRE_C_METRICS=0; if [[ -f "${METRICS_LOG}" ]]; then PRE_C_METRICS=$(wc -c < "${METRICS_LOG}"); fi
 
 info "(C) Starting privacy-default nginx (port 9114, no otel_log_export)..."
 start_nginx_scenario "${C_PREFIX}" "${C_PREFIX}/nginx.conf"
@@ -173,19 +173,23 @@ for i in $(seq 1 10); do curl -sf http://127.0.0.1:9114/ >/dev/null; done
 for i in $(seq 1 10); do curl -sf http://127.0.0.1:9114/error >/dev/null || true; done
 
 info "(C) Waiting ${FLUSH_WAIT_S}s for flush..."
-sleep "${FLUSH_WAIT_S}"
+sleep "${FLUSH_WAIT_S}" || true
 stop_nginx_scenario "${C_PREFIX}"
 
 C_LOGS_NEW=""
 if [[ -f "${LOGS_LOG}" ]]; then
     POST_C=$(wc -c < "${LOGS_LOG}")
-    (( POST_C > PRE_C_LOGS )) && C_LOGS_NEW=$(tail -c "+$(( PRE_C_LOGS + 1 ))" "${LOGS_LOG}")
+    if [[ $POST_C -gt $PRE_C_LOGS ]]; then
+    C_LOGS_NEW=$(tail -c "+$(( PRE_C_LOGS + 1 ))" "${LOGS_LOG}")
+fi
 fi
 
 C_METRICS_NEW=""
 if [[ -f "${METRICS_LOG}" ]]; then
     POST_CM=$(wc -c < "${METRICS_LOG}")
-    (( POST_CM > PRE_C_METRICS )) && C_METRICS_NEW=$(tail -c "+$(( PRE_C_METRICS + 1 ))" "${METRICS_LOG}")
+    if [[ $POST_CM -gt $PRE_C_METRICS ]]; then
+    C_METRICS_NEW=$(tail -c "+$(( PRE_C_METRICS + 1 ))" "${METRICS_LOG}")
+fi
 fi
 
 C_LOG_COUNT=$(echo "${C_LOGS_NEW}" | grep -o '"http.access"' | wc -l | tr -d ' ')
@@ -249,7 +253,7 @@ http {
 }
 EOF
 
-PRE_D_LOGS=0; [[ -f "${LOGS_LOG}" ]] && PRE_D_LOGS=$(wc -c < "${LOGS_LOG}")
+PRE_D_LOGS=0; if [[ -f "${LOGS_LOG}" ]]; then PRE_D_LOGS=$(wc -c < "${LOGS_LOG}"); fi
 
 info "(D) Starting on/off nginx (port 9115)..."
 start_nginx_scenario "${D_PREFIX}" "${D_PREFIX}/nginx.conf"
@@ -263,20 +267,22 @@ info "(D) Sending 5 requests to /no-export (location-level otel_log_export off).
 for i in $(seq 1 5); do curl -sf http://127.0.0.1:9115/no-export >/dev/null; done
 
 info "(D) Waiting ${FLUSH_WAIT_S}s for flush..."
-sleep "${FLUSH_WAIT_S}"
+sleep "${FLUSH_WAIT_S}" || true
 stop_nginx_scenario "${D_PREFIX}"
 
 D_LOGS_NEW=""
 if [[ -f "${LOGS_LOG}" ]]; then
     POST_D=$(wc -c < "${LOGS_LOG}")
-    (( POST_D > PRE_D_LOGS )) && D_LOGS_NEW=$(tail -c "+$(( PRE_D_LOGS + 1 ))" "${LOGS_LOG}")
+    if [[ $POST_D -gt $PRE_D_LOGS ]]; then
+    D_LOGS_NEW=$(tail -c "+$(( PRE_D_LOGS + 1 ))" "${LOGS_LOG}")
+fi
 fi
 
 D_LOG_COUNT=$(echo "${D_LOGS_NEW}" | grep -o '"http.access"' | wc -l | tr -d ' ')
 info "(D) http.access LogRecord count (on + off scenario): ${D_LOG_COUNT}"
 
 # At least 5 records from the "/" location under otel_log_export on.
-if (( D_LOG_COUNT >= 5 )); then
+if [[ $D_LOG_COUNT -ge $5 ]]; then
     pass "(D) on form: ≥ 5 tail LogRecords from otel_log_export on at server level (got ${D_LOG_COUNT})"
 else
     fail "(D) on form: expected ≥ 5 tail LogRecords from otel_log_export on, got ${D_LOG_COUNT}"
@@ -284,7 +290,7 @@ fi
 
 # At most 5 records total: /no-export location has off so its 5 requests must not
 # contribute.  Exactly 5 from "/" means off correctly suppressed the other 5.
-if (( D_LOG_COUNT <= 5 )); then
+if [[ $D_LOG_COUNT -le $5 ]]; then
     pass "(D) off override: count ≤ 5 — location-level otel_log_export off suppressed /no-export requests"
 else
     fail "(D) off override: count ${D_LOG_COUNT} > 5 — location off did not suppress /no-export export (off-override broken)"
@@ -340,7 +346,7 @@ http {
 }
 EOF
 
-PRE_E_METRICS=0; [[ -f "${METRICS_LOG}" ]] && PRE_E_METRICS=$(wc -c < "${METRICS_LOG}")
+PRE_E_METRICS=0; if [[ -f "${METRICS_LOG}" ]]; then PRE_E_METRICS=$(wc -c < "${METRICS_LOG}"); fi
 
 info "(E) Starting exemplar-gate nginx (port 9116)..."
 start_nginx_scenario "${E_PREFIX}" "${E_PREFIX}/nginx.conf"
@@ -356,13 +362,15 @@ info "(E) Sending 5 untraced requests to /no-trace (otel_trace off)..."
 for i in $(seq 1 5); do curl -sf http://127.0.0.1:9116/no-trace >/dev/null; done
 
 info "(E) Waiting ${FLUSH_WAIT_S}s for flush..."
-sleep "${FLUSH_WAIT_S}"
+sleep "${FLUSH_WAIT_S}" || true
 stop_nginx_scenario "${E_PREFIX}"
 
 E_METRICS_NEW=""
 if [[ -f "${METRICS_LOG}" ]]; then
     POST_E=$(wc -c < "${METRICS_LOG}")
-    (( POST_E > PRE_E_METRICS )) && E_METRICS_NEW=$(tail -c "+$(( PRE_E_METRICS + 1 ))" "${METRICS_LOG}")
+    if [[ $POST_E -gt $PRE_E_METRICS ]]; then
+    E_METRICS_NEW=$(tail -c "+$(( PRE_E_METRICS + 1 ))" "${METRICS_LOG}")
+fi
 fi
 
 rm -rf "${E_PREFIX}"
