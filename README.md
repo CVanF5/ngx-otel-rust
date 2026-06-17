@@ -26,11 +26,12 @@ What this module emits:
   process owns the entire cold path: the async export loop runs hyper on
   `ngx-rust`'s executor, with no Tokio runtime.  Workers hold zero collector
   sockets.
-- **Access logs + exemplars** (Phase 2, `otel_access_log_sample <n>`):
-  reservoir-sampled exemplars plus a thin exception tail (status ≥ 4xx and
-  latency outliers), written into a per-worker single-producer ring on the
-  request path.  The bulk traffic is represented by metrics; there is no
-  per-request log.
+- **Access logs + exemplars** (Phase 2, `otel_log_export on | if=<expr>`):
+  a thin exception-tail of full `LogRecord`s for operator-selected requests,
+  written into a per-worker single-producer ring on the request path.  Metric
+  exemplars are separate: they ride trace sampling (`otel_trace`), one
+  uniformly-sampled exemplar per data point per export cycle.  The bulk traffic
+  is represented by metrics; there is no per-request log.
 - **Error logs** (Phase 2, `otel_error_log`): coalesced error `LogRecord`s with
   a companion error-rate counter.
 - **Traces** (Phase 3, `otel_trace <expr>`): OTel server spans with W3C
@@ -276,9 +277,10 @@ design proposal to integrate. In brief:
   byte and timing histograms; the nginx `stub_status` counters and gauges
   (see note below); and a `ngx_otel.error_log.events` error-rate counter.
   Cumulative temporality.
-- **Logs — access** (`otel_access_log_sample <n>`): metrics-primary, plus
-  reservoir-sampled **exemplars** (trace-linked) and a **thin exception tail** of
-  `LogRecord`s for status ≥ 4xx / latency outliers. Not a per-request log.
+- **Logs — access** (`otel_log_export on | if=<expr>`): metrics-primary, plus a
+  **thin exception tail** of `LogRecord`s for operator-selected requests. Not a
+  per-request log. Metric **exemplars** (trace-linked) are emitted separately on
+  the trace-sampling path (`otel_trace`), uniformly sampled per data point.
 - **Logs — error** (`otel_error_log [level]`): coalesced `nginx.error` `LogRecord`s
   (one sample + count per template) with a companion error-rate metric.
 - **Traces** (`otel_trace <expr>` per location): OTel server spans. W3C
@@ -551,13 +553,14 @@ http {
     otel_metric_status_code_class on;       # emit method × status-class × protocol attrs on the duration series (live)
 
     # Logs (off unless these are set; orthogonal to nginx's own access_log/error_log):
-    otel_access_log_sample 128;             # enable access exemplars + thin exception tail; arg = exemplar reservoir size
-    # otel_log_ring_size 512k;              # per-worker logs ring capacity (tail + exemplar substrate)
+    # otel_log_export is per-location/server (see server block below) — select which
+    # requests get an exception-tail LogRecord. Exemplars ride otel_trace, not this.
+    # otel_log_ring_size 512k;              # per-worker logs ring capacity (exception-tail substrate)
     otel_error_log;                         # enable error-log export; floor defaults to `error`. e.g. `otel_error_log warn;`
     # otel_error_log_coalesce off;          # default on; off = best-effort verbatim streaming (lossy under load — see TELEMETRY_MODEL.md)
 
-    # url.path + user_agent.original ride on access exemplars/tail automatically
-    # (when otel_access_log_sample is set), never as metric dimensions.
+    # url.path + user_agent.original ride on the exception-tail LogRecord
+    # (when otel_log_export selects a request), never as metric dimensions.
 
     server {
         # Traces (Phase 3): per-location / per-server control.
@@ -565,6 +568,7 @@ http {
         # valid in http, server, and location blocks; inner location wins.
         otel_trace on;                      # complex value: literal / $var / split_clients
         otel_trace_context propagate;       # ignore | extract (default) | inject | propagate
+        otel_log_export on;                 # exception-tail export: on | off | if=<expr>; valid http/server/location
 
         location /api {
             otel_span_name "API $request_method"; # per-location span name override

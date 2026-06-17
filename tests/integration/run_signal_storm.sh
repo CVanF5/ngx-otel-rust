@@ -3,7 +3,7 @@
 #
 # Exercises the busy-flag + lock-free coalescer under signal delivery:
 #
-#   1. Start nginx with otel_error_log + otel_access_log_sample enabled.
+#   1. Start nginx with otel_error_log enabled (error-log export path).
 #   2. Run a 30-second flood of /flood requests (broken upstream, generates
 #      "connect() failed" error-log entries at ERR level).
 #   3. Simultaneously send SIGUSR1 to worker PIDs every 1s (SIGUSR1 causes

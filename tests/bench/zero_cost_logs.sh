@@ -5,12 +5,12 @@
 # overhead of the rebalanced access-log path.
 #
 # Config layout:
-#   BL (Baseline):   module loaded + otel_exporter + access sample OFF
+#   BL (Baseline):   module loaded + otel_exporter + log export OFF
 #                    → every request goes through log-phase handler but
-#                      is_access_sample_enabled() is false, branch not taken
-#   TA (Treatment A): BL + otel_access_log_sample 16
-#                    → histogram always-on; only interesting requests push a
-#                      tail record (is_interesting gate, common 200/fast skipped)
+#                      any_log_export_enabled() is false, branch not taken
+#   TA (Treatment A): BL + otel_log_export on
+#                    → histogram always-on; every request pushes a tail record
+#                      (operator-selected export — `on` selects all)
 #   TB (Treatment B): TA with 2× wrk connections (higher RPS, informational)
 #
 # Gate (INFORMATIONAL on dev hardware — ±1% is invalid on a laptop):
@@ -241,9 +241,9 @@ echo "BL vs TD regression: ${REG_TD}% (error_log flood — active path, informat
     echo ""
     echo "| Config | Median (req/s) | p95 (req/s) | Regression vs BL |"
     echo "|--------|---------------|-------------|-----------------|"
-    echo "| BL (sample OFF, histogram always-on) | ${MEDIAN_BL} | ${P95_BL} | — |"
-    echo "| TA (otel_access_log_sample 16) | ${MEDIAN_TA} | ${P95_TA} | ${REG_TA}% |"
-    echo "| TB (otel_access_log_sample 16, high RPS) | ${MEDIAN_TB} | ${P95_TB} | ${REG_TB}% (informational) |"
+    echo "| BL (log export OFF, histogram always-on) | ${MEDIAN_BL} | ${P95_BL} | — |"
+    echo "| TA (otel_log_export on) | ${MEDIAN_TA} | ${P95_TA} | ${REG_TA}% |"
+    echo "| TB (otel_log_export on, high RPS) | ${MEDIAN_TB} | ${P95_TB} | ${REG_TB}% (informational) |"
     echo "| TC (otel_error_log warn, no errors — idle writer) | ${MEDIAN_TC} | ${P95_TC} | ${REG_TC}% |"
     echo "| TD (otel_error_log warn, flood → 502 — active writer) | ${MEDIAN_TD} | ${P95_TD} | ${REG_TD}% (informational) |"
     echo ""

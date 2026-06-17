@@ -4,28 +4,27 @@
 # WHY THIS EXISTS
 # ---------------
 # saturation.sh measured the ALWAYS-ON metrics-recording hot path (histogram
-# bumps) under CPU saturation, but with `return 200` and NO `otel_access_log_sample`
-# it did NOT exercise the access-log SAMPLING path: the exemplar reservoir write,
-# the exception-tail ring push (emit_access_record), or the per-request
-# `traceparent`/`user-agent` header scan (instrumented.rs gate at :185 is
-# `is_access_sample_enabled() && is_interesting(...)`).
+# bumps) under CPU saturation, but with `return 200` and NO `otel_log_export`
+# it did NOT exercise the access-log EXPORT path: the exception-tail ring push
+# (emit_access_record) or the per-request `traceparent`/`user-agent` header scan
+# (the instrumented.rs export gate is the selected `otel_log_export` mode).
 #
-# This bench closes that gap. Every request returns 500 (>= TAIL_STATUS_FLOOR=400,
-# so `is_interesting` is TRUE on every request) and carries a `traceparent` header,
-# so when `otel_access_log_sample` is set the FULL hot path fires on every request:
-# histograms + exemplar reservoir + tail ring push + traceparent parse + UA scan.
-# That is the worst-case per-request cost of the sampling path.
+# This bench closes that gap. Every request returns 500 and carries a
+# `traceparent` header, so when `otel_log_export on` is set the FULL hot path
+# fires on every request: histograms + exemplar reservoir write (trace-sampled)
+# + tail ring push + traceparent parse + UA scan. That is the worst-case
+# per-request cost of the export path.
 #
 # Three configs (randomized per round) decompose the cost:
 #   c1          — clean nginx, NO module (fair baseline; same return-500 workload)
-#   c3_metrics  — module + exporter, NO otel_access_log_sample
-#                 (always-on histograms only; sampling block skipped)
-#   c3_full     — module + exporter + otel_access_log_sample (FULL path every request)
+#   c3_metrics  — module + exporter, NO otel_log_export
+#                 (always-on histograms only; export block skipped)
+#   c3_full     — module + exporter + otel_log_export on (FULL path every request)
 # Deltas: (c3_metrics - c1) = histogram cost; (c3_full - c3_metrics) = the marginal
-# cost of exemplars + tail + traceparent capture.
+# cost of the tail + traceparent capture (+ exemplar write when traced).
 #
-# A collector LOGS-received check on c3_full proves the tail/exemplar path actually
-# emitted (otel_access_log_sample is genuinely functioning, not silently off).
+# A collector LOGS-received check on c3_full proves the tail path actually
+# emitted (otel_log_export is genuinely functioning, not silently off).
 #
 # HOST: dedicated timing hardware only (host-1) for the gate of record. Needs Linux
 # /proc, taskset, wrk, jq, and a native OTLP collector whose file exporters write
@@ -61,7 +60,6 @@ NGINX_BIND_WAIT_S="${NGINX_BIND_WAIT_S:-2}"
 WRK_URL="${WRK_URL:-http://127.0.0.1:9101/}"
 SERVICE_NAME="${SERVICE_NAME:-ngx-otel-sat-accesslog}"
 METRIC_INTERVAL="${METRIC_INTERVAL:-1s}"   # aggressive flush (worst case for exporter)
-SAMPLE_SIZE="${SAMPLE_SIZE:-64}"           # otel_access_log_sample reservoir size
 # A valid W3C traceparent (version 00, 16-byte trace id, 8-byte span id, sampled).
 TRACEPARENT="${TRACEPARENT:-00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01}"
 
@@ -98,7 +96,7 @@ command -v taskset >/dev/null || { fail "taskset not installed"; exit 1; }
 ensure_collector_running      || { fail "collector not reachable at ${COLLECTOR_HTTP_ENDPOINT}"; exit 1; }
 info "nginx=${NGINX_BINARY}"
 info "module=${MODULE_PATH} (mtime=$(date -r "${MODULE_PATH}" +%s))"
-info "SERVER_CORES=${SERVER_CORES} LOAD_CORES=${LOAD_CORES} conn=${CONN} dur=${DUR}s interval=${METRIC_INTERVAL} sample=${SAMPLE_SIZE}"
+info "SERVER_CORES=${SERVER_CORES} LOAD_CORES=${LOAD_CORES} conn=${CONN} dur=${DUR}s interval=${METRIC_INTERVAL}"
 mkdir -p "${RESULTS_DIR}"
 
 COLLECTOR_PID="$(pgrep -f 'otelcol' | head -1 || true)"
@@ -153,7 +151,7 @@ make_conf() {
             echo "    otel_exporter { endpoint ${COLLECTOR_HTTP_ENDPOINT}/v1/metrics; }"
             echo "    otel_service_name ${SERVICE_NAME};"
             echo "    otel_metric_interval ${METRIC_INTERVAL};"
-            [[ "${with_sample}" == "1" ]] && echo "    otel_access_log_sample ${SAMPLE_SIZE};"
+            [[ "${with_sample}" == "1" ]] && echo "    otel_log_export on;"
         fi
         # return 500 => every request is is_interesting() (status >= 400).
         echo "    server { listen 127.0.0.1:9101; location / { return 500 'err\\n'; } }"

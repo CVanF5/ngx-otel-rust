@@ -183,7 +183,7 @@ telemetry suspended; nginx -s reload restores
   which re-arms the latch.
 
 Note: detection requires drop traffic on a ring (spans enabled or
-`otel_access_log_sample` set, plus requests that push records). A fully idle
+`otel_log_export` set, plus requests that push records). A fully idle
 nginx with a dead exporter stays silent until telemetry pressure appears —
 by design, the check lives on the symptom path only.
 

@@ -263,7 +263,7 @@ http {
     }
     otel_service_name ${SERVICE_NAME};
     otel_metric_interval ${METRIC_INTERVAL_S}s;
-    otel_access_log_sample 1;
+    otel_log_export on;
 
     server {
         listen 127.0.0.1:${NGINX_PORT};

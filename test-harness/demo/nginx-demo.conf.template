@@ -78,11 +78,12 @@ http {
     otel_metric_status_code_class on;
 
     # ── Logs (off unless set; orthogonal to nginx's own access_log/error_log) ─
-    # Access log as summary + samples: a thin exception tail (status >= 4xx /
-    # latency outliers) plus trace-linked exemplars. The argument is the exemplar
-    # reservoir size; tail records carry url.path / status / method / client.address.
-    otel_access_log_sample 64;
-    # Per-worker logs ring capacity backing the tail + exemplars (default 512k;
+    # Access log as summary + samples: a thin exception tail of full LogRecords
+    # for operator-selected requests. Tail records carry url.path / status /
+    # method / client.address. (Metric exemplars are separate — they ride trace
+    # sampling below, one uniformly-sampled trace pointer per data point per cycle.)
+    otel_log_export on;
+    # Per-worker logs ring capacity backing the exception tail (default 512k;
     # unused in the demo):
     #   otel_log_ring_size 512k;
     # Error log over OTLP: coalesced nginx.error LogRecords plus a companion error-

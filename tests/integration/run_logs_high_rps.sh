@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tests/integration/run_logs_high_rps.sh — high-RPS access-log stress test
 #
-# Fires sustained high-RPS traffic at nginx with otel_access_log_sample 16 and
+# Fires sustained high-RPS traffic at nginx with otel_log_export on and
 # verifies that:
 #   1. nginx does not crash.
 #   2. At least 50% of sent requests appear as LogRecords in logs.json

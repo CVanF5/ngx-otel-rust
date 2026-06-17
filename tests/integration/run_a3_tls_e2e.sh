@@ -453,7 +453,7 @@ http {
     }
     otel_service_name ${SVC_A};
     otel_metric_interval ${METRIC_INTERVAL_S}s;
-    otel_access_log_sample 1;
+    otel_log_export on;
     otel_trace on;
 
     server {

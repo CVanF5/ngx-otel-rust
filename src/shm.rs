@@ -29,7 +29,7 @@ use nginx_sys::{
 };
 use ngx::core::Status;
 
-use crate::logs::access::{SampledRequest, MAX_URL_PATH, MAX_USER_AGENT};
+use crate::logs::access::SampledRequest;
 
 /// Duration histogram bucket boundaries in **milliseconds**.
 ///
@@ -547,11 +547,13 @@ pub struct WorkerSlots {
     pub upstream_bytes_received: Histogram<N_BYTES_BUCKETS>,
     /// `http.server.upstream.bytes.sent` (bytes)
     pub upstream_bytes_sent: Histogram<N_BYTES_BUCKETS>,
-    /// Exemplar reservoir.
-    /// Shared across all combos; per-entry `combo_idx` identifies the histogram.
-    /// The runtime `access_sample_size` directive caps the effective reservoir
-    /// size to ≤ `MAX_EXEMPLAR_RESERVOIR`.
-    pub exemplar_reservoir: ExemplarReservoir,
+    /// Per-data-point exemplar reservoirs — one small reservoir per base
+    /// `combo_idx` (`request_duration_combos` data point).  Each reservoir holds
+    /// up to `EXEMPLAR_RESERVOIR_SIZE` uniformly-sampled exemplars for that data
+    /// point, reset every export cycle.  Exemplars are attached to the base
+    /// `http.server.request.duration` series only (the decomposed by_route /
+    /// by_upstream series carry none).
+    pub exemplar_reservoirs: [ExemplarReservoir; N_COMBOS],
     /// Per-severity-class error-log event counters.
     ///
     /// `error_rate_counters[severity_class_index(ngx_level)]` is bumped by the
@@ -568,26 +570,38 @@ pub struct WorkerSlots {
 
 // ── Exemplar reservoir ─────────────────────────────
 
-/// Maximum per-worker exemplar reservoir size.
+/// Per-data-point exemplar reservoir size.
 ///
-/// Operators set the effective size via `otel_access_log_sample <size>`
-/// (capped at this value).  At ~256 bytes per entry × 64 ≈ 16 KB per
-/// worker — a negligible addition to `WorkerSlots`.
-pub const MAX_EXEMPLAR_RESERVOIR: usize = 64;
+/// OTel's `SimpleFixedSizeExemplarReservoir` defaults its size to the
+/// number of concurrent threads/CPUs purely as a *contention* heuristic for
+/// multi-threaded SDKs where many threads offer to one shared reservoir; that
+/// does not bind us — nginx workers are single-threaded event loops and we
+/// already keep one reservoir per worker (≈ one per CPU), so the per-CPU
+/// spreading is achieved at the worker level.  The remaining choice is "how
+/// many example traces per data point per interval is useful", which is a
+/// small number.  We lock this at 2.
+/// <https://opentelemetry.io/docs/specs/otel/metrics/sdk/#exemplar-defaults>
+pub const EXEMPLAR_RESERVOIR_SIZE: usize = 2;
 
-/// A single exemplar entry in the per-worker reservoir.
+/// A single exemplar entry in a per-data-point reservoir.
 ///
-/// Written on the hot path with `Ordering::Relaxed` on the atomic fields;
-/// the plain byte buffers (`url_path_buf`, `user_agent_buf`) are written
-/// with direct pointer writes — tearing is acceptable for exemplar hints.
+/// Written on the hot path with `Ordering::Relaxed` stores.  The fields are
+/// the canonical OTel exemplar payload — `value`, `time_unix_nano`,
+/// `trace_id`, `span_id`.  No `filtered_attributes` are stored: `url.path` /
+/// `user_agent` were a misuse of that field (they are not metric-measurement
+/// attributes) and a redaction hazard, and the linked trace already carries
+/// `url.path`.
+/// <https://opentelemetry.io/docs/specs/otel/metrics/data-model/#exemplars>
 ///
-/// The `has_trace` flag and `combo_idx` use `Relaxed` ordering.
-/// The reader should only access entries for which `count > slot_index`
-/// (see [`ExemplarReservoir::snapshot`]).
+/// There is no per-entry commit barrier: the reservoir `count` is the only
+/// synchronisation point and the individual fields are written `Relaxed`, so a
+/// concurrent cross-process reader can observe a *torn* exemplar (a value
+/// paired with the wrong trace_id).  This is an intentional hot-path
+/// trade-off: exemplars are sampling hints for drill-down, not an
+/// authoritative record (see TELEMETRY_MODEL.md "Exemplars are best-effort
+/// hints").
 ///
-/// Size: 5 × AtomicU64 + AtomicU32 + AtomicU8 + AtomicU8 + 2 pad
-///       + MAX_URL_PATH + MAX_USER_AGENT
-///     = 40 + 4 + 1 + 1 + 2 + 64 + 128 = 240 bytes.
+/// Size: 5 × AtomicU64 + AtomicU32 + AtomicU8 + 3 pad = 40 + 4 + 1 + 3 = 48 bytes.
 #[repr(C)]
 pub struct ExemplarEntry {
     /// Observed request duration in µs (matches the exp-histogram `us` unit).
@@ -601,61 +615,73 @@ pub struct ExemplarEntry {
     /// Unix epoch timestamp of the request in nanoseconds.
     pub ts_unix_nano: AtomicU64,
     /// Combo index (identifies the histogram data point this belongs to).
+    ///
+    /// Redundant now that there is one reservoir per data point (the reservoir
+    /// array index is the combo), but kept on the snapshot so the exporter's
+    /// per-combo match path is unchanged.
     pub combo_idx: core::sync::atomic::AtomicU32,
     /// 1 if `trace_id` / `span_id` are valid; 0 if absent.
     pub has_trace: core::sync::atomic::AtomicU8,
-    /// Length of `url_path_buf` that is valid.
-    pub url_path_len: core::sync::atomic::AtomicU8,
-    /// Length of `user_agent_buf` that is valid.
-    pub user_agent_len: core::sync::atomic::AtomicU8,
-    _pad: [u8; 1],
-    /// `url.path` bytes — high-cardinality, exemplar filtered_attribute ONLY.
-    /// NEVER a metric dimension.
-    /// `UnsafeCell` so the hot-path byte writes through `&self` are sound
-    /// interior mutation rather than aliasing UB. `repr(transparent)`, so the
-    /// shm layout is unchanged.
-    pub url_path_buf: core::cell::UnsafeCell<[u8; MAX_URL_PATH]>,
-    /// `user_agent.original` bytes — high-cardinality, exemplar filtered_attribute ONLY.
-    /// NEVER a metric dimension. `UnsafeCell` for the same reason as `url_path_buf`.
-    pub user_agent_buf: core::cell::UnsafeCell<[u8; MAX_USER_AGENT]>,
+    _pad: [u8; 3],
 }
 
-/// Per-worker exemplar reservoir — a fixed-capacity circular buffer of
-/// [`ExemplarEntry`] entries, filled by counter-mod sampling.
+/// Per-data-point exemplar reservoir — a fixed-capacity pool of
+/// [`ExemplarEntry`] filled by uniform `SimpleFixedSizeExemplarReservoir`
+/// sampling.
 ///
 /// # Sampling discipline
-/// Each incoming candidate calls `count.fetch_add(1)` to claim a slot index:
-/// `slot = count % effective_size`.  When `count < effective_size` the slot
-/// is freshly allocated; afterwards it overwrites an older entry.  This is
-/// NOT Vitter-style reservoir sampling (biased towards recent entries) but is
-/// O(1), alloc-free, and lock-free — the single `fetch_add` IS the one
-/// permitted hot-path write.
+///
+/// Each candidate calls `seen.fetch_add(1)` to obtain `n` (the number of
+/// measurements seen this cycle, 0-based).  Following OTel's
+/// `SimpleFixedSizeExemplarReservoir`: when `n < size` the candidate is written
+/// to slot `n` (fill phase); otherwise `bucket = rand_index(n)` in `0..=n` and
+/// the candidate is written to slot `bucket` only if `bucket < size`.
+///
+/// Every measurement therefore has equal probability of being retained
+/// (uniform), not the recency bias of a `n % size` ring.  The "random" index
+/// is a cheap alloc-free, lock-free integer hash of `n` (no `rand`/`Math.random`
+/// on the hot path); over a cycle it is uniform enough for sampling hints.
+/// The single `fetch_add` IS the one permitted hot-path write.
+/// <https://opentelemetry.io/docs/specs/otel/metrics/sdk/#exemplar-defaults>
+///
+/// # Reset (one cross-process write)
+/// The exporter calls [`ExemplarReservoir::reset`] after [`ExemplarReservoir::snapshot`]
+/// every collection cycle, storing `0` into `seen` (the spec's
+/// `num_measurements_seen` reset).  `seen` is only ever touched atomically —
+/// `fetch_add(Relaxed)` by the worker, `store(0, Release)` by the exporter — so
+/// the store-vs-RMW interleaving is well-defined (no data race).  A worker
+/// write landing in the same instant the exporter zeroes is a benign
+/// lost-update, consistent with the best-effort-hint semantics above.
 #[repr(C)]
 pub struct ExemplarReservoir {
-    /// Sequential counter: how many candidates have been offered to the reservoir.
-    pub count: AtomicU64,
-    pub entries: [ExemplarEntry; MAX_EXEMPLAR_RESERVOIR],
+    /// `num_measurements_seen` this collection cycle (OTel spec name).  Reset to
+    /// 0 by the exporter after each snapshot.
+    pub seen: AtomicU64,
+    pub entries: [ExemplarEntry; EXEMPLAR_RESERVOIR_SIZE],
 }
 
 impl ExemplarReservoir {
     /// Write one exemplar entry on the hot path from a `SampledRequest`.
     ///
-    /// `effective_size` must be in `1..=MAX_EXEMPLAR_RESERVOIR`; values outside
-    /// this range are clamped.
-    ///
     /// # Hot-path note
-    /// One `fetch_add` + ≤ 9 `Relaxed` stores + 2 memcpy ≤ 192 bytes.
-    /// All within the budget of "one exemplar reservoir write."
-    ///
-    /// # High-cardinality fields
-    /// `url_path` and `user_agent` are stored in the entry as filtered_attributes;
-    /// they are **never** used as metric dimensions.
+    /// One `fetch_add` + a branch + ≤ 6 `Relaxed` stores.  Alloc-free,
+    /// lock-free, no syscall.
     #[inline]
-    pub fn write(&self, effective_size: usize, req: &SampledRequest<'_>) {
-        let k = effective_size.clamp(1, MAX_EXEMPLAR_RESERVOIR);
-        let n = self.count.fetch_add(1, Ordering::Relaxed) as usize;
-        let slot = n % k;
-        let e = &self.entries[slot];
+    pub fn write(&self, req: &SampledRequest<'_>) {
+        let n = self.seen.fetch_add(1, Ordering::Relaxed);
+        let size = EXEMPLAR_RESERVOIR_SIZE as u64;
+        // SimpleFixedSizeExemplarReservoir slot selection.
+        let bucket = if n < size {
+            n
+        } else {
+            // rand_index in 0..=n; cheap integer hash (SplitMix64 finaliser) of
+            // `n` mapped into the inclusive range, in lieu of an RNG.
+            Self::rand_index(n) % (n + 1)
+        };
+        if bucket >= size {
+            return; // measurement not retained (uniform eviction)
+        }
+        let e = &self.entries[bucket as usize];
         e.value_us.store(req.duration_us, Ordering::Relaxed);
         e.ts_unix_nano.store(req.ts_unix_nano, Ordering::Relaxed);
         e.combo_idx.store(req.combo_idx, Ordering::Relaxed);
@@ -669,43 +695,29 @@ impl ExemplarReservoir {
         } else {
             e.has_trace.store(0, Ordering::Relaxed);
         }
-        // High-cardinality fields: copy bytes into the fixed-size buffers.
-        //
-        // There is NO per-entry commit barrier: the count is the only
-        // synchronisation point, and the individual fields above (combo_idx,
-        // trace_id, these byte buffers) are written with Relaxed / non-atomic
-        // copies.  A concurrent reader can therefore observe a *torn* exemplar —
-        // a url.path spliced from two requests, or a trace_id paired with the
-        // wrong data point.  This is an intentional hot-path trade-off:
-        // exemplars are sampling hints for drill-down, not an authoritative
-        // record (see TELEMETRY_MODEL.md "Exemplars are best-effort hints").
-        let url_len = req.url_path.len().min(MAX_URL_PATH) as u8;
-        let ua_len = req.user_agent.len().min(MAX_USER_AGENT) as u8;
-        // SAFETY: the buffers are `UnsafeCell<[u8; N]>`, so mutating through
-        // `&self` is sound interior mutability (not aliasing UB). `.get()` yields
-        // `*mut [u8; N]`; the cast to `*mut u8` addresses the first byte. `url_len`
-        // / `ua_len` are clamped ≤ the buffer length, so both copies stay in
-        // bounds. Within a worker this is the single writer; cross-process tearing
-        // vs the exporter's read is the accepted best-effort-hint semantics.
-        unsafe {
-            let dst = e.url_path_buf.get().cast::<u8>();
-            core::ptr::copy_nonoverlapping(req.url_path.as_ptr(), dst, url_len as usize);
-            let dst = e.user_agent_buf.get().cast::<u8>();
-            core::ptr::copy_nonoverlapping(req.user_agent.as_ptr(), dst, ua_len as usize);
-        }
-        e.url_path_len.store(url_len, Ordering::Relaxed);
-        e.user_agent_len.store(ua_len, Ordering::Relaxed);
     }
 
-    /// Snapshot all active entries.
+    /// Cheap deterministic integer hash of `n` (SplitMix64 finaliser) — a
+    /// stand-in for an RNG so the hot path stays alloc-free and dependency-free.
+    /// Distributes successive `n` across the output range uniformly enough for
+    /// sampling-hint selection.
+    #[inline]
+    fn rand_index(n: u64) -> u64 {
+        let mut z = n.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Snapshot the active entries of this reservoir.
     ///
-    /// Returns a Vec of `ExemplarSnapshot` items (one per filled slot).
-    /// Callers should skip entries where `combo_idx == 0` and `ts_unix_nano == 0`
-    /// (uninitialised slots).
-    pub fn snapshot(&self, effective_size: usize) -> std::vec::Vec<ExemplarSnapshot> {
-        let k = effective_size.clamp(1, MAX_EXEMPLAR_RESERVOIR);
-        let count = self.count.load(Ordering::Acquire) as usize;
-        let filled = count.min(k);
+    /// Occupancy is the reservoir's own `seen` count clamped to the reservoir
+    /// size (`filled = seen.min(size)`).  This replaces the old
+    /// `combo_idx == 0 && ts == 0` sentinel, which is invalid now that combo 0
+    /// is a legitimate data point with its own reservoir.
+    pub fn snapshot(&self) -> std::vec::Vec<ExemplarSnapshot> {
+        let seen = self.seen.load(Ordering::Acquire) as usize;
+        let filled = seen.min(EXEMPLAR_RESERVOIR_SIZE);
 
         let mut out = std::vec::Vec::with_capacity(filled);
         for i in 0..filled {
@@ -720,14 +732,6 @@ impl ExemplarReservoir {
             trace_id[0..8].copy_from_slice(&lo);
             trace_id[8..16].copy_from_slice(&hi);
             let span_id = e.span_id.load(Ordering::Acquire).to_be_bytes();
-            let url_path_len = e.url_path_len.load(Ordering::Acquire);
-            let user_agent_len = e.user_agent_len.load(Ordering::Acquire);
-            // SAFETY: single-threaded read within the exporter process; `.get()`
-            // yields `*mut [u8; N]` which we copy out. Concurrent worker writes
-            // live in another process — the documented best-effort tearing.
-            let url_path = unsafe { *e.url_path_buf.get() };
-            // SAFETY: as above — exporter-process read of the UnsafeCell buffer.
-            let user_agent = unsafe { *e.user_agent_buf.get() };
             out.push(ExemplarSnapshot {
                 value_us,
                 combo_idx,
@@ -735,13 +739,20 @@ impl ExemplarReservoir {
                 trace_id,
                 span_id,
                 ts_unix_nano: ts_ns,
-                url_path,
-                url_path_len,
-                user_agent,
-                user_agent_len,
             });
         }
         out
+    }
+
+    /// Reset the sampling state (the OTel `num_measurements_seen` count) after a
+    /// collection cycle.  This is the single cross-process write into the
+    /// reservoir; see the struct doc for its race semantics.
+    ///
+    /// The stale entry payloads are intentionally NOT zeroed — once `seen` is 0
+    /// the next snapshot reports `filled = 0`, and the fill phase overwrites the
+    /// slots before they can be observed again.
+    pub fn reset(&self) {
+        self.seen.store(0, Ordering::Release);
     }
 }
 
@@ -753,10 +764,6 @@ pub struct ExemplarSnapshot {
     pub trace_id: [u8; 16],
     pub span_id: [u8; 8],
     pub ts_unix_nano: u64,
-    pub url_path: [u8; MAX_URL_PATH],
-    pub url_path_len: u8,
-    pub user_agent: [u8; MAX_USER_AGENT],
-    pub user_agent_len: u8,
 }
 
 impl WorkerSlots {
@@ -925,7 +932,8 @@ unsafe fn wp_from_cycle(cycle: *const ngx_cycle_t) -> Option<usize> {
 ///   - `request_body_bytes`, `response_body_bytes` (global aggregates)
 ///   - `upstream_response_ms`, `upstream_header_ms`, `upstream_connect_ms`,
 ///     `upstream_bytes_received`, `upstream_bytes_sent` (global upstream aggregates)
-///   - `exemplar_reservoir` (`combo_idx` refs `request_duration_combos` — config-stable)
+///   - `exemplar_reservoirs` (indexed by base `combo_idx`, which refs
+///     `request_duration_combos` — config-stable)
 ///   - `error_rate_counters` (severity class — config-stable)
 ///
 /// `start_time_unix_nano` resets per-reload (export/mod.rs:487 — new exporter process
@@ -1811,100 +1819,177 @@ mod tests {
         assert_eq!(buckets.iter().sum::<u64>(), 0);
     }
 
-    /// Exemplar reservoir is bounded, alloc-free, and fills then wraps.
-    #[test]
-    fn exemplar_reservoir_bounded_and_alloc_free() {
-        let mut buf = std::vec![0u8; mem::size_of::<WorkerSlots>()];
-        // SAFETY: `buf` is a freshly-allocated, zero-initialised `Vec<u8>` sized
-        // to exactly hold a `WorkerSlots`; the global allocator over-aligns it,
-        // and zero is the valid initial state for its atomic fields. The shared
-        // reference lives only for the test.
-        let slot = unsafe { &*buf.as_mut_ptr().cast::<WorkerSlots>() };
-        let reservoir = &slot.exemplar_reservoir;
+    /// Build a minimal sampled request for the reservoir tests.  Only the fields
+    /// the slimmed exemplar entry consumes (value/ts/combo/trace) carry meaning;
+    /// the rest are the canonical tail fields, irrelevant to the reservoir.
+    #[cfg(test)]
+    fn sampled<'a>(
+        combo_idx: u32,
+        duration_us: u64,
+        ts_unix_nano: u64,
+        trace: Option<([u8; 16], [u8; 8])>,
+    ) -> SampledRequest<'a> {
+        SampledRequest {
+            ts_unix_nano,
+            trace,
+            url_path: b"",
+            user_agent: b"",
+            duration_us,
+            combo_idx,
+            method: b"GET",
+            status: 200,
+            request_length: 0,
+            response_bytes: 0,
+            client_addr: b"127.0.0.1",
+        }
+    }
 
-        // Write 3 exemplars into a reservoir of size 2 → slot 0 and 1 filled,
-        // slot 0 is overwritten by the 3rd write.
-        use crate::logs::access::SampledRequest;
+    /// The slimmed exemplar entry is 48 bytes (canonical fields only — no
+    /// url.path / user_agent buffers), and the per-combo reservoir array is the
+    /// only exemplar storage in `WorkerSlots`.
+    #[test]
+    fn exemplar_entry_is_slim() {
+        assert_eq!(
+            core::mem::size_of::<ExemplarEntry>(),
+            48,
+            "ExemplarEntry must be 48 bytes (5×u64 + u32 + u8 + 3 pad)"
+        );
+        // Per-combo reservoir array sized by EXEMPLAR_RESERVOIR_SIZE × N_COMBOS.
+        assert_eq!(EXEMPLAR_RESERVOIR_SIZE, 2);
+        let one = core::mem::size_of::<ExemplarReservoir>();
+        // seen(u64) + size × entry(48) = 8 + 2×48 = 104.
+        assert_eq!(one, 8 + EXEMPLAR_RESERVOIR_SIZE * 48, "reservoir = seen + entries");
+        assert_eq!(core::mem::size_of::<[ExemplarReservoir; N_COMBOS]>(), one * N_COMBOS);
+    }
+
+    /// A reservoir of size 2 fed N > size sampled candidates retains at most
+    /// `size` exemplars (uniform fixed-size reservoir, NOT N).
+    #[test]
+    fn exemplar_reservoir_bounded() {
+        let mut buf = std::vec![0u8; mem::size_of::<WorkerSlots>()];
+        // SAFETY: zero-init buffer sized to a WorkerSlots; zero is the valid
+        // initial state for its atomics; reference lives only for the test.
+        let slot = unsafe { &*buf.as_mut_ptr().cast::<WorkerSlots>() };
+        let reservoir = &slot.exemplar_reservoirs[5];
+
         let tid = [
             0x4bu8, 0xf9, 0x2f, 0x35, 0x77, 0xb3, 0x4d, 0xa6, 0xa3, 0xce, 0x92, 0x9d, 0x0e, 0x0e,
             0x47, 0x36,
         ];
         let sid = [0x00u8, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7];
 
-        reservoir.write(
-            2,
-            &SampledRequest {
-                ts_unix_nano: 1_000_000_000,
-                trace: Some((tid, sid)),
-                url_path: b"/api",
-                user_agent: b"curl/7",
-                duration_us: 100,
-                combo_idx: 5,
-                method: b"GET",
-                status: 200,
-                request_length: 0,
-                response_bytes: 0,
-                client_addr: b"127.0.0.1",
-            },
-        ); // slot 0
-        reservoir.write(
-            2,
-            &SampledRequest {
-                ts_unix_nano: 2_000_000_000,
-                trace: None,
-                url_path: b"",
-                user_agent: b"",
-                duration_us: 200,
-                combo_idx: 6,
-                method: b"GET",
-                status: 200,
-                request_length: 0,
-                response_bytes: 0,
-                client_addr: b"127.0.0.1",
-            },
-        ); // slot 1
-        reservoir.write(
-            2,
-            &SampledRequest {
-                ts_unix_nano: 3_000_000_000,
-                trace: Some((tid, sid)),
-                url_path: b"/v2",
-                user_agent: b"Go-http",
-                duration_us: 300,
-                combo_idx: 7,
-                method: b"GET",
-                status: 200,
-                request_length: 0,
-                response_bytes: 0,
-                client_addr: b"127.0.0.1",
-            },
-        ); // slot 0 overwritten
+        for i in 0..50u64 {
+            reservoir.write(&sampled(5, 100 + i, 1_000 + i, Some((tid, sid))));
+        }
 
-        // count must be 3 (candidates seen)
-        assert_eq!(reservoir.count.load(core::sync::atomic::Ordering::Acquire), 3);
+        assert_eq!(reservoir.seen.load(Ordering::Acquire), 50, "all candidates seen");
+        let snap = reservoir.snapshot();
+        assert_eq!(
+            snap.len(),
+            EXEMPLAR_RESERVOIR_SIZE,
+            "snapshot returns at most reservoir size, NOT the flood of 50"
+        );
+        for e in &snap {
+            assert_eq!(e.combo_idx, 5);
+            assert!(e.has_trace);
+        }
+    }
 
-        // snapshot with effective_size=2 should return 2 entries (min(count=3, k=2))
-        let snapshot = reservoir.snapshot(2);
-        assert_eq!(snapshot.len(), 2, "snapshot should return min(count, k) entries");
+    /// The reservoir resets every collection cycle: after `reset()` an idle
+    /// reservoir's next snapshot is empty (occupancy is count-based, not the old
+    /// `combo_idx == 0` sentinel).
+    #[test]
+    fn exemplar_reservoir_resets_after_snapshot() {
+        let mut buf = std::vec![0u8; mem::size_of::<WorkerSlots>()];
+        // SAFETY: as above.
+        let slot = unsafe { &*buf.as_mut_ptr().cast::<WorkerSlots>() };
+        let reservoir = &slot.exemplar_reservoirs[0]; // combo 0 is a VALID combo now
 
-        // Slot 0 was overwritten by write #3 (value=300, combo=7, url=/v2, ua=Go-http)
-        let s0 = &snapshot[0];
-        assert_eq!(s0.value_us, 300, "slot 0 has latest value");
-        assert_eq!(s0.combo_idx, 7, "slot 0 has latest combo_idx");
-        assert!(s0.has_trace, "slot 0 has trace context");
-        assert_eq!(s0.url_path_len, 3); // "/v2"
-        assert_eq!(&s0.url_path[..3], b"/v2");
+        for i in 0..10u64 {
+            reservoir.write(&sampled(0, 200 + i, 5_000 + i, None));
+        }
+        let snap = reservoir.snapshot();
+        assert_eq!(snap.len(), EXEMPLAR_RESERVOIR_SIZE, "filled before reset");
+        // Combo 0 with a real value must be reported (no false sentinel skip).
+        assert!(snap.iter().any(|e| e.combo_idx == 0 && e.value_us >= 200));
 
-        // Slot 1 was written by write #2 (value=200, combo=6, no trace, no url)
-        let s1 = &snapshot[1];
-        assert_eq!(s1.value_us, 200, "slot 1 has its value");
-        assert_eq!(s1.combo_idx, 6, "slot 1 has its combo_idx");
-        assert!(!s1.has_trace, "slot 1 has no trace context");
-        assert_eq!(s1.url_path_len, 0);
+        // Exporter resets the sampling state after the snapshot.
+        reservoir.reset();
+        let snap_after = reservoir.snapshot();
+        assert_eq!(snap_after.len(), 0, "idle reservoir reports 0 after reset");
+    }
 
-        // snapshot with larger effective_size than count → only min(count, k) slots
-        let snap2 = reservoir.snapshot(10);
-        assert_eq!(snap2.len(), 3, "snapshot with k>count returns count entries");
+    /// Per-data-point isolation: an exemplar written into combo A's reservoir
+    /// never appears under combo B.
+    #[test]
+    fn exemplar_reservoirs_are_per_data_point() {
+        let mut buf = std::vec![0u8; mem::size_of::<WorkerSlots>()];
+        // SAFETY: as above.
+        let slot = unsafe { &*buf.as_mut_ptr().cast::<WorkerSlots>() };
+
+        slot.exemplar_reservoirs[7].write(&sampled(7, 700, 7_000, None));
+        // Combo 8 untouched.
+        let a = slot.exemplar_reservoirs[7].snapshot();
+        let b = slot.exemplar_reservoirs[8].snapshot();
+        assert_eq!(a.len(), 1, "combo 7 reservoir has its one exemplar");
+        assert_eq!(a[0].combo_idx, 7);
+        assert_eq!(a[0].value_us, 700);
+        assert_eq!(b.len(), 0, "combo 8 reservoir is empty — no cross-combo bleed");
+    }
+
+    /// Uniform sampling sanity: the `SimpleFixedSizeExemplarReservoir` algorithm
+    /// (1) fills both slots during the fill phase, (2) lets *every* measurement
+    /// be a replacement candidate (its eviction probability is 1/(n+1), so
+    /// replacements legitimately thin out as n grows — that is the uniform
+    /// property, not a defect), and (3) directs evictions across BOTH slots over
+    /// many cycles rather than collapsing onto one.
+    /// <https://opentelemetry.io/docs/specs/otel/metrics/sdk/#exemplar-defaults>
+    #[test]
+    fn exemplar_reservoir_uniform_distribution() {
+        let mut buf = std::vec![0u8; mem::size_of::<WorkerSlots>()];
+        // SAFETY: as above.
+        let slot = unsafe { &*buf.as_mut_ptr().cast::<WorkerSlots>() };
+        let reservoir = &slot.exemplar_reservoirs[3];
+
+        // (1) Fill phase: the first `size` writes land in slots 0..size in order.
+        reservoir.write(&sampled(3, 10, 1, None)); // → slot 0
+        reservoir.write(&sampled(3, 20, 1, None)); // → slot 1
+        assert_eq!(reservoir.entries[0].value_us.load(Ordering::Acquire), 10);
+        assert_eq!(reservoir.entries[1].value_us.load(Ordering::Acquire), 20);
+
+        // (3) Across many short cycles (each ~16 candidates, reset between),
+        // post-fill evictions must reach BOTH slots — a constant/mod-0 index
+        // would freeze one slot forever.
+        let mut slot0_evictions = 0u64;
+        let mut slot1_evictions = 0u64;
+        for cycle in 0..200u64 {
+            reservoir.reset();
+            let base = 1_000 + cycle * 100;
+            let before0 = u64::MAX; // force first-write detection per cycle
+            let mut prev0 = before0;
+            let mut prev1 = u64::MAX;
+            for j in 0..16u64 {
+                reservoir.write(&sampled(3, base + j, 1, None));
+                let v0 = reservoir.entries[0].value_us.load(Ordering::Acquire);
+                let v1 = reservoir.entries[1].value_us.load(Ordering::Acquire);
+                // Count post-fill replacements (j >= size means an eviction roll).
+                if j >= EXEMPLAR_RESERVOIR_SIZE as u64 {
+                    if v0 != prev0 {
+                        slot0_evictions += 1;
+                    }
+                    if v1 != prev1 {
+                        slot1_evictions += 1;
+                    }
+                }
+                prev0 = v0;
+                prev1 = v1;
+            }
+        }
+        assert!(
+            slot0_evictions > 0 && slot1_evictions > 0,
+            "uniform eviction must reach both slots over many cycles \
+             (slot0={slot0_evictions}, slot1={slot1_evictions})"
+        );
     }
 
     /// Guard: verify that the histogram combo set remains
@@ -1962,10 +2047,12 @@ mod tests {
             "N_COMBOS must be method × sc × proto (route/upstream are separate tables)"
         );
 
-        // 2. url/ua in ExemplarEntry, NOT in histograms.
-        // Caps are single-homed in `logs::access` and imported here.
-        let _url_max: usize = MAX_URL_PATH; // present in ExemplarEntry only (via access::MAX_URL_PATH)
-        let _ua_max: usize = MAX_USER_AGENT; // present in ExemplarEntry only (via access::MAX_USER_AGENT)
+        // 2. url.path / user_agent caps are single-homed in `logs::access` and
+        //    appear on the exception-tail LogRecord ONLY — never as a metric
+        //    dimension, and (as of exemplar standardization) no longer in the
+        //    exemplar entry either (the linked trace carries url.path).
+        let _url_max: usize = crate::logs::access::MAX_URL_PATH;
+        let _ua_max: usize = crate::logs::access::MAX_USER_AGENT;
 
         // 3. combo_index is 3-arg (no url/ua/route/upstream) — route and upstream
         //    use separate WorkerSlots fields (route_duration_combos / upstream_duration_combos).

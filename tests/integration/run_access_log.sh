@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # tests/integration/run_access_log.sh — access-log integration test
 #
-# Starts NGINX with `otel_access_log_sample 16;`, sends HTTP requests, waits for
-# the export interval, then verifies the rebalanced access-log shape:
+# Starts NGINX with `otel_log_export if=$otel_export_tail;` (a $status>=400 map),
+# sends HTTP requests, waits for the export interval, then verifies the
+# rebalanced access-log shape:
 #
 # Assertions:
-#   1. 200 flood produces ZERO per-request LogRecords (is_interesting gate blocks them).
+#   1. 200 flood produces ZERO per-request LogRecords (the if= map selects errors only).
 #   2. Error requests (500) DO produce tail LogRecords.
 #   3. Histogram metric (http.server.request.duration) still arrives (always-on).
 #   4. Tail records contain http.request.method, http.response.status_code,

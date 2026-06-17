@@ -481,11 +481,6 @@ impl HttpRequestHandler for LogPhaseHandler {
                     };
                     crate::liveness::check_exporter_liveness_on_drop(amcf, conn_log);
                 }
-
-                // Sink 2: exemplar reservoir.
-                // One fetch_add + ≤ 9 Relaxed stores + 2 memcpy = within budget.
-                let effective_size = amcf.access_sample_size().max(1);
-                slot.exemplar_reservoir.write(effective_size, &sampled);
             }
         }
 
@@ -496,6 +491,33 @@ impl HttpRequestHandler for LogPhaseHandler {
         // This block is INDEPENDENT of the access-log gate above — spans are emitted
         // for all sampled requests, not only "interesting" tail ones.
         if let Some(ctx) = span_ctx.filter(|ctx| ctx.sampled) {
+            // ── Exemplar write (OTel TraceBased exemplar filter) ───────────────
+            // Record an exemplar ONLY for sampled-trace requests, into this base
+            // data point's reservoir.  This implements the spec's default
+            // `TraceBased` ExemplarFilter (sample only from sampled spans) and
+            // means every exemplar carries a real, resolvable trace pointer —
+            // `has_trace = false` exemplars are never produced.
+            // <https://opentelemetry.io/docs/specs/otel/metrics/sdk/#exemplar-defaults>
+            // Hot path: one fetch_add + a branch + ≤ 6 Relaxed stores.
+            // Request start time in ns (ms precision from nginx's stored fields);
+            // the slim exemplar entry consumes only value/ts/combo/trace.
+            let exemplar_ts_ns: u64 = (r.start_sec as u64)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(r.start_msec as u64 * 1_000_000);
+            slot.exemplar_reservoirs[base_idx].write(&SampledRequest {
+                ts_unix_nano: exemplar_ts_ns,
+                trace: Some((ctx.trace_id, ctx.span_id)),
+                url_path: b"",
+                user_agent: b"",
+                duration_us,
+                combo_idx: base_idx as u32,
+                method: r.method_name.as_bytes(),
+                status: r.headers_out.status as u16,
+                request_length: 0,
+                response_bytes: 0,
+                client_addr: b"",
+            });
+
             if let Some(spans_base) = amcf.spans_shm_base() {
                 // Collect per-location config (span_name_cv + span_attrs).
                 // `HttpOtelModule::location_conf` returns the merged LocationConf for
@@ -764,14 +786,11 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
         let mut up_bytes = ([0u64; N_BYTES_BUCKETS], 0u64, 0u64);
         let mut up_bytes_sent = ([0u64; N_BYTES_BUCKETS], 0u64, 0u64);
 
-        // amcf needed before the worker loop for effective_size.
         // SAFETY: `self.amcf` is the main-config pointer captured at exporter
         // setup; it is either null or points to the `MainConfig` that lives for
         // the whole process. `as_ref()` yields `None` for null and otherwise a
         // reference that does not outlive `self`, so it is sound.
         let amcf_ref_early: Option<&crate::config::MainConfig> = unsafe { self.amcf.as_ref() };
-        // Effective exemplar reservoir size (from otel_access_log_sample directive).
-        let effective_size = amcf_ref_early.map(|c| c.access_sample_size().max(1)).unwrap_or(1);
 
         // Collect exemplars from all workers: Vec<(combo_idx, Exemplar)>
         let mut all_exemplars: std::vec::Vec<(u32, Exemplar)> = std::vec::Vec::new();
@@ -835,43 +854,31 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
             let (bc, bs, bcount) = slot.upstream_bytes_sent.snapshot();
             add_histogram(&mut up_bytes_sent, &bc, bs, bcount);
 
-            // Collect exemplars from this worker's reservoir.
-            for snap in slot.exemplar_reservoir.snapshot(effective_size) {
-                // Build filtered_attributes: url.path + user_agent.original.
-                // These are HIGH-CARDINALITY fields — they appear on exemplars ONLY,
-                // NEVER as metric dimensions.
-                let mut filtered_attrs: std::vec::Vec<KeyValue> = std::vec::Vec::new();
-                if snap.url_path_len > 0 {
-                    if let Ok(s) =
-                        core::str::from_utf8(&snap.url_path[..snap.url_path_len as usize])
-                    {
-                        filtered_attrs.push(KeyValue {
-                            key: "url.path".into(),
-                            value: AnyValue::String(std::string::String::from(s)),
-                        });
-                    }
+            // Collect exemplars from this worker's per-data-point reservoirs and
+            // RESET each (the OTel `num_measurements_seen` reset every collection
+            // cycle — see ExemplarReservoir doc).  Reset is the one cross-process
+            // write into the reservoir; it is store-vs-RMW on the atomic `seen`,
+            // so the interleaving with a concurrent worker write is well-defined.
+            // The canonical exemplar carries no `filtered_attributes` (url.path /
+            // user_agent were a misuse of that field + a redaction hazard; the
+            // linked trace already carries url.path).
+            // <https://opentelemetry.io/docs/specs/otel/metrics/sdk/#exemplar-defaults>
+            for combo in 0..N_COMBOS {
+                let reservoir = &slot.exemplar_reservoirs[combo];
+                for snap in reservoir.snapshot() {
+                    all_exemplars.push((
+                        snap.combo_idx,
+                        Exemplar {
+                            value: snap.value_us as f64,
+                            time_unix_nano: snap.ts_unix_nano,
+                            trace_id: snap.trace_id,
+                            span_id: snap.span_id,
+                            has_trace: snap.has_trace,
+                            filtered_attributes: std::vec::Vec::new(),
+                        },
+                    ));
                 }
-                if snap.user_agent_len > 0 {
-                    if let Ok(s) =
-                        core::str::from_utf8(&snap.user_agent[..snap.user_agent_len as usize])
-                    {
-                        filtered_attrs.push(KeyValue {
-                            key: "user_agent.original".into(),
-                            value: AnyValue::String(std::string::String::from(s)),
-                        });
-                    }
-                }
-                all_exemplars.push((
-                    snap.combo_idx,
-                    Exemplar {
-                        value: snap.value_us as f64,
-                        time_unix_nano: snap.ts_unix_nano,
-                        trace_id: snap.trace_id,
-                        span_id: snap.span_id,
-                        has_trace: snap.has_trace,
-                        filtered_attributes: filtered_attrs,
-                    },
-                ));
+                reservoir.reset();
             }
         }
 

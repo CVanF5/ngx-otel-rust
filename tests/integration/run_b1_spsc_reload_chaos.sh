@@ -210,7 +210,7 @@ http {
     # Enable access-log sampling: every status >= 400 is "interesting" and
     # produces a tail LogRecord written to the log ring (the SPSC ring whose
     # exclusivity that the abdication gate enforces).
-    otel_access_log_sample 64;
+    otel_log_export on;
 
     server {
         listen 127.0.0.1:${NGINX_PORT};

@@ -13,7 +13,8 @@ proposal covers *why*.
 | Signal | Enabled by | Where |
 |---|---|---|
 | **Metrics** | on by default (`otel_metrics`) | [Metrics](#metrics) |
-| **Logs — access (tail + exemplars)** | `otel_access_log_sample <n>` | [Logs](#logs) |
+| **Logs — access (exception tail)** | `otel_log_export on \| if=<expr>` | [Logs](#logs) |
+| **Metric exemplars** | trace sampling (`otel_trace`) | [Metrics](#metrics) |
 | **Logs — error (coalesced + rate metric)** | `otel_error_log [level]` | [Logs](#logs) |
 | **Traces** | `otel_trace <expr>` per location | [Traces](#traces) |
 
@@ -42,7 +43,8 @@ log export is opt-in (privacy).
 | Trace-linked exemplars | `trace_id` on the duration histogram for metric → trace drill-down | Shipped |
 | Distributed traces | one OTel server span per request; W3C `traceparent` propagation (`otel_trace`) | Shipped |
 | **Logs: nothing exported by default** | no request-level log data leaves nginx unless configured (privacy) | Shipped |
-| Access exception-tail logs | full `LogRecord`s for selected requests + exemplars (`otel_access_log_sample`) | Shipped *(selection is a built-in predicate today)* |
+| Access exception-tail logs | full `LogRecord`s for operator-selected requests (`otel_log_export on \| if=<expr>`) | Shipped |
+| Metric exemplars | uniformly-sampled, trace-linked, one per data point per cycle, on trace-sampled requests (`otel_trace`) | Shipped |
 | Error logs | template-coalesced error `LogRecord`s + companion rate metric (`otel_error_log`) | Shipped |
 | **Selectable logs** | operator chooses *which* requests export, via an nginx `if=$cond` (status/latency/anything); nothing hardcoded | **Planned** |
 | Tunable metric cardinality | `otel_metric_status_code_class on\|off` — rich per-status-class vs lean series | Shipped |
@@ -188,9 +190,13 @@ table in `WorkerSlots` (`src/shm.rs`).
   environment exposed to port scans.  The `by_route` and `by_upstream`
   histograms **do** record these requests — the request still consumed real
   nginx resources regardless of the abort.
-- **Exemplars:** the base series attaches reservoir-sampled exemplars
-  (value + `trace_id`/`span_id` + `filtered_attributes`) per combo, populated
-  from the access-log sampling path (`otel_access_log_sample`).
+- **Exemplars:** the base series attaches uniformly-sampled exemplars
+  (canonical `value` + `time_unix_nano` + `trace_id`/`span_id`, no
+  `filtered_attributes`) — one small fixed-size reservoir per data point,
+  reset every export cycle.  Exemplars are recorded only for trace-sampled
+  requests (`otel_trace`; the OTel default `TraceBased` exemplar filter), so
+  every exemplar carries a resolvable trace pointer.  The decomposed
+  `by_route` / `by_upstream` series carry no exemplars.
 
 ### Exponential histogram parameters (`src/shm.rs`)
 
@@ -335,21 +341,25 @@ OTel logs are **orthogonal to nginx's own `access_log`/`error_log`** (the module
 via its own directives; core file logging is untouched and remains the on-box
 transcript). The OTel stream carries "summary + samples", not a per-request firehose.
 
-### Access log — exemplars + thin exception tail
+### Access log — thin exception tail (plus metric exemplars)
 
-The bulk of access information is the **metrics** above. Per-event access output is
-**gated by `otel_access_log_sample <reservoir-size>`** (absent ⇒ off) and is two
-things, never a per-request log:
+The bulk of access information is the **metrics** above. Per-event access output is two
+distinct, orthogonal things, never a per-request log:
 
-- **Exemplars** on the `http.server.request.duration` base series: reservoir-sampled
-  representative requests, each carrying the measured value + `trace_id`/`span_id`
-  (from the inbound W3C `traceparent`, when present) + `filtered_attributes` (the
-  high-cardinality detail `url.path`, `client.address`, `user_agent.original`). This is
-  the metric → exemplar → trace drill-down pivot. (`src/metric_source/instrumented.rs`,
-  encoder `Exemplar`.)
-- **Exception-tail `LogRecord`s**: emitted ONLY for "interesting" requests (status
-  ≥ 4xx, latency outliers — an is-interesting gate), carrying the same high-cardinality
-  attributes + `trace_id`/`span_id` + request duration. Substrate is the per-worker SPSC ring.
+- **Metric exemplars** on the `http.server.request.duration` base series: representative
+  trace pointers attached to the histogram, carrying the canonical OTel exemplar payload
+  — measured `value` + `time_unix_nano` + `trace_id`/`span_id`, and **no
+  `filtered_attributes`**. They are produced on the **trace-sampling** path (recorded
+  only when the request is sampled — OTel's default `TraceBased` exemplar filter), so
+  every exemplar carries a resolvable trace pointer. One small fixed-size reservoir
+  (size 2) **per data point**, uniformly sampled
+  (`SimpleFixedSizeExemplarReservoir`) and **reset every export cycle**. This is the
+  metric → exemplar → trace drill-down pivot. (`src/metric_source/instrumented.rs`,
+  `src/shm.rs` `ExemplarReservoir`, encoder `Exemplar`.)
+- **Exception-tail `LogRecord`s**: emitted for the requests an operator selects with
+  **`otel_log_export on | if=<expr>`** (absent ⇒ off, the privacy-safe default),
+  carrying the high-cardinality attributes below + `trace_id`/`span_id` + request
+  duration. Substrate is the per-worker SPSC ring.
   (`src/logs/access.rs`, `src/logs/ring.rs`.)
 
   | Attribute key | Type | Value |
@@ -363,7 +373,8 @@ things, never a per-request log:
   | `user_agent.original` | string | User-Agent value (truncated to 128 bytes) |
   | `http.server.request.duration` | double | request duration **in seconds** (OTel semconv unit; derived from µs measurement, sub-ms precision) |
 
-A common (2xx, fast) request produces **neither** — only the histogram `fetch_add`.
+A common (2xx, fast, unselected, unsampled) request produces **neither** — only the
+histogram `fetch_add`.
 
 **Exemplars vs exported log records** — both are "samples," but they are different
 signals with different purposes:
@@ -371,29 +382,30 @@ signals with different purposes:
 | | Exemplars | Exported log records (exception tail) |
 |---|---|---|
 | Signal family | Metrics (attached to the duration histogram) | Logs |
-| Carries | measured value + `trace_id`/`span_id` + filtered high-cardinality attrs | full per-request `LogRecord` (attributes above + duration) |
-| Selection | reservoir-sampled across *all* requests (size = `otel_access_log_sample <n>`) | the is-interesting gate (status ≥ 4xx, latency outliers) — see note |
+| Carries | `value` + `time_unix_nano` + `trace_id`/`span_id` (no `filtered_attributes`) | full per-request `LogRecord` (attributes above + duration) |
+| Selection | trace-sampled requests (`otel_trace`), uniform per data point, reset each cycle | operator condition `otel_log_export on \| if=<expr>` |
 | Purpose | metric → trace drill-down pivot | the actual log line for the requests you care about |
-| Authoritative? | best-effort hint (can be torn — see above) | yes |
+| Authoritative? | best-effort hint (can be torn — see below) | yes |
 
-> **Planned — user-defined export selection.** The is-interesting gate is currently a
-> built-in predicate (status ≥ 4xx, or a latency outlier). A planned change replaces it
-> with an operator-defined condition — an nginx `if=$cond` built with `map`, over
-> `$status`, `$request_time`, or anything — so *which* requests export as log records is
-> fully the operator's decision and nothing is hardcoded. With no such directive, no log
-> records are exported (privacy default).
+> **Why exemplars dropped `url.path` / `user_agent`.** Per the OTel data model,
+> `filtered_attributes` are attributes that were on the metric *measurement* but dropped
+> from aggregation; `url.path` / `user_agent` are never measurement attributes here, so
+> placing them there misuses the field (and the spec flags filtered attributes as a
+> redaction hazard). The linked trace already carries `url.path`, and `user_agent` is
+> addable via `otel_span_attr`, so no information is lost.
+> <https://opentelemetry.io/docs/specs/otel/metrics/data-model/#exemplars>
 
 > **Exemplars are best-effort hints, not an authoritative record.** Each exemplar
 > slot is written lock-free from the worker hot path with no per-field commit
-> barrier (the reader gates on an atomic count, but the string fields — `url.path`,
-> `user_agent.original` — and the `trace_id` are filled with `Relaxed`/byte
-> copies). Under concurrent overwrite a reader can observe a *torn* exemplar
-> (e.g. a `url.path` spliced from two requests, or a `trace_id` paired with the
-> wrong data point). This is an intentional hot-path trade-off: exemplars are
-> sampling hints for drill-down, so a rare torn string is acceptable. Do not
-> treat an individual exemplar's high-cardinality fields as ground truth; the
-> aggregate histogram and the exception-tail `LogRecord`s are the authoritative
-> surfaces.
+> barrier (the reader gates on an atomic count, but `value`, `trace_id`/`span_id`
+> are filled with `Relaxed` stores). Under concurrent overwrite a reader can
+> observe a *torn* exemplar (e.g. a `value` paired with the wrong `trace_id`).
+> The reset of the per-reservoir count after each collection cycle is likewise a
+> single cross-process atomic store, racing benignly with a concurrent worker
+> write (a lost update at most). This is an intentional hot-path trade-off:
+> exemplars are sampling hints for drill-down. Do not treat an individual
+> exemplar as ground truth; the aggregate histogram and the exception-tail
+> `LogRecord`s are the authoritative surfaces.
 
 ### Error log — coalesced `LogRecord`s
 
@@ -550,8 +562,8 @@ Mirrors the C++ `nginx-otel` module's redirect-safe design:
 ### Trace–metric–log correlation
 
 - **Exemplars** on `http.server.request.duration` carry `trace_id`/`span_id` from the
-  module's own spans (when `otel_access_log_sample` + `otel_trace` are both configured).
-  This is the metric→exemplar→**Tempo trace** drill-down pivot.
+  module's own spans (recorded on the trace-sampling path, so `otel_trace` must select
+  the request). This is the metric→exemplar→**Tempo trace** drill-down pivot.
 - **Access tail `LogRecord`s** carry the same `trace_id`/`span_id` as the span.
 - **Error `LogRecord`s** do NOT carry trace context (the `ngx_log_writer_pt` seam can't
   reach request context — see the error-log scope note in [Logs](#logs)).
