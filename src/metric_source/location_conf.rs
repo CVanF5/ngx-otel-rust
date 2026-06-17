@@ -19,11 +19,40 @@
 //!   Absent → built-in `"METHOD route_name"` format.
 //! - `otel_span_attr <key> <value>` — add a custom attribute to every span
 //!   emitted from this location.
+//! - `otel_log_export on|off|if=<cond>` — per-location selection of which
+//!   requests have an exception-tail log record exported.  Absent → no export
+//!   (privacy-safe default).  Mirrors core `access_log … if=`.
 
 use core::ptr;
 
 use nginx_sys::{ngx_http_complex_value_t, ngx_str_t};
 use ngx::http::{Merge, MergeConfigError};
+
+// ── LogExportMode ──────────────────────────────────────────────────────────────
+
+/// Per-location selection state for `otel_log_export`.
+///
+/// Decides whether the LOG-phase handler exports an exception-tail log record
+/// for a request.  Nothing is exported unless an operator opts in, so the
+/// default state is [`LogExportMode::Unset`] (treated as "no export").
+///
+/// Forms map to the variants as follows:
+/// - bare `otel_log_export;` / `otel_log_export on;` → [`LogExportMode::All`]
+/// - `otel_log_export off;` → [`LogExportMode::Off`]
+/// - `otel_log_export if=<cond>;` → [`LogExportMode::If`] (the compiled
+///   complex value is held in [`LocationConf::log_export_cv`])
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LogExportMode {
+    /// Directive not set at this level (inherit from parent; resolves to no
+    /// export when no ancestor sets it).
+    Unset = 0,
+    /// Explicitly disabled — no export, overriding any inherited selection.
+    Off = 1,
+    /// Export the exception-tail record for every request at this location.
+    All = 2,
+    /// Export only when the `if=<cond>` complex value is truthy at request time.
+    If = 3,
+}
 
 // ── TraceContextMode ──────────────────────────────────────────────────────────
 
@@ -45,6 +74,9 @@ pub enum TraceContextMode {
 
 /// Raw byte encoding for "not set" (`trace_context_raw` sentinel).
 const TRACE_CONTEXT_UNSET: u8 = 0xFF;
+
+/// Raw byte encoding for "not set" (`log_export_raw` sentinel).
+const LOG_EXPORT_UNSET: u8 = LogExportMode::Unset as u8;
 
 // ── LocationConf ─────────────────────────────────────────────────────────────
 
@@ -89,6 +121,19 @@ pub struct LocationConf {
     /// the nginx config buffer — valid for process lifetime).
     /// Read on the hot path only for **sampled** requests.
     pub span_attrs: std::vec::Vec<(ngx_str_t, ngx_str_t)>,
+
+    /// Raw encoding of `otel_log_export` mode for this location.
+    ///
+    /// 0 = unset (inherit from parent; resolves to no export), 1 = off,
+    /// 2 = all, 3 = if.  Accessed via [`LocationConf::log_export_mode`].
+    log_export_raw: u8,
+
+    /// Complex value for `otel_log_export if=<cond>`.
+    ///
+    /// `null` unless the mode is [`LogExportMode::If`].  Evaluated at the LOG
+    /// phase; truthy ⇒ export the exception-tail record (truthiness mirrors
+    /// core nginx: falsy iff empty or the single byte `"0"`).
+    pub log_export_cv: *mut ngx_http_complex_value_t,
 }
 
 impl LocationConf {
@@ -116,6 +161,30 @@ impl LocationConf {
     pub fn trace_context_is_set(&self) -> bool {
         self.trace_context_raw != TRACE_CONTEXT_UNSET
     }
+
+    /// Effective `otel_log_export` mode for this location.
+    #[inline]
+    pub fn log_export_mode(&self) -> LogExportMode {
+        match self.log_export_raw {
+            1 => LogExportMode::Off,
+            2 => LogExportMode::All,
+            3 => LogExportMode::If,
+            _ => LogExportMode::Unset,
+        }
+    }
+
+    /// Record an explicit `otel_log_export` mode.
+    #[inline]
+    pub fn set_log_export_mode(&mut self, mode: LogExportMode) {
+        self.log_export_raw = mode as u8;
+    }
+
+    /// Returns `true` if `otel_log_export` was explicitly set for this location
+    /// (as opposed to being the inherited default).
+    #[inline]
+    pub fn log_export_is_set(&self) -> bool {
+        self.log_export_raw != LOG_EXPORT_UNSET
+    }
 }
 
 impl Default for LocationConf {
@@ -125,6 +194,8 @@ impl Default for LocationConf {
             trace_context_raw: TRACE_CONTEXT_UNSET, // inherit / default Extract
             span_name_cv: ptr::null_mut(),
             span_attrs: std::vec::Vec::new(),
+            log_export_raw: LOG_EXPORT_UNSET, // inherit / no export
+            log_export_cv: ptr::null_mut(),
         }
     }
 }
@@ -142,6 +213,13 @@ impl Merge for LocationConf {
         // Inherit span_name_cv from parent when not set at this level.
         if self.span_name_cv.is_null() {
             self.span_name_cv = prev.span_name_cv;
+        }
+        // Inherit otel_log_export from parent when not set at this level.
+        // An explicit `off`/`on`/`if=` at this level wins over the inherited
+        // value (mirrors core access_log inheritance).
+        if !self.log_export_is_set() {
+            self.log_export_raw = prev.log_export_raw;
+            self.log_export_cv = prev.log_export_cv;
         }
         // span_attrs: each location defines its own independent set (child wins;
         // no inheritance — mirrors the C++ module's addSpanAttr accumulation at

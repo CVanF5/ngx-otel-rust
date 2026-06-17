@@ -11,10 +11,12 @@
 //! - No syscalls beyond what the nginx log phase already incurs.
 //! - No locks; only atomic increments (`Ordering::Relaxed` on writes).
 //! - The handler is registered **only** when `otel_exporter` is configured.
-//! - Exception-tail / exemplar emission is gated by
-//!   `amcf.is_access_sample_enabled() && is_interesting(status, duration_ms)`;
-//!   with the sample directive absent the path is byte-equivalent to the
-//!   metrics-only path (zero cost beyond one cheap branch + the histogram bump).
+//! - Exception-tail emission is gated by the operator: a cheap main-conf bool
+//!   (`amcf.any_log_export_enabled()`) plus the matched location's
+//!   `otel_log_export` mode.  With no location selecting export the path is
+//!   byte-equivalent to the metrics-only path (zero cost beyond one cheap
+//!   branch + the histogram bump).  Nothing is hardcoded — absent configuration
+//!   exports zero log records.
 
 use core::sync::atomic::Ordering;
 
@@ -29,6 +31,7 @@ use crate::logs::{
     access::{emit_access_record, SampledRequest},
     WorkerRingProducer,
 };
+use crate::metric_source::location_conf::LogExportMode;
 use crate::shm::{
     combo_index, logs_access_ring, spans_ring, worker_slots, HttpMethod, ProtoVersion, StatusClass,
     WorkerSlots, BYTES_BOUNDS, DEFAULT_SPAN_RING_CAP, DURATION_BOUNDS_MS, N_BYTES_BUCKETS,
@@ -160,7 +163,7 @@ impl HttpRequestHandler for LogPhaseHandler {
         // SpanCtx.start_mono can drive the µs histogram when tracing is on.
         // Set by SpanStartHandler in REWRITE.  None when tracing is not configured.
         // Re-used for:
-        //   (1) µs histogram / duration_ms gate (this block).
+        //   (1) µs duration histogram (this block).
         //   (2) trace correlation on the access tail log / exemplar (below).
         //   (3) span record emission when sampled (the span block below).
         let span_ctx: Option<&crate::traces::ctx::SpanCtx> = {
@@ -210,9 +213,6 @@ impl HttpRequestHandler for LogPhaseHandler {
             let start_us = (r.start_sec as u64) * 1_000_000 + (r.start_msec as u64) * 1_000;
             end_us.saturating_sub(start_us)
         };
-        // Keep a ms version for the is_interesting tail-latency gate (still ms-threshold).
-        let duration_ms: u64 = duration_us / 1_000;
-
         // ── request duration (decomposed tables) ─────────────────────────────
         // Three independent histogram bumps — each O(1) fetch_add, no alloc, no lock.
         let method = HttpMethod::from_bytes(r.method_name.as_bytes());
@@ -348,13 +348,37 @@ impl HttpRequestHandler for LogPhaseHandler {
             }
         }
 
-        // ── exception-tail / exemplar sampling ────────────────────────────
-        // Gate 1 (cheap config check): absent directive → is_access_sample_enabled()
-        //   = false, this entire block is skipped.
-        // Gate 2 (is_interesting predicate): the common 200/fast case falls through
-        //   with no ring push.  Only errors and latency outliers reach emit_access_record.
+        // ── exception-tail / exemplar export ──────────────────────────────
+        // Gate 1 (cheap config check): no location selects export anywhere →
+        //   any_log_export_enabled() = false, this entire block is skipped, so
+        //   a deployment without `otel_log_export` pays only the single bool.
+        // Gate 2 (per-location selection): the matched location's
+        //   `otel_log_export` mode decides export.  `on`/bare ⇒ always export;
+        //   `if=<cond>` ⇒ export when the complex value is truthy; `off`/unset
+        //   ⇒ nothing.  Nothing is hardcoded — the operator's condition is the
+        //   only predicate (privacy-safe default of no export).
         // The histogram bump above is always-on and is NOT gated here.
-        if amcf.is_access_sample_enabled() && is_interesting(status, duration_ms) {
+        let export_selected = if amcf.any_log_export_enabled() {
+            match HttpOtelModule::location_conf(r) {
+                Some(lc) => match lc.log_export_mode() {
+                    LogExportMode::All => true,
+                    LogExportMode::If => {
+                        // SAFETY: `r` is the valid non-null request for this
+                        // handler; `lc.log_export_cv` is non-null for the `If`
+                        // mode (set at config time, lives on the conf pool for
+                        // the process lifetime).
+                        let r_ptr = r as *const nginx_sys::ngx_http_request_t
+                            as *mut nginx_sys::ngx_http_request_t;
+                        eval_export_truthy(r_ptr, lc.log_export_cv)
+                    }
+                    LogExportMode::Off | LogExportMode::Unset => false,
+                },
+                None => false,
+            }
+        } else {
+            false
+        };
+        if export_selected {
             if let Some(logs_base) = amcf.logs_shm_base() {
                 let cap = amcf.log_ring_cap();
                 // Safety: zone was sized for ≥ worker_id slots at registration.
@@ -605,27 +629,56 @@ impl HttpRequestHandler for LogPhaseHandler {
     }
 }
 
-/// Default tail status floor: requests with HTTP status ≥ this value are
-/// "interesting" and qualify for the exception-tail / exemplar ring.
-/// 400 catches 4xx (client errors) and 5xx (server errors).
-pub const TAIL_STATUS_FLOOR: u16 = 400;
-
-/// Default tail latency floor in milliseconds: requests taking ≥ this long
-/// are "interesting" regardless of status.  1000 ms = 1 s (latency outlier).
-pub const TAIL_LATENCY_MS: u64 = 1000;
-
-/// Predicate for the exception-tail / exemplar gate.
+/// Truthiness test for an evaluated `otel_log_export if=<cond>` value.
 ///
-/// Returns `true` when the request is "interesting" — an error status or a
-/// latency outlier.  The common 200/fast case returns `false` and skips the
-/// ring push entirely.
+/// Mirrors nginx core's convention for `access_log … if=`: a value is falsy
+/// iff it is empty or the single byte `"0"`; anything else is truthy.  Factored
+/// out as a pure function so the export decision is unit-testable without a
+/// live request.
 ///
 /// # Hot-path note
-/// This function is `#[inline]`, branch-only (no alloc, no lock, no syscall).
-/// It is only ever called when `is_access_sample_enabled()` is true.
+/// Branch-only (no alloc, no lock, no syscall).
 #[inline]
-pub fn is_interesting(status: u16, duration_ms: u64) -> bool {
-    status >= TAIL_STATUS_FLOOR || duration_ms >= TAIL_LATENCY_MS
+pub fn is_truthy(bytes: &[u8]) -> bool {
+    !(bytes.is_empty() || (bytes.len() == 1 && bytes[0] == b'0'))
+}
+
+/// Evaluate an `otel_log_export if=<cond>` complex value and report whether the
+/// result is truthy (mirroring core `access_log … if=`).
+///
+/// # Safety
+/// `r` must be the valid request pointer for the current LOG-phase handler and
+/// `cv` a non-null `ngx_http_complex_value_t*` compiled at config time (process
+/// lifetime).  Evaluating a complex value at the LOG phase is sound — it is the
+/// same phase core `access_log if=` evaluates in, and all request variables
+/// (`$status`, `$request_time`, …) are materialized.
+///
+/// # Hot-path note
+/// One `ngx_http_complex_value` call plus the truthiness branch; no allocation,
+/// no lock, no syscall beyond what the complex value itself performs.
+#[inline]
+fn eval_export_truthy(
+    r: *mut nginx_sys::ngx_http_request_t,
+    cv: *mut nginx_sys::ngx_http_complex_value_t,
+) -> bool {
+    // SAFETY: `ngx_str_t` is a plain (len, data) C struct; zeroing yields a
+    // valid empty-string output buffer.
+    let mut out: nginx_sys::ngx_str_t = unsafe { core::mem::zeroed() };
+    // SAFETY: per the fn contract `r` is the valid request pointer and `cv` is a
+    // non-null complex value in conf-pool memory; `out` is a local output buffer.
+    let rc = unsafe { nginx_sys::ngx_http_complex_value(r, cv, &raw mut out) };
+    if rc != nginx_sys::NGX_OK as nginx_sys::ngx_int_t {
+        return false;
+    }
+    let bytes: &[u8] = if out.len == 0 || out.data.is_null() {
+        b""
+    } else {
+        // SAFETY: on NGX_OK, `out.data` points into the request pool with
+        // `out.len` valid bytes; the slice is built only when both checks above
+        // pass (non-null data, non-zero len).
+        unsafe { core::slice::from_raw_parts(out.data, out.len) }
+    };
+    is_truthy(bytes)
 }
 
 /// Build an OTel HTTP server span name `"METHOD route_name"` into a fixed
@@ -1132,6 +1185,7 @@ mod tests {
         access::{emit_access_record, SampledRequest},
         WorkerRingProducer,
     };
+    use crate::metric_source::location_conf::LogExportMode;
 
     /// Regression: `(ngx_msec_t)-1` sentinel must NOT be recorded into
     /// upstream timing histograms.
@@ -1210,15 +1264,58 @@ mod tests {
         }
     }
 
-    /// With `is_access_sample_enabled() = false` (the default), the exception-tail
-    /// gate is closed: no ring operations occur even for interesting requests.
+    // Resolve the export decision exactly as the LOG-phase gate does:
+    // `any_log_export` (the cheap main-conf bool) plus the matched location's
+    // mode.  For the `If` mode the gate calls `eval_export_truthy`, whose only
+    // non-FFI logic is `is_truthy` over the evaluated bytes; here we feed the
+    // pure `is_truthy` seam the bytes a complex value would have produced, so no
+    // request stub is involved.
+    fn export_selected(any_log_export: bool, mode: LogExportMode, if_cond_bytes: &[u8]) -> bool {
+        if !any_log_export {
+            return false;
+        }
+        match mode {
+            LogExportMode::All => true,
+            LogExportMode::If => super::is_truthy(if_cond_bytes),
+            LogExportMode::Off | LogExportMode::Unset => false,
+        }
+    }
+
+    /// `is_truthy` mirrors core nginx `access_log … if=`: falsy iff empty or the
+    /// single byte `"0"`; everything else (including `"00"`) is truthy.
     #[test]
-    fn access_emission_off_no_ring_touch() {
+    fn is_truthy_matches_core_convention() {
+        assert!(!super::is_truthy(b""), "empty is falsy");
+        assert!(!super::is_truthy(b"0"), "single \"0\" is falsy");
+        assert!(super::is_truthy(b"1"), "\"1\" is truthy");
+        assert!(super::is_truthy(b"00"), "\"00\" is truthy (len != 1)");
+        assert!(super::is_truthy(b"true"), "non-empty is truthy");
+        assert!(super::is_truthy(b" "), "a space is truthy (non-empty)");
+    }
+
+    /// With no location selecting export (`Unset`, the default) or an explicit
+    /// `Off`, the gate is closed: no ring operations occur.
+    #[test]
+    fn unset_and_off_modes_no_ring_touch() {
         let (_buf, ring) = make_ring_with_cap(4096);
 
-        // Gate check: access_sample_enabled = false → skip emit entirely.
-        let access_sample_enabled = false;
-        if access_sample_enabled && super::is_interesting(503, 0) {
+        // Default (any_log_export off, mode Unset) → no export.
+        if export_selected(false, LogExportMode::Unset, b"") {
+            let producer = WorkerRingProducer { ring };
+            emit_access_record(
+                &producer,
+                &make_req(b"GET", 503, 0, 512, b"127.0.0.1", 0, None, b"", b""),
+            );
+        }
+        // Even with the main-conf bool on, an Unset/Off location does not export.
+        if export_selected(true, LogExportMode::Unset, b"") {
+            let producer = WorkerRingProducer { ring };
+            emit_access_record(
+                &producer,
+                &make_req(b"GET", 503, 0, 512, b"127.0.0.1", 0, None, b"", b""),
+            );
+        }
+        if export_selected(true, LogExportMode::Off, b"") {
             let producer = WorkerRingProducer { ring };
             emit_access_record(
                 &producer,
@@ -1228,40 +1325,39 @@ mod tests {
 
         // Ring must be empty — no record pushed.
         let mut out = std::vec::Vec::new();
-        assert!(!ring.pop_into(&mut out), "ring must be empty when access sample is disabled");
+        assert!(!ring.pop_into(&mut out), "ring must be empty when no location selects export");
         assert_eq!(ring.drop_count(), 0, "no drops expected");
     }
 
-    /// With `is_access_sample_enabled() = true`, a 200/fast request is NOT
-    /// interesting and must NOT reach the ring.
+    /// `If` mode exports only when the condition is truthy; a falsy condition
+    /// pushes nothing, and `All` always pushes.
     #[test]
-    fn tail_predicate_selects_only_interesting() {
+    fn mode_selection_drives_export() {
         let (_buf, ring) = make_ring_with_cap(4096);
-        let access_sample_enabled = true;
+        let mut out = std::vec::Vec::new();
 
-        // 200, 0ms — not interesting, no push.
-        if access_sample_enabled && super::is_interesting(200, 0) {
+        // If(falsy) — no push.
+        if export_selected(true, LogExportMode::If, b"0") {
             let producer = WorkerRingProducer { ring };
             emit_access_record(
                 &producer,
                 &make_req(b"GET", 200, 0, 512, b"127.0.0.1", 0, None, b"", b""),
             );
         }
-        let mut out = std::vec::Vec::new();
-        assert!(!ring.pop_into(&mut out), "200/fast must NOT reach the tail ring");
+        assert!(!ring.pop_into(&mut out), "If(falsy) must NOT reach the tail ring");
 
-        // 503, 0ms — interesting (error), push expected.
-        if access_sample_enabled && super::is_interesting(503, 0) {
+        // If(truthy) — push expected.
+        if export_selected(true, LogExportMode::If, b"1") {
             let producer = WorkerRingProducer { ring };
             emit_access_record(
                 &producer,
-                &make_req(b"GET", 503, 0, 0, b"127.0.0.1", 0, None, b"", b""),
+                &make_req(b"GET", 200, 0, 0, b"127.0.0.1", 0, None, b"", b""),
             );
         }
-        assert!(ring.pop_into(&mut out), "503 must reach the tail ring");
+        assert!(ring.pop_into(&mut out), "If(truthy) must reach the tail ring");
 
-        // 200, 2000ms — interesting (latency outlier), push expected.
-        if access_sample_enabled && super::is_interesting(200, 2000) {
+        // All — push expected even for a 200/fast request (nothing hardcoded).
+        if export_selected(true, LogExportMode::All, b"") {
             let producer = WorkerRingProducer { ring };
             emit_access_record(
                 &producer,
@@ -1269,19 +1365,17 @@ mod tests {
             );
         }
         out.clear();
-        assert!(ring.pop_into(&mut out), "slow 200 must reach the tail ring");
+        assert!(ring.pop_into(&mut out), "All must reach the tail ring for any request");
     }
 
-    /// With `is_access_sample_enabled() = true` and an interesting request, the
-    /// log-phase handler pushes one access record into the ring with the expected
-    /// fields.
+    /// When a request is selected for export, the log-phase handler pushes one
+    /// access record into the ring with the expected fields.
     #[test]
     fn access_emission_on_pushes_record() {
         let (_buf, ring) = make_ring_with_cap(4096);
 
-        // Gate check: access_sample_enabled = true + interesting (503 ≥ 400) → emit.
-        let access_sample_enabled = true;
-        if access_sample_enabled && super::is_interesting(503, 0) {
+        // Selected via All — export the record.
+        if export_selected(true, LogExportMode::All, b"") {
             let producer = WorkerRingProducer { ring };
             emit_access_record(
                 &producer,
@@ -1302,7 +1396,7 @@ mod tests {
         // Ring must have one record.
         let mut out = std::vec::Vec::new();
         let ok = ring.pop_into(&mut out);
-        assert!(ok, "ring must have a record for an interesting request");
+        assert!(ok, "ring must have a record for a selected request");
         assert!(!out.is_empty(), "record must be non-empty");
 
         // Check kind byte = 0x00 (access).

@@ -329,7 +329,7 @@ pub struct MainConfig {
     /// load. A future bidi control channel will also use this zone.
     pub control_shm_zone: *mut nginx_sys::ngx_shm_zone_t,
     /// The registered logs shm zone (set during postconfiguration when
-    /// `is_access_sample_enabled() || error_log_enabled`).  Per-worker layout:
+    /// `any_log_export_enabled() || error_log_enabled`).  Per-worker layout:
     /// two rings per slot (access + error), each of `log_ring_cap` bytes.
     /// Memory = `log_ring_cap × 2 × N` + slab-pool header overhead.
     pub logs_shm_zone: *mut nginx_sys::ngx_shm_zone_t,
@@ -365,8 +365,15 @@ pub struct MainConfig {
     /// Presence ⇒ exception tail + exemplar sampling on; absent ⇒ off.
     /// The histogram is always-on regardless of this field.
     ///
-    /// Read via the `is_access_sample_enabled` / `access_sample_size` accessors.
+    /// Read via the `access_sample_size` accessor.
     pub access_sample_size: usize,
+    /// Set `true` when at least one location has `otel_log_export` set to a
+    /// selecting form (`on`/bare or `if=<cond>`).  Drives the logs shm-zone
+    /// allocation gate and the hot-path "Gate 1" cheap check, so that the
+    /// common no-export deployment stays zero-cost.
+    ///
+    /// Read via the `any_log_export_enabled` accessor.
+    pub any_log_export: bool,
     /// `otel_log_ring_size <size>` — per-worker ring capacity in bytes.
     /// `0` = not configured (uses `DEFAULT_LOG_RING_CAP`).
     pub log_ring_size: usize,
@@ -478,6 +485,8 @@ impl Default for MainConfig {
             n_active_workers: core::sync::atomic::AtomicUsize::new(0),
             // 0 = not configured (off by default).
             access_sample_size: 0,
+            // No location selects log export until a directive sets one.
+            any_log_export: false,
             log_ring_size: 0,
             // Error-log defaults.
             error_log_enabled: false,
@@ -850,9 +859,9 @@ impl MainConfig {
         // the metrics zone so both are mapped before workers fork.
         self.register_control_shm_zone(cf, module)?;
 
-        // Register the per-worker logs shm zone when the access exception-tail
-        // or the OTel error-log writer is enabled.
-        if self.is_access_sample_enabled() || self.error_log_enabled {
+        // Register the per-worker logs shm zone when any location selects
+        // log export, or the OTel error-log writer is enabled.
+        if self.any_log_export_enabled() || self.error_log_enabled {
             self.register_logs_zone(cf, module)?;
         }
 
@@ -986,7 +995,7 @@ impl MainConfig {
     /// Register the per-worker logs shm zone with nginx.
     ///
     /// Must be called from `postconfiguration` when
-    /// `is_access_sample_enabled() || error_log_enabled`.
+    /// `any_log_export_enabled() || error_log_enabled`.
     /// Sizes the zone for `n_workers` workers.
     /// Parallels `register_shm_zone`.
     pub fn register_logs_zone(
@@ -1110,24 +1119,23 @@ impl MainConfig {
         Some(unsafe { addr.cast::<u8>().add(crate::shm::data_offset()) })
     }
 
-    /// Returns `true` when `otel_access_log_sample <size>` was configured.
-    ///
-    /// `access_sample_size == 0` = not configured → off (default).
-    /// `access_sample_size > 0` = configured → exception tail + exemplar sampling on.
-    ///
-    /// The histogram is always-on regardless; this gate controls only the tail ring
-    /// and exemplar reservoir.
-    #[inline]
-    pub fn is_access_sample_enabled(&self) -> bool {
-        self.access_sample_size > 0
-    }
-
     /// Effective exemplar reservoir size (from `otel_access_log_sample <size>`).
     ///
     /// Returns 0 when the directive was not configured.
     #[inline]
     pub fn access_sample_size(&self) -> usize {
         self.access_sample_size
+    }
+
+    /// Returns `true` when at least one location selects log export
+    /// (`otel_log_export on` / bare / `if=<cond>` somewhere in the config).
+    ///
+    /// Gates the logs shm zone (allocated only when needed) and the LOG-phase
+    /// "Gate 1" cheap check.  `off` does not set this — explicitly disabling a
+    /// location is not a selection.
+    #[inline]
+    pub fn any_log_export_enabled(&self) -> bool {
+        self.any_log_export
     }
 
     /// Resolve the `http.route` slot index for a request's matched location.
@@ -2121,25 +2129,44 @@ macro_rules! production_commands {
                 offset: 0,
                 post: ptr::null_mut(),
             },
+            // otel_log_export on | off | if=<cond>;
+            // Per-location selection of which requests have an exception-tail
+            // log record exported.  Bare or `on` ⇒ export all; `if=<cond>` ⇒
+            // export when the complex value is truthy; `off` ⇒ disabled.
+            // Absent ⇒ no export (privacy-safe default).  Mirrors core
+            // `access_log … if=`.  Valid in main, server, and location blocks;
+            // inner wins on merge.
+            ngx_command_t {
+                name: ngx_string!("otel_log_export"),
+                type_: (NGX_HTTP_MAIN_CONF
+                    | NGX_HTTP_SRV_CONF
+                    | NGX_HTTP_LOC_CONF
+                    | NGX_CONF_NOARGS
+                    | NGX_CONF_TAKE1) as ngx_uint_t,
+                set: Some(cmd_set_otel_log_export),
+                conf: NGX_HTTP_LOC_CONF_OFFSET,
+                offset: 0,
+                post: ptr::null_mut(),
+            },
         ]
     };
 }
 
-/// Production build: 19 production commands + terminator.
+/// Production build: 20 production commands + terminator.
 #[cfg(not(any(test, feature = "test-support")))]
-pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 20] = {
-    let mut cmds = [ngx_command_t::empty(); 20];
+pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 21] = {
+    let mut cmds = [ngx_command_t::empty(); 21];
     let prod = production_commands!();
     let mut i = 0;
-    while i < 19 {
+    while i < 20 {
         cmds[i] = prod[i];
         i += 1;
     }
-    // cmds[19] stays empty() — terminator
+    // cmds[20] stays empty() — terminator
     cmds
 };
 
-/// test-support build: 19 production commands + otel_status_endpoint + terminator.
+/// test-support build: 20 production commands + otel_status_endpoint + terminator.
 ///
 /// `otel_status_endpoint;` is a location-level directive (no args) that registers
 /// a content handler returning `control_shm.version` as plain text. Used by the
@@ -2147,16 +2174,16 @@ pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 20] = {
 /// process-level introspection. Absent from production builds (verified by grep
 /// on `objs-release/ngx_http_otel_module.so`).
 #[cfg(any(test, feature = "test-support"))]
-pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 21] = {
-    let mut cmds = [ngx_command_t::empty(); 21];
+pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 22] = {
+    let mut cmds = [ngx_command_t::empty(); 22];
     let prod = production_commands!();
     let mut i = 0;
-    while i < 19 {
+    while i < 20 {
         cmds[i] = prod[i];
         i += 1;
     }
-    // Index 19: otel_status_endpoint (test-support only).
-    cmds[19] = ngx_command_t {
+    // Index 20: otel_status_endpoint (test-support only).
+    cmds[20] = ngx_command_t {
         name: ngx_string!("otel_status_endpoint"),
         type_: (nginx_sys::NGX_HTTP_LOC_CONF | NGX_CONF_NOARGS) as ngx_uint_t,
         set: Some(cmd_set_otel_status_endpoint),
@@ -2164,7 +2191,7 @@ pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 21] = {
         offset: 0,
         post: ptr::null_mut(),
     };
-    // cmds[20] stays empty() — terminator.
+    // cmds[21] stays empty() — terminator.
     cmds
 };
 
@@ -2726,6 +2753,90 @@ extern "C" fn cmd_set_otel_trace(
     NGX_CONF_OK
 }
 
+/// Directive callback for `otel_log_export on | off | if=<cond>;`.
+///
+/// Selects which requests have an exception-tail log record exported, mirroring
+/// core `access_log … if=`:
+/// - bare `otel_log_export;` or `otel_log_export on;` → export all requests.
+/// - `otel_log_export off;` → disabled (overrides an inherited selection).
+/// - `otel_log_export if=<cond>;` → export when `<cond>` is truthy at request
+///   time (the remainder after `if=` is compiled as a complex value).
+///
+/// Setting any selecting form (`on`/bare/`if=`) flips the main-conf
+/// `any_log_export` flag so the logs shm zone is allocated.  `off` does not.
+extern "C" fn cmd_set_otel_log_export(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    use crate::metric_source::location_conf::{LocationConf, LogExportMode};
+
+    // SAFETY: nginx passes our module's `LocationConf*` as `conf` for a
+    // `NGX_HTTP_LOC_CONF_OFFSET` directive; the cast + `as_mut` yield a valid
+    // exclusive reference.
+    let lcf = unsafe { conf.cast::<LocationConf>().as_mut().expect("location config") };
+    if lcf.log_export_is_set() {
+        return c"is duplicate".as_ptr().cast_mut();
+    }
+
+    // SAFETY: `cf` is the valid non-null directive parse context.
+    let args = unsafe { cf_args(cf) };
+
+    // args[0] is the directive name; args[1] (if present) is the single param.
+    let mode = if args.len() < 2 {
+        // Bare `otel_log_export;` → export all.
+        LogExportMode::All
+    } else {
+        let param = args[1].as_bytes();
+        if param == b"on" {
+            LogExportMode::All
+        } else if param == b"off" {
+            LogExportMode::Off
+        } else if param.len() >= 3 && &param[..3] == b"if=" {
+            // Compile the remainder after `if=` as a complex value.
+            let cond = &param[3..];
+            let mut cond_str = ngx_str_t { len: cond.len(), data: cond.as_ptr().cast_mut() };
+            // SAFETY: `cf` is valid; `cond_str` borrows the directive arg bytes,
+            // which nginx keeps valid for the duration of the parse (and the
+            // compiled complex value copies the script into pool memory).
+            let cv = unsafe { compile_complex_value(cf, &raw mut cond_str) };
+            if cv.is_null() {
+                ngx_conf_log_error!(
+                    NGX_LOG_EMERG,
+                    &raw mut *cf,
+                    "otel_log_export: failed to compile \"if=\" condition"
+                );
+                return NGX_CONF_ERROR;
+            }
+            lcf.log_export_cv = cv;
+            LogExportMode::If
+        } else {
+            ngx_conf_log_error!(
+                NGX_LOG_EMERG,
+                &raw mut *cf,
+                "otel_log_export: invalid parameter; expected on | off | if=<cond>"
+            );
+            return NGX_CONF_ERROR;
+        }
+    };
+
+    lcf.set_log_export_mode(mode);
+
+    // Flip the main-conf flag for selecting forms so the logs shm zone is
+    // allocated.  Parse-time is correct: directive callbacks run before
+    // postconfiguration, which reads the flag for the allocation decision.
+    if matches!(mode, LogExportMode::All | LogExportMode::If) {
+        // SAFETY: `cf` is a valid non-null parse context; the shared borrow is
+        // sound for reading the module main conf.
+        let cf_ref = unsafe { &*cf };
+        if let Some(amcf) = HttpOtelModule::main_conf_mut(cf_ref) {
+            amcf.any_log_export = true;
+        }
+    }
+
+    NGX_CONF_OK
+}
+
 /// Directive callback for `otel_trace_context ignore|extract|inject|propagate;`.
 extern "C" fn cmd_set_otel_trace_context(
     cf: *mut ngx_conf_t,
@@ -2916,8 +3027,10 @@ mod tests {
         assert!(!cfg.is_configured());
         assert_eq!(cfg.interval_ms(), DEFAULT_INTERVAL_MS);
         assert!(cfg.status_code_class_enabled()); // UNSET treated as on
-                                                  // exception-tail / exemplar sampling is off by default
-        assert!(!cfg.is_access_sample_enabled(), "access sample must default to off");
+                                                  // log export is off by default (privacy-safe)
+        assert!(!cfg.any_log_export_enabled(), "log export must default to off");
+        // exemplar reservoir sizing is off by default
+        assert_eq!(cfg.access_sample_size(), 0, "exemplar reservoir size must default to 0");
         // error-log export is off by default
         assert!(!cfg.error_log_enabled, "error_log_enabled must default to false");
         assert!(cfg.error_log_coalesce, "error_log_coalesce must default to true (on)");
@@ -2961,24 +3074,21 @@ mod tests {
         assert!(cfg.error_log_coalesce);
     }
 
-    /// Verify that `otel_access_log_sample` toggles `is_access_sample_enabled()`
-    /// and records the reservoir size.
+    /// Verify that `otel_access_log_sample` records the exemplar reservoir size.
     ///
     /// This is a unit test of the accessor and field — the directive handler
     /// (`cmd_set_access_sample`) is exercised implicitly by integration tests that
     /// send a real nginx.conf containing `otel_access_log_sample 16;`.
     #[test]
-    fn access_sample_directive_toggles_enablement() {
+    fn access_sample_directive_records_size() {
         let mut cfg = MainConfig::default();
         // Default: off (0).
-        assert!(!cfg.is_access_sample_enabled());
         assert_eq!(cfg.access_sample_size(), 0);
         // Set directly (mirrors what cmd_set_access_sample does).
         cfg.access_sample_size = 16;
-        assert!(cfg.is_access_sample_enabled());
         assert_eq!(cfg.access_sample_size(), 16);
         cfg.access_sample_size = 0;
-        assert!(!cfg.is_access_sample_enabled());
+        assert_eq!(cfg.access_sample_size(), 0);
     }
 
     /// Route index lookup returns the correct index for registered locations

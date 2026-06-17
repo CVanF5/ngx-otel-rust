@@ -1048,10 +1048,10 @@ pub async fn export_loop(amcf: &'static MainConfig) {
 
             // Drain fresh log records from all workers' rings and ship them.
             // Skipped on abdication — new exporter is sole consumer.
-            // Gate on access_sample OR error_log — either enables the logs shm path.
+            // Gate on log export OR error_log — either enables the logs shm path.
             if !periodic_abdicated
                 && !logs_deferred
-                && (amcf.is_access_sample_enabled() || amcf.error_log_enabled)
+                && (amcf.any_log_export_enabled() || amcf.error_log_enabled)
             {
                 if let Some(logs_base) = amcf.logs_shm_base() {
                     // SAFETY: `logs_shm_base()` returned `Some`, so the logs zone
@@ -1787,7 +1787,7 @@ async fn graceful_drain(
 
     // Final freshly-collected logs batch (access + error rings).
     // Skipped on abdication — new exporter is sole consumer of the rings.
-    if !has_successor && (amcf.is_access_sample_enabled() || amcf.error_log_enabled) {
+    if !has_successor && (amcf.any_log_export_enabled() || amcf.error_log_enabled) {
         if let Some(logs_base) = amcf.logs_shm_base() {
             // Use n_active_workers (same rationale as export path).
             let n_workers = {
@@ -2685,9 +2685,10 @@ fn collect_all_sources(amcf: &MainConfig, worker_start_ns: u64, collector_host: 
 
 /// Drain all worker access-log and error-log rings and assemble a [`LogsBatch`].
 ///
-/// Called once per export tick when `is_access_sample_enabled()` is true.
-/// Drains tail records written by `is_interesting()` requests (access) and
-/// error records written by the `ngx_otel_error_writer` hook (error logs).
+/// Called once per export tick when `any_log_export_enabled()` is true.
+/// Drains exception-tail records written for operator-selected requests
+/// (access) and error records written by the `ngx_otel_error_writer` hook
+/// (error logs).
 ///
 /// Updates `ACCESS_LOGS_DROPPED` from each ring's `drop_count()`.
 /// Updates `ERROR_LOGS_DROPPED` from the error ring's `drop_count()`.
