@@ -98,6 +98,20 @@ info "nginx binary: ${NGINX_BINARY}"
 info "module: ${MODULE_PATH}"
 ensure_collector_running || exit 1
 
+# ─── Clean up any leftover nginx from prior interrupted runs ─────────────────
+for port in 9114 9115 9116; do
+    if command -v ss >/dev/null 2>&1; then
+        pid=$(ss -tlnp 2>/dev/null | grep ":${port} " | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2 || true)
+    else
+        pid=""
+    fi
+    if [[ -n "${pid:-}" ]]; then
+        info "Killing leftover nginx on port ${port} (PID ${pid})..."
+        kill "${pid}" 2>/dev/null || true
+        sleep 1 || true
+    fi
+done
+
 # ─── Helper: run_nginx_scenario ──────────────────────────────────────────────
 # run_nginx_scenario <prefix> <conf_path>
 # Starts nginx with <conf_path> in sandbox <prefix>.
@@ -282,7 +296,7 @@ D_LOG_COUNT=$(echo "${D_LOGS_NEW}" | { grep -o '"http.access"' 2>/dev/null || tr
 info "(D) http.access LogRecord count (on + off scenario): ${D_LOG_COUNT}"
 
 # At least 5 records from the "/" location under otel_log_export on.
-if [[ $D_LOG_COUNT -ge $5 ]]; then
+if [[ $D_LOG_COUNT -ge 5 ]]; then
     pass "(D) on form: ≥ 5 tail LogRecords from otel_log_export on at server level (got ${D_LOG_COUNT})"
 else
     fail "(D) on form: expected ≥ 5 tail LogRecords from otel_log_export on, got ${D_LOG_COUNT}"
@@ -290,7 +304,7 @@ fi
 
 # At most 5 records total: /no-export location has off so its 5 requests must not
 # contribute.  Exactly 5 from "/" means off correctly suppressed the other 5.
-if [[ $D_LOG_COUNT -le $5 ]]; then
+if [[ $D_LOG_COUNT -le 5 ]]; then
     pass "(D) off override: count ≤ 5 — location-level otel_log_export off suppressed /no-export requests"
 else
     fail "(D) off override: count ${D_LOG_COUNT} > 5 — location off did not suppress /no-export export (off-override broken)"
