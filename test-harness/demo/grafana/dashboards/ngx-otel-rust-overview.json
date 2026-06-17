@@ -1,6 +1,6 @@
 {
   "uid": "ngx-otel-rust-overview",
-  "title": "NGINX \u2014 Default vs ngx-otel-rust (OTel)",
+  "title": "NGINX — Default vs ngx-otel-rust (OTel)",
   "tags": [
     "nginx",
     "otel",
@@ -44,7 +44,7 @@
           "text": ".+",
           "value": ".+"
         },
-        "description": "Set by clicking an exemplar diamond (or paste a trace_id). Filters the 'Exemplar \u2192 Request Log' panel."
+        "description": "Set by clicking an exemplar diamond (or paste a trace_id). Filters the 'Exemplar → Request Log' panel."
       }
     ]
   },
@@ -55,7 +55,7 @@
     {
       "id": 26,
       "type": "row",
-      "title": "Default NGINX (stub_status) \u2014 everything vanilla nginx exposes",
+      "title": "Default NGINX (stub_status) — everything vanilla nginx exposes",
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -73,7 +73,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "nginx stub_status total request rate \u2014 the only request signal vanilla nginx exposes.",
+      "description": "nginx stub_status total request rate — the only request signal vanilla nginx exposes.",
       "gridPos": {
         "h": 5,
         "w": 6,
@@ -408,7 +408,7 @@
     {
       "id": 27,
       "type": "row",
-      "title": "Enhanced by ngx-otel-rust \u2014 Traffic & Latency",
+      "title": "Enhanced by ngx-otel-rust — Traffic & Latency",
       "collapsed": true,
       "gridPos": {
         "h": 1,
@@ -425,7 +425,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "description": "Avg request duration (\u00b5s metric \u2192 ms). Per-route/upstream breakdowns below \u2014 dimensions stub_status cannot produce.",
+          "description": "Avg request duration (µs metric → ms). Per-route/upstream breakdowns below — dimensions stub_status cannot produce.",
           "gridPos": {
             "h": 5,
             "w": 6,
@@ -439,12 +439,12 @@
                 "uid": "prometheus"
               },
               "refId": "A",
-              "expr": "sum(histogram_sum(rate(http_server_request_duration{service_name=\"$service\"}[$__rate_interval]))) / sum(histogram_count(rate(http_server_request_duration{service_name=\"$service\"}[$__rate_interval]))) / 1000"
+              "expr": "sum(histogram_sum(rate(http_server_request_duration{service_name=\"$service\"}[$__rate_interval]))) / sum(histogram_count(rate(http_server_request_duration{service_name=\"$service\"}[$__rate_interval])))"
             }
           ],
           "fieldConfig": {
             "defaults": {
-              "unit": "\u00b5s",
+              "unit": "µs",
               "thresholds": {
                 "mode": "absolute",
                 "steps": [
@@ -770,7 +770,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "description": "Exp-histogram latency distribution (\u00b5s). The shape \u2014 not just an average \u2014 is the OTel value-add.",
+          "description": "Exp-histogram latency distribution (µs). The shape — not just an average — is the OTel value-add.",
           "gridPos": {
             "h": 9,
             "w": 12,
@@ -797,7 +797,7 @@
               "steps": 64
             },
             "yAxis": {
-              "unit": "\u00b5s"
+              "unit": "µs"
             },
             "tooltip": {
               "mode": "single",
@@ -815,12 +815,12 @@
         {
           "id": 11,
           "type": "timeseries",
-          "title": "Request Latency by Status (avg \u00b5s) \u00b7 \u2b26 exemplars \u2192 click to Loki",
+          "title": "Request Latency by Status (avg µs) · ⬦ exemplars → click to Loki",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "description": "Avg request duration (\u00b5s) per status class, with EXEMPLAR diamonds: each \u2b26 is one sampled real request placed at its own latency (its native-histogram bucket), tagged with the W3C trace_id. Click a diamond \u2192 \"View tail log (Loki)\" to open the matching access tail LogRecord (joined by trace_id). This is the metric\u2192exemplar\u2192log drill-down.",
+          "description": "Avg request duration (µs) per status class, with EXEMPLAR diamonds: each ⬦ is one sampled real request placed at its own latency (its native-histogram bucket), tagged with the W3C trace_id. Click a diamond → \"View tail log (Loki)\" to open the matching access tail LogRecord (joined by trace_id). This is the metric→exemplar→log drill-down.",
           "gridPos": {
             "h": 8,
             "w": 12,
@@ -834,14 +834,14 @@
                 "uid": "prometheus"
               },
               "refId": "A",
-              "expr": "sum(histogram_sum(rate(http_server_request_duration{service_name=\"$service\"}[$__rate_interval]))) by (http_response_status_code) / sum(histogram_count(rate(http_server_request_duration{service_name=\"$service\"}[$__rate_interval]))) by (http_response_status_code) / 1000",
+              "expr": "sum(histogram_sum(rate(http_server_request_duration{service_name=\"$service\"}[$__rate_interval]))) by (http_response_status_code) / sum(histogram_count(rate(http_server_request_duration{service_name=\"$service\"}[$__rate_interval]))) by (http_response_status_code)",
               "legendFormat": "{{http_response_status_code}}",
               "exemplar": true
             }
           ],
           "fieldConfig": {
             "defaults": {
-              "unit": "\u00b5s",
+              "unit": "µs",
               "custom": {
                 "drawStyle": "line",
                 "lineWidth": 2,
@@ -963,12 +963,12 @@
         {
           "id": 12,
           "type": "bargauge",
-          "title": "Slowest Routes (avg \u00b5s \u00b7 http.route)",
+          "title": "Slowest Routes (avg µs · http.route)",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "description": "Per-route latency (location name) \u2014 only possible because the module emits a per-route histogram.",
+          "description": "Per-route latency (location name) — only possible because the module emits a per-route histogram.",
           "gridPos": {
             "h": 9,
             "w": 12,
@@ -982,14 +982,14 @@
                 "uid": "prometheus"
               },
               "refId": "A",
-              "expr": "topk(10, sum(histogram_sum(rate(http_server_request_duration_by_route{service_name=\"$service\"}[$__rate_interval]))) by (http_route) / sum(histogram_count(rate(http_server_request_duration_by_route{service_name=\"$service\"}[$__rate_interval]))) by (http_route) / 1000)",
+              "expr": "topk(10, sum(histogram_sum(rate(http_server_request_duration_by_route{service_name=\"$service\"}[$__rate_interval]))) by (http_route) / sum(histogram_count(rate(http_server_request_duration_by_route{service_name=\"$service\"}[$__rate_interval]))) by (http_route))",
               "legendFormat": "{{http_route}}",
               "instant": true
             }
           ],
           "fieldConfig": {
             "defaults": {
-              "unit": "\u00b5s",
+              "unit": "µs",
               "thresholds": {
                 "mode": "absolute",
                 "steps": [
@@ -1029,7 +1029,7 @@
         {
           "id": 13,
           "type": "bargauge",
-          "title": "Avg Duration by Upstream Zone (\u00b5s \u00b7 nginx.upstream.zone)",
+          "title": "Avg Duration by Upstream Zone (µs · nginx.upstream.zone)",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
@@ -1048,14 +1048,14 @@
                 "uid": "prometheus"
               },
               "refId": "A",
-              "expr": "sum(histogram_sum(rate(http_server_request_duration_by_upstream{service_name=\"$service\"}[$__rate_interval]))) by (nginx_upstream_zone) / sum(histogram_count(rate(http_server_request_duration_by_upstream{service_name=\"$service\"}[$__rate_interval]))) by (nginx_upstream_zone) / 1000",
+              "expr": "sum(histogram_sum(rate(http_server_request_duration_by_upstream{service_name=\"$service\"}[$__rate_interval]))) by (nginx_upstream_zone) / sum(histogram_count(rate(http_server_request_duration_by_upstream{service_name=\"$service\"}[$__rate_interval]))) by (nginx_upstream_zone)",
               "legendFormat": "{{nginx_upstream_zone}}",
               "instant": true
             }
           ],
           "fieldConfig": {
             "defaults": {
-              "unit": "\u00b5s",
+              "unit": "µs",
               "thresholds": {
                 "mode": "absolute",
                 "steps": [
@@ -1298,7 +1298,7 @@
           ],
           "fieldConfig": {
             "defaults": {
-              "unit": "\u00b5s",
+              "unit": "µs",
               "custom": {
                 "drawStyle": "line",
                 "lineWidth": 2,
@@ -1522,7 +1522,7 @@
     {
       "id": 53,
       "type": "row",
-      "title": "Serving Certificates (TLS \u2014 ngx-otel-rust cert metrics)",
+      "title": "Serving Certificates (TLS — ngx-otel-rust cert metrics)",
       "collapsed": true,
       "gridPos": {
         "h": 1,
@@ -1534,7 +1534,7 @@
         {
           "id": 54,
           "type": "table",
-          "title": "Serving Certificates \u2014 Time to Expiration",
+          "title": "Serving Certificates — Time to Expiration",
           "description": "TLS serving certificates as enumerated from the live SSL_CTX at startup/reload (ngx_otel.tls.certificate.time_to_expiration). What nginx SERVES, not what is on disk: a renewed file changes nothing until reload. Negative = expired. Thresholds: red < 7d, orange < 30d.",
           "datasource": {
             "type": "prometheus",
@@ -1649,8 +1649,8 @@
         {
           "id": 57,
           "type": "table",
-          "title": "Collector Certificate \u2014 Time to Expiration (ngx_otel.tls.collector_cert.not_after)",
-          "description": "The TLS certificate the OTLP collector presents during the handshake (B1 gauge: ngx_otel.tls.collector_cert.not_after, epoch s). Absent until the first successful TLS handshake; one row per collector endpoint. Countdown = not_after \u2212 now. Thresholds: red < 7d, orange < 30d.",
+          "title": "Collector Certificate — Time to Expiration (ngx_otel.tls.collector_cert.not_after)",
+          "description": "The TLS certificate the OTLP collector presents during the handshake (B1 gauge: ngx_otel.tls.collector_cert.not_after, epoch s). Absent until the first successful TLS handshake; one row per collector endpoint. Countdown = not_after − now. Thresholds: red < 7d, orange < 30d.",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
@@ -1756,7 +1756,7 @@
     {
       "id": 28,
       "type": "row",
-      "title": "Enhanced by ngx-otel-rust \u2014 Logs (Loki)",
+      "title": "Enhanced by ngx-otel-rust — Logs (Loki)",
       "collapsed": true,
       "gridPos": {
         "h": 1,
@@ -1768,7 +1768,7 @@
         {
           "id": 50,
           "type": "logs",
-          "title": "Exemplar \u2192 Request Log  (trace_id = $trace_id)",
+          "title": "Exemplar → Request Log  (trace_id = $trace_id)",
           "datasource": {
             "type": "loki",
             "uid": "loki"
@@ -1872,12 +1872,12 @@
         {
           "id": 19,
           "type": "logs",
-          "title": "Error Log (nginx.error \u2014 coalesced)",
+          "title": "Error Log (nginx.error — coalesced)",
           "datasource": {
             "type": "loki",
             "uid": "loki"
           },
-          "description": "OTel error-log signal: coalesced nginx error LogRecords (severity \u2265 warn). Body = verbatim message; nginx.error.coalesced_count = flood size.",
+          "description": "OTel error-log signal: coalesced nginx error LogRecords (severity ≥ warn). Body = verbatim message; nginx.error.coalesced_count = flood size.",
           "gridPos": {
             "h": 9,
             "w": 24,
@@ -1892,7 +1892,7 @@
               },
               "refId": "A",
               "queryType": "range",
-              "expr": "{service_name=\"$service\"} | severity_number >= 13 | line_format \"\u00d7{{if .nginx_error_coalesced_count}}{{.nginx_error_coalesced_count}}{{else}}1{{end}} \u2502 {{ __line__ }}\""
+              "expr": "{service_name=\"$service\"} | severity_number >= 13 | line_format \"×{{if .nginx_error_coalesced_count}}{{.nginx_error_coalesced_count}}{{else}}1{{end}} │ {{ __line__ }}\""
             }
           ],
           "options": {
@@ -1910,7 +1910,7 @@
         {
           "id": 20,
           "type": "logs",
-          "title": "Interesting Access Logs (4xx/5xx)",
+          "title": "Access Logs — Errors (4xx/5xx)",
           "datasource": {
             "type": "loki",
             "uid": "loki"
@@ -1948,7 +1948,7 @@
         {
           "id": 21,
           "type": "logs",
-          "title": "Sampled Access Logs (tail)",
+          "title": "Exported Access Logs (tail)",
           "datasource": {
             "type": "loki",
             "uid": "loki"
@@ -1991,7 +1991,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "description": "Producer-side error-event counter by severity_class \u2014 the metrics-primary companion to the coalesced error LogRecords.",
+          "description": "Producer-side error-event counter by severity_class — the metrics-primary companion to the coalesced error LogRecords.",
           "gridPos": {
             "h": 8,
             "w": 24,
