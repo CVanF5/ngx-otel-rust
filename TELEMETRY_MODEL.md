@@ -13,8 +13,8 @@ proposal covers *why*.
 
 | Signal | Enabled by | Where |
 |---|---|---|
-| **Metrics** | on by default (`otel_metrics`) | [Metrics](#metrics) |
-| **Logs — access (exception tail)** | `otel_log_export on \| if=<expr>` | [Logs](#logs) |
+| **Metrics** | on whenever `otel_exporter` is configured (no per-signal directive) | [Metrics](#metrics) |
+| **Logs — access (exception tail)** | `otel_log_export on \| if=<expr>` (bare `otel_log_export;` ⇒ `on`) | [Logs](#logs) |
 | **Metric exemplars** | trace sampling (`otel_trace`) | [Metrics](#metrics) |
 | **Logs — error (coalesced + rate metric)** | `otel_error_log [level]` | [Logs](#logs) |
 | **Traces** | `otel_trace <expr>` per location | [Traces](#traces) |
@@ -49,13 +49,11 @@ log export is opt-in (privacy).
 | Feature | What it does | Status |
 |---|---|---|
 | Core + HTTP metrics | nginx connection/request gauges + per-request latency as an exponential histogram (µs) | Shipped |
-| Trace-linked exemplars | `trace_id` on the duration histogram for metric → trace drill-down | Shipped |
+| Trace-linked metric exemplars | a `trace_id`/`span_id` pointer on the duration histogram (no other attributes), uniformly sampled, one per data point per export cycle, reset each cycle, on trace-sampled requests (`otel_trace`) — the metric → trace drill-down | Shipped |
 | Distributed traces | one OTel server span per request; W3C `traceparent` propagation (`otel_trace`) | Shipped |
 | **Logs: nothing exported by default** | no request-level log data leaves nginx unless configured (privacy) | Shipped |
-| Access exception-tail logs | full `LogRecord`s for operator-selected requests (`otel_log_export on \| if=<expr>`) | Shipped |
-| Metric exemplars | uniformly-sampled, trace-linked, one per data point per cycle, on trace-sampled requests (`otel_trace`) | Shipped |
+| Access exception-tail logs (operator-selectable) | full `LogRecord`s for the requests an operator selects — `otel_log_export on \| if=<expr>` chooses *which* requests (status, latency, any nginx condition); nothing hardcoded, off by default | Shipped |
 | Error logs | template-coalesced error `LogRecord`s + companion rate metric (`otel_error_log`) | Shipped |
-| **Selectable logs** | operator chooses *which* requests export, via an nginx `if=$cond` (status/latency/anything); nothing hardcoded | **Planned** |
 | Tunable metric cardinality | `otel_metric_status_code_class on\|off` — rich per-status-class vs lean series | Shipped |
 | TLS exporter transport | HTTPS / mTLS + OTLP-gRPC-over-TLS (ALPN `h2`) | Shipped |
 | Collector & serving-cert metrics | expiry / validity gauges | Shipped |
@@ -127,8 +125,9 @@ protocol-neutral `DeliveryOutcome` verdict returned by each transport adapter
   `Permanent` (spec: "MUST NOT retry").
 - **`Permanent`** — non-retryable peer rejection (HTTP `400`, `404`, `413`,
   `501`, and any non-retryable `4xx`/`5xx` not listed above; gRPC
-  `INVALID_ARGUMENT`/`INTERNAL`/`UNIMPLEMENTED`). The batch is dropped and
-  counted in `ngx_otel.delivery.permanent_rejected`.
+  `INVALID_ARGUMENT`/`INTERNAL`/`UNIMPLEMENTED`, and `RESOURCE_EXHAUSTED` when no
+  recoverability hint is present). The batch is dropped and counted in
+  `ngx_otel.delivery.permanent_rejected`.
 - **`Unauthorized`** — authentication or authorization failure (HTTP
   `401`/`403`; gRPC `UNAUTHENTICATED`/`PERMISSION_DENIED`). Same policy
   action as `Permanent` (drop, no retry, no backoff, no auto-pause), but kept
@@ -265,8 +264,13 @@ metrics only when an upstream was used (from `ngx_http_upstream_state_t`).
 
 Read from nginx's `stub_status` globals each export interval
 (`src/metric_source/stub_status.rs`). Connection state
-(active/reading/writing/waiting) is emitted as OTLP **Gauge** metrics; the
-cumulative counters (accepted/handled/requests) as monotonic **Sum** metrics.
+(active/reading/writing/waiting) is emitted as OTLP **Gauge** metrics. The
+cumulative counters (accepted/handled/requests) are each emitted as a
+**single-bucket explicit Histogram**, not as an OTLP Sum: the running total is
+carried in the histogram's `sum` field (so a Prometheus / remote-write backend
+reads the value from the `…_sum` series). Emitting them this way lets the encoder
+treat every metric uniformly; a true monotonic Sum instrument is a possible future
+change.
 
 > **Build-flag requirement.** These seven series exist **only** when nginx is
 > built with `--with-http_stub_status_module` (which defines `NGX_STAT_STUB`,
@@ -278,13 +282,13 @@ cumulative counters (accepted/handled/requests) as monotonic **Sum** metrics.
 
 | Name | Instrument | Unit (UCUM) | Temporality | Stability |
 |---|---|---|---|---|
-| `nginx.requests.total` | Counter (Sum, monotonic) | `{request}` | Cumulative | experimental |
-| `nginx.connections.accepted` | Counter (Sum, monotonic) | `{connection}` | Cumulative | experimental |
-| `nginx.connections.handled` | Counter (Sum, monotonic) | `{connection}` | Cumulative | experimental |
-| `nginx.connections.active` | Gauge | `{connection}` | — | experimental |
-| `nginx.connections.reading` | Gauge | `{connection}` | — | experimental |
-| `nginx.connections.writing` | Gauge | `{connection}` | — | experimental |
-| `nginx.connections.waiting` | Gauge | `{connection}` | — | experimental |
+| `nginx.requests.total` | Histogram (explicit, single-bucket) | `requests` | Cumulative | experimental |
+| `nginx.connections.accepted` | Histogram (explicit, single-bucket) | `connections` | Cumulative | experimental |
+| `nginx.connections.handled` | Histogram (explicit, single-bucket) | `connections` | Cumulative | experimental |
+| `nginx.connections.active` | Gauge | `connections` | — | experimental |
+| `nginx.connections.reading` | Gauge | `connections` | — | experimental |
+| `nginx.connections.writing` | Gauge | `connections` | — | experimental |
+| `nginx.connections.waiting` | Gauge | `connections` | — | experimental |
 
 ---
 
@@ -366,21 +370,18 @@ transcript). The OTel stream carries "summary + samples", not a per-request fire
 The bulk of access information is the **metrics** above. Per-event access output is two
 distinct, orthogonal things, never a per-request log:
 
-- **Metric exemplars** on the `http.server.request.duration` base series: representative
-  trace pointers attached to the histogram, carrying the canonical OTel exemplar payload
-  — measured `value` + `time_unix_nano` + `trace_id`/`span_id`, and **no
-  `filtered_attributes`**. They are produced on the **trace-sampling** path (recorded
-  only when the request is sampled — OTel's default `TraceBased` exemplar filter), so
-  every exemplar carries a resolvable trace pointer. One small fixed-size reservoir
-  (size 2) **per data point**, uniformly sampled
-  (`SimpleFixedSizeExemplarReservoir`) and **reset every export cycle**. This is the
-  metric → exemplar → trace drill-down pivot. (`src/metric_source/instrumented.rs`,
-  `src/shm.rs` `ExemplarReservoir`, encoder `Exemplar`.)
+- **Metric exemplars** on the `http.server.request.duration` base series — the
+  metric → trace drill-down pivot. Their full behavior (canonical
+  `value`/`time_unix_nano`/`trace_id`/`span_id` payload with no other attributes,
+  one small reservoir per data point, uniformly sampled, reset every export cycle,
+  recorded only for trace-sampled requests) is documented once in the **HTTP server
+  request duration** section above; the table just below contrasts them with exported
+  log records. (`src/metric_source/instrumented.rs`, `src/shm.rs`.)
 - **Exception-tail `LogRecord`s**: emitted for the requests an operator selects with
-  **`otel_log_export on | if=<expr>`** (absent ⇒ off, the privacy-safe default),
-  carrying the high-cardinality attributes below + `trace_id`/`span_id` + request
-  duration. Substrate is the per-worker SPSC ring.
-  (`src/logs/access.rs`, `src/logs/ring.rs`.)
+  **`otel_log_export on | if=<expr> | off`** (bare `otel_log_export;` is the same as
+  `on`; absent ⇒ off, the privacy-safe default), carrying the high-cardinality
+  attributes below + `trace_id`/`span_id` + request duration. Substrate is the
+  per-worker SPSC ring. (`src/logs/access.rs`, `src/logs/ring.rs`.)
 
   | Attribute key | Type | Value |
   |---|---|---|
@@ -665,19 +666,19 @@ The exporter process emits its own health metrics every export interval
 
 | Metric | Instrument | Unit | Description |
 |---|---|---|---|
-| `ngx_otel.dropped_records` | Sum (monotonic) | `{record}` | Records from any signal (metrics, logs, spans) dropped because the per-signal retry buffer was full (oldest batch evicted) or a graceful-drain abort discarded queued batches (previously only the metrics lane was accounted) |
-| `ngx_otel.send_failures` | Sum (monotonic) | `{failure}` | Cumulative export send failures since worker startup |
-| `ngx_otel.bidi_backpressure_drops` | Sum (monotonic) | `{message}` | Bidi outbound messages dropped due to channel backpressure |
-| `ngx_otel.logs.access.dropped_records` | Sum (monotonic) | `{record}` | Access log records dropped because the per-worker ring was full |
-| `ngx_otel.logs.error.dropped_records` | Sum (monotonic) | `{record}` | Error log records dropped because the per-worker ring was full |
-| `ngx_otel.logs.error.coalesced_orphaned_records` | Sum (monotonic) | `{record}` | Coalesced error-log occurrences whose verbatim ring sample was dropped (ring full); a synthetic record is emitted for each orphaned slot so the occurrence count is preserved. Accumulated additively across drain cycles. |
-| `ngx_otel.logs.send_failures` | Sum (monotonic) | `{failure}` | Cumulative logs transport send failures since exporter startup |
-| `ngx_otel.traces.dropped_records` | Sum (monotonic) | `{record}` | Span records dropped because the per-worker spans ring was full |
+| `ngx_otel.dropped_records` | Sum (monotonic) | `records` | Records from any signal (metrics, logs, spans) dropped because the per-signal retry buffer was full (oldest batch evicted) or a graceful-drain abort discarded queued batches (previously only the metrics lane was accounted) |
+| `ngx_otel.send_failures` | Sum (monotonic) | `failures` | Cumulative export send failures since worker startup |
+| `ngx_otel.bidi_backpressure_drops` | Sum (monotonic) | `messages` | Bidi outbound messages dropped due to channel backpressure |
+| `ngx_otel.logs.access.dropped_records` | Sum (monotonic) | `records` | Access log records dropped because the per-worker ring was full |
+| `ngx_otel.logs.error.dropped_records` | Sum (monotonic) | `records` | Error log records dropped because the per-worker ring was full |
+| `ngx_otel.logs.error.coalesced_orphaned_records` | Sum (monotonic) | `records` | Coalesced error-log occurrences whose verbatim ring sample was dropped (ring full); a synthetic record is emitted for each orphaned slot so the occurrence count is preserved. Accumulated additively across drain cycles. |
+| `ngx_otel.logs.send_failures` | Sum (monotonic) | `failures` | Cumulative logs transport send failures since exporter startup |
+| `ngx_otel.traces.dropped_records` | Sum (monotonic) | `records` | Span records dropped because the per-worker spans ring was full |
 | `ngx_otel.export_interval` | Gauge | `ms` | Configured metric export interval |
 | `ngx_otel.exporter.restarts` | Gauge | `crashes` | Prior exporter crashes observed in the current crash-loop window when this exporter process started (`0` = clean start; set once at exporter startup from the shared-memory crash counter). Not emitted after crash-loop give-up — no exporter process remains to emit it; the disable is announced by an ALERT in the error log. See `LIFECYCLE.md` |
-| `ngx_otel.delivery.permanent_rejected` | Sum (monotonic) | `{batch}` | Batches the peer rejected as permanently unacceptable (e.g. HTTP `400`/`413`/`501`/non-retryable `4xx`/`5xx`; gRPC `INVALID_ARGUMENT`/`INTERNAL`/`UNIMPLEMENTED`); dropped and never retried. A sustained non-zero rate indicates a payload or endpoint configuration problem. |
-| `ngx_otel.delivery.partial_rejected` | Sum (monotonic) | `{record}` | Individual records the peer reported it dropped on an otherwise-accepted batch (OTLP `partial_success.rejected_*` field / gRPC partial-success body). The batch is released; only the peer-reported rejected record count accumulates here. |
-| `ngx_otel.delivery.unauthorized` | Sum (monotonic) | `{batch}` | Batches dropped because the peer reported an authentication or authorization failure (HTTP `401`/`403`; gRPC `UNAUTHENTICATED`/`PERMISSION_DENIED`). Same drop policy as `permanent_rejected` (no retry, no backoff, no auto-pause); a rate-limited "check exporter credentials" log entry is emitted alongside. A non-zero value indicates a credential or permission problem on the exporter endpoint. |
+| `ngx_otel.delivery.permanent_rejected` | Sum (monotonic) | `batches` | Batches the peer rejected as permanently unacceptable (e.g. HTTP `400`/`413`/`501`/non-retryable `4xx`/`5xx`; gRPC `INVALID_ARGUMENT`/`INTERNAL`/`UNIMPLEMENTED`); dropped and never retried. A sustained non-zero rate indicates a payload or endpoint configuration problem. |
+| `ngx_otel.delivery.partial_rejected` | Sum (monotonic) | `records` | Individual records the peer reported it dropped on an otherwise-accepted batch (OTLP `partial_success.rejected_*` field / gRPC partial-success body). The batch is released; only the peer-reported rejected record count accumulates here. |
+| `ngx_otel.delivery.unauthorized` | Sum (monotonic) | `batches` | Batches dropped because the peer reported an authentication or authorization failure (HTTP `401`/`403`; gRPC `UNAUTHENTICATED`/`PERMISSION_DENIED`). Same drop policy as `permanent_rejected` (no retry, no backoff, no auto-pause); a rate-limited "check exporter credentials" log entry is emitted alongside. A non-zero value indicates a credential or permission problem on the exporter endpoint. |
 
 ---
 
