@@ -1,0 +1,164 @@
+Whole-range gate sanitizer evidence — Selectable logs + exemplar standardization
+GIT_COMMIT=8fc478f190f9be6909a257c79fdad89833742b16   Host: debian-vm (Linux arm64)   Date: 2026-06-17
+Command: make asan-test
+
+VERDICT: ASan GATE = PASS (zero AddressSanitizer reports; exit 0).
+=========================================================================================
+
+--- F2 step 1: symbols on the loaded artifact ---
+[asan-run] Step 3.5: OK — 142 __asan_* symbols confirmed in libngx_http_otel_module.so.
+
+--- F2 step 2: named PASS lines from the run ---
+[PASS] Workers hold zero collector sockets (workers own no 4317/4318 fds)
+[PASS] error.log: export loop started with protocol=otlp_grpc
+[PASS] metrics.json delta contains service.name = ngx-otel-grpc-export-integration (gRPC path confirmed)
+[PASS] metrics.json delta contains http.server.request.duration
+[PASS] error.log: exactly 1 'export loop started' line
+[PASS] graceful drain integrity: 1 start(s), 1 complete(s)
+[PASS] error.log: no panics / crashes
+[PASS] All assertions passed.  Production gRPC export E2E test COMPLETE.
+[PASS] error.log: exactly 1 'grpc smoke: firing one unary' line
+[PASS] error.log: exactly 1 'grpc smoke: export complete' line
+[PASS] error.log: zero 'grpc smoke: export failed' lines
+[PASS] error.log: no panic / SIGSEGV / SIGABRT / unexpected worker exit signals
+[PASS] metrics.json delta contains service.name = ngx-otel-grpc-smoke
+[PASS] error.log: exactly 1 'bidi smoke: firing one bidi stream' line
+[PASS] error.log: exactly 1 'bidi smoke: bidi complete (sent=10, received=10)' line
+[PASS] error.log: zero 'bidi smoke: bidi failed' lines
+[PASS] All 8 assertions passed.  Bidi gRPC smoke COMPLETE.
+[PASS] TEST A: error.log contains 'export loop started'
+[PASS] TEST A: no resolver-missing error in error.log
+[PASS] TEST A: no connection / DNS errors in error.log
+[PASS] TEST A: collector received +4 new metric record(s) (DNS → v4 path confirmed)
+[PASS] TEST B: error.log contains 'export loop started'
+[PASS] TEST B: no IPv6 connection errors in error.log
+[PASS] TEST B: v6 stub received 18306 bytes — IPv6 literal connect confirmed
+[PASS] TEST C: error.log contains 'export loop started'
+[PASS] TEST C: no resolver-missing error in error.log
+[PASS] TEST C: no connection / DNS errors in error.log
+[PASS] TEST C: v6 AAAA stub received 18312 bytes — DNS→v6 AAAA path confirmed
+[PASS] TEST D: nginx exited cleanly within 0s of -QUIT (no hang)
+[PASS] TEST D: no panic or fatal signal in error.log
+[PASS] TEST D: error.log contains expected connection-failure entry (NXDOMAIN error path)
+[PASS] TEST D: collector metric count unchanged (13) — no records exported on NXDOMAIN (correct)
+[PASS] All DNS + dual-stack integration assertions passed.
+[PASS] error.log: exactly 2 'export loop started' lines (one per exporter generation)
+[PASS] error.log: 2 'graceful drain complete' lines (≥ 2 expected)
+[PASS] error.log: exactly 1 'otel: SIGHUP reload detected' line
+[PASS] metrics.json: service.name = ngx-otel-step10-reload present (8 lines)
+[PASS] metrics.json: 2 unique startTimeUnixNano values for ngx_otel.dropped_records (≥ 2 expected)
+[PASS] metrics.json: all ngx_otel.dropped_records data points have timeUnixNano >= startTimeUnixNano
+[PASS] All assertions passed. SIGHUP reload test COMPLETE.
+[PASS] traces.json: ResourceSpans payload received — span reached the collector
+[PASS] traces.json: span traceId=a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6 matches inbound traceparent
+[PASS] traces.json: parentSpanId=f1e2d3c4b5a69788 matches inbound traceparent span_id
+[PASS] traces.json: http.request.method attribute present
+[PASS] traces.json: http.response.status_code attribute present
+[PASS] traces.json: url.path attribute present
+[PASS] logs.json: trace_id a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6 carried on tail LogRecord (cross-signal logs→trace)
+[PASS] metrics.json: trace_id a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6 in metric exemplar (cross-signal metrics→trace)
+[PASS] metrics.json: no resourceSpans in new data (traces routed to traces.json only)
+[PASS] D1a: sampled parent (d1aaaa00000000001111111111111111) → span present in traces.json (otel_trace $otel_parent_sampled works)
+[PASS] D1b: unsampled parent (d1bbbb00000000002222222222222222) → no span in traces.json (correct: gate declined)
+[PASS] All assertions passed.
+[PASS] metrics.json: service.name = ngx-otel-access-log-test present (metrics not regressed)
+[PASS] metrics.json: http.server.request.duration present
+[PASS] metrics.json: http.server.request.duration is exponentialHistogram
+[PASS] metrics.json: http.route dimension present
+[PASS] metrics.json: nginx.upstream.zone dimension present
+[PASS] metrics.json: ≥ 2 distinct http.route data points (different locations)
+[PASS] metrics.json: '(other)' route bucket present (regex/unregistered → overflow bucket)
+[PASS] logs.json: 200 flood blocked, interesting requests produced tail records (count=9)
+[PASS] logs.json: at least 1 tail LogRecord present from error requests (got 9)
+[PASS] logs.json: http.request.method attribute present
+[PASS] logs.json: http.response.status_code attribute present
+[PASS] logs.json: client.address attribute present
+[PASS] logs.json: severity_number = 9 (INFO) present
+[PASS] logs.json: event_name = http.access present
+[PASS] metrics.json: trace_id 4bf92f3577b34da6a3ce929d0e0e4736 carried in exemplar (inbound traceparent propagated)
+[PASS] logs.json: trace_id 4bf92f3577b34da6a3ce929d0e0e4736 carried on tail LogRecord (traceparent → LogRecord)
+[PASS] logs.json: url.path attribute present on tail records
+[PASS] logs.json: http.server.request.duration key present
+[PASS] All assertions passed.
+[PASS] (a) single cert: path + CN + not_after=1893456000 exact
+[PASS] (b) dual RSA+ECDSA: both certs enumerated (rsa=1924992000, ecdsa=1956528000)
+[PASS] (c) multi-server_name: first non-wildcard name recorded
+[PASS] (d) $var cert path: skip NOTICE present, nothing enumerated
+[PASS] total enumeration count = 4 (no spurious entries)
+[PASS] (e) no-ssl binary: module loads, 1 'unavailable' NOTICE, serves, no crash
+[PASS] C2 cert-walk integration: ALL assertions passed (a)-(e)
+[PASS] (1) cert a not_after: ngx_otel.tls.certificate.not_after = 1893456000 exact (every flush)
+[PASS] (1) cert a not_before: ngx_otel.tls.certificate.not_before = 1781705675 exact (every flush)
+[PASS] (1) dual rsa not_after: ngx_otel.tls.certificate.not_after = 1924992000 exact (every flush)
+[PASS] (1) dual ecdsa not_after: ngx_otel.tls.certificate.not_after = 1956528000 exact (every flush)
+[PASS] (2) time_to_expiration 111750320 ≈ not_after − now (111750319, |Δ|=1s ≤ 300s)
+[PASS] (3) dual RSA+ECDSA block: 2 series per metric in a single flush
+[PASS] (4) attribute set EXACTLY the 7 scope-guard keys on all 45 points
+[PASS] (6) reload: swapped cert exported (not_after=2051222400, CN=cert-a2.example.test on the same point)
+[PASS] (5) Agent name nginx.certificate.time_to_expiration ABSENT from collector output
+[PASS] (7) no-ssl binary: export proven (export_interval present), cert series ABSENT
+[PASS] C3 cert-metrics integration: ALL assertions passed (1)-(7)
+[PASS] Exporter started, PID = 7136
+[PASS] Workers have zero connections to :4317/:4318 (before kill) (architectural isolation)
+[PASS] Workers return HTTP 200 while exporter is dead (200)
+[PASS] Master respawned exporter: PID = 7203 (was 7136)
+[PASS] Workers have zero connections to :4317/:4318 (after respawn) (architectural isolation)
+[PASS] error.log contains 'cycle entered' 2 times (initial + respawn)
+[PASS] Master and exporter exited cleanly after SIGQUIT
+[PASS] === All kill-9 containment assertions passed ===
+[PASS] test-support module built: /work/ngx-otel-rust/target/test-support/aarch64-unknown-linux-gnu/debug/libngx_http_otel_module.so
+[PASS] nginx master started, PID = 7911
+[PASS] Initial exporter appeared
+[PASS] Self-disable ALERT observed in error.log
+[PASS] Backoff messages in error.log: 4 (exponential throttle active)
+[PASS] No exporter process after self-disable (nginx correctly stopped respawning)
+[PASS] ALERT message includes 'telemetry OFF' — correct operator guidance
+[PASS] ALERT message includes 'nginx request handling UNAFFECTED'
+[PASS] nginx master still responsive after exporter self-disable (PID 7911)
+[PASS] Workers return HTTP 200 after exporter self-disable (data plane UNAFFECTED)
+[PASS] nginx master exited cleanly on SIGQUIT
+[PASS] === All crash-loop self-disable assertions passed ===
+[PASS] Exporter started with dead endpoint
+[PASS] nginx exited 1s after SIGQUIT (budget 20s)
+[PASS] No orphan exporter after SIGQUIT
+[PASS] Part B: exporter started, PID = 8016
+[PASS] SIGHUP: new exporter PID = 8025 (was 8016)
+[PASS] Workers return HTTP 200 after SIGHUP reload with dead collector
+[PASS] New exporter still alive 3s after reload (crash counter reset on SIGHUP verified)
+[PASS] Part B nginx exited cleanly
+[PASS] Part C: test-support module ready: /work/ngx-otel-rust/target/test-support/aarch64-unknown-linux-gnu/debug/libngx_http_otel_module.so
+[PASS] Part C: nginx master started, PID = 8049
+[PASS] Part C: exporter self-disabled — 2026/06/17 14:15:32 [alert] 8083#0: otel exporter: disabled after 6 crashes in 60s — telemetry OFF, nginx request handling UNAFFECTED
+[PASS] Part C: no exporter running before SIGHUP (self-disable confirmed, crash_count stable in shm)
+[PASS] Part C: first post-reload exporter appeared, PID = 8101
+[PASS] Part C: PID 8112 logs low crash# — counter reset on SIGHUP CONFIRMED: 2026/06/17 14:15:33 [warn] 8112#0: otel exporter: crash #2 in window, backing off 200ms before init
+[PASS] Part C: master still alive 3s after reload (not prematurely disabled)
+[PASS] Part C nginx exited cleanly
+[PASS] === All dead-collector shutdown/reload assertions passed ===
+[PASS] Assertion 1: ALERT 'gen-1 exporter will be unsupervised after daemonize' present in error.log
+[PASS] Assertion 2: gen-1 exporter (PID=8155) has PPID=1 ≠ master=8156 (orphaned to init)
+[PASS] Assertion 3: master did NOT respawn gen-1 within 6s — supervision gap confirmed
+[PASS] Assertion 4: gen-2 exporter PID=8187 has PPID=8156=master — supervision restored by reload
+[PASS] Assertion 5: master respawned gen-2 → gen-3 PID=8203 — SIGCHLD supervision confirmed
+[PASS] === B4 daemon-on gen-1 supervision test: all assertions passed ===
+[PASS] nginx started (master=8243 exporter=8245)
+[PASS] Round 1: old exporter exited
+[PASS] Round 2: old exporter exited
+[PASS] Round 3: old exporter exited
+[PASS] assertion (a-i): no duplicate records across 3 SIGHUP rounds (75 unique paths, 75 found)
+[PASS] assertion (a-ii): conservation OK (75 arrived + 0 dropped = 75 sent)
+[PASS] assertion (a-iii): zero parse/garbage-length errors in error.log and collector logs
+[PASS] nginx exited cleanly
+[PASS] assertion (b): quit-completeness: all 8 pre-quit records arrived
+[PASS] SPSC reload chaos gate: PASS — SPSC exclusivity across reload, conservation verified, no parse errors, quit-completeness confirmed
+[PASS] Hang-collector listening (PID 8738)
+[PASS] Exporter started against the hung collector
+[PASS] h3f3_periodic_deadline: PERIODIC_SEND_BUDGET signature observed during the chaos run
+[PASS] h3f3_quit_responsiveness: nginx exited 4.09s after SIGQUIT (ceiling 25s)
+[PASS] No orphan exporter after SIGQUIT
+[PASS] === h3f3_quit_responsiveness: PASSED (deadline signature observed; quit latency 4.09s <= 25s) ===
+[asan-run] ASan gate: PASS (no use-after-free / heap error on the exercised wake paths).
+
+--- F2 step 3: report scan (zeros last) ---
+[asan-run] Zero AddressSanitizer reports across: run_grpc_export.sh run_grpc_bidi_smoke.sh run_dns_dualstack.sh run_reload.sh run_traces.sh run_access_log.sh run_c2_cert_walk.sh run_c3_cert_metrics.sh run_chaos_kill9.sh run_chaos_crashloop.sh run_chaos_dead_collector.sh run_b4_daemon_on_gen1.sh run_b1_spsc_reload_chaos.sh run_chaos_quit_responsiveness.sh
+[asan-run] ASan gate: PASS (no use-after-free / heap error on the exercised wake paths).

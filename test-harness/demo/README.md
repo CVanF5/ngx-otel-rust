@@ -2,9 +2,9 @@
 
 A self-contained **OTel Collector → Prometheus + Loki → Grafana** stack that
 visualises everything the `ngx-otel-rust` module emits today: **metrics**
-(incl. native-histogram latency + **exemplars**) and **logs** (access exception
-tail + coalesced error log). A **Tempo** (traces) path is pre-wired but dormant
-for Phase 3.
+(incl. native-histogram latency + **exemplars**) and **logs** (operator-selected
+access tail + coalesced error log). A **Tempo** (traces) path is pre-wired but
+dormant for Phase 3.
 
 ```
                                    --remote-write-->  Prometheus :19090 --\
@@ -56,21 +56,29 @@ One dashboard, four collapsible rows:
   histogram latency panel **with exemplars**, duration heatmap, slowest routes,
   per-upstream timing, body/upstream throughput.
 * **Enhanced — Logs (Loki)** — the **Exemplar → Request Log** panel (see below),
-  coalesced error log (`×N` = events collapsed), interesting (4xx/5xx) and
-  sampled access logs, log rate.
+  coalesced error log (`×N` = events collapsed), operator-selected access tail
+  logs (this demo exports every request via `otel_log_export on`), log rate.
 * **Exporter Health** — export interval, send failures, dropped records.
 
 ## Exemplars: the metric → log drill-down
 
-The request-duration histogram carries **exemplars**: each is one
-sampled real request, tagged with its `trace_id`, `url.path`, and value. The
-access tail **LogRecord** carries the **same `trace_id`**. So a point on the
-latency graph and a log line are two views of one request, joined by `trace_id`.
+The request-duration histogram carries **exemplars**: each is one real request
+from a **sampled trace**, tagged with its `trace_id` and value — the canonical
+OpenTelemetry exemplar payload. The access tail **LogRecord** carries the **same
+`trace_id`**. So a point on the latency graph and a log line are two views of one
+request, joined by `trace_id`.
+
+Exemplars are **trace-gated** (only a request on a sampled trace produces one)
+and drawn from a **small fixed-size reservoir per data point that resets every
+export cycle** — so each series shows a handful of fresh ⬦ per interval, not a
+dense cloud. They carry only the standard `{value, time, trace_id, span_id}`;
+`url.path`/`user_agent` are intentionally **not** attached (high-cardinality, and
+`url.path` is already on the tail LogRecord).
 
 To see it on the **"Request Latency by Status … ⬦ exemplars"** panel:
 
 1. **Hover** an exemplar diamond (⬦) — its y-position is the request's latency
-   (its histogram bucket); the tooltip shows `trace_id`, `url.path`, and value.
+   (its histogram bucket); the tooltip shows the `trace_id` and value.
 2. **Click "Show this request's log ↓"** — this sets the dashboard's `trace_id`
    variable, and the **"Exemplar → Request Log"** Loki panel (top of the Logs
    row) filters to that exact request's tail log.
@@ -111,15 +119,16 @@ transform; `resource_to_telemetry_conversion` promotes `service.name` →
 
 ## Logs (live) and traces (future)
 
-* **Logs → Loki — on by default.** Loki 3.x ingests **OTLP logs natively** at
+* **Logs → Loki.** Loki 3.x ingests **OTLP logs natively** at
   `/otlp/v1/logs` (no Promtail). The collector's `otlphttp/loki` exporter ships
   straight there; the Loki datasource is provisioned. OTLP attributes land as
   Loki **structured metadata** (filter with a pipeline stage `| field="…"`, not
   in the `{}` stream selector — only `service_name` is a stream label). The
-  module emits two log signals: the **access exception tail** (4xx/5xx +
-  latency outliers + sampled, carrying `trace_id`/`url.path`) and the
-  **coalesced error log** (`nginx.error`, deduped per drain window with a
-  `coalesced_count` the dashboard renders as `×N`).
+  module emits two log signals: the **access tail** LogRecord — **operator-
+  selected** per location via `otel_log_export` (this demo uses `otel_log_export
+  on` to export every request; the module default is **no** access-log export),
+  carrying `trace_id`/`url.path` — and the **coalesced error log** (`nginx.error`,
+  deduped per drain window with a `coalesced_count` the dashboard renders as `×N`).
 * **Traces → Tempo — Phase 3.** Same pattern: `--profile traces`, uncomment the
   `otlp/tempo` exporter + `traces:` pipeline. Tempo datasource is provisioned.
 
@@ -143,13 +152,18 @@ verified"). All fixed on `main`:
    emitted `count=1` single-bucket histograms for the connection gauges, which
    Prometheus remote-write drops (non-monotonic). Now real OTLP **Gauge**s, so
    the Default-NGINX connection panels render under remote-write.
+5. **Exemplar flood + non-standard payload** (`6e77d1c`) — the per-worker
+   exemplar reservoir was oversized (up to 64) and **never reset between export
+   cycles**, so the same points re-emitted every interval (a dense, overlapping
+   ⬦ "flood" on the latency panel) and carried high-cardinality
+   `url.path`/`user_agent` attributes. Now a **small per-data-point reservoir
+   (size 2) reset every cycle**, **trace-gated**, emitting only the canonical
+   `{value, time, trace_id, span_id}`.
 
 ## Notes
 
 * Grafana runs with anonymous Admin and no login form — **demo only**.
 * Collector/Prometheus/Grafana/Loki images match the test harness
   (`otel/opentelemetry-collector-contrib:0.152.0`, etc.).
-* Prometheus logs benign "out-of-order exemplars" warnings — the per-worker
-  exemplar reservoir re-sends across intervals; fresh exemplars still store.
 * `run-demo.sh` backgrounds host nginx; if you restart nginx by hand, use
   `nohup` so it survives the shell exiting.
