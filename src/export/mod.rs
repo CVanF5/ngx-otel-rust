@@ -395,7 +395,7 @@ impl MetricSource for SelfMetricsSource {
                 "ngx_otel.dropped_records",
                 "Records from any signal (metrics, logs, spans) dropped because the \
                  per-signal retry buffer was full or a drain-abort discarded queued batches",
-                "records",
+                "{record}",
                 dropped,
                 self.start_time_unix_nano,
                 now,
@@ -403,7 +403,7 @@ impl MetricSource for SelfMetricsSource {
             monotonic_sum_metric(
                 "ngx_otel.send_failures",
                 "Cumulative export send failures since worker startup",
-                "failures",
+                "{failure}",
                 failures,
                 self.start_time_unix_nano,
                 now,
@@ -411,7 +411,7 @@ impl MetricSource for SelfMetricsSource {
             monotonic_sum_metric(
                 "ngx_otel.bidi_backpressure_drops",
                 "Bidi outbound messages dropped due to channel backpressure",
-                "messages",
+                "{message}",
                 backpressure_drops,
                 self.start_time_unix_nano,
                 now,
@@ -419,7 +419,7 @@ impl MetricSource for SelfMetricsSource {
             monotonic_sum_metric(
                 "ngx_otel.logs.access.dropped_records",
                 "Access log records dropped because the per-worker ring was full",
-                "records",
+                "{record}",
                 access_logs_dropped,
                 self.start_time_unix_nano,
                 now,
@@ -427,7 +427,7 @@ impl MetricSource for SelfMetricsSource {
             monotonic_sum_metric(
                 "ngx_otel.logs.error.dropped_records",
                 "Error log records dropped because the per-worker ring was full",
-                "records",
+                "{record}",
                 error_logs_dropped,
                 self.start_time_unix_nano,
                 now,
@@ -437,7 +437,7 @@ impl MetricSource for SelfMetricsSource {
                 "Error log coalesced-count occurrences orphaned because the verbatim \
                  ring sample was dropped (ring full); a synthetic record is emitted \
                  per orphaned slot so backends still receive the occurrence count",
-                "records",
+                "{record}",
                 error_logs_coalesced_orphaned,
                 self.start_time_unix_nano,
                 now,
@@ -445,7 +445,7 @@ impl MetricSource for SelfMetricsSource {
             monotonic_sum_metric(
                 "ngx_otel.logs.send_failures",
                 "Cumulative logs transport send failures since exporter startup",
-                "failures",
+                "{failure}",
                 logs_send_failures,
                 self.start_time_unix_nano,
                 now,
@@ -453,7 +453,7 @@ impl MetricSource for SelfMetricsSource {
             monotonic_sum_metric(
                 "ngx_otel.traces.dropped_records",
                 "Span records dropped because the per-worker spans ring was full",
-                "records",
+                "{record}",
                 traces_dropped,
                 self.start_time_unix_nano,
                 now,
@@ -468,7 +468,7 @@ impl MetricSource for SelfMetricsSource {
             gauge_metric(
                 "ngx_otel.exporter.restarts",
                 "Prior exporter crashes in the current crash-loop window at this process start (0 = clean start; nginx request handling is never affected by the exporter crash-loop state)",
-                "crashes",
+                "{crash}",
                 exporter_restarts,
                 now,
             ),
@@ -477,7 +477,7 @@ impl MetricSource for SelfMetricsSource {
                 "Batches the peer rejected as permanently unacceptable \
                  (e.g. HTTP 400/413, gRPC INVALID_ARGUMENT/INTERNAL/UNIMPLEMENTED); \
                  dropped and never retried",
-                "batches",
+                "{batch}",
                 permanent_rejected,
                 self.start_time_unix_nano,
                 now,
@@ -487,7 +487,7 @@ impl MetricSource for SelfMetricsSource {
                 "Individual records the peer reported it dropped on an otherwise-accepted batch \
                  (OTLP partial_success / gRPC partial-success body); the batch is released, \
                  only the reported rejected count is accumulated here",
-                "records",
+                "{record}",
                 partial_rejected,
                 self.start_time_unix_nano,
                 now,
@@ -499,7 +499,7 @@ impl MetricSource for SelfMetricsSource {
                  policy as permanent_rejected (no retry, no backoff, no auto-pause) but kept \
                  in a distinct counter for observability — a non-zero value indicates a \
                  credential or permission problem on the exporter endpoint",
-                "batches",
+                "{batch}",
                 unauthorized_rejected,
                 self.start_time_unix_nano,
                 now,

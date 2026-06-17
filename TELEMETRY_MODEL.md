@@ -282,13 +282,13 @@ change.
 
 | Name | Instrument | Unit (UCUM) | Temporality | Stability |
 |---|---|---|---|---|
-| `nginx.requests.total` | Histogram (explicit, single-bucket) | `requests` | Cumulative | experimental |
-| `nginx.connections.accepted` | Histogram (explicit, single-bucket) | `connections` | Cumulative | experimental |
-| `nginx.connections.handled` | Histogram (explicit, single-bucket) | `connections` | Cumulative | experimental |
-| `nginx.connections.active` | Gauge | `connections` | — | experimental |
-| `nginx.connections.reading` | Gauge | `connections` | — | experimental |
-| `nginx.connections.writing` | Gauge | `connections` | — | experimental |
-| `nginx.connections.waiting` | Gauge | `connections` | — | experimental |
+| `nginx.requests.total` | Histogram (explicit, single-bucket) | `{request}` | Cumulative | experimental |
+| `nginx.connections.accepted` | Histogram (explicit, single-bucket) | `{connection}` | Cumulative | experimental |
+| `nginx.connections.handled` | Histogram (explicit, single-bucket) | `{connection}` | Cumulative | experimental |
+| `nginx.connections.active` | Gauge | `{connection}` | — | experimental |
+| `nginx.connections.reading` | Gauge | `{connection}` | — | experimental |
+| `nginx.connections.writing` | Gauge | `{connection}` | — | experimental |
+| `nginx.connections.waiting` | Gauge | `{connection}` | — | experimental |
 
 ---
 
@@ -666,19 +666,19 @@ The exporter process emits its own health metrics every export interval
 
 | Metric | Instrument | Unit | Description |
 |---|---|---|---|
-| `ngx_otel.dropped_records` | Sum (monotonic) | `records` | Records from any signal (metrics, logs, spans) dropped because the per-signal retry buffer was full (oldest batch evicted) or a graceful-drain abort discarded queued batches (previously only the metrics lane was accounted) |
-| `ngx_otel.send_failures` | Sum (monotonic) | `failures` | Cumulative export send failures since worker startup |
-| `ngx_otel.bidi_backpressure_drops` | Sum (monotonic) | `messages` | Bidi outbound messages dropped due to channel backpressure |
-| `ngx_otel.logs.access.dropped_records` | Sum (monotonic) | `records` | Access log records dropped because the per-worker ring was full |
-| `ngx_otel.logs.error.dropped_records` | Sum (monotonic) | `records` | Error log records dropped because the per-worker ring was full |
-| `ngx_otel.logs.error.coalesced_orphaned_records` | Sum (monotonic) | `records` | Coalesced error-log occurrences whose verbatim ring sample was dropped (ring full); a synthetic record is emitted for each orphaned slot so the occurrence count is preserved. Accumulated additively across drain cycles. |
-| `ngx_otel.logs.send_failures` | Sum (monotonic) | `failures` | Cumulative logs transport send failures since exporter startup |
-| `ngx_otel.traces.dropped_records` | Sum (monotonic) | `records` | Span records dropped because the per-worker spans ring was full |
+| `ngx_otel.dropped_records` | Sum (monotonic) | `{record}` | Records from any signal (metrics, logs, spans) dropped because the per-signal retry buffer was full (oldest batch evicted) or a graceful-drain abort discarded queued batches (previously only the metrics lane was accounted) |
+| `ngx_otel.send_failures` | Sum (monotonic) | `{failure}` | Cumulative export send failures since worker startup |
+| `ngx_otel.bidi_backpressure_drops` | Sum (monotonic) | `{message}` | Bidi outbound messages dropped due to channel backpressure |
+| `ngx_otel.logs.access.dropped_records` | Sum (monotonic) | `{record}` | Access log records dropped because the per-worker ring was full |
+| `ngx_otel.logs.error.dropped_records` | Sum (monotonic) | `{record}` | Error log records dropped because the per-worker ring was full |
+| `ngx_otel.logs.error.coalesced_orphaned_records` | Sum (monotonic) | `{record}` | Coalesced error-log occurrences whose verbatim ring sample was dropped (ring full); a synthetic record is emitted for each orphaned slot so the occurrence count is preserved. Accumulated additively across drain cycles. |
+| `ngx_otel.logs.send_failures` | Sum (monotonic) | `{failure}` | Cumulative logs transport send failures since exporter startup |
+| `ngx_otel.traces.dropped_records` | Sum (monotonic) | `{record}` | Span records dropped because the per-worker spans ring was full |
 | `ngx_otel.export_interval` | Gauge | `ms` | Configured metric export interval |
-| `ngx_otel.exporter.restarts` | Gauge | `crashes` | Prior exporter crashes observed in the current crash-loop window when this exporter process started (`0` = clean start; set once at exporter startup from the shared-memory crash counter). Not emitted after crash-loop give-up — no exporter process remains to emit it; the disable is announced by an ALERT in the error log. See `LIFECYCLE.md` |
-| `ngx_otel.delivery.permanent_rejected` | Sum (monotonic) | `batches` | Batches the peer rejected as permanently unacceptable (e.g. HTTP `400`/`413`/`501`/non-retryable `4xx`/`5xx`; gRPC `INVALID_ARGUMENT`/`INTERNAL`/`UNIMPLEMENTED`); dropped and never retried. A sustained non-zero rate indicates a payload or endpoint configuration problem. |
-| `ngx_otel.delivery.partial_rejected` | Sum (monotonic) | `records` | Individual records the peer reported it dropped on an otherwise-accepted batch (OTLP `partial_success.rejected_*` field / gRPC partial-success body). The batch is released; only the peer-reported rejected record count accumulates here. |
-| `ngx_otel.delivery.unauthorized` | Sum (monotonic) | `batches` | Batches dropped because the peer reported an authentication or authorization failure (HTTP `401`/`403`; gRPC `UNAUTHENTICATED`/`PERMISSION_DENIED`). Same drop policy as `permanent_rejected` (no retry, no backoff, no auto-pause); a rate-limited "check exporter credentials" log entry is emitted alongside. A non-zero value indicates a credential or permission problem on the exporter endpoint. |
+| `ngx_otel.exporter.restarts` | Gauge | `{crash}` | Prior exporter crashes observed in the current crash-loop window when this exporter process started (`0` = clean start; set once at exporter startup from the shared-memory crash counter). Not emitted after crash-loop give-up — no exporter process remains to emit it; the disable is announced by an ALERT in the error log. See `LIFECYCLE.md` |
+| `ngx_otel.delivery.permanent_rejected` | Sum (monotonic) | `{batch}` | Batches the peer rejected as permanently unacceptable (e.g. HTTP `400`/`413`/`501`/non-retryable `4xx`/`5xx`; gRPC `INVALID_ARGUMENT`/`INTERNAL`/`UNIMPLEMENTED`); dropped and never retried. A sustained non-zero rate indicates a payload or endpoint configuration problem. |
+| `ngx_otel.delivery.partial_rejected` | Sum (monotonic) | `{record}` | Individual records the peer reported it dropped on an otherwise-accepted batch (OTLP `partial_success.rejected_*` field / gRPC partial-success body). The batch is released; only the peer-reported rejected record count accumulates here. |
+| `ngx_otel.delivery.unauthorized` | Sum (monotonic) | `{batch}` | Batches dropped because the peer reported an authentication or authorization failure (HTTP `401`/`403`; gRPC `UNAUTHENTICATED`/`PERMISSION_DENIED`). Same drop policy as `permanent_rejected` (no retry, no backoff, no auto-pause); a rate-limited "check exporter credentials" log entry is emitted alongside. A non-zero value indicates a credential or permission problem on the exporter endpoint. |
 
 ---
 
