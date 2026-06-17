@@ -158,10 +158,17 @@ done
 
 # One error request WITH a traceparent header.
 # Assert: the emitted exemplar carries the trace_id from this header.
+#
+# Exemplars now use one small (size-2) uniformly-sampled reservoir PER data
+# point (method × status_class × proto), reset every export cycle.  To make the
+# cross-signal assertion deterministic, this probe request must be the SOLE
+# occupant of its combo so it cannot be evicted: send it as POST (the plain
+# /error requests above are GET → a different combo), and it is the only POST,
+# so it lands in the reservoir's fill phase and is retained for the cycle.
 TRACEPARENT="00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 TRACE_ID="4bf92f3577b34da6a3ce929d0e0e4736"
-info "Sending 1 GET with traceparent header to /error..."
-curl -sf -H "traceparent: ${TRACEPARENT}" http://127.0.0.1:9101/error >/dev/null || true
+info "Sending 1 POST with traceparent header to /error (unique combo for a deterministic exemplar)..."
+curl -sf -X POST -H "traceparent: ${TRACEPARENT}" http://127.0.0.1:9101/error >/dev/null || true
 
 # A proxy request to trigger the upstream zone (→ 502 = interesting).
 info "Sending 3 GET requests to /api (upstream → 502 = interesting)..."
@@ -338,9 +345,9 @@ if [[ -n "${NEW_LOGS}" ]]; then
     fi
 
     # HARD: the exemplar on the matching base combo carries the 32-char
-    # trace_id from the traceparent request. With sample size 16 and only a
-    # handful of 5xx requests in the combo, the reservoir keeps them all, so this
-    # is deterministic — absence is a real failure.
+    # trace_id from the traceparent request. The probe is the sole occupant of
+    # its (POST × 5xx) combo reservoir (the plain errors are GET), so the size-2
+    # uniform reservoir retains it deterministically — absence is a real failure.
     if echo "${NEW_METRICS}" | grep -q "${TRACE_ID}"; then
         pass "metrics.json: trace_id ${TRACE_ID} carried in exemplar (inbound traceparent propagated)"
     else
