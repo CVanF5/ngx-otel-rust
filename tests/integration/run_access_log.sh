@@ -36,13 +36,26 @@ case "$(uname -s)" in
     Darwin) MODULE_EXT="dylib" ;;
     *)      MODULE_EXT="so"    ;;
 esac
-# When CARGO_BUILD_TARGET is set (e.g., the TSAN gate uses --target so cargo
-# can also -Zbuild-std), cargo writes its output to target/<triple>/release/
-# rather than target/release/.  Backwards-compatible: unset -> original path.
+
+# Resolve MODULE_PATH — prefer a caller-supplied path, then check for a
+# pre-built module (objs-release or CARGO_BUILD_TARGET output), then fall
+# back to a fresh cargo build.  The pre-built path avoids a flavor-mismatch
+# error when NGINX_BUILD_DIR was configured with --with-debug.
+RELEASE_MODULE="${CRATE_DIR}/objs-release/ngx_http_otel_module.so"
 if [[ -n "${CARGO_BUILD_TARGET:-}" ]]; then
-    MODULE_PATH="${CRATE_DIR}/target/${CARGO_BUILD_TARGET}/release/libngx_http_otel_module.${MODULE_EXT}"
+    CARGO_MODULE="${CRATE_DIR}/target/${CARGO_BUILD_TARGET}/release/libngx_http_otel_module.${MODULE_EXT}"
 else
-    MODULE_PATH="${CRATE_DIR}/target/release/libngx_http_otel_module.${MODULE_EXT}"
+    CARGO_MODULE="${CRATE_DIR}/target/release/libngx_http_otel_module.${MODULE_EXT}"
+fi
+
+if [[ -n "${MODULE_PATH:-}" ]]; then
+    : # use the caller-supplied path as-is
+elif [[ -n "${CARGO_BUILD_TARGET:-}" && -f "${CARGO_MODULE}" ]]; then
+    MODULE_PATH="${CARGO_MODULE}"
+elif [[ -f "${RELEASE_MODULE}" ]]; then
+    MODULE_PATH="${RELEASE_MODULE}"
+elif [[ -f "${CARGO_MODULE}" ]]; then
+    MODULE_PATH="${CARGO_MODULE}"
 fi
 
 SERVICE_NAME="ngx-otel-access-log-test"
@@ -72,20 +85,25 @@ if [[ ! -x "${NGINX_BINARY}" ]]; then
 fi
 ensure_collector_running || exit 1
 
-# ─── Build the module ────────────────────────────────────────────────────────
+# ─── Build the module (if not already available) ─────────────────────────────
 
-info "Building release module..."
-(
-    cd "${CRATE_DIR}"
-    NGINX_SOURCE_DIR="${NGINX_SOURCE_DIR:-${REPO_ROOT}/nginx}" \
-    NGINX_BUILD_DIR="${NGINX_BUILD_DIR:-${REPO_ROOT}/nginx/objs}" \
-    cargo build --release 2>&1
-)
-if [[ ! -f "${MODULE_PATH}" ]]; then
-    echo "ERROR: module not found after build: ${MODULE_PATH}" >&2
-    exit 1
+if [[ -n "${MODULE_PATH:-}" && -f "${MODULE_PATH}" ]]; then
+    info "Using pre-built module: ${MODULE_PATH}"
+else
+    info "Building release module..."
+    (
+        cd "${CRATE_DIR}"
+        NGINX_SOURCE_DIR="${NGINX_SOURCE_DIR:-${REPO_ROOT}/nginx}" \
+        NGINX_BUILD_DIR="${NGINX_BUILD_DIR:-${REPO_ROOT}/nginx/objs}" \
+        cargo build --release 2>&1
+    )
+    MODULE_PATH="${CARGO_MODULE}"
+    if [[ ! -f "${MODULE_PATH}" ]]; then
+        echo "ERROR: module not found after build: ${MODULE_PATH}" >&2
+        exit 1
+    fi
+    info "Module built: ${MODULE_PATH}"
 fi
-info "Module built: ${MODULE_PATH}"
 
 # ─── Sandbox prefix directory ────────────────────────────────────────────────
 
