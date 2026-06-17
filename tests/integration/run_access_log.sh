@@ -144,13 +144,15 @@ info "nginx running (PID ${NGINX_PID})"
 
 # ─── Send HTTP traffic ───────────────────────────────────────────────────────
 
-# 200 flood — is_interesting gate should block all of these.
+# 200 flood — the if=$otel_export_tail map evaluates to 0 for 2xx, so no tail
+# records are exported for these requests.
 info "Sending ${N_OK_REQUESTS} GET requests (200) to http://127.0.0.1:9101/..."
 for i in $(seq 1 "${N_OK_REQUESTS}"); do
     curl -sf http://127.0.0.1:9101/ >/dev/null
 done
 
-# Error requests — is_interesting gate should pass all of these (status 500 ≥ 400).
+# Error requests — the map evaluates to 1 for 5xx, so these are operator-selected
+# for export and each produces a tail LogRecord.
 info "Sending ${N_ERR_REQUESTS} GET requests (500/error) to http://127.0.0.1:9101/error..."
 for i in $(seq 1 "${N_ERR_REQUESTS}"); do
     curl -sf http://127.0.0.1:9101/error >/dev/null || true  # 500 exit ≠ 0
@@ -288,9 +290,9 @@ info "logs.json: got $(echo "${NEW_LOGS}" | wc -c) bytes of new content"
 LOG_RECORD_COUNT=$(echo "${NEW_LOGS}" | grep -o '"http.access"' | wc -l | tr -d ' ' || echo 0)
 info "event_name=http.access count in new logs.json content: ${LOG_RECORD_COUNT}"
 
-# ── Key assertion 1: 200 flood → ZERO LogRecords (is_interesting gate) ────────
-# N_OK_REQUESTS 200s + 1 traceparent/error + 3 /api (502) = many interesting reqs.
-# Interesting = N_ERR_REQUESTS (500) + 1 (traceparent/error) + 3 (/api 502) = N_ERR_REQUESTS+4
+# ── Key assertion 1: 200 flood → ZERO LogRecords ─────────────────────────────
+# The if=$otel_export_tail map blocks 2xx. Operator-selected requests:
+# N_ERR_REQUESTS (500) + 1 (traceparent/error) + 3 (/api 502) = N_ERR_REQUESTS+4
 TOTAL_INTERESTING=$(( N_ERR_REQUESTS + 4 ))
 if (( LOG_RECORD_COUNT >= 1 && LOG_RECORD_COUNT <= TOTAL_INTERESTING )); then
     pass "logs.json: 200 flood blocked, interesting requests produced tail records (count=${LOG_RECORD_COUNT})"

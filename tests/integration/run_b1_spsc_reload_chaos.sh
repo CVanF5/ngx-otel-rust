@@ -207,15 +207,14 @@ http {
     otel_service_name ngx-otel-b1-chaos;
     otel_metric_interval ${METRIC_INTERVAL_S}s;
 
-    # Enable access-log sampling: every status >= 400 is "interesting" and
-    # produces a tail LogRecord written to the log ring (the SPSC ring whose
-    # exclusivity that the abdication gate enforces).
+    # Export a tail LogRecord for every request (otel_log_export on), exercising
+    # the log ring (the SPSC ring whose exclusivity the abdication gate enforces).
     otel_log_export on;
 
     server {
         listen 127.0.0.1:${NGINX_PORT};
 
-        # All /b1chaos/* requests return 500 → is_interesting = true →
+        # All /b1chaos/* requests return 500 → operator-selected via otel_log_export on →
         # a tail LogRecord with url.path = "/b1chaos/<N>" is pushed to the ring.
         location /b1chaos/ {
             return 500 "b1-chaos-record\n";

@@ -153,7 +153,7 @@ make_conf() {
             echo "    otel_metric_interval ${METRIC_INTERVAL};"
             [[ "${with_sample}" == "1" ]] && echo "    otel_log_export on;"
         fi
-        # return 500 => every request is is_interesting() (status >= 400).
+        # return 500 => every request is operator-selected for export (otel_log_export on).
         echo "    server { listen 127.0.0.1:9101; location / { return 500 'err\\n'; } }"
         echo "}"
     } > "${prefix}/nginx.conf"
