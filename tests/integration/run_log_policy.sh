@@ -108,7 +108,11 @@ for port in 9114 9115 9116; do
     if [[ -n "${pid:-}" ]]; then
         info "Killing leftover nginx on port ${port} (PID ${pid})..."
         kill "${pid}" 2>/dev/null || true
-        sleep 1 || true
+        # Wait up to 5 s for the port to be released before continuing.
+        for _w in 1 2 3 4 5; do
+            if ! ss -tlnp 2>/dev/null | grep -q ":${port} "; then break; fi
+            sleep 1 || true
+        done
     fi
 done
 
@@ -119,12 +123,24 @@ done
 SCENARIO_PID=""
 
 start_nginx_scenario() {
-    local prefix="$1" conf="$2"
+    local prefix="$1" conf="$2" port="$3"
     "${NGINX_BINARY}" -p "${prefix}" -c "${conf}" &
     SCENARIO_PID=$!
-    sleep 1 || true
+    # Wait up to 3 s for nginx to open the listen socket.
+    local ready=0
+    for _s in 1 2 3; do
+        sleep 1 || true
+        if command -v ss >/dev/null 2>&1 && ss -tlnp 2>/dev/null | grep -q ":${port} "; then
+            ready=1; break
+        fi
+    done
     if ! kill -0 "${SCENARIO_PID}" 2>/dev/null; then
         echo "ERROR: nginx exited immediately. Check ${prefix}/logs/error.log" >&2
+        tail -30 "${prefix}/logs/error.log" >&2
+        exit 1
+    fi
+    if [[ "${ready}" -eq 0 ]]; then
+        echo "ERROR: nginx did not open port ${port} within 3 s. Check ${prefix}/logs/error.log" >&2
         tail -30 "${prefix}/logs/error.log" >&2
         exit 1
     fi
@@ -181,7 +197,7 @@ PRE_C_LOGS=0; if [[ -f "${LOGS_LOG}" ]]; then PRE_C_LOGS=$(wc -c < "${LOGS_LOG}"
 PRE_C_METRICS=0; if [[ -f "${METRICS_LOG}" ]]; then PRE_C_METRICS=$(wc -c < "${METRICS_LOG}"); fi
 
 info "(C) Starting privacy-default nginx (port 9114, no otel_log_export)..."
-start_nginx_scenario "${C_PREFIX}" "${C_PREFIX}/nginx.conf"
+start_nginx_scenario "${C_PREFIX}" "${C_PREFIX}/nginx.conf" 9114
 info "(C) Sending 10×200 + 10×500 to port 9114..."
 for i in $(seq 1 10); do curl -sf http://127.0.0.1:9114/ >/dev/null; done
 for i in $(seq 1 10); do curl -sf http://127.0.0.1:9114/error >/dev/null || true; done
@@ -270,7 +286,7 @@ EOF
 PRE_D_LOGS=0; if [[ -f "${LOGS_LOG}" ]]; then PRE_D_LOGS=$(wc -c < "${LOGS_LOG}"); fi
 
 info "(D) Starting on/off nginx (port 9115)..."
-start_nginx_scenario "${D_PREFIX}" "${D_PREFIX}/nginx.conf"
+start_nginx_scenario "${D_PREFIX}" "${D_PREFIX}/nginx.conf" 9115
 
 # Send 5 requests to / (otel_log_export on → all exported).
 info "(D) Sending 5 requests to / (server-level otel_log_export on)..."
@@ -363,7 +379,7 @@ EOF
 PRE_E_METRICS=0; if [[ -f "${METRICS_LOG}" ]]; then PRE_E_METRICS=$(wc -c < "${METRICS_LOG}"); fi
 
 info "(E) Starting exemplar-gate nginx (port 9116)..."
-start_nginx_scenario "${E_PREFIX}" "${E_PREFIX}/nginx.conf"
+start_nginx_scenario "${E_PREFIX}" "${E_PREFIX}/nginx.conf" 9116
 
 # Send 15 requests with the known traceparent to / (traced location).
 info "(E) Sending 15 traced requests to / (otel_trace on)..."
