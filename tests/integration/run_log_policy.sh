@@ -169,7 +169,7 @@ info "=== Scenario (C): privacy default ==="
 
 C_PREFIX="$(mktemp -d /tmp/ngx-otel-privacy.XXXXXX)"
 mkdir -p "${C_PREFIX}/logs" "${C_PREFIX}/client_body_temp"
-trap 'kill "${SCENARIO_PID:-}" 2>/dev/null; rm -rf "${C_PREFIX}" "${D_PREFIX:-}" "${E_PREFIX:-}"' EXIT
+trap '[[ -n "${SCENARIO_PID:-}" ]] && kill "${SCENARIO_PID}" 2>/dev/null; rm -rf "${C_PREFIX}" "${D_PREFIX:-}" "${E_PREFIX:-}"' EXIT
 
 cat > "${C_PREFIX}/nginx.conf" <<EOF
 daemon off;
