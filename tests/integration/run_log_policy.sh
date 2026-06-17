@@ -192,7 +192,7 @@ if [[ -f "${METRICS_LOG}" ]]; then
 fi
 fi
 
-C_LOG_COUNT=$(echo "${C_LOGS_NEW}" | grep -o '"http.access"' | wc -l | tr -d ' ')
+C_LOG_COUNT=$(echo "${C_LOGS_NEW}" | { grep -o '"http.access"' 2>/dev/null || true; } | wc -l | tr -d ' ')
 info "(C) http.access LogRecord count: ${C_LOG_COUNT}"
 
 # HARD ASSERTION: exactly zero.
@@ -278,7 +278,7 @@ if [[ -f "${LOGS_LOG}" ]]; then
 fi
 fi
 
-D_LOG_COUNT=$(echo "${D_LOGS_NEW}" | grep -o '"http.access"' | wc -l | tr -d ' ')
+D_LOG_COUNT=$(echo "${D_LOGS_NEW}" | { grep -o '"http.access"' 2>/dev/null || true; } | wc -l | tr -d ' ')
 info "(D) http.access LogRecord count (on + off scenario): ${D_LOG_COUNT}"
 
 # At least 5 records from the "/" location under otel_log_export on.
