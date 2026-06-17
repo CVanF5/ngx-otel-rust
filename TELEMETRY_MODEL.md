@@ -3,8 +3,9 @@
 This document is the **producer-side contract for everything the module emits** —
 metrics, logs, and traces — in the style of the
 [OpenTelemetry Semantic Conventions][semconv]: signal names, instruments/record
-shapes, units, temporality, and the bounded attribute set the OTAP collector
-dictionary-encodes downstream. **If you are building a dashboard, alert, or pipeline
+shapes, units, temporality, and the small fixed set of attribute values the module
+keeps to (so a downstream collector can compress them — see Conventions, below).
+**If you are building a dashboard, alert, or pipeline
 against this module, this file is the source of truth for *what* it emits** — the
 proposal covers *why*.
 
@@ -18,12 +19,18 @@ proposal covers *why*.
 | **Logs — error (coalesced + rate metric)** | `otel_error_log [level]` | [Logs](#logs) |
 | **Traces** | `otel_trace <expr>` per location | [Traces](#traces) |
 
-**Conventions shared by all signals:** the [Resource and scope](#resource-and-scope)
-below applies to every signal; all attributes are drawn from OTel semconv and kept
-**WithinU8 cardinality** so the collector dictionary-encodes per-point columns
-at u8 key width; high-cardinality detail (`url.path`, `client.address`,
-`user_agent.original`, upstream peer addr) is never a metric dimension — it rides
-on exemplars, the access tail, or error-record bodies. Transport is OTLP (HTTP or
+**Conventions shared by all signals.** The [Resource and scope](#resource-and-scope)
+below applies to every signal. Every attribute name comes from the OpenTelemetry
+semantic conventions. Just as important, every attribute is restricted to a small,
+fixed set of possible values — at most 256 distinct values for any one attribute.
+This is deliberate. With a small fixed value set, a downstream collector can store
+each attribute as a small integer index into a lookup table — a compact "dictionary"
+encoding — instead of repeating the full string on every data point. To stay inside
+that budget, genuinely open-ended detail is kept off the metrics entirely: the
+request path (`url.path`), the client address (`client.address`), the User-Agent
+string (`user_agent.original`), and the upstream peer address are never used as a
+metric attribute. That detail rides instead on exemplars, on the access-log
+exception tail, or in error-record bodies. Transport is OTLP (HTTP or
 gRPC, `otel_export_protocol`) from the dedicated `nginx: otel exporter` process.
 Both transports support `https://` (TLS; configured via `ssl_certificate`,
 `ssl_certificate_key`, `ssl_verify`, and `trusted_certificate` inside
@@ -162,13 +169,13 @@ table in `WorkerSlots` (`src/shm.rs`).
 - The base series emits up to **160** data points (`N_HTTP_METHODS(8) ×
   N_STATUS_CLASSES(5) × N_PROTO_VERSIONS(4)`); empty combos are skipped.
   `http.response.status_code` carries the **status-class representative**
-  (100/200/300/400/500), not the raw code — class bucketing keeps the column
-  WithinU8.
+  (100/200/300/400/500), not the raw code — grouping into classes keeps the number
+  of distinct values small (5, instead of hundreds of raw status codes).
 - `by_route` / `by_upstream` are **always** emitted (independent of
   `otel_metric_status_code_class`). Route names are the matched `location`
   name (never the raw URI), bounded `ROUTE_CAP = 64` + an `"other"` slot;
   upstream zones are bounded `UPSTREAM_CAP = 32` + `"other"` / no-upstream.
-- **SIGHUP reload behaviour (F1):** `by_route` and `by_upstream` histogram
+- **SIGHUP reload behaviour:** `by_route` and `by_upstream` histogram
   slots are **zeroed on every reload** (`otel_shm_zone_init`, `shm.rs`).
   The slot→name mapping is rebuilt from the new config on each reload
   (new `ngx_http_core_loc_conf_t*` / `ngx_shm_zone_t*` values; any location
@@ -179,7 +186,7 @@ table in `WorkerSlots` (`src/shm.rs`).
   already baseline on restart.  The base-series (`by method × status × protocol`)
   and all global aggregate histograms carry over unchanged (their indices are
   config-independent).
-- **Client-abort behaviour (F2):** requests where nginx never sent response
+- **Client-abort behaviour:** requests where nginx never sent response
   headers (`headers_out.status == 0`) are **excluded from the base series**
   (`http.server.request.duration`).  This covers port-scan SYN probes,
   TLS-to-plaintext probes, and client disconnects that arrive before the
@@ -210,15 +217,19 @@ table in `WorkerSlots` (`src/shm.rs`).
   computed in O(1) using only integer shifts and 7 precomputed u64 thresholds —
   no float, no `log()` call, no syscall on the hot path. Verified exact for all
   values in [1, 2^14] and a random sample up to 2^24.
-- **Boundary convention (note):** the bucket index uses a lower-inclusive
-  boundary `[base^k, base^(k+1))` (i.e. `floor(log2(v)*8) = k` iff
-  `2^(k/8) ≤ v < 2^((k+1)/8)`), whereas the OTel exp-histogram spec defines
-  bucket `k` as the upper-inclusive `(base^k, base^(k+1)]`. The two differ for
-  exactly one input: a value landing *precisely* on a boundary `base^k` (e.g.
-  2µs, 4µs, 8µs — exact powers of 2) is counted in bucket `k` here vs `k-1`
-  per spec — an off-by-one of a single bucket only at exact powers of 2. For
-  all other integer-µs latencies the bucketing is identical. This is a
-  deliberate, documented choice.
+- **One-bucket difference from the spec, at exact powers of two (note):** our
+  bucketing matches the OpenTelemetry exponential-histogram spec for every latency
+  except one corner case, and the difference is only about which side of a bucket
+  edge a value falls on. We treat each bucket as "from its lower edge up to, but not
+  including, the next edge"; the spec treats it as "above the lower edge, up to and
+  including the next edge." Those two rules disagree only when a value lands *exactly*
+  on an edge — and for these buckets, the edges sit at exact powers of two
+  microseconds (2µs, 4µs, 8µs, and so on). Such a value goes into the next bucket up
+  under our rule versus the spec's. Every other integer-microsecond latency buckets
+  identically. This is a deliberate, documented choice.
+  (For reference: our index is `floor(log2(value_us) * 8)`, a lower-inclusive
+  `[base^k, base^(k+1))` boundary; the spec uses the upper-inclusive
+  `(base^k, base^(k+1)]`.)
 
 ---
 
@@ -238,7 +249,7 @@ metrics only when an upstream was used (from `ngx_http_upstream_state_t`).
 | `http.server.upstream.bytes.received` | Histogram (explicit) | `By` | Cumulative |
 | `http.server.upstream.bytes.sent` | Histogram (explicit) | `By` | Cumulative |
 
-> **C1 — sentinel filtering:** nginx initialises `response_time`,
+> **Sentinel filtering — skipping upstream timings nginx never measured:** nginx initialises `response_time`,
 > `connect_time`, and `header_time` in `ngx_http_upstream_state_t` to
 > `(ngx_msec_t)-1` (`ngx_http_upstream.c:1580-1582`) to mark "timing not
 > measured" (e.g., aborted upstream attempts, connection failures).  The
@@ -277,10 +288,11 @@ cumulative counters (accepted/handled/requests) as monotonic **Sum** metrics.
 
 ## Attributes
 
-The duration series attach the bounded, semconv-aligned dimensions below.
-All are **WithinU8 cardinality** so the OTAP collector-side classifier can
-dictionary-encode each per-point column at u8 key width. The closed-cardinality
-enums live in `src/shm.rs` (`HttpMethod`, `StatusClass`, `ProtoVersion`).
+The duration series carry the attributes below. Each one is restricted to a small,
+fixed set of possible values (at most 256), for the dictionary-encoding reason given
+in Conventions at the top of this document — so a collector can store each as a small
+integer index rather than a repeated string. Those fixed value sets are defined as
+Rust enums in `src/shm.rs` (`HttpMethod`, `StatusClass`, `ProtoVersion`).
 
 | Attribute | On series | Cardinality |
 |---|---|---|
@@ -294,7 +306,7 @@ enums live in `src/shm.rs` (`HttpMethod`, `StatusClass`, `ProtoVersion`).
 > `user_agent.original`, and `client.address` are deliberately kept **off** the
 > metrics. They ride on **access-log exemplars + the exception tail**, reachable
 > via the exemplar → trace drill-down, never as histogram attributes (that would
-> break the WithinU8 budget).
+> blow the small fixed-value-set budget described in Conventions at the top).
 
 ## Histogram bucket boundaries (`src/shm.rs`)
 
@@ -315,7 +327,7 @@ The companion error-rate metric emitted alongside the coalesced error `LogRecord
 |---|---|---|---|---|
 | `ngx_otel.error_log.events` | Counter (Sum, monotonic) | `{error}` | Cumulative | `severity_class` only |
 
-Severity classes (5 values, WithinU8 cardinality):
+Severity classes (5 values — a small fixed set):
 
 | `severity_class` | nginx levels | level names |
 |---|---|---|
@@ -325,13 +337,17 @@ Severity classes (5 values, WithinU8 cardinality):
 | `"info"` | 6–7 | notice, info |
 | `"debug"` | 8 | debug |
 
-> **Scope boundary.** The error metric is keyed on `severity_class` **only** — no
-> `http.route` / `nginx.upstream.zone` and no `trace_id`. The `ngx_log_writer_pt`
-> seam hands the writer its own log node, not the connection's `c->log`, so the
-> request context is structurally unreachable on the error path (the access path is
-> unaffected). "Which upstream/route" remains readable in the error sample's **body
-> text**. Per-template counts ride on the `LogRecord`'s `nginx.error.coalesced_count`
-> attribute, never on the metric.
+> **Why this metric has so few attributes.** It is broken down by severity only —
+> there is no route, upstream, or `trace_id` dimension. The reason is structural.
+> nginx invokes our error-log writer through a hook that is given its own logging
+> handle, not the one attached to the connection that triggered the log line. So at
+> the point where error logging happens, we have no way to tell which request or
+> connection produced the message — that information is simply not reachable there.
+> (The access-log path *does* have it, and is unaffected.) You can still see which
+> upstream or route was involved: nginx writes that into the error message text
+> itself, and we ship that text verbatim in the record body. The per-template
+> occurrence count rides on the log record's `nginx.error.coalesced_count`
+> attribute, not on this metric.
 
 ---
 
@@ -395,17 +411,18 @@ signals with different purposes:
 > addable via `otel_span_attr`, so no information is lost.
 > <https://opentelemetry.io/docs/specs/otel/metrics/data-model/#exemplars>
 
-> **Exemplars are best-effort hints, not an authoritative record.** Each exemplar
-> slot is written lock-free from the worker hot path with no per-field commit
-> barrier (the reader gates on an atomic count, but `value`, `trace_id`/`span_id`
-> are filled with `Relaxed` stores). Under concurrent overwrite a reader can
-> observe a *torn* exemplar (e.g. a `value` paired with the wrong `trace_id`).
-> The reset of the per-reservoir count after each collection cycle is likewise a
-> single cross-process atomic store, racing benignly with a concurrent worker
-> write (a lost update at most). This is an intentional hot-path trade-off:
-> exemplars are sampling hints for drill-down. Do not treat an individual
-> exemplar as ground truth; the aggregate histogram and the exception-tail
-> `LogRecord`s are the authoritative surfaces.
+> **Treat an exemplar as a hint, not as an exact record.** An individual exemplar
+> can occasionally be internally inconsistent — for instance, a latency `value`
+> paired with the wrong request's `trace_id`. This is a deliberate trade-off.
+> Exemplars are written by the worker on the per-request hot path without any lock
+> and without a step that commits all of an exemplar's fields together, so that
+> recording one costs almost nothing. The cost of that speed is that a reader
+> draining the data at the exact moment a worker is overwriting a slot can catch it
+> half-updated (a "torn" read). The once-per-cycle reset of each reservoir's counter
+> has the same property: a worker writing at that instant can lose that one update.
+> None of this affects the totals — the aggregate histogram and the exception-tail
+> log records are computed separately and remain authoritative. Use an exemplar only
+> as a pointer for drilling from a metric into a trace, never as ground truth.
 
 ### Error log — coalesced `LogRecord`s
 
@@ -434,12 +451,19 @@ Floods of identical lines are collapsed at the producer.
   errors fall through to nginx's own `error_log` (structural; not exported over OTel).
 - Source: `src/logs/error_writer.rs`, `src/logs/coalesce.rs`, drain in `src/export/mod.rs`.
 
-#### F5 — orphaned-slot synthetic `LogRecord`
+#### When the error buffer fills up: a count-only placeholder record
 
-When the error-log ring is full a verbatim sample cannot be stored, but the
-coalesced-count entry for that template still exists.  On drain, if the count
-slot has a non-zero `orphaned_count` but no verbatim record, the exporter emits
-a **synthetic `LogRecord`** that preserves the occurrence total without a real body:
+Recall how coalescing works, just above: for each repeated error the module keeps
+one example message plus a running tally of how many times that error occurred this
+interval. The example messages are stored in a fixed-size buffer (the "ring"). Under
+a heavy flood of errors that buffer can fill up, so a new example message cannot be
+stored — but the tally is just a counter, and it keeps counting regardless.
+
+When that happens, the drain step is left holding a tally with no example message to
+attach it to. Dropping the tally would under-report how many errors actually
+happened, so instead the exporter sends a placeholder log record: it carries the
+count, and its body says, in effect, "this many of these occurred; the example text
+was dropped because the buffer was full." The fields:
 
 | `LogRecord` field | Value |
 |---|---|
@@ -451,9 +475,9 @@ a **synthetic `LogRecord`** that preserves the occurrence total without a real b
 | attr `nginx.error.coalesced_orphaned` | `true` — marks this as a synthetic (no real body) |
 
 The companion metric `ngx_otel.logs.error.coalesced_orphaned_records` counts
-these events (see [Metrics](#metrics)).  A high value indicates the error-log
-ring is saturated and some verbatim samples are being lost while counts are
-preserved.  Source: `src/export/mod.rs` (`drain_coalesce_table`, F5 path).
+these events (see [Metrics](#metrics)).  A high value means the error buffer is
+saturated: example messages are being lost, though the occurrence counts are still
+preserved.  Source: `src/export/mod.rs` (`drain_coalesce_table`).
 
 ## Traces
 
@@ -491,7 +515,7 @@ One OTel **server span** per sampled request.
 | `end_time_unix_nano` | `start_time_unix_nano + monotonic_duration_ns` (always ≥ start; NTP-immune; derived from `Instant::elapsed()` at LOG) | `src/metric_source/instrumented.rs` |
 | `trace_id` | extracted from inbound `traceparent` (propagate/extract), or freshly generated | `src/traces/ctx.rs` |
 | `span_id` | freshly generated per request | `src/traces/ctx.rs` |
-| `parent_span_id` | from inbound `traceparent` (when `extract` or `propagate`), else **empty** (root span — OTLP `bytes` field empty = no parent, per proto semantics; F7 wire fix) | `src/metric_source/span_start.rs` |
+| `parent_span_id` | from inbound `traceparent` (when `extract` or `propagate`), else **empty** (root span — OTLP `bytes` field empty = no parent, per proto semantics) | `src/metric_source/span_start.rs` |
 | `flags` | W3C trace flags byte (propagated from inbound header, or `0x01` for root spans) | `src/metric_source/span_start.rs` |
 | `kind` | `SERVER` | `src/traces/mod.rs` |
 | `status` | `ERROR` (5xx), else `Unset` — semconv-correct (4xx is not a server-span error) | `src/metric_source/instrumented.rs` |
@@ -634,12 +658,12 @@ The exporter process emits its own health metrics every export interval
 
 | Metric | Instrument | Unit | Description |
 |---|---|---|---|
-| `ngx_otel.dropped_records` | Sum (monotonic) | `{record}` | Records from any signal (metrics, logs, spans) dropped because the per-signal retry buffer was full (oldest batch evicted) or a graceful-drain abort discarded queued batches (F6 fix: previously only metrics lane was accounted) |
+| `ngx_otel.dropped_records` | Sum (monotonic) | `{record}` | Records from any signal (metrics, logs, spans) dropped because the per-signal retry buffer was full (oldest batch evicted) or a graceful-drain abort discarded queued batches (previously only the metrics lane was accounted) |
 | `ngx_otel.send_failures` | Sum (monotonic) | `{failure}` | Cumulative export send failures since worker startup |
 | `ngx_otel.bidi_backpressure_drops` | Sum (monotonic) | `{message}` | Bidi outbound messages dropped due to channel backpressure |
 | `ngx_otel.logs.access.dropped_records` | Sum (monotonic) | `{record}` | Access log records dropped because the per-worker ring was full |
 | `ngx_otel.logs.error.dropped_records` | Sum (monotonic) | `{record}` | Error log records dropped because the per-worker ring was full |
-| `ngx_otel.logs.error.coalesced_orphaned_records` | Sum (monotonic) | `{record}` | Coalesced error-log occurrences whose verbatim ring sample was dropped (ring full); a synthetic record is emitted for each orphaned slot so the occurrence count is preserved (F5 fix). Accumulated additively across drain cycles. |
+| `ngx_otel.logs.error.coalesced_orphaned_records` | Sum (monotonic) | `{record}` | Coalesced error-log occurrences whose verbatim ring sample was dropped (ring full); a synthetic record is emitted for each orphaned slot so the occurrence count is preserved. Accumulated additively across drain cycles. |
 | `ngx_otel.logs.send_failures` | Sum (monotonic) | `{failure}` | Cumulative logs transport send failures since exporter startup |
 | `ngx_otel.traces.dropped_records` | Sum (monotonic) | `{record}` | Span records dropped because the per-worker spans ring was full |
 | `ngx_otel.export_interval` | Gauge | `ms` | Configured metric export interval |
@@ -689,7 +713,7 @@ series per certificate per metric, distinguished by `file_path` /
 
 The certificate table is built **once per configuration cycle** — at startup
 and on every reload — by walking the live `SSL_CTX` of each `server` block at
-`postconfiguration` time (`src/cert_table.rs`, item C2). Between reloads the
+`postconfiguration` time (`src/cert_table.rs`). Between reloads the
 values are constant except `time_to_expiration`, which is recomputed against
 the wall clock each export interval.
 
@@ -714,7 +738,7 @@ expose.
 ## Collector-certificate gauge (`ngx_otel.tls.collector_cert.not_after`)
 
 One int64 Gauge for the TLS certificate the **collector** (OTLP endpoint)
-presents during the handshake (`src/transport/tls.rs`, B1). Emitted by the
+presents during the handshake (`src/transport/tls.rs`). Emitted by the
 exporter process every export interval once a successful TLS handshake has
 been completed.
 
