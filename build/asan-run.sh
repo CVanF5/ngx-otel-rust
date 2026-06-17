@@ -76,7 +76,7 @@ log "PROVENANCE: GIT_COMMIT=${GIT_COMMIT} DATE=${RUN_DATE}"
 # run_reload.sh.  Add it back via ASAN_SCRIPTS=... once the endpoint is sorted.
 # A0: run_c2_cert_walk.sh and run_c3_cert_metrics.sh added (FFI/X509 ownership
 # is exactly ASan territory — the C4 reviewer recommended it; A0 chore 1).
-ASAN_SCRIPTS="${ASAN_SCRIPTS:-run_grpc_export.sh run_grpc_bidi_smoke.sh run_dns_dualstack.sh run_reload.sh run_traces.sh run_access_log.sh run_c2_cert_walk.sh run_c3_cert_metrics.sh}"
+ASAN_SCRIPTS="${ASAN_SCRIPTS:-run_grpc_export.sh run_grpc_bidi_smoke.sh run_dns_dualstack.sh run_reload.sh run_traces.sh run_redirect_safe.sh run_access_log.sh run_c2_cert_walk.sh run_c3_cert_metrics.sh}"
 # Chaos scripts: run after the main loop with ASan-overhead-aware timeout overrides.
 # Set ASAN_CHAOS_SCRIPTS="" to skip chaos scripts (e.g. for a quick wake-path-only run).
 # FU4: run_b4_daemon_on_gen1.sh and run_b1_spsc_reload_chaos.sh added; both were

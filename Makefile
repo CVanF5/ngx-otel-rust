@@ -13,6 +13,7 @@ TESTS		?= tests/integration/run.sh \
 		   tests/integration/run_reload.sh \
 		   tests/integration/run_endpoint_change.sh \
 		   tests/integration/run_traces.sh \
+		   tests/integration/run_redirect_safe.sh \
 		   tests/integration/run_a3_tls_e2e.sh \
 		   tests/integration/run_b1_collector_cert_gauge.sh
 NGX_CARGO	?= cargo
