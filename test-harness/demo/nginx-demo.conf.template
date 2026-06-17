@@ -82,7 +82,17 @@ http {
     # for operator-selected requests. Tail records carry url.path / status /
     # method / client.address. (Metric exemplars are separate — they ride trace
     # sampling below, one uniformly-sampled trace pointer per data point per cycle.)
-    otel_log_export on;
+    #
+    # Pick WHICH requests get a tail LogRecord with `otel_log_export`, mirroring
+    # nginx's own `access_log ... if=`. Forms: `on` (every request) · `if=$var`
+    # (export when $var is truthy — non-empty and not "0") · `off`/omitted (no
+    # records — the privacy-safe default). Here we export ONLY error responses
+    # (HTTP status >= 400) by mapping $status to a truthy flag:
+    map $status $otel_export_tail {
+        default  "";      # 1xx/2xx/3xx → falsy → not exported
+        ~^[45]   1;       # 4xx and 5xx → truthy → exported
+    }
+    otel_log_export if=$otel_export_tail;
     # Per-worker logs ring capacity backing the exception tail (default 512k;
     # unused in the demo):
     #   otel_log_ring_size 512k;

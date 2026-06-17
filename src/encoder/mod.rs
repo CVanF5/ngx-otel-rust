@@ -455,7 +455,7 @@ mod tests {
             metrics: std::vec![Metric {
                 name: "http.server.request.duration".into(),
                 description: "HTTP server request duration".into(),
-                unit: "ms".into(),
+                unit: "us".into(),
                 data: MetricData::Histogram(HistogramData {
                     aggregation_temporality: AggregationTemporality::Cumulative,
                     data_points: std::vec![HistogramDataPoint {
@@ -504,7 +504,7 @@ mod tests {
         assert_eq!(sm.metrics.len(), 1);
         let m = &sm.metrics[0];
         assert_eq!(m.name, "http.server.request.duration");
-        assert_eq!(m.unit, "ms");
+        assert_eq!(m.unit, "us");
 
         // Histogram data point.
         let hist = match m.data.as_ref().expect("data present") {
@@ -663,7 +663,7 @@ mod tests {
             metrics: std::vec![Metric {
                 name: "http.server.request.duration".into(),
                 description: "test".into(),
-                unit: "ms".into(),
+                unit: "us".into(),
                 data: MetricData::ExponentialHistogram(ExponentialHistogramData {
                     aggregation_temporality: AggregationTemporality::Cumulative,
                     data_points: std::vec![dp],
