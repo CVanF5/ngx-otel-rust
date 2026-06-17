@@ -9,8 +9,10 @@
 //! [`HyperHttpTransport`] POSTs OTLP/HTTP protobuf bytes; [`GrpcTransport`]
 //! sends OTLP/gRPC unary over h2c. Each exposes an inherent `send` (metrics)
 //! plus a logs entry point; the export loop selects between them with the
-//! `ExportTransport` enum. Plaintext TCP or Unix sockets today; TLS is planned
-//! for both transports.
+//! `ExportTransport` enum. Both transports support TLS: HTTPS/mTLS for
+//! OTLP/HTTP, and gRPC over TLS via ALPN `h2` for OTLP/gRPC. Plaintext is also
+//! accepted (HTTP/1.1 or h2c over TCP); OTLP/HTTP additionally supports `unix:`
+//! socket endpoints.
 
 pub mod grpc;
 pub mod hyper_http;

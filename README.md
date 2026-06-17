@@ -20,18 +20,15 @@ process; pre-upstream-PR.**
 
 What this module emits:
 
-- **Metrics** (Phase 1, on by default): per-worker shared-memory counter
-  slots, written from a Log-phase handler with no allocations, no locks, and
-  no syscalls on the request path.  A dedicated `nginx: otel exporter` child
-  process owns the entire cold path: the async export loop runs hyper on
-  `ngx-rust`'s executor, with no Tokio runtime.  Workers hold zero collector
-  sockets.
+- **Metrics** (Phase 1, on by default): lock-free, syscall-free per-worker
+  counters on the request path; a dedicated exporter process aggregates and
+  exports once per window. See [Windowed aggregation](#windowed-aggregation-and-scaling-characteristics) for how this keeps cost bounded as load grows.
 - **Access logs + exemplars** (Phase 2, `otel_log_export on | if=<expr>`):
-  a thin exception-tail of full `LogRecord`s for operator-selected requests,
-  written into a per-worker single-producer ring on the request path.  Metric
-  exemplars are separate: they ride trace sampling (`otel_trace`), one
-  uniformly-sampled exemplar per data point per export cycle.  The bulk traffic
-  is represented by metrics; there is no per-request log.
+  a thin exception-tail of `LogRecord`s for operator-selected requests, plus
+  trace-linked metric exemplars on the trace-sampling path. The bulk of traffic
+  is represented by metrics; there is no per-request log. See
+  [Signals](#signals-what-this-module-emits) and `TELEMETRY_MODEL.md` for
+  the exemplar reservoir details.
 - **Error logs** (Phase 2, `otel_error_log`): coalesced error `LogRecord`s with
   a companion error-rate counter.
 - **Traces** (Phase 3, `otel_trace <expr>`): OTel server spans with W3C
@@ -68,7 +65,7 @@ follow them across services.
 - **Trace-linked exemplars.** Sampled requests carry a `trace_id` alongside their
   latency, so you pivot from a latency spike straight to a representative trace.
 - **Selectable logs.** Log export is opt-in — you decide which requests become log
-  records (*planned:* via an nginx `if=$condition` over status, latency, or anything).
+  records via an nginx `if=<expr>` over status, latency, or anything else.
   With nothing configured, no log records are emitted.
 - **Distributed traces.** OTel server spans with W3C `traceparent` propagation and
   per-location span naming and attributes.
@@ -163,7 +160,7 @@ never open a collector connection.
 
 A small control shared-memory zone carries a liveness heartbeat plus a
 flags word.  Workers load that flags word once per request — one `Relaxed`
-atomic read, the sole hot-path branch, reserved for Phase 5 dynamic
+atomic read, the sole hot-path branch, reserved for future dynamic
 reconfiguration.
 
 The `MetricSource` and `Encoder` trait boundaries, plus the
@@ -274,13 +271,17 @@ design proposal to integrate. In brief:
   histogram, recorded in microseconds, decomposed three ways — a base series
   keyed on method, status class, and protocol; a per-`http.route` series; and
   a per-`nginx.upstream.zone` series. Plus request, response, and upstream
-  byte and timing histograms; the nginx `stub_status` counters and gauges
-  (see note below); and a `ngx_otel.error_log.events` error-rate counter.
-  Cumulative temporality.
+  byte and timing histograms; the nginx `stub_status` series (see note below);
+  and a `ngx_otel.error_log.events` error-rate counter. Histograms and Sums
+  use cumulative temporality; Gauges (connection-state series, `export_interval`,
+  `exporter.restarts`, and the TLS certificate gauges) are instantaneous and
+  carry no temporality.
 - **Logs — access** (`otel_log_export on | if=<expr>`): metrics-primary, plus a
   **thin exception tail** of `LogRecord`s for operator-selected requests. Not a
   per-request log. Metric **exemplars** (trace-linked) are emitted separately on
-  the trace-sampling path (`otel_trace`), uniformly sampled per data point.
+  the trace-sampling path (`otel_trace`): up to two uniformly-sampled exemplars
+  per data point per export cycle (a small fixed reservoir, reset each cycle).
+  See `TELEMETRY_MODEL.md` for the full exemplar contract.
 - **Logs — error** (`otel_error_log [level]`): coalesced `nginx.error` `LogRecord`s
   (one sample + count per template) with a companion error-rate metric.
 - **Traces** (`otel_trace <expr>` per location): OTel server spans. W3C
@@ -291,9 +292,9 @@ design proposal to integrate. In brief:
   drill-down from a metric, through its exemplar, to the Tempo trace.
 - **Exporter self-metrics**: `ngx_otel.dropped_records`, `ngx_otel.send_failures`,
   `ngx_otel.logs.access.dropped_records`, `ngx_otel.logs.error.dropped_records`,
-  `ngx_otel.logs.send_failures`, `ngx_otel.traces.dropped_records`,
-  `ngx_otel.bidi_backpressure_drops`, `ngx_otel.export_interval`,
-  `ngx_otel.exporter.restarts`,
+  `ngx_otel.logs.error.coalesced_orphaned_records`, `ngx_otel.logs.send_failures`,
+  `ngx_otel.traces.dropped_records`, `ngx_otel.bidi_backpressure_drops`,
+  `ngx_otel.export_interval`, `ngx_otel.exporter.restarts`,
   `ngx_otel.delivery.permanent_rejected`, `ngx_otel.delivery.partial_rejected`,
   `ngx_otel.delivery.unauthorized`. See
   `TELEMETRY_MODEL.md` § "Exporter self-observability metrics".
@@ -466,6 +467,13 @@ Produces:
 >   `ngx_stat_*` symbols the module references are not present in that nginx.
 >   Build the module against headers from the same nginx you will load it into.
 
+> **`nginx.connections.accepted`, `nginx.connections.handled`, and
+> `nginx.requests.total` are emitted as single-bucket OTLP Histograms** (the
+> cumulative value appears in the `_sum` series, not as a Sum/counter
+> instrument). The connection-state series — `nginx.connections.active`,
+> `.reading`, `.writing`, `.waiting` — are real OTLP Gauges (instantaneous,
+> no `_count`/`_sum`).
+
 > **`--with-http_ssl_module` and the `ngx_otel.tls.certificate.*` metrics.**
 > The serving-certificate gauges (`not_after` / `not_before` /
 > `time_to_expiration`) require nginx built with `--with-http_ssl_module`
@@ -588,9 +596,9 @@ http {
 
 Notes:
 
-- The module imposes **zero per-request cost when `otel_exporter` is
-  not configured**.  Verified statistically via the zero-cost benchmark
-  harness (see `tests/bench/RESULTS.md`).
+- When `otel_exporter` is not configured the module is completely inert
+  (see the [zero-cost-when-disabled invariant](#architecture) and
+  `tests/bench/RESULTS.md`).
 - `endpoint` is the **base** URL.  For OTLP/HTTP the module appends
   `/v1/metrics`, `/v1/logs`, `/v1/traces` to the base automatically
   (OTel spec behaviour for `OTEL_EXPORTER_OTLP_ENDPOINT`).
@@ -689,27 +697,19 @@ export NGINX_SOURCE_DIR=/path/to/nginx \
        NGINX_BUILD_DIR=/path/to/nginx/objs
 bash tests/integration/run.sh                        # metrics arrive end-to-end (OTLP/HTTP)
 bash tests/integration/run_reload.sh                 # SIGHUP reload + counter-reset
-bash tests/integration/run_endpoint_change.sh        # endpoint change across reload
-bash tests/integration/run_grpc_smoke.sh             # unary gRPC viability
-bash tests/integration/run_grpc_bidi_smoke.sh        # bidi gRPC viability
-bash tests/integration/run_grpc_bidi_overload.sh     # bidi backpressure
 bash tests/integration/run_grpc_export.sh            # production OTLP/gRPC export path
-bash tests/integration/run_exporter_lifecycle.sh     # exporter process spawn/lifecycle
-bash tests/integration/run_exporter_crash_respawn.sh # exporter crash + respawn + dropped_records
-bash tests/integration/run_exporter_reload_overlap.sh # SIGHUP exporter overlap
-bash tests/integration/run_exporter_heartbeat.sh     # control-shm heartbeat (needs test-support)
 bash tests/integration/run_access_log.sh             # access exception tail + exemplars
 bash tests/integration/run_error_log.sh              # coalesced error log + rate metric
-bash tests/integration/run_dns_dualstack.sh          # DNS + IPv6 dual-stack transport
-bash tests/integration/run_signal_storm.sh           # error-writer re-entrancy under signals
 bash tests/bench/zero_cost.sh                        # zero-cost-when-disabled (~10 min)
 bash tests/bench/analyse.sh                          # re-derive tolerance check from JSON
 ```
 
+There are 36 `run_*.sh` scripts in `tests/integration/` covering reload, endpoint changes, gRPC variants, exporter lifecycle, crash-respawn, DNS/IPv6, TLS, signal handling, and more.
+Run any script directly with `bash tests/integration/run_<name>.sh`; see the `tests/integration/` directory for the full set.
+
 The bash integration scripts are due to be ported to Perl
-[`Test::Nginx`] in Phase B of the build-system migration (see
-[Project layout](#project-layout) below); after that `make test`
-will drive `prove -I $(NGINX_TESTS_DIR)/lib t/`.  The load-driver
+[`Test::Nginx`] (see [Project layout](#project-layout) below); after that
+`make test` will drive `prove -I $(NGINX_TESTS_DIR)/lib t/`.  The load-driver
 scripts (`tests/bench/*.sh`) stay bash — Test::Nginx isn't a good fit
 for `wrk`-driven benchmarks.
 
@@ -819,9 +819,16 @@ ngx-otel-rust/
 │   │                      # grpc/ (OTLP/gRPC unary production transport + bidi
 │   │                      # smoke harnesses on a runtime-less h2 executor)
 │   ├── exporter/          # dedicated "nginx: otel exporter" process: control_shm
-│   │                      # (flags + heartbeat), worker->exporter channel, supervisor
-│   └── export/            # export loop, graceful drain, retry buffer,
-│                          # SelfMetricsSource (9 self-metrics incl. exporter.restarts)
+│   │                      # (flags + heartbeat), worker->exporter channel
+│   ├── export/            # export loop, graceful drain, retry buffer,
+│   │                      # SelfMetricsSource (13 self-metrics incl. exporter.restarts)
+│   ├── traces/            # span instrumentation, W3C traceparent, sampling
+│   ├── logs/              # access and error log record assembly
+│   ├── processor/         # exporter-pipeline Processor (drain→process→encode; e.g. probe_drop span filter)
+│   ├── shim/              # C shims for nginx struct fields (bindgen workarounds)
+│   ├── cert_table.rs      # TLS certificate table (serving-cert + collector-cert gauges)
+│   ├── liveness.rs        # liveness helpers for the exporter process
+│   └── util.rs            # shared utilities
 ├── tests/
 │   ├── transport_integration.rs  # async transport integration test (test-support feature)
 │   ├── transport_errors.rs       # error-path coverage

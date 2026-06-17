@@ -49,7 +49,7 @@ log export is opt-in (privacy).
 | Feature | What it does | Status |
 |---|---|---|
 | Core + HTTP metrics | nginx connection/request gauges + per-request latency as an exponential histogram (µs) | Shipped |
-| Trace-linked metric exemplars | a `trace_id`/`span_id` pointer on the duration histogram (no other attributes), uniformly sampled, one per data point per export cycle, reset each cycle, on trace-sampled requests (`otel_trace`) — the metric → trace drill-down | Shipped |
+| Trace-linked metric exemplars | a `trace_id`/`span_id` pointer on the duration histogram (no other attributes), uniformly sampled, up to two per data point per export cycle (small fixed reservoir, reset each cycle), on trace-sampled requests (`otel_trace`) — the metric → trace drill-down | Shipped |
 | Distributed traces | one OTel server span per request; W3C `traceparent` propagation (`otel_trace`) | Shipped |
 | **Logs: nothing exported by default** | no request-level log data leaves nginx unless configured (privacy) | Shipped |
 | Access exception-tail logs (operator-selectable) | full `LogRecord`s for the requests an operator selects — `otel_log_export on \| if=<expr>` chooses *which* requests (status, latency, any nginx condition); nothing hardcoded, off by default | Shipped |
