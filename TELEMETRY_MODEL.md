@@ -29,8 +29,10 @@ encoding — instead of repeating the full string on every data point. To stay i
 that budget, genuinely open-ended detail is kept off the metrics entirely: the
 request path (`url.path`), the client address (`client.address`), the User-Agent
 string (`user_agent.original`), and the upstream peer address are never used as a
-metric attribute. That detail rides instead on exemplars, on the access-log
-exception tail, or in error-record bodies. Transport is OTLP (HTTP or
+metric attribute. That detail rides instead on the access-log exception tail, in
+error-record bodies, and — for `url.path` — on the per-request span. The metric
+exemplars themselves do **not** carry it: an exemplar holds only a `trace_id` /
+`span_id` pointer, and you reach the detail by following that pointer into the trace. Transport is OTLP (HTTP or
 gRPC, `otel_export_protocol`) from the dedicated `nginx: otel exporter` process.
 Both transports support `https://` (TLS; configured via `ssl_certificate`,
 `ssl_certificate_key`, `ssl_verify`, and `trusted_certificate` inside
@@ -304,9 +306,11 @@ Rust enums in `src/shm.rs` (`HttpMethod`, `StatusClass`, `ProtoVersion`).
 
 > **High-cardinality detail is NOT a metric dimension.** `url.path`,
 > `user_agent.original`, and `client.address` are deliberately kept **off** the
-> metrics. They ride on **access-log exemplars + the exception tail**, reachable
-> via the exemplar → trace drill-down, never as histogram attributes (that would
-> blow the small fixed-value-set budget described in Conventions at the top).
+> metrics. They ride on the **access-log exception tail** (and `url.path` is also a
+> span attribute), reachable from a metric by following an exemplar's `trace_id`
+> pointer into the trace — the exemplar itself carries only that pointer, not these
+> values. They are never histogram attributes (that would blow the small
+> fixed-value-set budget described in Conventions at the top).
 
 ## Histogram bucket boundaries (`src/shm.rs`)
 
@@ -528,13 +532,16 @@ Standard OTel HTTP semconv attributes recorded on every span:
 | Attribute | Value | Source |
 |---|---|---|
 | `http.request.method` | HTTP method string | `r->method_name` |
-| `url.path` | request URI path (≤ `MAX_SPAN_URL_PATH` bytes) | `r->uri` |
+| `url.path` | request URI path (≤ 64 bytes, `MAX_URL_PATH`) | `r->uri` |
 | `http.response.status_code` | raw status code | `r->headers_out.status` |
 | `http.server.request.duration` | request duration **in seconds** (derived from µs measurement; same field, same unit as the access-tail LogRecord — enables coherent metric→exemplar→log→trace drill-down) | `src/traces/mod.rs` |
-| `http.route` | matched location name | `clcf->name` via `route_from_location` |
-| `network.protocol.version` | `"1.0"` / `"1.1"` / `"2.0"` / `"3.0"` | `r->http_version` |
-| `user_agent.original` | User-Agent header value (≤ `MAX_SPAN_USER_AGENT` bytes) | `headers_in.user_agent` |
 | Custom attrs | from `otel_span_attr` directives | `src/metric_source/location_conf.rs` |
+
+> **Not recorded as span attributes:** `http.route` (the matched location name
+> appears in the span *name* `"METHOD route_name"`, and as `http.route` on the
+> `by_route` *metric* — but it is not a span attribute), `network.protocol.version`,
+> and `user_agent.original` / `client.address` (these ride on the access-tail
+> `LogRecord`). Add any of them to the span per location with `otel_span_attr`.
 
 ### Sampling
 
