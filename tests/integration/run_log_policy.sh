@@ -99,16 +99,16 @@ info "module: ${MODULE_PATH}"
 ensure_collector_running || exit 1
 
 # ─── Clean up any leftover nginx from prior interrupted runs ─────────────────
+# Kill every process that holds our test ports (master + workers share the
+# listen socket, so all must exit before the port can be reused).
 for port in 9114 9115 9116; do
-    if command -v ss >/dev/null 2>&1; then
-        pid=$(ss -tlnp 2>/dev/null | grep ":${port} " | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2 || true)
-    else
-        pid=""
-    fi
-    if [[ -n "${pid:-}" ]]; then
-        info "Killing leftover nginx on port ${port} (PID ${pid})..."
-        kill "${pid}" 2>/dev/null || true
-        # Wait up to 5 s for the port to be released before continuing.
+    if ! command -v ss >/dev/null 2>&1; then continue; fi
+    # Extract all PIDs listening on the port, not just the first.
+    pids=$(ss -tlnp 2>/dev/null | grep ":${port} " | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u || true)
+    if [[ -n "${pids}" ]]; then
+        info "Killing leftover processes on port ${port}: ${pids}..."
+        echo "${pids}" | xargs -r kill 2>/dev/null || true
+        # Wait up to 5 s for the port to be released.
         for _w in 1 2 3 4 5; do
             if ! ss -tlnp 2>/dev/null | grep -q ":${port} "; then break; fi
             sleep 1 || true
@@ -126,11 +126,14 @@ start_nginx_scenario() {
     local prefix="$1" conf="$2" port="$3"
     "${NGINX_BINARY}" -p "${prefix}" -c "${conf}" &
     SCENARIO_PID=$!
-    # Wait up to 3 s for nginx to open the listen socket.
+    # Wait up to 3 s for the master to open the listen socket and stay alive.
     local ready=0
     for _s in 1 2 3; do
         sleep 1 || true
-        if command -v ss >/dev/null 2>&1 && ss -tlnp 2>/dev/null | grep -q ":${port} "; then
+        # Both conditions must hold: the process is alive AND it owns the port.
+        if kill -0 "${SCENARIO_PID}" 2>/dev/null && \
+           command -v ss >/dev/null 2>&1 && \
+           ss -tlnp 2>/dev/null | grep ":${port} " | grep -q "pid=${SCENARIO_PID}"; then
             ready=1; break
         fi
     done
@@ -140,7 +143,7 @@ start_nginx_scenario() {
         exit 1
     fi
     if [[ "${ready}" -eq 0 ]]; then
-        echo "ERROR: nginx did not open port ${port} within 3 s. Check ${prefix}/logs/error.log" >&2
+        echo "ERROR: nginx master (PID ${SCENARIO_PID}) did not open port ${port} within 3 s. Check ${prefix}/logs/error.log" >&2
         tail -30 "${prefix}/logs/error.log" >&2
         exit 1
     fi
