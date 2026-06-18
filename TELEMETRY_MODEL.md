@@ -824,13 +824,34 @@ the nginx serving certificates.
 A reference Grafana dashboard is committed at
 `test-harness/demo/grafana/dashboards/ngx-otel-rust-overview.json`. It covers the
 emitted surface: request rate / latency by method · status-class · route
-(`by_route`, topk) · upstream zone (`by_upstream`); body-size and upstream-timing
+(`nginx.http.request.duration.by_route`, topk) · upstream zone
+(`nginx.http.request.duration.by_upstream`); body-size and upstream-timing
 quantiles (explicit-bucket); nginx `stub_status`; the exporter self-metrics; an
 error-rate panel (`ngx_otel.error_log.events`); a serving-certificate expiry table
 (`ngx_otel.tls.certificate.time_to_expiration`, 30d/7d thresholds); a Loki panel
 for 4xx/5xx access logs;
 and the exemplar → Tempo trace pivot (`exemplarTraceIdDestinations` on the Tempo
 datasource) for the metric → exemplar → trace → log drill-down.
+
+Dashboard query conventions (matching the wire changes in this module version):
+
+- **Counter queries** use the plain series names `nginx_requests_total`,
+  `nginx_connections_accepted`, `nginx_connections_handled` (real OTLP Sum
+  instruments — no `_sum` suffix).
+- **Duration panels** display values in **seconds** (`s` unit). A 150µs request
+  reads 0.00015 in the panel; Grafana renders it as e.g. `150µs` automatically.
+  No `/1000` scaling in any query.
+- **Status-class breakdowns** use the label `http_response_status_class` with
+  string values `1xx`…`5xx`. Color overrides are keyed on `"2xx"`, `"3xx"`, etc.
+- **Tier-2 series** use `nginx_http_request_duration_by_route`,
+  `nginx_http_request_duration_by_upstream`, `nginx_upstream_response_duration`,
+  `nginx_upstream_header_duration`, `nginx_upstream_connect_duration`,
+  `nginx_upstream_bytes_received`, `nginx_upstream_bytes_sent`.
+- **Export interval** is queried as `ngx_otel_export_interval` directly (native
+  seconds — no division).
+- **TLS cert table** column transforms reference the namespaced attribute labels
+  `tls_server_certificate_file_path`, `tls_server_certificate_serial_number`,
+  `tls_server_certificate_public_key_algorithm`.
 
 ## References
 
