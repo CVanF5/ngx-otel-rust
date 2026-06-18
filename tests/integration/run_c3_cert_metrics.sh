@@ -233,7 +233,7 @@ assert_exact_point() {
         ".resourceMetrics[].scopeMetrics[].metrics[]
          | select(.name == \$m)
          | .gauge.dataPoints[]
-         | select(any(.attributes[]; .key == \"file_path\" and .value.stringValue == \$p))
+         | select(any(.attributes[]; .key == \"tls.server.certificate.file_path\" and .value.stringValue == \$p))
          | .asInt" "${DELTA1}" | sort -u)"
     [[ "${got}" == "${expected}" ]] \
         || fail "${label}: expected ${metric}=${expected} for ${path}, got '${got}'"
@@ -249,7 +249,7 @@ TTE_A="$(jq -r --arg p "${CERTS}/a.crt" \
     ".resourceMetrics[].scopeMetrics[].metrics[]
      | select(.name == \"ngx_otel.tls.certificate.time_to_expiration\")
      | .gauge.dataPoints[]
-     | select(any(.attributes[]; .key == \"file_path\" and .value.stringValue == \$p))
+     | select(any(.attributes[]; .key == \"tls.server.certificate.file_path\" and .value.stringValue == \$p))
      | .asInt" "${DELTA1}" | tail -1)"
 [[ -n "${TTE_A}" ]] || fail "(2) no time_to_expiration point for a.crt"
 EXPECTED_TTE=$(( EXP_A - NOW_1 ))
@@ -273,7 +273,7 @@ done
 pass "(3) dual RSA+ECDSA block: 2 series per metric in a single flush"
 
 # (4) attribute set EXACTLY the 7 allowed keys on EVERY cert-metric point.
-ALLOWED='["file_path","public_key_algorithm","serial_number","server.address","signature_algorithm","tls.server.issuer","tls.server.subject"]'
+ALLOWED='["server.address","tls.server.certificate.file_path","tls.server.certificate.public_key_algorithm","tls.server.certificate.serial_number","tls.server.certificate.signature_algorithm","tls.server.issuer","tls.server.subject"]'
 BAD_SETS="$(jq -c --argjson allowed "${ALLOWED}" \
     "[${CERT_METRICS_JQ} | .gauge.dataPoints[] | [.attributes[].key] | sort | select(. != \$allowed)] | unique" \
     "${DELTA1}" | sort -u | grep -v '^\[\]$' || true)"
@@ -313,7 +313,7 @@ NOT_AFTER_VALUES="$(jq -r --arg p "${CERTS}/a.crt" \
     ".resourceMetrics[].scopeMetrics[].metrics[]
      | select(.name == \"ngx_otel.tls.certificate.not_after\")
      | .gauge.dataPoints[]
-     | select(any(.attributes[]; .key == \"file_path\" and .value.stringValue == \$p))
+     | select(any(.attributes[]; .key == \"tls.server.certificate.file_path\" and .value.stringValue == \$p))
      | .asInt" "${DELTA2}" | sort -u)"
 grep -qx "${EXP_SWAPPED}" <<< "${NOT_AFTER_VALUES}" \
     || fail "(6) after reload expected not_after=${EXP_SWAPPED} for a.crt; distinct values: $(tr '\n' ' ' <<< "${NOT_AFTER_VALUES}")"
@@ -321,7 +321,7 @@ SWAPPED_CNS="$(jq -r --arg p "${CERTS}/a.crt" \
     ".resourceMetrics[].scopeMetrics[].metrics[]
      | select(.name == \"ngx_otel.tls.certificate.not_after\")
      | .gauge.dataPoints[]
-     | select(any(.attributes[]; .key == \"file_path\" and .value.stringValue == \$p))
+     | select(any(.attributes[]; .key == \"tls.server.certificate.file_path\" and .value.stringValue == \$p))
      | .attributes[] | select(.key == \"tls.server.subject\").value.stringValue" \
     "${DELTA2}" | sort -u)"
 grep -qx "cert-a2.example.test" <<< "${SWAPPED_CNS}" \
@@ -332,7 +332,7 @@ jq -e --arg p "${CERTS}/a.crt" --arg exp "${EXP_SWAPPED}" \
     "[.resourceMetrics[].scopeMetrics[].metrics[]
       | select(.name == \"ngx_otel.tls.certificate.not_after\")
       | .gauge.dataPoints[]
-      | select(any(.attributes[]; .key == \"file_path\" and .value.stringValue == \$p))
+      | select(any(.attributes[]; .key == \"tls.server.certificate.file_path\" and .value.stringValue == \$p))
       | select(.asInt == \$exp)
       | select(any(.attributes[]; .key == \"tls.server.subject\" and .value.stringValue == \"cert-a2.example.test\"))
      ] | length > 0" "${DELTA2}" >/dev/null \
