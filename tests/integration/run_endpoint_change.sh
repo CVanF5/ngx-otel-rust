@@ -308,7 +308,7 @@ fi
 #    post-failure counter values never land in metrics.json.  Counter
 #    advancement evidence is provided by assertion 2 (≥ 2 send-failure log
 #    lines, each corresponding to one in-memory counter increment).
-if echo "${CONTENT_A}" | grep -Eq '"ngx_otel\.send_failures"[^{]*\{[^}]*"asInt":"0"'; then
+if echo "${CONTENT_A}" | grep -Eq '"ngx_otel\.send_failures","description":"[^"]*","unit":"[^"]*","sum":\{"dataPoints":\[\{[^}]*"asInt":"0"'; then
     pass "metrics.json: ngx_otel.send_failures present in phase-A with asInt=0 (initial value correct)"
 else
     fail "metrics.json: ngx_otel.send_failures missing or has non-zero value in phase-A content.
