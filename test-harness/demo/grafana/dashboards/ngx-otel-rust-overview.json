@@ -454,11 +454,11 @@
                   },
                   {
                     "color": "yellow",
-                    "value": 0.05
+                    "value": 5e-05
                   },
                   {
                     "color": "red",
-                    "value": 0.25
+                    "value": 0.00025
                   }
                 ]
               },
@@ -999,11 +999,11 @@
                   },
                   {
                     "color": "yellow",
-                    "value": 0.05
+                    "value": 5e-05
                   },
                   {
                     "color": "red",
-                    "value": 0.25
+                    "value": 0.00025
                   }
                 ]
               },
@@ -1065,11 +1065,11 @@
                   },
                   {
                     "color": "yellow",
-                    "value": 0.05
+                    "value": 5e-05
                   },
                   {
                     "color": "red",
-                    "value": 0.25
+                    "value": 0.00025
                   }
                 ]
               },
