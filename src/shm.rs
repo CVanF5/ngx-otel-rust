@@ -415,7 +415,7 @@ impl StatusClass {
     /// OTel attribute integer value for this status class.
     ///
     /// Retained for completeness; the exported metric attribute uses
-    /// `as_str()` with key `http.response.status_class` instead (F6).
+    /// `as_str()` with key `http.response.status_class` instead.
     #[allow(dead_code)]
     #[inline]
     pub fn representative_status(self) -> i64 {
@@ -635,15 +635,15 @@ pub struct WorkerSlots {
     pub request_body_bytes: Histogram<N_BYTES_BUCKETS>,
     /// `http.server.response.body.size` (bytes)
     pub response_body_bytes: Histogram<N_BYTES_BUCKETS>,
-    /// `http.server.upstream.response.duration` (ms)
+    /// `nginx.upstream.response.duration` (ms)
     pub upstream_response_ms: Histogram<N_DURATION_BUCKETS>,
-    /// `http.server.upstream.header.duration` (ms)
+    /// `nginx.upstream.header.duration` (ms)
     pub upstream_header_ms: Histogram<N_DURATION_BUCKETS>,
-    /// `http.server.upstream.connect.duration` (ms)
+    /// `nginx.upstream.connect.duration` (ms)
     pub upstream_connect_ms: Histogram<N_DURATION_BUCKETS>,
-    /// `http.server.upstream.bytes.received` (bytes)
+    /// `nginx.upstream.bytes.received` (bytes)
     pub upstream_bytes_received: Histogram<N_BYTES_BUCKETS>,
-    /// `http.server.upstream.bytes.sent` (bytes)
+    /// `nginx.upstream.bytes.sent` (bytes)
     pub upstream_bytes_sent: Histogram<N_BYTES_BUCKETS>,
     /// Per-data-point exemplar reservoirs — one small reservoir per base
     /// `combo_idx` (`request_duration_combos` data point).  Each reservoir holds

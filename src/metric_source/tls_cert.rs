@@ -113,7 +113,7 @@ impl ServingCertSource<'_> {
 /// `tls.server.certificate.signature_algorithm`, `server.address`.
 /// Nothing else: no PEM, no keys, no fingerprints, no full DNs, no SANs, no key_bits.
 ///
-/// F11: bare keys `file_path`, `serial_number`, `public_key_algorithm`,
+/// Bare keys `file_path`, `serial_number`, `public_key_algorithm`,
 /// `signature_algorithm` are now namespaced under `tls.server.certificate.*`
 /// for consistency with the already-namespaced `tls.server.subject` /
 /// `tls.server.issuer` attributes.
@@ -165,7 +165,7 @@ mod tests {
 
     /// The seven scope-guard attribute keys, in emission order.
     ///
-    /// F11: bare keys are now namespaced under `tls.server.certificate.*`
+    /// Bare keys are now namespaced under `tls.server.certificate.*`
     /// for consistency with `tls.server.subject` / `tls.server.issuer`.
     const ALLOWED_KEYS: [&str; 7] = [
         "tls.server.certificate.file_path",

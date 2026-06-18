@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # tests/integration/run_metrics_wire.sh — wire-shape assertions for the
-# metrics-correctness changes (Items 1–3).
+# metrics OTel-correctness changes.
 #
 # Builds the module (production path), starts nginx, drives HTTP traffic, waits
 # for a metric flush, then asserts against the collector's metrics.json that the
@@ -249,7 +249,7 @@ trap cleanup_assert EXIT
 cat > "${ASSERT_SCRIPT}" <<'PYEOF'
 #!/usr/bin/env python3
 """
-Wire-shape assertions for metrics-correctness changes.
+Wire-shape assertions for metrics OTel-correctness changes.
 
 Reads NDJSON from stdin (one ResourceMetrics JSON object per line).
 Checks:

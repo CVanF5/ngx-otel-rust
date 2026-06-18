@@ -363,7 +363,7 @@ fn shutdown_requested() -> bool {
 /// [`MetricSource`] that exposes the export loop's own health as OTel metrics.
 pub struct SelfMetricsSource {
     /// Configured export interval in milliseconds.  Emitted as a Gauge in
-    /// **seconds** (`"s"`) — F5: OTel convention is to bake the unit into the
+    /// **seconds** (`"s"`) — OTel convention is to bake the unit into the
     /// unit field, not into the metric name.  The name `ngx_otel.export_interval`
     /// is unchanged; the value is `interval_ms / 1000` (integer seconds, rounded
     /// down; sub-second intervals are uncommon in practice).
@@ -381,7 +381,7 @@ impl MetricSource for SelfMetricsSource {
         let now = crate::util::now_unix_nano();
         let dropped = DROPPED_RECORDS.load(Ordering::Acquire) as i64;
         let failures = SEND_FAILURES.load(Ordering::Acquire) as i64;
-        // F5: emit in seconds (unit "s"), not ms.  The name stays
+        // Emit in seconds (unit "s"), not ms.  The name stays
         // `ngx_otel.export_interval` — OTel convention is to NOT bake units
         // into metric names; the unit field carries the information instead.
         let interval_s = (self.interval_ms / 1000) as i64;

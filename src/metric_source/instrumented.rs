@@ -949,7 +949,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                             .filter(|(cidx, _)| *cidx == combo as u32)
                             .map(|(_, e)| e.clone())
                             .collect();
-                        // F6: use the honest key `http.response.status_class` with a
+                        // Use the honest key `http.response.status_class` with a
                         // self-describing string value ("2xx", etc.).  semconv reserves
                         // `http.response.status_code` for the actual integer code; emitting
                         // a class representative (200/400/500…) there was misleading.
@@ -1034,7 +1034,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                     data_points.push(dp);
                 }
             }
-            // F2/F9: moved out of the `http.server.*` semconv namespace to
+            // Moved out of the `http.server.*` semconv namespace to
             // `nginx.*` — this is a Tier-2 nginx-specific metric, not semconv.
             Metric {
                 name: "nginx.http.request.duration.by_route".into(),
@@ -1063,7 +1063,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                     data_points.push(dp);
                 }
             }
-            // F2/F9: moved out of the `http.server.*` semconv namespace to
+            // Moved out of the `http.server.*` semconv namespace to
             // `nginx.*` — Tier-2 nginx-specific metric.
             Metric {
                 name: "nginx.http.request.duration.by_upstream".into(),
@@ -1102,8 +1102,8 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                 AggregationTemporality::Cumulative,
             ),
             // ── upstream timings ─────────────────────────────────────────
-            // F2/F9: renamed from `http.server.upstream.*` to `nginx.upstream.*`
-            // (Tier-2; not semconv).  F4: published in seconds (`"s"`); the worker
+            // Renamed from `http.server.upstream.*` to `nginx.upstream.*`
+            // (Tier-2; not semconv).  Published in seconds (`"s"`); the worker
             // records raw ms values against DURATION_BOUNDS_MS, so the bucket
             // placement is unchanged — only the bounds (DURATION_BOUNDS_S) and
             // the scalar sum (÷1000) change at export.
@@ -1140,7 +1140,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                 now,
                 AggregationTemporality::Cumulative,
             ),
-            // F2/F9: renamed from `http.server.upstream.bytes.*` to `nginx.upstream.bytes.*`.
+            // Renamed from `http.server.upstream.bytes.*` to `nginx.upstream.bytes.*`.
             // Unit stays `By`.
             hist_metric(
                 "nginx.upstream.bytes.received",
@@ -1169,7 +1169,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
 // ─── helpers ────────────────────────────────────────────────────────────────
 
 /// Convert a millisecond-summed explicit histogram data tuple for export as a
-/// **seconds** histogram (F4: `nginx.upstream.*.duration`).
+/// **seconds** histogram (`nginx.upstream.*.duration`).
 ///
 /// The worker accumulates upstream timing sums in raw ms.  This helper divides
 /// the scalar sum by `1000.0` (f64) so `hist_metric` publishes the sum in
@@ -1664,7 +1664,7 @@ mod tests {
         assert_eq!(super::us_to_seconds(1500), 0.0015, "summed µs convert losslessly");
     }
 
-    /// F6 — `http.server.request.duration` must emit `http.response.status_class`
+    /// `http.server.request.duration` must emit `http.response.status_class`
     /// with a self-describing string value (`"5xx"` for a 503), NOT the old
     /// `http.response.status_code` integer representative (500).
     ///
@@ -1749,7 +1749,7 @@ mod tests {
         }
     }
 
-    /// F2/F9 — the decomposed duration metrics must use the `nginx.*` namespace
+    /// The decomposed duration metrics must use the `nginx.*` namespace
     /// (Tier 2); the old `http.server.*` names must not be emitted.
     ///
     /// Mutation check: reverting the metric names in `instrumented.rs` back to
@@ -1836,7 +1836,7 @@ mod tests {
         );
     }
 
-    /// F4 — upstream duration metrics must emit unit `"s"` and the scalar sum
+    /// Upstream duration metrics must emit unit `"s"` and the scalar sum
     /// must be in seconds (ms sum ÷ 1000.0), not raw milliseconds.
     ///
     /// Regression: a 5ms upstream response time must surface as `0.005 s`, not `5`.
@@ -1923,7 +1923,7 @@ mod tests {
         );
     }
 
-    /// F5 — `ngx_otel.export_interval` must emit unit `"s"`, and the value for
+    /// `ngx_otel.export_interval` must emit unit `"s"`, and the value for
     /// a 10,000ms interval must be 10 (seconds), not 10,000.
     ///
     /// Mutation check: reverting unit `"s"` → `"ms"` and the `/ 1000` in
@@ -1963,7 +1963,7 @@ mod tests {
         );
     }
 
-    /// F11 — TLS cert attribute keys must be namespaced under `tls.server.certificate.*`.
+    /// TLS cert attribute keys must be namespaced under `tls.server.certificate.*`.
     ///
     /// Mutation check: reverting the keys back to bare `file_path`, `serial_number`, etc.
     /// makes the `assert_eq!(key, "tls.server.certificate.file_path", ...)` assertion fail.
