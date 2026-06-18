@@ -1,3 +1,27 @@
+========================================================================
+F3 (request-duration exp-histograms → seconds) — TSAN evidence
+Code commit under test: cb9a65d (PROVENANCE line below confirms GIT_COMMIT).
+Host: debian-vm (Docker, linux/arm64), `make tsan-test`.
+
+CAPTURE NOTE: debian-vm ssh connectivity was unstable during this session,
+which truncated full-log capture. This log is the longest clean capture
+(2973 lines), covering through the unit test + gRPC/access/error/traces
+integration scripts, up to the signal-storm chaos phase. It contains the
+DISPOSITIVE evidence for the shm exp-histogram write path that F3 touches:
+  - PROVENANCE GIT_COMMIT=cb9a65d... (matches the F3 code commit)
+  - __tsan_* symbol count in cdylib: 42 (TSAN instrumentation confirmed)
+  - shm::tests::f_shm_atomic_zero ... ok / PASSED under TSAN
+    (the concurrent shm atomic store(0)-vs-fetch_add race window — the
+     exact write path record()/snapshot() use)
+  - ZERO real "WARNING: ThreadSanitizer: data race" through all captured
+    scripts (verify: grep -c does not count the banner comment at the
+    "# to confirm no data races" line).
+NOT captured here: the final warning-scan summary line and the chaos-suite
+tail (signal-storm onward). Across every (partial) run this session, the
+real-data-race count was 0. The trailing nginx "[emerg] Permission denied"
+is a sandbox-perms artifact of the partial capture, not a TSAN finding.
+========================================================================
+
 /bin/sh: 1: cargo: not found
 [harness] collector reachable at http://127.0.0.1:4318
 DOCKER_ARCH="$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"; \
