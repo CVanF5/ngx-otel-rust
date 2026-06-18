@@ -869,7 +869,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                     all_exemplars.push((
                         snap.combo_idx,
                         Exemplar {
-                            // F3: exemplars attach to the seconds histogram; the
+                            // Exemplars attach to the seconds histogram; the
                             // reservoir stores raw µs, so convert to seconds here
                             // (one divide per exemplar at export — same lossless
                             // convert-at-export pattern as the histogram sum).
@@ -916,7 +916,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                 start_time_unix_nano: start,
                 time_unix_nano: now,
                 count: bcount,
-                // F3: the histogram is published in seconds.  The worker buckets
+                // The histogram is published in seconds.  The worker buckets
                 // seconds directly (shm::ExpHistogramSlot) but accumulates the
                 // sum in raw µs; convert the scalar sum to seconds here — one
                 // lossless divide per series at export (same convert-at-export
@@ -998,7 +998,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                         start_time_unix_nano: start,
                         time_unix_nano: now,
                         count: all_count,
-                        // F3: convert the raw-µs sum to seconds at export (see make_dp).
+                        // Convert the raw-µs sum to seconds at export (see make_dp).
                         sum: us_to_seconds(all_sum),
                         scale: EXP_HISTOGRAM_SCALE,
                         zero_count: all_zero,
@@ -1576,7 +1576,7 @@ mod tests {
         assert_eq!(s2xx_count, 1, "status-200 request must be recorded into S2xx combo");
     }
 
-    /// F3: the request-duration exp-histogram scalar `sum` and exemplar `value`
+    /// The request-duration exp-histogram scalar `sum` and exemplar `value`
     /// are published in **seconds** — the worker accumulates raw µs, and the
     /// exporter divides by 1e6 once.  A 150µs observation must surface as
     /// `0.00015 s`, NOT `150`.  (Reverting the `/ 1_000_000.0` in

@@ -1878,8 +1878,8 @@ mod tests {
     /// exceed the array clamp to the overflow bucket `N_EXP_BUCKETS − 1`.
     ///
     /// This is the proof that the integer boundary-table construction is
-    /// spec-exact at ALL boundaries (the point a naïve `floor` scheme fails — see
-    /// the `floor`-fails-at-15625 mutation note in the change brief).
+    /// spec-exact at ALL boundaries — the point a naïve `floor` scheme fails: it
+    /// mis-buckets the 15625-µs boundary, the lowest integer-µs seconds-octave edge.
     #[test]
     fn exp_histogram_seconds_bucket_exact() {
         let offset = EXP_HISTOGRAM_BUCKET_OFFSET as i64;
