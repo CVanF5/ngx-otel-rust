@@ -1,0 +1,7 @@
+Whole-range gate ASan evidence — metrics-correctness
+Host: debian-vm (Linux arm64).  Date: 2026-06-18.  GIT_COMMIT=86a3b0a3e32a1f814310f7cd8e7c5ec57d0823f5
+VERDICT: ASan gate = PASS (zero AddressSanitizer reports; exit 0). Re-run after the run_c3_cert_metrics.sh attribute-key fix.
+==========================================================================
+[asan-run] Step 3.5: OK — 142 __asan_* symbols confirmed in libngx_http_otel_module.so.
+[asan-run] Zero AddressSanitizer reports across: run_grpc_export.sh run_grpc_bidi_smoke.sh run_dns_dualstack.sh run_reload.sh run_traces.sh run_redirect_safe.sh run_access_log.sh run_c2_cert_walk.sh run_c3_cert_metrics.sh run_chaos_kill9.sh run_chaos_crashloop.sh run_chaos_dead_collector.sh run_b4_daemon_on_gen1.sh run_b1_spsc_reload_chaos.sh run_chaos_quit_responsiveness.sh
+[asan-run] ASan gate: PASS (no use-after-free / heap error on the exercised wake paths).
