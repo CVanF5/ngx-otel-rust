@@ -166,22 +166,28 @@ series carrying the bounded `{method × status-class × protocol}` dimensions, p
 independent per-route and per-upstream series. Each is its own `ExpHistogramSlot`
 table in `WorkerSlots` (`src/shm.rs`).
 
-| Metric | Instrument | Unit | Temporality | Attributes (data-point keys) |
-|---|---|---|---|---|
-| `http.server.request.duration` | ExponentialHistogram | `s` | Cumulative | `http.request.method`, `http.response.status_code`, `network.protocol.version` — **only when `otel_metric_status_code_class on`**; otherwise a single unattributed data point |
-| `http.server.request.duration.by_route` | ExponentialHistogram | `s` | Cumulative | `http.route` (matched `location` name) |
-| `http.server.request.duration.by_upstream` | ExponentialHistogram | `s` | Cumulative | `nginx.upstream.zone` (declared upstream `zone`) |
+The duration surface is split into two tiers: a standard semconv-conformant Tier 1 base
+metric, and Tier 2 nginx-specific breakdown metrics that use the `nginx.*` namespace
+to avoid squatting on the `http.server.*` semconv namespace.
+
+| Metric | Tier | Instrument | Unit | Temporality | Attributes (data-point keys) |
+|---|---|---|---|---|---|
+| `http.server.request.duration` | 1 (semconv) | ExponentialHistogram | `s` | Cumulative | `http.request.method`, `http.response.status_class`, `network.protocol.version` — **only when `otel_metric_status_code_class on`**; otherwise a single unattributed data point |
+| `nginx.http.request.duration.by_route` | 2 (nginx) | ExponentialHistogram | `s` | Cumulative | `http.route` (matched `location` name) |
+| `nginx.http.request.duration.by_upstream` | 2 (nginx) | ExponentialHistogram | `s` | Cumulative | `nginx.upstream.zone` (declared upstream `zone`) |
 
 - The base series emits up to **160** data points (`N_HTTP_METHODS(8) ×
   N_STATUS_CLASSES(5) × N_PROTO_VERSIONS(4)`); empty combos are skipped.
-  `http.response.status_code` carries the **status-class representative**
-  (100/200/300/400/500), not the raw code — grouping into classes keeps the number
-  of distinct values small (5, instead of hundreds of raw status codes).
-- `by_route` / `by_upstream` are **always** emitted (independent of
+  `http.response.status_class` carries a self-describing string value
+  (`"1xx"`, `"2xx"`, `"3xx"`, `"4xx"`, `"5xx"`) — grouping into classes keeps the
+  number of distinct values small (5), and the key `http.response.status_class` is
+  distinct from `http.response.status_code` (which semconv reserves for the actual
+  integer code).
+- The Tier-2 `nginx.*` metrics are **always** emitted (independent of
   `otel_metric_status_code_class`). Route names are the matched `location`
   name (never the raw URI), bounded `ROUTE_CAP = 64` + an `"other"` slot;
   upstream zones are bounded `UPSTREAM_CAP = 32` + `"other"` / no-upstream.
-- **SIGHUP reload behaviour:** `by_route` and `by_upstream` histogram
+- **SIGHUP reload behaviour:** `nginx.http.request.duration.by_route` and `nginx.http.request.duration.by_upstream` histogram
   slots are **zeroed on every reload** (`otel_shm_zone_init`, `shm.rs`).
   The slot→name mapping is rebuilt from the new config on each reload
   (new `ngx_http_core_loc_conf_t*` / `ngx_shm_zone_t*` values; any location
@@ -200,16 +206,17 @@ table in `WorkerSlots` (`src/shm.rs`).
   is CONDITIONALLY REQUIRED only when a response was actually sent — it is
   absent for aborted requests.  Counting status-0 as `5xx` (the prior
   `StatusClass::from_status` catch-all) inflated server-error rates on any
-  environment exposed to port scans.  The `by_route` and `by_upstream`
-  histograms **do** record these requests — the request still consumed real
-  nginx resources regardless of the abort.
+  environment exposed to port scans.  The `nginx.http.request.duration.by_route`
+  and `nginx.http.request.duration.by_upstream` histograms **do** record these
+  requests — the request still consumed real nginx resources regardless of the
+  abort.
 - **Exemplars:** the base series attaches uniformly-sampled exemplars
   (canonical `value` + `time_unix_nano` + `trace_id`/`span_id`, no
   `filtered_attributes`) — one small fixed-size reservoir per data point,
   reset every export cycle.  Exemplars are recorded only for trace-sampled
   requests (`otel_trace`; the OTel default `TraceBased` exemplar filter), so
-  every exemplar carries a resolvable trace pointer.  The decomposed
-  `by_route` / `by_upstream` series carry no exemplars.
+  every exemplar carries a resolvable trace pointer.  The Tier-2
+  `nginx.http.request.duration.by_route` / `.by_upstream` series carry no exemplars.
 
 ### Exponential histogram parameters (`src/shm.rs`)
 
@@ -243,15 +250,26 @@ Explicit-bucket `Histogram<N>` (`src/shm.rs`), single unattributed data point ea
 (no method/route/zone decomposition). Recorded in `LogPhaseHandler`; upstream
 metrics only when an upstream was used (from `ngx_http_upstream_state_t`).
 
+**Tier 1** (semconv-aligned names):
+
 | Metric | Instrument | Unit | Temporality |
 |---|---|---|---|
 | `http.server.request.body.size` | Histogram (explicit) | `By` | Cumulative |
 | `http.server.response.body.size` | Histogram (explicit) | `By` | Cumulative |
-| `http.server.upstream.response.duration` | Histogram (explicit) | `ms` | Cumulative |
-| `http.server.upstream.header.duration` | Histogram (explicit) | `ms` | Cumulative |
-| `http.server.upstream.connect.duration` | Histogram (explicit) | `ms` | Cumulative |
-| `http.server.upstream.bytes.received` | Histogram (explicit) | `By` | Cumulative |
-| `http.server.upstream.bytes.sent` | Histogram (explicit) | `By` | Cumulative |
+
+**Tier 2** (nginx-specific, `nginx.*` namespace):
+
+| Metric | Instrument | Unit | Temporality |
+|---|---|---|---|
+| `nginx.upstream.response.duration` | Histogram (explicit) | `s` | Cumulative |
+| `nginx.upstream.header.duration` | Histogram (explicit) | `s` | Cumulative |
+| `nginx.upstream.connect.duration` | Histogram (explicit) | `s` | Cumulative |
+| `nginx.upstream.bytes.received` | Histogram (explicit) | `By` | Cumulative |
+| `nginx.upstream.bytes.sent` | Histogram (explicit) | `By` | Cumulative |
+
+The upstream duration metrics record raw ms values from nginx at the worker and publish
+in seconds (÷1000) at export — the same convert-at-export pattern as the request
+duration exp-histogram scalar sum.
 
 > **Sentinel filtering — skipping upstream timings nginx never measured:** nginx initialises `response_time`,
 > `connect_time`, and `header_time` in `ngx_http_upstream_state_t` to
@@ -306,10 +324,16 @@ Rust enums in `src/shm.rs` (`HttpMethod`, `StatusClass`, `ProtoVersion`).
 | Attribute | On series | Cardinality |
 |---|---|---|
 | `http.request.method` | base duration | 8 (`HttpMethod`, 7 + `_OTHER`) |
-| `http.response.status_code` | base duration | 5 status classes (representative value) |
+| `http.response.status_class` | base duration | 5 strings (`"1xx"`–`"5xx"`) |
 | `network.protocol.version` | base duration | 4 (`ProtoVersion`) |
-| `http.route` | `…by_route` | ≤ 64 + `other` (location name) |
-| `nginx.upstream.zone` | `…by_upstream` | ≤ 32 + `other`/none |
+| `http.route` | `nginx.http.request.duration.by_route` | ≤ 64 + `other` (location name) |
+| `nginx.upstream.zone` | `nginx.http.request.duration.by_upstream` | ≤ 32 + `other`/none |
+
+> `http.response.status_class` carries a self-describing string (`"1xx"`, `"2xx"`,
+> `"3xx"`, `"4xx"`, `"5xx"`) — not an integer representative.  semconv reserves
+> `http.response.status_code` for the actual numeric status code; the separate class
+> key avoids a misleading label while preserving the 5-value cardinality bound.
+> The directive `otel_metric_status_code_class on|off` gates this attribute as before.
 
 > **High-cardinality detail is NOT a metric dimension.** `url.path`,
 > `user_agent.original`, and `client.address` are deliberately kept **off** the
@@ -322,9 +346,12 @@ Rust enums in `src/shm.rs` (`HttpMethod`, `StatusClass`, `ProtoVersion`).
 ## Histogram bucket boundaries (`src/shm.rs`)
 
 - **Request duration** — exponential (see parameters above): scale 3, seconds,
-  192 buckets, offset −160. **Not** the explicit `ms` boundaries below.
-- **Upstream durations (`ms`)** — explicit, `DURATION_BOUNDS_MS`, 14 + overflow:
-  `5, 10, 25, 50, 75, 100, 250, 500, 750, 1000, 2500, 5000, 7500, 10000`
+  192 buckets, offset −160.
+- **Upstream durations (`s`)** — explicit, `DURATION_BOUNDS_S`, 14 + overflow:
+  `0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0` s
+  (the standard OTel HTTP server latency boundaries; nginx records raw ms against
+  `DURATION_BOUNDS_MS` at the worker; the exporter publishes in seconds via
+  `DURATION_BOUNDS_S` and divides the scalar sum by 1000).
 - **Byte sizes (`By`)** — explicit, `BYTES_BOUNDS`, 6 + overflow:
   `128, 512, 4096, 65536, 524288, 4194304`
 
@@ -677,7 +704,7 @@ The exporter process emits its own health metrics every export interval
 | `ngx_otel.logs.error.coalesced_orphaned_records` | Sum (monotonic) | `{record}` | Coalesced error-log occurrences whose verbatim ring sample was dropped (ring full); a synthetic record is emitted for each orphaned slot so the occurrence count is preserved. Accumulated additively across drain cycles. |
 | `ngx_otel.logs.send_failures` | Sum (monotonic) | `{failure}` | Cumulative logs transport send failures since exporter startup |
 | `ngx_otel.traces.dropped_records` | Sum (monotonic) | `{record}` | Span records dropped because the per-worker spans ring was full |
-| `ngx_otel.export_interval` | Gauge | `ms` | Configured metric export interval |
+| `ngx_otel.export_interval` | Gauge | `s` | Configured metric export interval (value is `interval_ms / 1000`) |
 | `ngx_otel.exporter.restarts` | Gauge | `{crash}` | Prior exporter crashes observed in the current crash-loop window when this exporter process started (`0` = clean start; set once at exporter startup from the shared-memory crash counter). Not emitted after crash-loop give-up — no exporter process remains to emit it; the disable is announced by an ALERT in the error log. See `LIFECYCLE.md` |
 | `ngx_otel.delivery.permanent_rejected` | Sum (monotonic) | `{batch}` | Batches the peer rejected as permanently unacceptable (e.g. HTTP `400`/`413`/`501`/non-retryable `4xx`/`5xx`; gRPC `INVALID_ARGUMENT`/`INTERNAL`/`UNIMPLEMENTED`); dropped and never retried. A sustained non-zero rate indicates a payload or endpoint configuration problem. |
 | `ngx_otel.delivery.partial_rejected` | Sum (monotonic) | `{record}` | Individual records the peer reported it dropped on an otherwise-accepted batch (OTLP `partial_success.rejected_*` field / gRPC partial-success body). The batch is released; only the peer-reported rejected record count accumulates here. |
@@ -708,17 +735,21 @@ material, no fingerprints, no full DNs, no SANs):
 
 | Attribute | Value | Source |
 |---|---|---|
-| `file_path` | certificate file path as configured by `ssl_certificate` | `src/cert_table.rs` |
+| `tls.server.certificate.file_path` | certificate file path as configured by `ssl_certificate` | `src/cert_table.rs` |
 | `tls.server.subject` | subject CN only (empty string when the subject has no CN) | `src/cert_table.rs` |
 | `tls.server.issuer` | issuer CN only (empty string when the issuer has no CN) | `src/cert_table.rs` |
-| `serial_number` | serial as an uppercase hex string (no `0x` prefix) | `src/cert_table.rs` |
-| `public_key_algorithm` | `"RSA"`, `"EC"`, `"ED25519"`, ... | `src/cert_table.rs` |
-| `signature_algorithm` | signature algorithm short name (e.g. `"RSA-SHA256"`) | `src/cert_table.rs` |
+| `tls.server.certificate.serial_number` | serial as an uppercase hex string (no `0x` prefix) | `src/cert_table.rs` |
+| `tls.server.certificate.public_key_algorithm` | `"RSA"`, `"EC"`, `"ED25519"`, ... | `src/cert_table.rs` |
+| `tls.server.certificate.signature_algorithm` | signature algorithm short name (e.g. `"RSA-SHA256"`) | `src/cert_table.rs` |
 | `server.address` | first non-wildcard `server_name` of the owning server block; `"_"` when the block has none | `src/cert_table.rs` |
 
+The bare keys `file_path`, `serial_number`, `public_key_algorithm`, and
+`signature_algorithm` are namespaced under `tls.server.certificate.*` for
+consistency with `tls.server.subject` / `tls.server.issuer`.
+
 A server block with multiple certificates (e.g. dual RSA + ECDSA) yields one
-series per certificate per metric, distinguished by `file_path` /
-`public_key_algorithm` / `serial_number`.
+series per certificate per metric, distinguished by `tls.server.certificate.file_path` /
+`tls.server.certificate.public_key_algorithm` / `tls.server.certificate.serial_number`.
 
 ### Cadence: what nginx *serves*, not what is on disk
 

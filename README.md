@@ -268,14 +268,16 @@ building dashboards, alerts, or pipelines against this module; you do **not** ne
 design proposal to integrate. In brief:
 
 - **Metrics** (on by default): HTTP request duration as an OTel exponential
-  histogram in seconds (HTTP semconv unit; ~13µs resolution), decomposed three
-  ways — a base series
-  keyed on method, status class, and protocol; a per-`http.route` series; and
-  a per-`nginx.upstream.zone` series. Plus request, response, and upstream
-  byte and timing histograms; the nginx `stub_status` series (see note below);
-  and a `ngx_otel.error_log.events` error-rate counter. Histograms and Sums
-  use cumulative temporality; Gauges (connection-state series, `export_interval`,
-  `exporter.restarts`, and the TLS certificate gauges) are instantaneous and
+  histogram in seconds (HTTP semconv unit; ~13µs resolution). Emitted as two tiers:
+  **Tier 1** (`http.server.request.duration`) — semconv-conformant, keyed on method,
+  `http.response.status_class` (string `"1xx"`–`"5xx"`), and protocol;
+  **Tier 2** (`nginx.http.request.duration.by_route` / `.by_upstream`) — nginx-specific
+  breakdowns. Plus request/response body sizes; upstream timing histograms in
+  seconds (`nginx.upstream.{response,header,connect}.duration`) and byte histograms
+  (`nginx.upstream.bytes.{received,sent}`); the nginx `stub_status` series (see note
+  below); and a `ngx_otel.error_log.events` error-rate counter. Histograms and Sums
+  use cumulative temporality; Gauges (connection-state series, `export_interval` in
+  `s`, `exporter.restarts`, and the TLS certificate gauges) are instantaneous and
   carry no temporality.
 - **Logs — access** (`otel_log_export on | if=<expr>`): metrics-primary, plus a
   **thin exception tail** of `LogRecord`s for operator-selected requests. Not a

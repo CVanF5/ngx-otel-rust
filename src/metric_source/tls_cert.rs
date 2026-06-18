@@ -107,23 +107,28 @@ impl ServingCertSource<'_> {
 
 /// The per-certificate attribute set.
 ///
-/// Scope: EXACTLY these seven
-/// attributes — `file_path`, `tls.server.subject` (CN only),
-/// `tls.server.issuer` (CN only), `serial_number`, `public_key_algorithm`,
-/// `signature_algorithm`, `server.address`. Nothing else: no PEM, no keys,
-/// no fingerprints, no full DNs, no SANs, no key_bits.
+/// Scope: EXACTLY these seven attributes — `tls.server.certificate.file_path`,
+/// `tls.server.subject` (CN only), `tls.server.issuer` (CN only),
+/// `tls.server.certificate.serial_number`, `tls.server.certificate.public_key_algorithm`,
+/// `tls.server.certificate.signature_algorithm`, `server.address`.
+/// Nothing else: no PEM, no keys, no fingerprints, no full DNs, no SANs, no key_bits.
+///
+/// F11: bare keys `file_path`, `serial_number`, `public_key_algorithm`,
+/// `signature_algorithm` are now namespaced under `tls.server.certificate.*`
+/// for consistency with the already-namespaced `tls.server.subject` /
+/// `tls.server.issuer` attributes.
 fn cert_attrs(c: &CertInfo) -> std::vec::Vec<KeyValue> {
     let s = |key: &str, value: &str| KeyValue {
         key: key.into(),
         value: AnyValue::String(value.into()),
     };
     std::vec![
-        s("file_path", &c.file_path),
+        s("tls.server.certificate.file_path", &c.file_path),
         s("tls.server.subject", &c.subject_cn),
         s("tls.server.issuer", &c.issuer_cn),
-        s("serial_number", &c.serial),
-        s("public_key_algorithm", &c.pubkey_alg),
-        s("signature_algorithm", &c.sig_alg),
+        s("tls.server.certificate.serial_number", &c.serial),
+        s("tls.server.certificate.public_key_algorithm", &c.pubkey_alg),
+        s("tls.server.certificate.signature_algorithm", &c.sig_alg),
         s("server.address", &c.server_name),
     ]
 }
@@ -159,13 +164,16 @@ mod tests {
     }
 
     /// The seven scope-guard attribute keys, in emission order.
+    ///
+    /// F11: bare keys are now namespaced under `tls.server.certificate.*`
+    /// for consistency with `tls.server.subject` / `tls.server.issuer`.
     const ALLOWED_KEYS: [&str; 7] = [
-        "file_path",
+        "tls.server.certificate.file_path",
         "tls.server.subject",
         "tls.server.issuer",
-        "serial_number",
-        "public_key_algorithm",
-        "signature_algorithm",
+        "tls.server.certificate.serial_number",
+        "tls.server.certificate.public_key_algorithm",
+        "tls.server.certificate.signature_algorithm",
         "server.address",
     ];
 
@@ -211,12 +219,12 @@ mod tests {
                     other => panic!("attribute {k} must be a String, got {other:?}"),
                 }
             };
-            assert_eq!(val("file_path"), "/etc/ssl/a.crt");
+            assert_eq!(val("tls.server.certificate.file_path"), "/etc/ssl/a.crt");
             assert_eq!(val("tls.server.subject"), "a.example.test");
             assert_eq!(val("tls.server.issuer"), "Test CA");
-            assert_eq!(val("serial_number"), "0A1B2C");
-            assert_eq!(val("public_key_algorithm"), "RSA");
-            assert_eq!(val("signature_algorithm"), "RSA-SHA256");
+            assert_eq!(val("tls.server.certificate.serial_number"), "0A1B2C");
+            assert_eq!(val("tls.server.certificate.public_key_algorithm"), "RSA");
+            assert_eq!(val("tls.server.certificate.signature_algorithm"), "RSA-SHA256");
             assert_eq!(val("server.address"), "www.example.test");
         }
 
@@ -285,12 +293,12 @@ mod tests {
                     match &dp
                         .attributes
                         .iter()
-                        .find(|kv| kv.key == "public_key_algorithm")
+                        .find(|kv| kv.key == "tls.server.certificate.public_key_algorithm")
                         .unwrap()
                         .value
                     {
                         AnyValue::String(s) => s.as_str(),
-                        _ => panic!("public_key_algorithm must be a String"),
+                        _ => panic!("tls.server.certificate.public_key_algorithm must be a String"),
                     }
                 })
                 .collect();

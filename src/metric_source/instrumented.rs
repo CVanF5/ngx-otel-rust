@@ -761,7 +761,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
     fn collect(&self) -> std::vec::Vec<crate::data_model::Metric> {
         use crate::data_model::{AggregationTemporality, AnyValue, Exemplar, KeyValue};
         use crate::shm::{
-            combo_index, HttpMethod, ProtoVersion, StatusClass, BYTES_BOUNDS, DURATION_BOUNDS_MS,
+            combo_index, HttpMethod, ProtoVersion, StatusClass, BYTES_BOUNDS, DURATION_BOUNDS_S,
             EXP_HISTOGRAM_BUCKET_OFFSET, EXP_HISTOGRAM_SCALE, N_COMBOS, N_EXP_BUCKETS,
             N_HTTP_METHODS, N_PROTO_VERSIONS, N_ROUTE_SLOTS, N_STATUS_CLASSES, N_UPSTREAM_SLOTS,
         };
@@ -886,7 +886,10 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
             }
         }
 
-        let dur_bounds: std::vec::Vec<f64> = DURATION_BOUNDS_MS.iter().map(|&b| b as f64).collect();
+        // DURATION_BOUNDS_S is already f64 (seconds); upstream histograms record
+        // raw ms values against DURATION_BOUNDS_MS on the worker, and the exporter
+        // publishes in seconds by using DURATION_BOUNDS_S here and dividing the sum.
+        let dur_bounds_s: std::vec::Vec<f64> = DURATION_BOUNDS_S.to_vec();
         let byte_bounds: std::vec::Vec<f64> = BYTES_BOUNDS.iter().map(|&b| b as f64).collect();
 
         // ── Build http.server.request.duration ──────────────────────────
@@ -946,14 +949,19 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                             .filter(|(cidx, _)| *cidx == combo as u32)
                             .map(|(_, e)| e.clone())
                             .collect();
+                        // F6: use the honest key `http.response.status_class` with a
+                        // self-describing string value ("2xx", etc.).  semconv reserves
+                        // `http.response.status_code` for the actual integer code; emitting
+                        // a class representative (200/400/500…) there was misleading.
+                        // <https://opentelemetry.io/docs/specs/semconv/http/http-metrics/>
                         let attrs = std::vec![
                             KeyValue {
                                 key: "http.request.method".into(),
                                 value: AnyValue::String(method.as_str().into())
                             },
                             KeyValue {
-                                key: "http.response.status_code".into(),
-                                value: AnyValue::Int(status_class.representative_status())
+                                key: "http.response.status_class".into(),
+                                value: AnyValue::String(status_class.as_str().into())
                             },
                             KeyValue {
                                 key: "network.protocol.version".into(),
@@ -1026,8 +1034,10 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                     data_points.push(dp);
                 }
             }
+            // F2/F9: moved out of the `http.server.*` semconv namespace to
+            // `nginx.*` — this is a Tier-2 nginx-specific metric, not semconv.
             Metric {
-                name: "http.server.request.duration.by_route".into(),
+                name: "nginx.http.request.duration.by_route".into(),
                 description: "HTTP server request duration by matched location (http.route)".into(),
                 unit: "s".into(),
                 data: MetricData::ExponentialHistogram(ExponentialHistogramData {
@@ -1053,8 +1063,10 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                     data_points.push(dp);
                 }
             }
+            // F2/F9: moved out of the `http.server.*` semconv namespace to
+            // `nginx.*` — Tier-2 nginx-specific metric.
             Metric {
-                name: "http.server.request.duration.by_upstream".into(),
+                name: "nginx.http.request.duration.by_upstream".into(),
                 description: "HTTP server request duration by upstream zone (nginx.upstream.zone)"
                     .into(),
                 unit: "s".into(),
@@ -1089,39 +1101,49 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                 now,
                 AggregationTemporality::Cumulative,
             ),
-            // ── upstream timings ──────────────────────────────────────────
-            hist_metric(
-                "http.server.upstream.response.duration",
+            // ── upstream timings ─────────────────────────────────────────
+            // F2/F9: renamed from `http.server.upstream.*` to `nginx.upstream.*`
+            // (Tier-2; not semconv).  F4: published in seconds (`"s"`); the worker
+            // records raw ms values against DURATION_BOUNDS_MS, so the bucket
+            // placement is unchanged — only the bounds (DURATION_BOUNDS_S) and
+            // the scalar sum (÷1000) change at export.
+            hist_metric_with_sum(
+                "nginx.upstream.response.duration",
                 "Upstream response time",
-                "ms",
+                "s",
                 up_resp,
-                dur_bounds.clone(),
+                ms_to_s_hist_sum(up_resp.1),
+                dur_bounds_s.clone(),
                 start,
                 now,
                 AggregationTemporality::Cumulative,
             ),
-            hist_metric(
-                "http.server.upstream.header.duration",
+            hist_metric_with_sum(
+                "nginx.upstream.header.duration",
                 "Upstream time to first response byte",
-                "ms",
+                "s",
                 up_hdr,
-                dur_bounds.clone(),
+                ms_to_s_hist_sum(up_hdr.1),
+                dur_bounds_s.clone(),
                 start,
                 now,
                 AggregationTemporality::Cumulative,
             ),
-            hist_metric(
-                "http.server.upstream.connect.duration",
+            hist_metric_with_sum(
+                "nginx.upstream.connect.duration",
                 "Upstream connection establishment time",
-                "ms",
+                "s",
                 up_conn,
-                dur_bounds.clone(),
+                ms_to_s_hist_sum(up_conn.1),
+                dur_bounds_s.clone(),
                 start,
                 now,
                 AggregationTemporality::Cumulative,
             ),
+            // F2/F9: renamed from `http.server.upstream.bytes.*` to `nginx.upstream.bytes.*`.
+            // Unit stays `By`.
             hist_metric(
-                "http.server.upstream.bytes.received",
+                "nginx.upstream.bytes.received",
                 "Bytes received from upstream",
                 "By",
                 up_bytes,
@@ -1131,7 +1153,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                 AggregationTemporality::Cumulative,
             ),
             hist_metric(
-                "http.server.upstream.bytes.sent",
+                "nginx.upstream.bytes.sent",
                 "Bytes sent to upstream",
                 "By",
                 up_bytes_sent,
@@ -1145,6 +1167,27 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
 }
 
 // ─── helpers ────────────────────────────────────────────────────────────────
+
+/// Convert a millisecond-summed explicit histogram data tuple for export as a
+/// **seconds** histogram (F4: `nginx.upstream.*.duration`).
+///
+/// The worker accumulates upstream timing sums in raw ms.  This helper divides
+/// the scalar sum by `1000.0` (f64) so `hist_metric` publishes the sum in
+/// seconds.  Bucket counts and observation count are unchanged — bucket
+/// placement was done in ms at record time (against `DURATION_BOUNDS_MS`),
+/// and the exporter publishes the same thresholds in seconds (via
+/// `DURATION_BOUNDS_S`), so the bucket distribution is semantically correct.
+///
+/// Returns `(buckets, sum_in_seconds_rounded_to_ms, count)`.  The sum is
+/// converted as `(sum_ms as f64 / 1000.0).round() as u64` to avoid integer
+/// truncation that would zero a sub-second aggregate; rounding to the nearest
+/// ms preserves the sub-second information at the resolution nginx provides.
+/// This is the same convert-at-export pattern used by the request-duration
+/// exp-histogram sum (`us_to_seconds`) and span/log duration attributes.
+#[inline]
+fn ms_to_s_hist_sum(sum_ms: u64) -> f64 {
+    sum_ms as f64 / 1000.0
+}
 
 /// Convert an integer-microsecond duration to f64 **seconds** for the
 /// `http.server.request.duration` exp-histogram scalars (sum + exemplar value).
@@ -1172,14 +1215,19 @@ fn add_histogram<const N: usize>(
     acc.2 += count;
 }
 
-// Internal OTLP-histogram builder; the argument count mirrors the histogram's
-// own shape (name/desc/unit + data + bounds + start/now + temporality).
+/// Internal OTLP-histogram builder.
+///
+/// Shared by all explicit-boundary histograms.  `sum_f64` allows callers that
+/// need a unit-scaled sum (e.g. ms → s) to supply the pre-converted value; for
+/// histograms whose native unit is already the published unit, pass
+/// `data.1 as f64`.
 #[allow(clippy::too_many_arguments)]
-fn hist_metric<const N: usize>(
+fn hist_metric_with_sum<const N: usize>(
     name: &str,
     desc: &str,
     unit: &str,
     data: ([u64; N], u64, u64),
+    sum_f64: f64,
     bounds: std::vec::Vec<f64>,
     start_time_ns: u64,
     time_ns: u64,
@@ -1197,12 +1245,38 @@ fn hist_metric<const N: usize>(
                 start_time_unix_nano: start_time_ns,
                 time_unix_nano: time_ns,
                 count: data.2,
-                sum: data.1 as f64,
+                sum: sum_f64,
                 bucket_counts: data.0.to_vec(),
                 explicit_bounds: bounds,
             }],
         }),
     }
+}
+
+/// Thin wrapper for histograms whose accumulated sum unit matches the published
+/// unit (no scaling needed).
+#[allow(clippy::too_many_arguments)]
+fn hist_metric<const N: usize>(
+    name: &str,
+    desc: &str,
+    unit: &str,
+    data: ([u64; N], u64, u64),
+    bounds: std::vec::Vec<f64>,
+    start_time_ns: u64,
+    time_ns: u64,
+    temporality: crate::data_model::AggregationTemporality,
+) -> crate::data_model::Metric {
+    hist_metric_with_sum(
+        name,
+        desc,
+        unit,
+        data,
+        data.1 as f64,
+        bounds,
+        start_time_ns,
+        time_ns,
+        temporality,
+    )
 }
 
 // ── Unit tests ───────────────────────────────────────────────────────────────
@@ -1588,5 +1662,376 @@ mod tests {
         assert_eq!(super::us_to_seconds(0), 0.0, "0µs must convert to 0 s");
         // A raw-µs sum of 1500 (e.g. 10×150µs) → 0.0015 s, not 1500.
         assert_eq!(super::us_to_seconds(1500), 0.0015, "summed µs convert losslessly");
+    }
+
+    /// F6 — `http.server.request.duration` must emit `http.response.status_class`
+    /// with a self-describing string value (`"5xx"` for a 503), NOT the old
+    /// `http.response.status_code` integer representative (500).
+    ///
+    /// Mutation check: reverting `key: "http.response.status_class"` back to
+    /// `"http.response.status_code"` makes the `assert_eq!(key, "http.response.status_class")`
+    /// assertion fail; reverting `AnyValue::String(…)` back to `AnyValue::Int(…)` makes
+    /// the value assertion fail.
+    #[test]
+    fn f6_status_class_attribute_key_and_value() {
+        use crate::data_model::{AnyValue, MetricData};
+        use crate::shm::{combo_index, HttpMethod, ProtoVersion, StatusClass, WorkerSlots};
+        use core::mem;
+
+        // Zero-initialise one WorkerSlots.
+        let mut buf = std::vec![0u8; mem::size_of::<WorkerSlots>()];
+        // SAFETY: `buf` is zero-initialised to exactly `sizeof(WorkerSlots)`; zero
+        // is the valid initial state for all `AtomicU64` fields within it.
+        let slot = unsafe { &*buf.as_mut_ptr().cast::<WorkerSlots>() };
+
+        // Record a 503 (S5xx) with a real duration.
+        let method = HttpMethod::Get;
+        let proto = ProtoVersion::Http11;
+        let sc = StatusClass::from_status(503);
+        let base_idx = combo_index(method, sc, proto);
+        slot.request_duration_combos[base_idx].record(50_000); // 50ms
+
+        // Build an InstrumentedSource over this one-worker slot.
+        let mut zone_buf = std::vec![0u8; mem::size_of::<WorkerSlots>()];
+        zone_buf.copy_from_slice(&buf);
+        let src = crate::metric_source::instrumented::InstrumentedSource {
+            base: zone_buf.as_mut_ptr(),
+            n_workers: 1,
+            start_time_unix_nano: 0,
+            status_code_class_enabled: true,
+            amcf: core::ptr::null(),
+        };
+        use crate::metric_source::MetricSource;
+        let metrics = src.collect();
+
+        // Find the base duration metric.
+        let dur = metrics
+            .iter()
+            .find(|m| m.name == "http.server.request.duration")
+            .expect("http.server.request.duration must be present");
+
+        // Find the data point with method=GET.
+        let MetricData::ExponentialHistogram(ref eh) = dur.data else {
+            panic!("duration metric must be an ExponentialHistogram");
+        };
+
+        // Find the S5xx data point (count == 1, method == GET).
+        let dp = eh
+            .data_points
+            .iter()
+            .find(|dp| dp.count == 1)
+            .expect("must have a data point with count=1 (our S5xx observation)");
+
+        // The attribute for the status dimension must use the NEW key.
+        let status_kv = dp
+            .attributes
+            .iter()
+            .find(|kv| kv.key.contains("status"))
+            .expect("must have a status-related attribute");
+        assert_eq!(
+            status_kv.key, "http.response.status_class",
+            "F6: key must be http.response.status_class, not http.response.status_code \
+             (reverting the key in instrumented.rs makes this fail)"
+        );
+        // The value must be the string "5xx", not the integer 500.
+        match &status_kv.value {
+            AnyValue::String(s) => assert_eq!(
+                s.as_str(),
+                "5xx",
+                "F6: value must be the string \"5xx\" for a 503, not 500 \
+                 (reverting AnyValue::String to AnyValue::Int makes this fail)"
+            ),
+            AnyValue::Int(n) => panic!(
+                "F6: value must be String(\"5xx\"), got Int({n}) — old http.response.status_code \
+                 representative value; revert detected"
+            ),
+            other => panic!("F6: unexpected value type {other:?}"),
+        }
+    }
+
+    /// F2/F9 — the decomposed duration metrics must use the `nginx.*` namespace
+    /// (Tier 2); the old `http.server.*` names must not be emitted.
+    ///
+    /// Mutation check: reverting the metric names in `instrumented.rs` back to
+    /// `http.server.request.duration.by_route` / `http.server.request.duration.by_upstream`
+    /// makes the "old name absent" assertions fail.
+    #[test]
+    fn f2f9_tier2_metrics_renamed_to_nginx_namespace() {
+        use crate::shm::WorkerSlots;
+        use core::mem;
+
+        let mut buf = std::vec![0u8; mem::size_of::<WorkerSlots>()];
+        // SAFETY: `buf` is zero-initialised to exactly `sizeof(WorkerSlots)`; zero
+        // is the valid initial state for all `AtomicU64` fields within it.
+        // Record one observation so the metrics have at least one data point.
+        let slot = unsafe { &*buf.as_mut_ptr().cast::<WorkerSlots>() };
+        slot.request_duration_combos[0].record(1_000);
+        slot.route_duration_combos[0].record(1_000);
+        slot.upstream_duration_combos[0].record(1_000);
+        // Also record upstream timing to make those metrics appear.
+        slot.upstream_response_ms.record(5, &crate::shm::DURATION_BOUNDS_MS);
+
+        let src = crate::metric_source::instrumented::InstrumentedSource {
+            base: buf.as_mut_ptr(),
+            n_workers: 1,
+            start_time_unix_nano: 0,
+            status_code_class_enabled: false,
+            amcf: core::ptr::null(),
+        };
+        use crate::metric_source::MetricSource;
+        let metrics = src.collect();
+        let names: std::vec::Vec<&str> = metrics.iter().map(|m| m.name.as_str()).collect();
+
+        // New names MUST be present.
+        assert!(
+            names.contains(&"nginx.http.request.duration.by_route"),
+            "F2/F9: nginx.http.request.duration.by_route must be present; names={names:?}"
+        );
+        assert!(
+            names.contains(&"nginx.http.request.duration.by_upstream"),
+            "F2/F9: nginx.http.request.duration.by_upstream must be present; names={names:?}"
+        );
+        assert!(
+            names.contains(&"nginx.upstream.response.duration"),
+            "F2/F9: nginx.upstream.response.duration must be present; names={names:?}"
+        );
+        assert!(
+            names.contains(&"nginx.upstream.bytes.received"),
+            "F2/F9: nginx.upstream.bytes.received must be present; names={names:?}"
+        );
+
+        // Old names MUST NOT be present (reverting the renames makes these fail).
+        assert!(
+            !names.contains(&"http.server.request.duration.by_route"),
+            "F2/F9: old http.server.request.duration.by_route must NOT be emitted; names={names:?}"
+        );
+        assert!(
+            !names.contains(&"http.server.request.duration.by_upstream"),
+            "F2/F9: old http.server.request.duration.by_upstream must NOT be emitted; \
+             names={names:?}"
+        );
+        assert!(
+            !names.contains(&"http.server.upstream.response.duration"),
+            "F2/F9: old http.server.upstream.response.duration must NOT be emitted; \
+             names={names:?}"
+        );
+        assert!(
+            !names.contains(&"http.server.upstream.bytes.received"),
+            "F2/F9: old http.server.upstream.bytes.received must NOT be emitted; names={names:?}"
+        );
+
+        // Base metric must remain unchanged (Tier 1 — do NOT rename).
+        assert!(
+            names.contains(&"http.server.request.duration"),
+            "Tier-1 base metric must stay as http.server.request.duration; names={names:?}"
+        );
+        // Body-size metrics must also remain unchanged (F8 refuted — correct semconv names).
+        assert!(
+            names.contains(&"http.server.request.body.size"),
+            "http.server.request.body.size must not change; names={names:?}"
+        );
+        assert!(
+            names.contains(&"http.server.response.body.size"),
+            "http.server.response.body.size must not change; names={names:?}"
+        );
+    }
+
+    /// F4 — upstream duration metrics must emit unit `"s"` and the scalar sum
+    /// must be in seconds (ms sum ÷ 1000.0), not raw milliseconds.
+    ///
+    /// Regression: a 5ms upstream response time must surface as `0.005 s`, not `5`.
+    ///
+    /// Mutation check: reverting the unit from `"s"` to `"ms"` and the
+    /// `ms_to_s_hist_sum` helper back to raw ms makes these assertions fail.
+    #[test]
+    fn f4_upstream_duration_unit_is_seconds() {
+        use crate::data_model::MetricData;
+        use crate::shm::{WorkerSlots, DURATION_BOUNDS_MS};
+        use core::mem;
+
+        let mut buf = std::vec![0u8; mem::size_of::<WorkerSlots>()];
+        // SAFETY: `buf` is zero-initialised to exactly `sizeof(WorkerSlots)`; zero
+        // is the valid initial state for all `AtomicU64` fields within it.
+        let slot = unsafe { &*buf.as_mut_ptr().cast::<WorkerSlots>() };
+        // Record a known upstream response time: 5 ms.
+        slot.upstream_response_ms.record(5, &DURATION_BOUNDS_MS);
+        // Record upstream header and connect timings too.
+        slot.upstream_header_ms.record(3, &DURATION_BOUNDS_MS);
+        slot.upstream_connect_ms.record(1, &DURATION_BOUNDS_MS);
+
+        let src = crate::metric_source::instrumented::InstrumentedSource {
+            base: buf.as_mut_ptr(),
+            n_workers: 1,
+            start_time_unix_nano: 0,
+            status_code_class_enabled: false,
+            amcf: core::ptr::null(),
+        };
+        use crate::metric_source::MetricSource;
+        let metrics = src.collect();
+
+        for metric_name in &[
+            "nginx.upstream.response.duration",
+            "nginx.upstream.header.duration",
+            "nginx.upstream.connect.duration",
+        ] {
+            let m = metrics
+                .iter()
+                .find(|m| m.name.as_str() == *metric_name)
+                .unwrap_or_else(|| panic!("{metric_name} must be present in emitted metrics"));
+
+            // Unit must be "s" (reverting to "ms" makes this fail).
+            assert_eq!(
+                m.unit, "s",
+                "F4: {metric_name} unit must be \"s\", not \"ms\" \
+                 (reverting unit string makes this fail)"
+            );
+
+            // Extract the histogram data point.
+            let MetricData::Histogram(ref hist) = m.data else {
+                panic!("{metric_name} must be a Histogram");
+            };
+            let dp = &hist.data_points[0];
+
+            // Sum must be in seconds.  The exact value depends on which metric;
+            // all three have count=1 and sum that is the recorded ms ÷ 1000.
+            // The key invariant: sum < 1.0 for any < 1000ms observation.
+            assert!(
+                dp.sum < 1.0,
+                "F4: {metric_name} sum must be < 1.0 s for a sub-second recording; \
+                 got sum={} (if sum > 0 and >= 1, the ms→s conversion is missing)",
+                dp.sum
+            );
+            assert!(
+                dp.sum > 0.0,
+                "F4: {metric_name} sum must be > 0 (observation was recorded); \
+                 got sum={}",
+                dp.sum
+            );
+        }
+
+        // Spot-check the response duration sum: 5ms → 0.005 s.
+        let resp = metrics
+            .iter()
+            .find(|m| m.name == "nginx.upstream.response.duration")
+            .expect("nginx.upstream.response.duration must be present");
+        let MetricData::Histogram(ref hist) = resp.data else { panic!() };
+        let sum_s = hist.data_points[0].sum;
+        assert!(
+            (sum_s - 0.005).abs() < 1e-9,
+            "F4: 5ms must convert to 0.005 s, got {sum_s} \
+             (reverting ms_to_s_hist_sum makes this fail with sum=5.0)"
+        );
+    }
+
+    /// F5 — `ngx_otel.export_interval` must emit unit `"s"`, and the value for
+    /// a 10,000ms interval must be 10 (seconds), not 10,000.
+    ///
+    /// Mutation check: reverting unit `"s"` → `"ms"` and the `/ 1000` in
+    /// `SelfMetricsSource::collect` makes these assertions fail.
+    #[test]
+    fn f5_export_interval_unit_is_seconds() {
+        use crate::data_model::{MetricData, NumberValue};
+        use crate::export::SelfMetricsSource;
+        use crate::metric_source::MetricSource;
+
+        let src = SelfMetricsSource {
+            interval_ms: 10_000, // 10 seconds
+            start_time_unix_nano: 0,
+        };
+        let metrics = src.collect();
+        let m = metrics
+            .iter()
+            .find(|m| m.name == "ngx_otel.export_interval")
+            .expect("ngx_otel.export_interval must be present");
+
+        // Unit must be "s" (reverting to "ms" makes this fail).
+        assert_eq!(
+            m.unit, "s",
+            "F5: ngx_otel.export_interval unit must be \"s\", not \"ms\" \
+             (reverting unit string makes this fail)"
+        );
+
+        // Value must be 10 (seconds), not 10_000 (ms).
+        let MetricData::Gauge(ref g) = m.data else {
+            panic!("ngx_otel.export_interval must be a Gauge");
+        };
+        assert_eq!(
+            g.data_points[0].value,
+            NumberValue::AsInt(10),
+            "F5: 10,000ms interval must emit value 10 (seconds), not 10,000 \
+             (reverting the / 1000 in SelfMetricsSource::collect makes this fail with 10000)"
+        );
+    }
+
+    /// F11 — TLS cert attribute keys must be namespaced under `tls.server.certificate.*`.
+    ///
+    /// Mutation check: reverting the keys back to bare `file_path`, `serial_number`, etc.
+    /// makes the `assert_eq!(key, "tls.server.certificate.file_path", ...)` assertion fail.
+    #[test]
+    fn f11_tls_cert_attrs_namespaced() {
+        use crate::cert_table::CertInfo;
+        use crate::metric_source::tls_cert::ServingCertSource;
+        use crate::metric_source::MetricSource;
+
+        let cert = CertInfo {
+            file_path: "/etc/ssl/test.crt".into(),
+            server_name: "test.example".into(),
+            not_before_unix: 1_700_000_000,
+            not_after_unix: 1_893_456_000,
+            subject_cn: "test.example".into(),
+            issuer_cn: "Test CA".into(),
+            serial: "AABB".into(),
+            pubkey_alg: "RSA".into(),
+            sig_alg: "RSA-SHA256".into(),
+        };
+        let src = ServingCertSource { certs: std::slice::from_ref(&cert) };
+        let metrics = src.collect();
+        assert!(!metrics.is_empty(), "must emit cert metrics");
+
+        let dp = match &metrics[0].data {
+            crate::data_model::MetricData::Gauge(g) => &g.data_points[0],
+            _ => panic!("must be a Gauge"),
+        };
+        let keys: std::vec::Vec<&str> = dp.attributes.iter().map(|kv| kv.key.as_str()).collect();
+
+        // Namespaced keys MUST be present.
+        assert!(
+            keys.contains(&"tls.server.certificate.file_path"),
+            "F11: tls.server.certificate.file_path must be present; keys={keys:?}"
+        );
+        assert!(
+            keys.contains(&"tls.server.certificate.serial_number"),
+            "F11: tls.server.certificate.serial_number must be present; keys={keys:?}"
+        );
+        assert!(
+            keys.contains(&"tls.server.certificate.public_key_algorithm"),
+            "F11: tls.server.certificate.public_key_algorithm must be present; keys={keys:?}"
+        );
+        assert!(
+            keys.contains(&"tls.server.certificate.signature_algorithm"),
+            "F11: tls.server.certificate.signature_algorithm must be present; keys={keys:?}"
+        );
+
+        // Bare (un-namespaced) keys MUST NOT be present.
+        assert!(
+            !keys.contains(&"file_path"),
+            "F11: bare 'file_path' must NOT be emitted; reverting the namespace makes this fail"
+        );
+        assert!(
+            !keys.contains(&"serial_number"),
+            "F11: bare 'serial_number' must NOT be emitted; reverting the namespace makes this fail"
+        );
+        assert!(
+            !keys.contains(&"public_key_algorithm"),
+            "F11: bare 'public_key_algorithm' must NOT be emitted; reverting the namespace makes this fail"
+        );
+        assert!(
+            !keys.contains(&"signature_algorithm"),
+            "F11: bare 'signature_algorithm' must NOT be emitted; reverting the namespace makes this fail"
+        );
+
+        // Already-namespaced keys must remain unchanged.
+        assert!(keys.contains(&"tls.server.subject"), "tls.server.subject must be present");
+        assert!(keys.contains(&"tls.server.issuer"), "tls.server.issuer must be present");
     }
 }

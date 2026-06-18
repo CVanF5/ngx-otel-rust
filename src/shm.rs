@@ -33,14 +33,25 @@ use crate::logs::access::SampledRequest;
 
 /// Duration histogram bucket boundaries in **milliseconds**.
 ///
-/// These match the default OTel HTTP server latency boundaries (seconds × 1000).
-/// Retained for the byte-size histograms (request/response body, upstream
-/// bytes), which keep the explicit-boundary shape.
+/// These are the default OTel HTTP server latency boundaries (seconds × 1000).
+/// Used for the upstream explicit-boundary histograms — nginx reports upstream
+/// timings in ms so the worker records raw ms values against these bounds;
+/// the exporter publishes the same thresholds expressed in seconds (see
+/// `DURATION_BOUNDS_S`) and converts the scalar sum by ÷1000 at export.
 pub const DURATION_BOUNDS_MS: [u64; 14] =
     [5, 10, 25, 50, 75, 100, 250, 500, 750, 1000, 2500, 5000, 7500, 10000];
 
+/// Duration histogram bucket boundaries expressed in **seconds** (f64).
+///
+/// These are `DURATION_BOUNDS_MS ÷ 1000`, used exclusively in the exporter
+/// when publishing the `nginx.upstream.*.duration` histograms with unit `"s"`.
+/// The worker still records raw ms values against `DURATION_BOUNDS_MS`; the
+/// bucket counts are unchanged — only the published boundary scale and the
+/// scalar sum (÷1000) change at export.
+pub const DURATION_BOUNDS_S: [f64; 14] =
+    [0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0];
+
 /// Number of duration histogram buckets (14 boundaries + 1 overflow).
-/// Used by the byte-size histograms.
 pub const N_DURATION_BUCKETS: usize = 15;
 
 // ── Exponential-histogram constants ─────────────────────────
@@ -402,6 +413,10 @@ impl StatusClass {
     }
 
     /// OTel attribute integer value for this status class.
+    ///
+    /// Retained for completeness; the exported metric attribute uses
+    /// `as_str()` with key `http.response.status_class` instead (F6).
+    #[allow(dead_code)]
     #[inline]
     pub fn representative_status(self) -> i64 {
         match self {
@@ -410,6 +425,23 @@ impl StatusClass {
             Self::S3xx => 300,
             Self::S4xx => 400,
             Self::S5xx => 500,
+        }
+    }
+
+    /// String value for the `http.response.status_class` metric attribute.
+    ///
+    /// The key `http.response.status_class` carries a self-describing string
+    /// (`"2xx"`, etc.) rather than the class representative integer (200, …),
+    /// so the key is never mistaken for the actual `http.response.status_code`.
+    /// <https://opentelemetry.io/docs/specs/semconv/http/http-metrics/>
+    #[inline]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::S1xx => "1xx",
+            Self::S2xx => "2xx",
+            Self::S3xx => "3xx",
+            Self::S4xx => "4xx",
+            Self::S5xx => "5xx",
         }
     }
 }
