@@ -869,7 +869,11 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                     all_exemplars.push((
                         snap.combo_idx,
                         Exemplar {
-                            value: snap.value_us as f64,
+                            // F3: exemplars attach to the seconds histogram; the
+                            // reservoir stores raw µs, so convert to seconds here
+                            // (one divide per exemplar at export — same lossless
+                            // convert-at-export pattern as the histogram sum).
+                            value: us_to_seconds(snap.value_us),
                             time_unix_nano: snap.ts_unix_nano,
                             trace_id: snap.trace_id,
                             span_id: snap.span_id,
@@ -912,7 +916,12 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                 start_time_unix_nano: start,
                 time_unix_nano: now,
                 count: bcount,
-                sum: bs as f64,
+                // F3: the histogram is published in seconds.  The worker buckets
+                // seconds directly (shm::ExpHistogramSlot) but accumulates the
+                // sum in raw µs; convert the scalar sum to seconds here — one
+                // lossless divide per series at export (same convert-at-export
+                // precedent as the access-log/span duration attributes).
+                sum: us_to_seconds(bs),
                 scale: EXP_HISTOGRAM_SCALE,
                 zero_count: zc,
                 positive_offset: EXP_HISTOGRAM_BUCKET_OFFSET,
@@ -960,7 +969,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
             Metric {
                 name: "http.server.request.duration".into(),
                 description: "HTTP server request duration".into(),
-                unit: "us".into(),
+                unit: "s".into(),
                 data: MetricData::ExponentialHistogram(ExponentialHistogramData {
                     aggregation_temporality: AggregationTemporality::Cumulative,
                     data_points,
@@ -981,7 +990,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
             Metric {
                 name: "http.server.request.duration".into(),
                 description: "HTTP server request duration".into(),
-                unit: "us".into(),
+                unit: "s".into(),
                 data: MetricData::ExponentialHistogram(ExponentialHistogramData {
                     aggregation_temporality: AggregationTemporality::Cumulative,
                     data_points: std::vec![ExponentialHistogramDataPoint {
@@ -989,7 +998,8 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                         start_time_unix_nano: start,
                         time_unix_nano: now,
                         count: all_count,
-                        sum: all_sum as f64,
+                        // F3: convert the raw-µs sum to seconds at export (see make_dp).
+                        sum: us_to_seconds(all_sum),
                         scale: EXP_HISTOGRAM_SCALE,
                         zero_count: all_zero,
                         positive_offset: EXP_HISTOGRAM_BUCKET_OFFSET,
@@ -1019,7 +1029,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
             Metric {
                 name: "http.server.request.duration.by_route".into(),
                 description: "HTTP server request duration by matched location (http.route)".into(),
-                unit: "us".into(),
+                unit: "s".into(),
                 data: MetricData::ExponentialHistogram(ExponentialHistogramData {
                     aggregation_temporality: AggregationTemporality::Cumulative,
                     data_points,
@@ -1047,7 +1057,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                 name: "http.server.request.duration.by_upstream".into(),
                 description: "HTTP server request duration by upstream zone (nginx.upstream.zone)"
                     .into(),
-                unit: "us".into(),
+                unit: "s".into(),
                 data: MetricData::ExponentialHistogram(ExponentialHistogramData {
                     aggregation_temporality: AggregationTemporality::Cumulative,
                     data_points,
@@ -1135,6 +1145,18 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
 }
 
 // ─── helpers ────────────────────────────────────────────────────────────────
+
+/// Convert an integer-microsecond duration to f64 **seconds** for the
+/// `http.server.request.duration` exp-histogram scalars (sum + exemplar value).
+///
+/// The worker buckets seconds directly (`shm::ExpHistogramSlot`) but accumulates
+/// the scalar sum in raw µs; this is the lossless convert-at-export step (same
+/// `duration_us / 1_000_000.0` pattern the access-log/span duration attributes
+/// use in `export/mod.rs` and `traces/mod.rs`).
+#[inline]
+fn us_to_seconds(value_us: u64) -> f64 {
+    value_us as f64 / 1_000_000.0
+}
 
 #[inline]
 fn add_histogram<const N: usize>(
@@ -1552,5 +1574,19 @@ mod tests {
         let s2xx_idx = combo_index(method, StatusClass::S2xx, proto);
         let (_, _, _, s2xx_count) = slot.request_duration_combos[s2xx_idx].snapshot();
         assert_eq!(s2xx_count, 1, "status-200 request must be recorded into S2xx combo");
+    }
+
+    /// F3: the request-duration exp-histogram scalar `sum` and exemplar `value`
+    /// are published in **seconds** — the worker accumulates raw µs, and the
+    /// exporter divides by 1e6 once.  A 150µs observation must surface as
+    /// `0.00015 s`, NOT `150`.  (Reverting the `/ 1_000_000.0` in
+    /// [`super::us_to_seconds`] makes this assertion fail with 150.0.)
+    #[test]
+    fn f3_duration_sum_and_exemplar_in_seconds() {
+        assert_eq!(super::us_to_seconds(150), 0.00015, "150µs must convert to 0.00015 s");
+        assert_eq!(super::us_to_seconds(1_000_000), 1.0, "1e6 µs must convert to 1 s");
+        assert_eq!(super::us_to_seconds(0), 0.0, "0µs must convert to 0 s");
+        // A raw-µs sum of 1500 (e.g. 10×150µs) → 0.0015 s, not 1500.
+        assert_eq!(super::us_to_seconds(1500), 0.0015, "summed µs convert losslessly");
     }
 }

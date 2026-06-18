@@ -268,7 +268,8 @@ building dashboards, alerts, or pipelines against this module; you do **not** ne
 design proposal to integrate. In brief:
 
 - **Metrics** (on by default): HTTP request duration as an OTel exponential
-  histogram, recorded in microseconds, decomposed three ways — a base series
+  histogram in seconds (HTTP semconv unit; ~13µs resolution), decomposed three
+  ways — a base series
   keyed on method, status class, and protocol; a per-`http.route` series; and
   a per-`nginx.upstream.zone` series. Plus request, response, and upstream
   byte and timing histograms; the nginx `stub_status` series (see note below);

@@ -48,42 +48,103 @@ pub const N_DURATION_BUCKETS: usize = 15;
 /// OTel exponential histogram scale for `request_duration_combos`.
 ///
 /// **Resolution:** scale 3 → base = 2^(2^-3) = 2^0.125 ≈ 1.091
-/// → 8 buckets per power-of-2 microsecond.  At this scale, 90µs, 150µs,
-/// and 200µs land in distinct buckets (indices 51, 57, 61 respectively),
-/// resolving the ~90–200µs operating regime.  Scale 0 with integer-ms input
-/// collapsed everything < 1ms into `zero_count` — this fixes that.
+/// → 8 buckets per power-of-2.  The metric is published in **seconds**
+/// (`http.server.request.duration`, semconv unit `s`), so a duration of
+/// ~150µs (≈ p50) resolves to ~13µs near that point — seconds is the unit,
+/// not the resolution.
+/// <https://opentelemetry.io/docs/specs/otel/metrics/data-model/#exponentialhistogram>
 pub const EXP_HISTOGRAM_SCALE: i32 = 3;
 
 /// Number of positive-range bucket slots in each `ExpHistogramSlot`.
 ///
-/// At scale 3 in µs, 192 buckets covers [1µs, 2^24 µs = 16.7s), sufficient
-/// for all practical HTTP latencies.  Values ≥ 2^24 µs clamp to bucket 191.
-/// Values = 0 µs go to `zero_count` (should not occur in practice).
+/// At scale 3, 192 buckets covers ~24 octaves [~1µs, ~16.7s) of request
+/// duration.  Durations ≥ ~16.7s clamp to the last bucket (191).  A
+/// duration of 0 µs goes to `zero_count` (should not occur in practice).
+/// The array size is unchanged from the prior µs-indexed scheme; only the
+/// per-bucket meaning (now seconds) and the published offset change.
 pub const N_EXP_BUCKETS: usize = 192;
 
-/// Fixed bucket offset (OTel `offset` field in the wire format).
-/// Bucket `k` covers approximately [base^k, base^(k+1)) µs starting at 1µs.
-pub const EXP_HISTOGRAM_BUCKET_OFFSET: i32 = 0;
+/// Fixed bucket offset (OTel `positive.offset` field in the wire format).
+///
+/// The histogram is published in **seconds**.  The OTel exponential-histogram
+/// bucket index for a value `v` (seconds) at scale 3 is `ceil(log2(v)·8) − 1`
+/// (upper-inclusive).  Internal bucket `0` is the lowest covered seconds
+/// bucket, holding the smallest non-zero observation of `1µs = 1e-6 s`:
+/// `ceil(log2(1e-6)·8) − 1 = −160`.  The encoder emits this value verbatim as
+/// `positive.offset` so consumers interpret bucket counts in seconds.
+/// <https://opentelemetry.io/docs/specs/otel/metrics/data-model/#exponentialhistogram>
+pub const EXP_HISTOGRAM_BUCKET_OFFSET: i32 = -160;
+
+/// Per-bucket **upper bound in integer microseconds** for the seconds-indexed
+/// exponential histogram (scale 3).
+///
+/// `SECONDS_BUCKET_UPPER_US[i] = floor(1e6 · 2^((i + EXP_HISTOGRAM_BUCKET_OFFSET + 1) / 8))`
+/// — the exact integer µs threshold below which a duration falls into internal
+/// bucket `i` (spec index `i − 160`).  A duration `value_us` lands in the
+/// smallest `i` with `value_us ≤ SECONDS_BUCKET_UPPER_US[i]` (upper-inclusive;
+/// see [`ExpHistogramSlot::record`]).  Monotonically non-decreasing (the lowest
+/// sub-µs spec buckets collapse to threshold 1, unreachable above 0 µs); the
+/// integer-µs octave boundaries `15625 … 16000000` appear verbatim at indices
+/// `111, 119, …, 191`.
+///
+/// Generated (and re-verified in `exp_histogram_seconds_bucket_exact`) with:
+/// `python3 -c "from decimal import Decimal as D, getcontext; getcontext().prec=80;
+/// print([int(D(10)**6*(D(2)**(D(i-159)/D(8)))) for i in range(192)])"`.
+const SECONDS_BUCKET_UPPER_US: [u64; N_EXP_BUCKETS] = [
+    1, 1, 1, 1, 1, 1, 1, 1, //
+    2, 2, 2, 2, 2, 3, 3, 3, //
+    4, 4, 4, 5, 5, 6, 6, 7, //
+    8, 9, 9, 10, 11, 12, 13, 15, //
+    16, 18, 19, 21, 23, 25, 27, 30, //
+    33, 36, 39, 43, 47, 51, 55, 61, //
+    66, 72, 79, 86, 94, 102, 111, 122, //
+    133, 145, 158, 172, 188, 205, 223, 244, //
+    266, 290, 316, 345, 376, 410, 447, 488, //
+    532, 580, 633, 690, 753, 821, 895, 976, //
+    1064, 1161, 1266, 1381, 1506, 1642, 1791, 1953, //
+    2129, 2322, 2532, 2762, 3012, 3284, 3582, 3906, //
+    4259, 4645, 5065, 5524, 6024, 6569, 7164, 7812, //
+    8519, 9290, 10131, 11048, 12048, 13139, 14328, 15625, // 15625 = 2⁻⁶ s
+    17039, 18581, 20263, 22097, 24097, 26278, 28656, 31250, //
+    34078, 37162, 40526, 44194, 48194, 52556, 57312, 62500, //
+    68156, 74325, 81052, 88388, 96388, 105112, 114625, 125000, //
+    136313, 148650, 162104, 176776, 192776, 210224, 229251, 250000, //
+    272626, 297301, 324209, 353553, 385552, 420448, 458502, 500000, //
+    545253, 594603, 648419, 707106, 771105, 840896, 917004, 1000000, // 1000000 = 1 s
+    1090507, 1189207, 1296839, 1414213, 1542210, 1681792, 1834008, 2000000, //
+    2181015, 2378414, 2593679, 2828427, 3084421, 3363585, 3668016, 4000000, //
+    4362030, 4756828, 5187358, 5656854, 6168843, 6727171, 7336032, 8000000, //
+    8724061, 9513656, 10374716, 11313708, 12337686, 13454342, 14672064, 16000000, // 16 s
+];
 
 /// An OTel **exponential histogram** slot stored entirely in atomic counters.
 ///
-/// **Resolution (scale 3, µs input):** bucket `k` covers approximately
-/// [base^k, base^(k+1)) µs where base = 2^(2^-3) ≈ 1.091.
-/// 90µs → bucket 51; 150µs → 57; 200µs → 61 — all distinct.
-/// All durations are positive so `negative` is empty.
+/// The published metric is in **seconds** (`http.server.request.duration`).
+/// The worker receives durations as integer microseconds and buckets them
+/// directly into the seconds spec mapping (see [`ExpHistogramSlot::record`])
+/// so the histogram is exact and single-sourced — the exporter is a faithful
+/// pass-through, not a second aggregation stage.
 ///
-/// The record function computes the scale-3 bucket index with a few bit ops +
-/// one `fetch_add` — alloc-free and lock-free on the hot path.
+/// **Resolution (scale 3):** internal bucket `i` maps to spec index
+/// `i + EXP_HISTOGRAM_BUCKET_OFFSET` (= `i − 160`); bucket boundaries are
+/// `2^(spec/8)` seconds (base = 2^(2^-3) ≈ 1.091).  All durations are positive
+/// so `negative` is empty.
+///
+/// The record function computes the seconds bucket index with an integer
+/// binary search over a precomputed boundary table + one `fetch_add` —
+/// alloc-free, lock-free, no float, no `log()`, no syscall on the hot path.
 ///
 /// Size: `(N_EXP_BUCKETS + 3) × 8 = 195 × 8 = 1560 bytes`.
 #[repr(C)]
 pub struct ExpHistogramSlot {
-    /// Bucket `k` counts values in approximately [base^k, base^(k+1)) µs.
+    /// Bucket `i` counts durations in the seconds spec bucket
+    /// `i + EXP_HISTOGRAM_BUCKET_OFFSET`.
     /// `buckets[N_EXP_BUCKETS-1]` is the overflow bucket (≥ ~16.7s).
     pub buckets: [AtomicU64; N_EXP_BUCKETS],
-    /// Count of values = 0 µs (should not occur with µs-precision timing).
+    /// Count of durations = 0 µs (should not occur with µs-precision timing).
     pub zero_count: AtomicU64,
-    /// Sum of all observed values in µs.
+    /// Sum of all observed durations in **µs** (raw; divided by 1e6 to seconds
+    /// once at export — the lossless scalar conversion lives in the exporter).
     pub sum: AtomicU64,
     /// Total observation count.
     pub count: AtomicU64,
@@ -92,46 +153,51 @@ pub struct ExpHistogramSlot {
 impl ExpHistogramSlot {
     /// Record one duration observation on the hot path.
     ///
-    /// `value_us` is the duration in **microseconds**.  Feeding µs
-    /// (instead of ms) with scale 3 resolves the ~90–200µs regime into
-    /// distinct buckets.
+    /// `value_us` is the duration in **microseconds**.  The published metric is
+    /// in **seconds**; the worker buckets the seconds value `v = value_us / 1e6`
+    /// into the OTel exponential-histogram bucket directly so the histogram is
+    /// exact and single-sourced.
     ///
-    /// # Constraint: no allocation, no lock
+    /// # Constraint: no allocation, no lock, no float
     ///
-    /// Computes the **exact** OTel scale-3 bucket index
-    /// `floor(log2(value_us) * 8)` = `n*8 + j` using only integer shifts and
-    /// comparisons — no float, no `log()`, no syscall:
+    /// The OTel exp-histogram mapping is **upper-inclusive**: the bucket (spec)
+    /// index for a value `v` at scale 3 is `ceil(log2(v)·8) − 1`, i.e. `v` lands
+    /// in spec bucket `i` iff `2^(i/8) < v ≤ 2^((i+1)/8)`.  A value exactly on a
+    /// bucket boundary goes to the **lower** bucket.
+    /// <https://opentelemetry.io/docs/specs/otel/metrics/data-model/#exponentialhistogram>
     ///
-    /// 1. `n = 63 - leading_zeros(value_us)` — the floor-log2 (octave).
-    /// 2. `m = value_us << (63 - n)` — normalise to `[2^63, 2^64)`.
-    /// 3. `j` = count of the 7 precomputed thresholds `T[k] = floor(2^63 · 2^((k+1)/8))`
-    ///    that satisfy `m > T[k]`.  Because `m` is a multiple of `2^(63-n)` and each
-    ///    `T[k]` is never such a multiple, `m > T[k]` is equivalent to
-    ///    `value_us ≥ ceil(2^(n+(k+1)/8))`, the exact integer boundary condition.
+    /// We bucket integer microseconds against the seconds mapping using a
+    /// precomputed integer-µs upper-bound table.  Internal bucket `i` (spec
+    /// index `i + EXP_HISTOGRAM_BUCKET_OFFSET`) has upper bound
+    /// `UB_us[i] = floor(1e6 · 2^((i + OFFSET + 1)/8))`.  The seconds bucket
+    /// edges in µs are generally non-integer, EXCEPT the octave edges
+    /// `1e6 · 2^k` which are exact integer µs (`15625` = 2⁻⁶s, `31250`, …,
+    /// `1000000` = 1s, …, `16000000` = 16s) because `1e6 = 2⁶·5⁶` — a naïve
+    /// `floor` seconds scheme would mis-bucket exactly those common operating
+    /// points.  Flooring the (mostly irrational) upper bound is exact for the
+    /// upper-inclusive test on integer input: `value_us ≤ UB ⇔ value_us ≤
+    /// floor(UB)` (and at the integer octave edges `floor(UB) = UB` exactly, so
+    /// the boundary value `value_us = UB_us[i]` satisfies `≤` and lands in the
+    /// lower bucket `i` — upper-inclusive, handled by construction).
     ///
-    /// **Correctness:** verified exact for all `v ∈ [1, 2^14]` and a random
-    /// sample of `[1, 2^24]` against `floor(log2(v) · 8)`.
+    /// The bucket is the smallest `i` with `value_us ≤ UB_us[i]` =
+    /// `partition_point(|t| t < value_us)`, clamped to the overflow bucket — an
+    /// integer binary search, no float / `log()` / syscall / alloc / lock.
+    ///
+    /// **Correctness:** verified exact for all `v ∈ [1, 2^14]` and a
+    /// deterministic sample of `[1, 2^24]` (incl. every integer-µs octave
+    /// boundary) against `ceil(log2(value_us/1e6)·8) − 1` — see
+    /// `exp_histogram_seconds_bucket_exact`.
     #[inline]
     pub fn record(&self, value_us: u64) {
         if value_us == 0 {
             self.zero_count.fetch_add(1, Ordering::Relaxed);
         } else {
-            // T[k] = floor(2^63 * 2^((k+1)/8)) for k = 0..6.
-            // Derivation: `python3 -c "import math; [print(math.floor(2**63 * 2**((j+1)/8))) for j in range(7)]"`
-            // Verified: T[3] == isqrt(2^127) (exact via integer square root).
-            const THRESHOLDS: [u64; 7] = [
-                10058158527438640870, // k=0: floor(2^63 * 2^(1/8))
-                10968499650544839023, // k=1: floor(2^63 * 2^(2/8))
-                11961233684655323370, // k=2: floor(2^63 * 2^(3/8))
-                13043817825332782212, // k=3: floor(2^63 * 2^(4/8)) = isqrt(2^127)
-                14224384202002324189, // k=4: floor(2^63 * 2^(5/8))
-                15511800964685064948, // k=5: floor(2^63 * 2^(6/8))
-                16915738899553466670, // k=6: floor(2^63 * 2^(7/8))
-            ];
-            let n = 63u32.saturating_sub(value_us.leading_zeros()); // floor(log2(value_us))
-            let m = value_us << (63 - n); // normalise to [2^63, 2^64)
-            let j = THRESHOLDS.iter().filter(|&&t| m > t).count(); // sub-bucket 0..7
-            let idx = (n as usize) * 8 + j;
+            // partition_point returns the index of the first element NOT
+            // satisfying the predicate, i.e. the smallest `i` with
+            // SECONDS_BUCKET_UPPER_US[i] >= value_us — the spec upper-inclusive
+            // bucket.  Clamp to the overflow bucket for durations ≥ ~16.7s.
+            let idx = SECONDS_BUCKET_UPPER_US.partition_point(|&t| t < value_us);
             self.buckets[idx.min(N_EXP_BUCKETS - 1)].fetch_add(1, Ordering::Relaxed);
         }
         self.sum.fetch_add(value_us, Ordering::Relaxed);
@@ -1565,16 +1631,17 @@ mod tests {
         assert_eq!(total_sum, 1300);
 
         // Confirm no cross-write between slots.
-        // Exact scale-3 bucket: floor(log2(v) * 8).
-        //   100µs: log2(100)≈6.644, floor(6.644*8)=floor(53.15)=53
-        //   500µs: log2(500)≈8.966, floor(8.966*8)=floor(71.73)=71
+        // Seconds spec mapping (scale 3, upper-inclusive): the INTERNAL bucket is
+        // `ceil(log2(value_us/1e6)·8) − 1 − EXP_HISTOGRAM_BUCKET_OFFSET`.
+        //   100µs = 1e-4 s: ceil(log2(1e-4)·8)−1 = −107 → internal −107−(−160) = 53
+        //   500µs = 5e-4 s: ceil(log2(5e-4)·8)−1 = −88  → internal −88 −(−160) = 72
         let (buckets0, _, _, _) = slot0.request_duration_combos[combo].snapshot();
         let (buckets1, _, _, _) = slot1.request_duration_combos[combo].snapshot();
 
         // Expected bucket indices — hand-computed above, NOT recomputed via the same
         // formula under test (a self-referential helper never validates).
         const BUCKET_100: usize = 53;
-        const BUCKET_500: usize = 71;
+        const BUCKET_500: usize = 72;
         const _: () = assert!(BUCKET_100 != BUCKET_500, "100 and 500 must be in distinct buckets");
 
         assert_eq!(buckets0[BUCKET_100], 3, "worker 0 bucket for 100");
@@ -1724,7 +1791,8 @@ mod tests {
 
         // Record a very large value in the GET/2xx/HTTP1.1 base combo (µs).
         let combo = combo_index(HttpMethod::Get, StatusClass::S2xx, ProtoVersion::Http11);
-        // 99_999_999_999µs ≈ 27.8h; floor(log2) = 36 → k = 36*8+... ≥ 288 → clamped to 191
+        // 99_999_999_999µs ≈ 27.8h ≫ 16.7s → above the last seconds bucket's upper
+        // bound (16_000_000µs) → clamped to the overflow bucket 191.
         let very_large = 99_999_999_999u64;
         slot.request_duration_combos[combo].record(very_large);
 
@@ -1738,38 +1806,35 @@ mod tests {
         }
     }
 
-    /// Regression: low-end (value < 2^scale) bucket placement.
+    /// Low-end (small-duration) **internal** bucket placement, seconds mapping.
     ///
-    /// The prior `n <= s` shortcut wrote `value` directly as the bucket index,
-    /// mis-placing every sub-16µs observation and leaving buckets 16..31
-    /// permanently empty.  The correct scale-3 index is `floor(log2(value) * 8)`,
-    /// verified here against hand-computed expectations spanning:
-    /// - octave-aligned values (linear == geometric coincide; regression guard)
-    /// - mid-octave **divergence** values (linear gives n*8+(top-3 bits), geometric
-    ///   gives a higher index; these are the values that exposed the original bug)
+    /// Internal bucket `i` = `ceil(log2(value_us/1e6)·8) − 1 −
+    /// EXP_HISTOGRAM_BUCKET_OFFSET` (= spec seconds index minus the −160 offset).
+    /// Hand-computed expectations spanning octave-aligned values and a
+    /// mid-octave value whose **upper-inclusive `ceil`** placement differs from
+    /// the old lower-inclusive `floor` scheme (90µs: floor → 51, ceil → 52).
     ///
-    /// All expected indices are hard-coded literals from independent calculation —
-    /// never recomputed from the implementation under test.
+    /// All expected indices are hard-coded literals from independent calculation
+    /// (Python `ceil(log2(v/1e6)*8)-1 + 160`) — never recomputed from the
+    /// implementation under test.
     #[test]
     fn exp_histogram_low_end_bucket_placement() {
-        // (value_us, expected scale-3 bucket index = floor(log2(value) * 8))
+        // (value_us, expected INTERNAL bucket = ceil(log2(value_us/1e6)*8)-1 + 160)
         //
-        // Octave-aligned regression cases (linear == geometric here):
-        //   1  = 2^0         → bucket 0    (floor(0*8)=0)
-        //   2  = 2^1         → bucket 8    (floor(1*8)=8)
-        //   4  = 2^2         → bucket 16
-        //   8  = 2^3         → bucket 24
-        //   15 = 2^3 * 15/8  → bucket 31   (floor(log2(15)*8)=floor(3.907*8)=31)
-        //   16 = 2^4         → bucket 32
+        // Octave-aligned values (powers of two µs; offset −160 is a multiple of
+        // 8 so these coincide with the old floor indices — regression guard):
+        //   1  = 2^0 µs  → internal 0    (spec −160)
+        //   2  = 2^1 µs  → internal 8    (spec −152)
+        //   4  = 2^2 µs  → internal 16
+        //   8  = 2^3 µs  → internal 24
+        //   15           → internal 31
+        //   16 = 2^4 µs  → internal 32
         //
-        // Mid-octave divergence cases (old mantissa-linear code gave 52/60/68;
-        // exact geometric gives 53/61/69 — verified hand-computed below):
-        //   100: log2(100)≈6.644, floor(6.644*8)=floor(53.15)=53  (old code: 52)
-        //   200: log2(200)≈7.644, floor(7.644*8)=floor(61.15)=61  (old code: 60)
-        //   400: log2(400)≈8.644, floor(8.644*8)=floor(69.15)=69  (old code: 68)
-        //
-        // Also: 90µs (near-octave, was already correct in old code):
-        //   90:  log2(90)≈6.492, floor(6.492*8)=floor(51.93)=51
+        // Mid-octave (upper-inclusive ceil mapping):
+        //   90  = 9e-5 s : ceil(log2(9e-5)·8)−1 = −108 → internal 52  (floor scheme: 51)
+        //   100 = 1e-4 s : −107 → internal 53
+        //   200 = 2e-4 s : −99  → internal 61
+        //   400 = 4e-4 s : −91  → internal 69
         let cases = [
             // octave-aligned
             (1u64, 0usize),
@@ -1778,9 +1843,8 @@ mod tests {
             (8, 24),
             (15, 31),
             (16, 32),
-            // near-octave (already correct before the bucketing fix)
-            (90, 51),
-            // mid-octave divergence (wrong under old code, correct after the fix)
+            // mid-octave (upper-inclusive ceil; 90 differs from the old floor scheme)
+            (90, 52),
             (100, 53),
             (200, 61),
             (400, 69),
@@ -1799,6 +1863,89 @@ mod tests {
             assert_eq!(zero, 0, "value {value}: nonzero must not hit zero_count");
             assert_eq!(buckets[expected], 1, "value {value} must land in bucket {expected}");
             assert_eq!(buckets.iter().sum::<u64>(), 1, "value {value}: exactly one bucket set");
+        }
+    }
+
+    /// **Exhaustive exactness proof for the seconds bucketing (Option A).**
+    ///
+    /// For every `value_us` in `[1, 2^14]` and a deterministic geometric sample
+    /// up to `2^24` — explicitly including every integer-µs octave boundary
+    /// (`15625`, `31250`, …, `1000000` = 1s, …, `16000000` = 16s) — the worker's
+    /// emitted **spec** bucket index (`internal_idx + EXP_HISTOGRAM_BUCKET_OFFSET`)
+    /// must equal the OTel upper-inclusive reference
+    /// `ceil((value_us as f64 / 1e6).log2() * 8.0) as i64 − 1`, computed here in
+    /// f64 (independent of the integer table under test).  Indices that would
+    /// exceed the array clamp to the overflow bucket `N_EXP_BUCKETS − 1`.
+    ///
+    /// This is the proof that the integer boundary-table construction is
+    /// spec-exact at ALL boundaries (the point a naïve `floor` scheme fails — see
+    /// the `floor`-fails-at-15625 mutation note in the change brief).
+    #[test]
+    fn exp_histogram_seconds_bucket_exact() {
+        let offset = EXP_HISTOGRAM_BUCKET_OFFSET as i64;
+
+        // f64 reference: the OTel upper-inclusive spec bucket index in seconds.
+        let spec_ref = |value_us: u64| -> i64 {
+            let v_s = value_us as f64 / 1_000_000.0;
+            (v_s.log2() * 8.0).ceil() as i64 - 1
+        };
+
+        // Run one value through record() and return the spec index it landed in.
+        let recorded_spec = |value_us: u64| -> i64 {
+            let mut buf = std::vec![0u8; mem::size_of::<ExpHistogramSlot>()];
+            // SAFETY: zero-init buffer sized to one ExpHistogramSlot; zero is the
+            // valid initial state for its atomics; ref lives only for the call.
+            let slot = unsafe { &*buf.as_mut_ptr().cast::<ExpHistogramSlot>() };
+            slot.record(value_us);
+            let (buckets, zero, _sum, count) = slot.snapshot();
+            assert_eq!(count, 1, "value {value_us}: exactly one observation");
+            assert_eq!(zero, 0, "value {value_us}: nonzero must not hit zero_count");
+            let set: std::vec::Vec<usize> =
+                buckets.iter().enumerate().filter(|(_, &c)| c == 1).map(|(i, _)| i).collect();
+            assert_eq!(set.len(), 1, "value {value_us}: exactly one bucket set, got {set:?}");
+            set[0] as i64 + offset
+        };
+
+        // Compare with clamping to the overflow bucket's spec index.
+        let max_internal = (N_EXP_BUCKETS - 1) as i64;
+        let check = |value_us: u64| {
+            let want = spec_ref(value_us).clamp(offset, max_internal + offset);
+            let got = recorded_spec(value_us);
+            assert_eq!(
+                got, want,
+                "value_us {value_us}: emitted spec bucket {got} != reference {want}"
+            );
+        };
+
+        // Full exhaustive sweep [1, 2^14].
+        for value_us in 1u64..=(1 << 14) {
+            check(value_us);
+        }
+
+        // Deterministic geometric sample to 2^24 (every ~2^0.5 step).
+        let mut v = (1u64 << 14) + 1;
+        while v <= (1 << 24) {
+            check(v);
+            v = v + (v >> 1) + 1; // ~1.5× growth, deterministic
+        }
+
+        // The integer-µs octave boundaries — the exact points a `floor` scheme
+        // mis-buckets — must each land in the LOWER (upper-inclusive) bucket.
+        for &boundary in &[
+            15625u64, 31250, 62500, 125000, 250000, 500000, 1_000_000, 2_000_000, 4_000_000,
+            8_000_000, 16_000_000,
+        ] {
+            check(boundary);
+            // And one µs above each boundary lands one spec bucket higher — except
+            // 16_000_000 = 16s, whose upper bucket is already the overflow bucket
+            // (N_EXP_BUCKETS−1), so `boundary+1` clamps to the same bucket.
+            if boundary < SECONDS_BUCKET_UPPER_US[N_EXP_BUCKETS - 1] {
+                assert_eq!(
+                    recorded_spec(boundary + 1),
+                    recorded_spec(boundary) + 1,
+                    "boundary {boundary}: value just above must be one spec bucket higher"
+                );
+            }
         }
     }
 
@@ -2028,13 +2175,14 @@ mod tests {
             "90µs, 150µs, 200µs must each land in a distinct bucket (scale 3)"
         );
 
-        // Spot-check expected indices (exact: floor(log2(v) * 8)):
-        // 90µs:  log2(90)≈6.492,  floor(6.492*8)=floor(51.93)=51
-        // 150µs: log2(150)≈7.229, floor(7.229*8)=floor(57.83)=57
-        // 200µs: log2(200)≈7.644, floor(7.644*8)=floor(61.15)=61
-        assert_eq!(buckets[51], 1, "90µs → bucket 51");
-        assert_eq!(buckets[57], 1, "150µs → bucket 57");
-        assert_eq!(buckets[61], 1, "200µs → bucket 61");
+        // Spot-check expected INTERNAL indices (seconds mapping, upper-inclusive:
+        // ceil(log2(value_us/1e6)·8) − 1 + 160):
+        // 90µs  = 9e-5 s → internal 52
+        // 150µs = 1.5e-4 s → internal 58
+        // 200µs = 2e-4 s → internal 61
+        assert_eq!(buckets[52], 1, "90µs → internal bucket 52");
+        assert_eq!(buckets[58], 1, "150µs → internal bucket 58");
+        assert_eq!(buckets[61], 1, "200µs → internal bucket 61");
     }
 
     #[test]

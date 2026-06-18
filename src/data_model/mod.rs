@@ -465,7 +465,7 @@ pub(crate) mod tests {
         let metric = Metric {
             name: "http.server.request.duration".into(),
             description: "Duration of HTTP server requests".into(),
-            unit: "us".into(),
+            unit: "s".into(),
             data: MetricData::Histogram(HistogramData {
                 aggregation_temporality: AggregationTemporality::Delta,
                 data_points: std::vec![point],

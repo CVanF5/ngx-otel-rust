@@ -48,7 +48,7 @@ log export is opt-in (privacy).
 
 | Feature | What it does | Status |
 |---|---|---|
-| Core + HTTP metrics | nginx connection/request gauges + per-request latency as an exponential histogram (µs) | Shipped |
+| Core + HTTP metrics | nginx connection/request gauges + per-request latency as an exponential histogram (seconds) | Shipped |
 | Trace-linked metric exemplars | a `trace_id`/`span_id` pointer on the duration histogram (no other attributes), uniformly sampled, up to two per data point per export cycle (small fixed reservoir, reset each cycle), on trace-sampled requests (`otel_trace`) — the metric → trace drill-down | Shipped |
 | Distributed traces | one OTel server span per request; W3C `traceparent` propagation (`otel_trace`) | Shipped |
 | **Logs: nothing exported by default** | no request-level log data leaves nginx unless configured (privacy) | Shipped |
@@ -150,11 +150,16 @@ reaches the exporter retry buffer.
 
 ---
 
-## HTTP server request duration (exponential histogram, µs)
+## HTTP server request duration (exponential histogram, seconds)
 
 Derived per request in `LogPhaseHandler` (`src/metric_source/instrumented.rs`). The
-request duration is an OTel **exponential histogram recorded in microseconds**, for
-native sub-millisecond quantiles in the ~90–200µs operating regime.
+request duration is an OTel **exponential histogram published in seconds** (the HTTP
+semconv unit for `http.server.request.duration`), at scale 3 — still resolving the
+~90–200µs operating regime (seconds is the unit, not the resolution). The worker
+measures and buckets in integer microseconds against the seconds bucket mapping
+directly, so the published histogram is exact and single-sourced; only the scalar
+`sum` and exemplar values are converted µs→seconds (one lossless divide each) at
+export.
 
 The duration is emitted as **three decomposed series** (not a cross-product): a base
 series carrying the bounded `{method × status-class × protocol}` dimensions, plus
@@ -163,9 +168,9 @@ table in `WorkerSlots` (`src/shm.rs`).
 
 | Metric | Instrument | Unit | Temporality | Attributes (data-point keys) |
 |---|---|---|---|---|
-| `http.server.request.duration` | ExponentialHistogram | `us` | Cumulative | `http.request.method`, `http.response.status_code`, `network.protocol.version` — **only when `otel_metric_status_code_class on`**; otherwise a single unattributed data point |
-| `http.server.request.duration.by_route` | ExponentialHistogram | `us` | Cumulative | `http.route` (matched `location` name) |
-| `http.server.request.duration.by_upstream` | ExponentialHistogram | `us` | Cumulative | `nginx.upstream.zone` (declared upstream `zone`) |
+| `http.server.request.duration` | ExponentialHistogram | `s` | Cumulative | `http.request.method`, `http.response.status_code`, `network.protocol.version` — **only when `otel_metric_status_code_class on`**; otherwise a single unattributed data point |
+| `http.server.request.duration.by_route` | ExponentialHistogram | `s` | Cumulative | `http.route` (matched `location` name) |
+| `http.server.request.duration.by_upstream` | ExponentialHistogram | `s` | Cumulative | `nginx.upstream.zone` (declared upstream `zone`) |
 
 - The base series emits up to **160** data points (`N_HTTP_METHODS(8) ×
   N_STATUS_CLASSES(5) × N_PROTO_VERSIONS(4)`); empty combos are skipped.
@@ -209,28 +214,26 @@ table in `WorkerSlots` (`src/shm.rs`).
 ### Exponential histogram parameters (`src/shm.rs`)
 
 - **Scale:** `EXP_HISTOGRAM_SCALE = 3` → base = 2^(2^-3) ≈ 1.091 (8 buckets
-  per power-of-two µs). 90µs → bucket 51; 150µs → bucket 57; 200µs → bucket 61
-  — all distinct.
-- **Buckets:** `N_EXP_BUCKETS = 192`, `positive_offset = 0`, covering
-  ≈ [1µs, 2^24µs ≈ 16.7s); values above clamp to the last bucket; 0µs →
-  `zero_count`.
-- **Bucket computation is exact:** bucket index = `floor(log2(value_us) * 8)`,
-  computed in O(1) using only integer shifts and 7 precomputed u64 thresholds —
-  no float, no `log()` call, no syscall on the hot path. Verified exact for all
-  values in [1, 2^14] and a random sample up to 2^24.
-- **One-bucket difference from the spec, at exact powers of two (note):** our
-  bucketing matches the OpenTelemetry exponential-histogram spec for every latency
-  except one corner case, and the difference is only about which side of a bucket
-  edge a value falls on. We treat each bucket as "from its lower edge up to, but not
-  including, the next edge"; the spec treats it as "above the lower edge, up to and
-  including the next edge." Those two rules disagree only when a value lands *exactly*
-  on an edge — and for these buckets, the edges sit at exact powers of two
-  microseconds (2µs, 4µs, 8µs, and so on). Such a value goes into the next bucket up
-  under our rule versus the spec's. Every other integer-microsecond latency buckets
-  identically. This is a deliberate, documented choice.
-  (For reference: our index is `floor(log2(value_us) * 8)`, a lower-inclusive
-  `[base^k, base^(k+1))` boundary; the spec uses the upper-inclusive
-  `(base^k, base^(k+1)]`.)
+  per octave in seconds). A ~90–200µs latency still resolves into distinct
+  buckets (~13µs resolution near a 150µs p50).
+- **Buckets:** `N_EXP_BUCKETS = 192`, `positive_offset = -160`, covering ≈
+  [1µs, 16.7s) of duration; durations above clamp to the last bucket; 0µs →
+  `zero_count`. The offset is the seconds-spec index of the lowest covered
+  bucket: `ceil(log2(1e-6)·8) − 1 = −160` (internal bucket 0 holds a 1µs
+  observation).
+- **Bucket computation is spec-exact:** the published value is seconds
+  (`v = value_us / 1e6`); its bucket is the OpenTelemetry upper-inclusive
+  exponential-histogram index `ceil(log2(v)·8) − 1` — a value exactly on a
+  bucket edge goes to the lower bucket. The worker computes this with an
+  integer binary search over a precomputed per-bucket integer-µs upper-bound
+  table (`SECONDS_BUCKET_UPPER_US`) — no float, no `log()`, no syscall, no
+  alloc, no lock on the hot path. The integer-µs octave boundaries
+  (`15625` = 2⁻⁶s, …, `1000000` = 1s, …, `16000000` = 16s; integer because
+  `1e6 = 2⁶·5⁶`) are placed in the lower bucket exactly, per the spec.
+  **Verified exact** for every value in [1, 2^14] and a deterministic sample
+  up to 2^24 — including every integer-µs octave boundary — against the f64
+  reference `ceil(log2(value_us/1e6)·8) − 1`
+  (`exp_histogram_seconds_bucket_exact`). There is no spec deviation.
 
 ---
 
@@ -318,8 +321,8 @@ Rust enums in `src/shm.rs` (`HttpMethod`, `StatusClass`, `ProtoVersion`).
 
 ## Histogram bucket boundaries (`src/shm.rs`)
 
-- **Request duration** — exponential (see parameters above): scale 3, µs,
-  192 buckets, offset 0. **Not** the explicit `ms` boundaries below.
+- **Request duration** — exponential (see parameters above): scale 3, seconds,
+  192 buckets, offset −160. **Not** the explicit `ms` boundaries below.
 - **Upstream durations (`ms`)** — explicit, `DURATION_BOUNDS_MS`, 14 + overflow:
   `5, 10, 25, 50, 75, 100, 250, 500, 750, 1000, 2500, 5000, 7500, 10000`
 - **Byte sizes (`By`)** — explicit, `BYTES_BOUNDS`, 6 + overflow:
