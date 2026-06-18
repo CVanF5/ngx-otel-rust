@@ -815,7 +815,7 @@
         {
           "id": 11,
           "type": "timeseries",
-          "title": "Request Latency by Status (avg s) · ⬦ exemplars → click to Loki",
+          "title": "Request Latency by Status (p99 s) · ⬦ exemplars → click to Loki",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
@@ -834,7 +834,7 @@
                 "uid": "prometheus"
               },
               "refId": "A",
-              "expr": "sum(histogram_sum(rate(http_server_request_duration{service_name=\"$service\"}[$__rate_interval]))) by (http_response_status_class) / sum(histogram_count(rate(http_server_request_duration{service_name=\"$service\"}[$__rate_interval]))) by (http_response_status_class)",
+              "expr": "histogram_quantile(0.99, sum(rate(http_server_request_duration{service_name=\"$service\"}[$__rate_interval])) by (http_response_status_class))",
               "legendFormat": "{{http_response_status_class}}",
               "exemplar": true
             }
@@ -1028,7 +1028,7 @@
         },
         {
           "id": 13,
-          "type": "bargauge",
+          "type": "timeseries",
           "title": "Avg Duration by Upstream Zone (s · nginx.upstream.zone)",
           "datasource": {
             "type": "prometheus",
@@ -1050,7 +1050,8 @@
               "refId": "A",
               "expr": "sum(histogram_sum(rate(nginx_http_request_duration_by_upstream{service_name=\"$service\"}[$__rate_interval]))) by (nginx_upstream_zone) / sum(histogram_count(rate(nginx_http_request_duration_by_upstream{service_name=\"$service\"}[$__rate_interval]))) by (nginx_upstream_zone)",
               "legendFormat": "{{nginx_upstream_zone}}",
-              "instant": true
+              "instant": false,
+              "range": true
             }
           ],
           "fieldConfig": {
@@ -1075,20 +1076,32 @@
               },
               "color": {
                 "mode": "thresholds"
+              },
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "smooth",
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": true,
+                "axisPlacement": "auto",
+                "gradientMode": "opacity"
               }
             },
             "overrides": []
           },
           "options": {
-            "displayMode": "gradient",
-            "orientation": "horizontal",
-            "valueMode": "color",
-            "reduceOptions": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
               "calcs": [
+                "mean",
                 "lastNotNull"
-              ],
-              "fields": "",
-              "values": false
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
             }
           }
         },
