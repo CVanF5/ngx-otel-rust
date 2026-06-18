@@ -13,7 +13,8 @@
 #[cfg(ngx_feature = "stat_stub")]
 use core::sync::atomic::Ordering;
 
-use crate::data_model::{AggregationTemporality, HistogramData, Metric, MetricData};
+use crate::data_model::{Metric, MetricData};
+use crate::export::monotonic_sum_metric;
 use crate::metric_source::MetricSource;
 
 /// A `MetricSource` that reads NGINX's internal connection/request counters.
@@ -21,7 +22,15 @@ use crate::metric_source::MetricSource;
 /// These are the same values exposed by the HTTP stub_status module.
 /// All reads happen only on the designated export worker (`NgxProcess::Worker(0)`),
 /// never on the request path.
-pub struct StubStatusSource;
+pub struct StubStatusSource {
+    /// Exporter process start time (Unix epoch, nanoseconds). Used as the
+    /// `start_time_unix_nano` for the three monotonic cumulative Sums
+    /// (`nginx.connections.accepted`, `nginx.connections.handled`,
+    /// `nginx.requests.total`) so that downstream rate/delta-conversion
+    /// processors can anchor windows correctly. Captured once at exporter-loop
+    /// init (`export_loop`) and threaded in via `collect_all_sources`.
+    pub start_time_unix_nano: u64,
+}
 
 impl MetricSource for StubStatusSource {
     fn collect(&self) -> std::vec::Vec<Metric> {
@@ -33,25 +42,28 @@ impl MetricSource for StubStatusSource {
         let now = crate::util::now_unix_nano();
 
         std::vec![
-            counter_metric(
+            monotonic_sum_metric(
                 "nginx.connections.accepted",
                 "Total accepted connections",
                 "{connection}",
-                accepted,
+                accepted as i64,
+                self.start_time_unix_nano,
                 now,
             ),
-            counter_metric(
+            monotonic_sum_metric(
                 "nginx.connections.handled",
                 "Total handled connections",
                 "{connection}",
-                handled,
+                handled as i64,
+                self.start_time_unix_nano,
                 now,
             ),
-            counter_metric(
+            monotonic_sum_metric(
                 "nginx.requests.total",
                 "Total HTTP requests processed",
                 "{request}",
-                requests,
+                requests as i64,
+                self.start_time_unix_nano,
                 now,
             ),
             gauge_metric(
@@ -137,23 +149,10 @@ unsafe fn read_stats() -> (u64, u64, u64, u64, u64, u64, u64) {
     (0, 0, 0, 0, 0, 0, 0)
 }
 
-/// Build a cumulative-sum "counter" metric from a scalar value.
-///
-/// We model counters as single-bucket histograms (count=1, sum=value) so the
-/// encoder can emit them uniformly.  A proper `Sum` instrument is a possible
-/// future encoder refinement.
-fn counter_metric(name: &str, desc: &str, unit: &str, value: u64, time_ns: u64) -> Metric {
-    scalar_histogram(name, desc, unit, value, time_ns, AggregationTemporality::Cumulative)
-}
-
 /// Build a gauge metric (instantaneous value) from a scalar.
 ///
-/// Emitted as a real OTLP `Gauge` — NOT a single-bucket histogram. The
-/// stub_status connection counts (active/reading/writing/waiting) are
-/// instantaneous gauges; modelling them as `count=1` histograms is
-/// semantically wrong and is silently dropped by Prometheus remote-write
-/// (a histogram whose `_count` never increases is non-monotonic). A proper
-/// Gauge round-trips through every OTLP backend.
+/// Emitted as a real OTLP `Gauge` — NOT a Sum. The stub_status connection
+/// counts (active/reading/writing/waiting) are instantaneous gauges.
 fn gauge_metric(name: &str, desc: &str, unit: &str, value: u64, time_ns: u64) -> Metric {
     use crate::data_model::{GaugeData, NumberDataPoint, NumberValue};
     Metric {
@@ -171,35 +170,6 @@ fn gauge_metric(name: &str, desc: &str, unit: &str, value: u64, time_ns: u64) ->
     }
 }
 
-fn scalar_histogram(
-    name: &str,
-    desc: &str,
-    unit: &str,
-    value: u64,
-    time_ns: u64,
-    temporality: AggregationTemporality,
-) -> Metric {
-    use crate::data_model::HistogramDataPoint;
-    Metric {
-        name: name.into(),
-        description: desc.into(),
-        unit: unit.into(),
-        data: MetricData::Histogram(HistogramData {
-            aggregation_temporality: temporality,
-            data_points: std::vec![HistogramDataPoint {
-                attributes: std::vec![],
-                start_time_unix_nano: 0,
-                time_unix_nano: time_ns,
-                count: 1,
-                sum: value as f64,
-                // Single "catch-all" bucket: no explicit boundaries.
-                bucket_counts: std::vec![1],
-                explicit_bounds: std::vec![],
-            }],
-        }),
-    }
-}
-
 // ─── tests ──────────────────────────────────────────────────────────────────
 
 // In a stub-enabled build (`--with-http_stub_status_module` → NGX_STAT_STUB →
@@ -211,11 +181,13 @@ fn scalar_histogram(
 #[cfg(all(test, ngx_feature = "stat_stub"))]
 mod tests {
     use super::*;
-    use crate::data_model::MetricData;
+    use crate::data_model::{AggregationTemporality, MetricData};
+
+    const TEST_START_NS: u64 = 1_700_000_000_000_000_000;
 
     #[test]
     fn stub_status_produces_seven_metrics() {
-        let src = StubStatusSource;
+        let src = StubStatusSource { start_time_unix_nano: TEST_START_NS };
         let metrics = src.collect();
         assert_eq!(metrics.len(), 7, "expected 7 stub_status metrics");
 
@@ -228,27 +200,71 @@ mod tests {
         assert!(names.contains(&"nginx.connections.writing"));
         assert!(names.contains(&"nginx.connections.waiting"));
 
-        // Counters (accepted/handled/requests) are cumulative single-bucket
-        // histograms; the connection GAUGES (active/reading/writing/waiting) are
-        // real OTLP Gauges (not fake histograms — see gauge_metric). Each has
-        // exactly one data point.
-        let gauges = [
+        // The three monotonic counters must be OTLP Sums (monotonic, Cumulative)
+        // with the exporter start time set. The four connection-state series must
+        // remain real OTLP Gauges (instantaneous, no start time).
+        let counter_names =
+            ["nginx.connections.accepted", "nginx.connections.handled", "nginx.requests.total"];
+        let gauge_names = [
             "nginx.connections.active",
             "nginx.connections.reading",
             "nginx.connections.writing",
             "nginx.connections.waiting",
         ];
         for m in &metrics {
-            if gauges.contains(&m.name.as_str()) {
+            if counter_names.contains(&m.name.as_str()) {
+                let MetricData::Sum(ref s) = m.data else {
+                    panic!(
+                        "stub_status counter {} must be a Sum (got {:?})",
+                        m.name,
+                        core::mem::discriminant(&m.data)
+                    );
+                };
+                assert!(s.is_monotonic, "counter {} Sum must be monotonic", m.name);
+                assert_eq!(
+                    s.aggregation_temporality,
+                    AggregationTemporality::Cumulative,
+                    "counter {} Sum must be Cumulative",
+                    m.name
+                );
+                assert_eq!(s.data_points.len(), 1, "counter {} has wrong #points", m.name);
+                assert_eq!(
+                    s.data_points[0].start_time_unix_nano, TEST_START_NS,
+                    "counter {} must carry the exporter start time",
+                    m.name
+                );
+            } else if gauge_names.contains(&m.name.as_str()) {
                 let MetricData::Gauge(ref g) = m.data else {
                     panic!("stub_status connection gauge {} must be a Gauge", m.name);
                 };
                 assert_eq!(g.data_points.len(), 1, "gauge {} has wrong #points", m.name);
             } else {
-                let MetricData::Histogram(ref h) = m.data else {
-                    panic!("stub_status counter {} must be a histogram", m.name);
-                };
-                assert_eq!(h.data_points.len(), 1, "metric {} has wrong #points", m.name);
+                panic!("unexpected metric name: {}", m.name);
+            }
+        }
+    }
+
+    /// Mutation-cycle assertion: the three counters are Sums (not Histograms).
+    ///
+    /// To verify this is a real guard: revert `monotonic_sum_metric` calls in
+    /// `StubStatusSource::collect` back to `counter_metric`/`scalar_histogram`
+    /// and this test fails with "must be a Sum (got Histogram)".
+    #[test]
+    fn counters_are_sums_not_histograms() {
+        let src = StubStatusSource { start_time_unix_nano: TEST_START_NS };
+        let metrics = src.collect();
+        for m in &metrics {
+            match m.name.as_str() {
+                "nginx.connections.accepted"
+                | "nginx.connections.handled"
+                | "nginx.requests.total" => {
+                    assert!(
+                        matches!(m.data, MetricData::Sum(_)),
+                        "{} must be MetricData::Sum, not a Histogram",
+                        m.name
+                    );
+                }
+                _ => {}
             }
         }
     }

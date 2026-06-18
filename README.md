@@ -468,11 +468,11 @@ Produces:
 >   Build the module against headers from the same nginx you will load it into.
 
 > **`nginx.connections.accepted`, `nginx.connections.handled`, and
-> `nginx.requests.total` are emitted as single-bucket OTLP Histograms** (the
-> cumulative value appears in the `_sum` series, not as a Sum/counter
-> instrument). The connection-state series — `nginx.connections.active`,
-> `.reading`, `.writing`, `.waiting` — are real OTLP Gauges (instantaneous,
-> no `_count`/`_sum`).
+> `nginx.requests.total` are emitted as OTLP Sums** (monotonic, Cumulative —
+> real counters). A Prometheus remote-write backend exposes them as
+> `nginx_requests_total` (etc.) with no `_sum` suffix. The connection-state
+> series — `nginx.connections.active`, `.reading`, `.writing`, `.waiting` —
+> are real OTLP Gauges (instantaneous, no start time).
 
 > **`--with-http_ssl_module` and the `ngx_otel.tls.certificate.*` metrics.**
 > The serving-certificate gauges (`not_after` / `not_before` /

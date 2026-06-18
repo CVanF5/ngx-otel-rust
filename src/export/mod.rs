@@ -2601,7 +2601,7 @@ fn collect_all_sources(amcf: &MainConfig, worker_start_ns: u64, collector_host: 
     //    rather than zero. The operator is told why via a one-shot WARN at export
     //    loop startup (see `export_loop`).
     #[cfg(ngx_feature = "stat_stub")]
-    metrics.extend(StubStatusSource.collect());
+    metrics.extend(StubStatusSource { start_time_unix_nano: worker_start_ns }.collect());
 
     // 2. Per-worker shm histograms (http.server.request.duration, etc.).
     if let Some(base) = amcf.shm_base() {
@@ -3174,7 +3174,7 @@ fn read_u16_prefixed(buf: &[u8], pos: &mut usize) -> std::vec::Vec<u8> {
 /// counter) started. OTel cumulative semantics require this so rate
 /// computations across collector restarts work correctly; a `0` start time
 /// means epoch (1970) and confuses delta-conversion processors.
-fn monotonic_sum_metric(
+pub(crate) fn monotonic_sum_metric(
     name: &str,
     desc: &str,
     unit: &str,

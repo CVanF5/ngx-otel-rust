@@ -265,12 +265,12 @@ metrics only when an upstream was used (from `ngx_http_upstream_state_t`).
 Read from nginx's `stub_status` globals each export interval
 (`src/metric_source/stub_status.rs`). Connection state
 (active/reading/writing/waiting) is emitted as OTLP **Gauge** metrics. The
-cumulative counters (accepted/handled/requests) are each emitted as a
-**single-bucket explicit Histogram**, not as an OTLP Sum: the running total is
-carried in the histogram's `sum` field (so a Prometheus / remote-write backend
-reads the value from the `…_sum` series). Emitting them this way lets the encoder
-treat every metric uniformly; a true monotonic Sum instrument is a possible future
-change.
+cumulative counters (accepted/handled/requests) are emitted as OTLP **Sum**
+(monotonic, Cumulative) — real counters you can `rate()` directly in
+Prometheus/PromQL. The running total is the Sum data point value; a Prometheus
+remote-write backend exposes it as `nginx_requests_total` (no `_sum` suffix).
+The exporter start time is carried as `start_time_unix_nano` so
+delta-conversion processors can anchor windows correctly.
 
 > **Build-flag requirement.** These seven series exist **only** when nginx is
 > built with `--with-http_stub_status_module` (which defines `NGX_STAT_STUB`,
@@ -282,9 +282,9 @@ change.
 
 | Name | Instrument | Unit (UCUM) | Temporality | Stability |
 |---|---|---|---|---|
-| `nginx.requests.total` | Histogram (explicit, single-bucket) | `{request}` | Cumulative | experimental |
-| `nginx.connections.accepted` | Histogram (explicit, single-bucket) | `{connection}` | Cumulative | experimental |
-| `nginx.connections.handled` | Histogram (explicit, single-bucket) | `{connection}` | Cumulative | experimental |
+| `nginx.requests.total` | Counter (Sum, monotonic) | `{request}` | Cumulative | experimental |
+| `nginx.connections.accepted` | Counter (Sum, monotonic) | `{connection}` | Cumulative | experimental |
+| `nginx.connections.handled` | Counter (Sum, monotonic) | `{connection}` | Cumulative | experimental |
 | `nginx.connections.active` | Gauge | `{connection}` | — | experimental |
 | `nginx.connections.reading` | Gauge | `{connection}` | — | experimental |
 | `nginx.connections.writing` | Gauge | `{connection}` | — | experimental |
