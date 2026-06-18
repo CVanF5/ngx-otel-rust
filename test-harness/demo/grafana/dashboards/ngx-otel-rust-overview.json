@@ -1908,44 +1908,6 @@
           }
         },
         {
-          "id": 20,
-          "type": "logs",
-          "title": "Access Logs — Errors (4xx/5xx)",
-          "datasource": {
-            "type": "loki",
-            "uid": "loki"
-          },
-          "description": null,
-          "gridPos": {
-            "h": 9,
-            "w": 24,
-            "x": 0,
-            "y": 40
-          },
-          "targets": [
-            {
-              "datasource": {
-                "type": "loki",
-                "uid": "loki"
-              },
-              "refId": "A",
-              "queryType": "range",
-              "expr": "{service_name=\"$service\"} | http_response_status_code=~\"4..|5..\" | line_format \"{{.http_response_status_code}} {{.http_request_method}} {{.url_path}} (client {{.client_address}})\""
-            }
-          ],
-          "options": {
-            "showTime": true,
-            "wrapLogMessage": true,
-            "dedupStrategy": "none",
-            "enableLogDetails": true,
-            "sortOrder": "Descending"
-          },
-          "fieldConfig": {
-            "defaults": {},
-            "overrides": []
-          }
-        },
-        {
           "id": 21,
           "type": "logs",
           "title": "Exported Access Logs (tail)",
@@ -1968,7 +1930,7 @@
               },
               "refId": "A",
               "queryType": "range",
-              "expr": "{service_name=\"$service\"} | http_response_status_code=~\".+\" | line_format \"{{.severity_text}} {{.http_request_method}} {{.http_response_status_code}} {{.url_path}}\""
+              "expr": "{service_name=\"$service\"} | http_response_status_code=~\".+\" | line_format \"{{.severity_text}} {{.http_request_method}} {{.http_response_status_code}} {{.url_path}} (client {{.client_address}})\""
             }
           ],
           "options": {
