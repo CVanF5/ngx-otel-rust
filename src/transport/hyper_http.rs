@@ -1981,6 +1981,51 @@ fn set_alpn(ssl: *mut openssl_sys::SSL, proto: &[u8]) -> Result<(), TransportErr
 // Core HTTP/1.1 POST via hyper
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Co-drive hyper's IO task (`conn`) and the response future (`resp_fut`) on a
+/// single waker context, returning the response once it resolves.
+///
+/// The connection future is manually fused: a future must not be polled again
+/// after it returns `Poll::Ready` (see the `Future::poll` contract,
+/// <https://doc.rust-lang.org/std/future/trait.Future.html#panics>), so once
+/// `conn` completes it is no longer driven and only `resp_fut` is polled on
+/// subsequent wakes.
+///
+/// A clean `Ready(Ok(()))` from `conn` is NOT treated as an error: the export
+/// request sends `Connection: close`, so the IO task finishing cleanly is the
+/// normal success path. hyper has already buffered the response by then, which
+/// `resp_fut` yields (or itself reports as an incomplete/closed error if the
+/// close was genuinely premature). Only a `Ready(Err(_))` from `conn` is
+/// surfaced directly.
+async fn drive_to_response<C, R, T, CE, RE>(
+    mut conn: core::pin::Pin<&mut C>,
+    mut resp_fut: core::pin::Pin<&mut R>,
+) -> Result<T, Box<dyn std::error::Error + Send + Sync>>
+where
+    C: Future<Output = Result<(), CE>>,
+    R: Future<Output = Result<T, RE>>,
+    CE: std::error::Error + Send + Sync + 'static,
+    RE: std::error::Error + Send + Sync + 'static,
+{
+    let mut conn_done = false;
+    future::poll_fn(|cx| -> Poll<Result<T, Box<dyn std::error::Error + Send + Sync>>> {
+        // Drive the IO task first (while it is still live) so writes flush
+        // and reads make progress, then poll the response future. Surface
+        // only a connection *error*; a clean completion just fuses the task.
+        if !conn_done {
+            match conn.as_mut().poll(cx) {
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(Box::new(e))),
+                Poll::Ready(Ok(())) => conn_done = true,
+                Poll::Pending => {}
+            }
+        }
+        resp_fut
+            .as_mut()
+            .poll(cx)
+            .map(|r| r.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) }))
+    })
+    .await
+}
+
 /// POST `body` to `http_path` via hyper's HTTP/1.1 client.
 ///
 /// Returns the HTTP status code, response headers, and fully-collected response
@@ -2039,37 +2084,12 @@ async fn http_post_raw(
 
     let resp_fut = sender.send_request(req);
 
-    let mut conn = core::pin::pin!(conn);
-    let mut resp_fut = core::pin::pin!(resp_fut);
+    let conn = core::pin::pin!(conn);
+    let resp_fut = core::pin::pin!(resp_fut);
 
-    type DriveErr = Box<dyn std::error::Error + Send + Sync>;
-    let resp = future::poll_fn(|cx| -> Poll<Result<_, DriveErr>> {
-        // Drive the connection task alongside the response future. First poll
-        // the response future: once it is Ready we have the response (or its
-        // error) and must stop polling the connection future. Polling the
-        // connection first risks observing its completion (below) and returning
-        // before the already-arrived response is taken.
-        if let Poll::Ready(r) = resp_fut.as_mut().poll(cx) {
-            return Poll::Ready(r.map_err(Into::into));
-        }
-        // The response is not ready yet. Drive the connection task. If it
-        // terminates — whether with an error (TLS reset, peer RST) OR a clean
-        // Ok(()) close before any response arrived — surface it as an error
-        // rather than returning Pending: a completed Connection future must not
-        // be polled again (a futures contract violation), and leaving resp_fut
-        // Pending would otherwise stall until the read timeout fires.
-        match conn.as_mut().poll(cx) {
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),
-            Poll::Ready(Ok(())) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "connection closed before response",
-            )
-            .into())),
-            Poll::Pending => Poll::Pending,
-        }
-    })
-    .await
-    .map_err(|e| TransportError::Connection { cause: e.to_string() })?;
+    let resp = drive_to_response(conn, resp_fut)
+        .await
+        .map_err(|e| TransportError::Connection { cause: e.to_string() })?;
 
     let status = resp.status();
     let headers = resp.headers().clone();
@@ -2092,6 +2112,121 @@ async fn http_post_raw(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── drive_to_response: connection-future fuse ───────────────────────────
+
+    /// Minimal synchronous executor for the fuse tests: polls to completion on
+    /// a no-op waker. The futures under test make deterministic progress, so no
+    /// real wakeups are needed.
+    fn run_to_completion<F: Future>(fut: F) -> F::Output {
+        use core::task::{RawWaker, RawWakerVTable};
+        unsafe fn clone(_: *const ()) -> RawWaker {
+            RawWaker::new(core::ptr::null(), &VTABLE)
+        }
+        unsafe fn noop(_: *const ()) {}
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+        // SAFETY: standard no-op waker idiom over a null pointer.
+        let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = core::pin::pin!(fut);
+        for _ in 0..1000 {
+            if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+                return v;
+            }
+        }
+        panic!("run_to_completion: future did not resolve");
+    }
+
+    #[derive(Debug)]
+    struct TestErr(&'static str);
+    impl core::fmt::Display for TestErr {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+    impl std::error::Error for TestErr {}
+
+    /// A future returning `Poll::Ready` after `ready_after` polls, then panics
+    /// if polled again — mirroring the `Future::poll` contract that a completed
+    /// future must not be re-polled.
+    struct PanicOnRepoll<T> {
+        polls: u32,
+        ready_after: u32,
+        value: Option<T>,
+    }
+    impl<T: Unpin> Future for PanicOnRepoll<T> {
+        type Output = T;
+        fn poll(mut self: core::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<T> {
+            assert!(self.value.is_some(), "PanicOnRepoll polled after completion");
+            self.polls += 1;
+            if self.polls > self.ready_after {
+                Poll::Ready(self.value.take().expect("value present"))
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    /// A clean `Ready(Ok(()))` from the connection future is the normal
+    /// `Connection: close` success path: it must NOT be turned into an error,
+    /// and the buffered response (resolved after the conn completes) is returned.
+    ///
+    /// Mutation evidence: revert the fix so `Ready(Ok(()))` synthesizes an
+    /// `UnexpectedEof` error → this asserts `Ok("body")` → test FAILS.
+    #[test]
+    fn drive_to_response_clean_close_then_response_succeeds() {
+        // conn completes cleanly on poll #1; response becomes ready on poll #2.
+        let conn =
+            PanicOnRepoll::<Result<(), TestErr>> { polls: 0, ready_after: 0, value: Some(Ok(())) };
+        let resp = PanicOnRepoll::<Result<&'static str, TestErr>> {
+            polls: 0,
+            ready_after: 1,
+            value: Some(Ok("body")),
+        };
+        let conn = core::pin::pin!(conn);
+        let resp = core::pin::pin!(resp);
+        let out = run_to_completion(drive_to_response(conn, resp));
+        assert_eq!(out.expect("clean close must not error").to_string(), "body".to_string());
+    }
+
+    /// After the connection future completes, it must never be polled again
+    /// (a `Future::poll` contract violation). `PanicOnRepoll` panics if it is,
+    /// so a regression that re-polls the completed conn future fails this test.
+    #[test]
+    fn drive_to_response_does_not_repoll_completed_conn() {
+        // conn ready immediately; response needs several more polls, each of
+        // which would re-drive a non-fused conn and trip the panic.
+        let conn =
+            PanicOnRepoll::<Result<(), TestErr>> { polls: 0, ready_after: 0, value: Some(Ok(())) };
+        let resp =
+            PanicOnRepoll::<Result<u8, TestErr>> { polls: 0, ready_after: 5, value: Some(Ok(42)) };
+        let conn = core::pin::pin!(conn);
+        let resp = core::pin::pin!(resp);
+        let out = run_to_completion(drive_to_response(conn, resp));
+        assert_eq!(out.expect("response resolves"), 42u8);
+    }
+
+    /// A connection-future ERROR before any response is surfaced (the original
+    /// finding's valid half): a peer reset / TLS error must not be masked.
+    #[test]
+    fn drive_to_response_conn_error_is_surfaced() {
+        let conn = PanicOnRepoll::<Result<(), TestErr>> {
+            polls: 0,
+            ready_after: 0,
+            value: Some(Err(TestErr("peer reset"))),
+        };
+        // Response would never resolve on its own; the conn error must win.
+        let resp = PanicOnRepoll::<Result<u8, TestErr>> {
+            polls: 0,
+            ready_after: u32::MAX,
+            value: Some(Ok(0)),
+        };
+        let conn = core::pin::pin!(conn);
+        let resp = core::pin::pin!(resp);
+        let out = run_to_completion(drive_to_response(conn, resp));
+        let err = out.expect_err("conn error must surface");
+        assert!(err.to_string().contains("peer reset"), "got: {err}");
+    }
 
     // ── socket_connect_error (SO_ERROR probe) ───────────────────────────────
 
