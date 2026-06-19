@@ -1121,17 +1121,30 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                         {
                             // Outcome-driven policy (release / requeue+defer / drop).
                             Ok(Ok(ref outcome)) => {
-                                if handle_fresh_send_outcome(
+                                // Re-read the monotonic clock here, AFTER the
+                                // logs retry-drain and fresh-send awaits (each
+                                // capped at PERIODIC_SEND_BUDGET). A `Retryable`
+                                // verdict sets `not_before_msec = basis +
+                                // defer_ms`; with a stale (pre-send) basis the
+                                // deadline can already be in the past once
+                                // `defer_ms` is capped at `BACKOFF_CAP_MS`, so
+                                // `is_deferred` would return false and the
+                                // exporter would hammer a failing collector at
+                                // full cadence. `is_deferred` at the top of the
+                                // loop intentionally keeps the pre-send capture
+                                // (it gates entry for THIS iteration).
+                                // `apply_logs_fresh_send_outcome` re-reads the
+                                // clock internally (post-send); the call site
+                                // cannot accidentally supply a stale basis.
+                                if apply_logs_fresh_send_outcome(
                                     outcome,
                                     &mut logs_backoff,
-                                    now_msec,
                                     &mut logs_retry_queue,
                                     logs_bytes,
                                     n_logs,
                                     retry_buffer_depth,
                                     &LOGS_SEND_FAILURES,
                                     log.as_ptr(),
-                                    "logs",
                                 ) == OutcomeAction::Release
                                 {
                                     ngx::ngx_log_error!(
@@ -1262,17 +1275,30 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                         {
                             // Outcome-driven policy (release / requeue+defer / drop).
                             Ok(Ok(ref outcome)) => {
-                                if handle_fresh_send_outcome(
+                                // Re-read the monotonic clock here, AFTER the
+                                // spans retry-drain and fresh-send awaits (each
+                                // capped at PERIODIC_SEND_BUDGET). A `Retryable`
+                                // verdict sets `not_before_msec = basis +
+                                // defer_ms`; with a stale (pre-send) basis the
+                                // deadline can already be in the past once
+                                // `defer_ms` is capped at `BACKOFF_CAP_MS`, so
+                                // `is_deferred` would return false and the
+                                // exporter would hammer a failing collector at
+                                // full cadence. `is_deferred` at the top of the
+                                // loop intentionally keeps the pre-send capture
+                                // (it gates entry for THIS iteration).
+                                // `apply_spans_fresh_send_outcome` re-reads the
+                                // clock internally (post-send); the call site
+                                // cannot accidentally supply a stale basis.
+                                if apply_spans_fresh_send_outcome(
                                     outcome,
                                     &mut spans_backoff,
-                                    now_msec,
                                     &mut spans_retry_queue,
                                     spans_bytes,
                                     n_spans,
                                     retry_buffer_depth,
                                     &TRACES_SEND_FAILURES,
                                     log.as_ptr(),
-                                    "spans",
                                 ) == OutcomeAction::Release
                                 {
                                     ngx::ngx_log_error!(
@@ -1486,18 +1512,18 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                     // failing collector at full cadence. The backoff basis must be a
                     // fresh "now". `is_deferred` above intentionally keeps the
                     // pre-send capture (it gates entry for THIS iteration).
-                    let metrics_backoff_basis_msec = now_monotonic_msec();
-                    if handle_fresh_send_outcome(
+                    // `apply_metrics_fresh_send_outcome` re-reads the clock
+                    // internally (post-send); the call site cannot accidentally
+                    // supply a stale basis.
+                    if apply_metrics_fresh_send_outcome(
                         outcome,
                         &mut metrics_backoff,
-                        metrics_backoff_basis_msec,
                         &mut retry_queue,
                         bytes,
                         n_pts,
                         retry_buffer_depth,
                         &SEND_FAILURES,
                         log.as_ptr(),
-                        "metrics",
                     ) == OutcomeAction::Release
                     {
                         ngx::ngx_log_error!(
@@ -2264,6 +2290,96 @@ fn handle_fresh_send_outcome(
     action
 }
 
+/// Apply the send outcome for a **fresh metrics batch**, re-reading the
+/// monotonic clock internally (after the send await) so the backoff deadline
+/// is computed from a fresh "now", not a pre-send stale capture.
+///
+/// Each signal has its own wrapper so the call sites cannot accidentally pass
+/// a stale pre-send clock value — the basis is always read here, immediately
+/// before delegating to [`handle_fresh_send_outcome`].
+#[allow(clippy::too_many_arguments)]
+fn apply_metrics_fresh_send_outcome(
+    outcome: &crate::transport::DeliveryOutcome,
+    backoff: &mut SignalBackoff,
+    queue: &mut VecDeque<(std::vec::Vec<u8>, u64)>,
+    bytes: std::vec::Vec<u8>,
+    n_records: u64,
+    retry_buffer_depth: usize,
+    failure_counter: &AtomicU64,
+    log: *mut nginx_sys::ngx_log_t,
+) -> OutcomeAction {
+    // Re-read the clock AFTER the send await returns. See `post_send_backoff_basis`.
+    let basis = post_send_backoff_basis();
+    handle_fresh_send_outcome(
+        outcome,
+        backoff,
+        basis,
+        queue,
+        bytes,
+        n_records,
+        retry_buffer_depth,
+        failure_counter,
+        log,
+        "metrics",
+    )
+}
+
+/// Apply the send outcome for a **fresh logs batch**; see
+/// [`apply_metrics_fresh_send_outcome`] for the stale-basis rationale.
+#[allow(clippy::too_many_arguments)]
+fn apply_logs_fresh_send_outcome(
+    outcome: &crate::transport::DeliveryOutcome,
+    backoff: &mut SignalBackoff,
+    queue: &mut VecDeque<(std::vec::Vec<u8>, u64)>,
+    bytes: std::vec::Vec<u8>,
+    n_records: u64,
+    retry_buffer_depth: usize,
+    failure_counter: &AtomicU64,
+    log: *mut nginx_sys::ngx_log_t,
+) -> OutcomeAction {
+    let basis = post_send_backoff_basis();
+    handle_fresh_send_outcome(
+        outcome,
+        backoff,
+        basis,
+        queue,
+        bytes,
+        n_records,
+        retry_buffer_depth,
+        failure_counter,
+        log,
+        "logs",
+    )
+}
+
+/// Apply the send outcome for a **fresh spans batch**; see
+/// [`apply_metrics_fresh_send_outcome`] for the stale-basis rationale.
+#[allow(clippy::too_many_arguments)]
+fn apply_spans_fresh_send_outcome(
+    outcome: &crate::transport::DeliveryOutcome,
+    backoff: &mut SignalBackoff,
+    queue: &mut VecDeque<(std::vec::Vec<u8>, u64)>,
+    bytes: std::vec::Vec<u8>,
+    n_records: u64,
+    retry_buffer_depth: usize,
+    failure_counter: &AtomicU64,
+    log: *mut nginx_sys::ngx_log_t,
+) -> OutcomeAction {
+    let basis = post_send_backoff_basis();
+    handle_fresh_send_outcome(
+        outcome,
+        backoff,
+        basis,
+        queue,
+        bytes,
+        n_records,
+        retry_buffer_depth,
+        failure_counter,
+        log,
+        "spans",
+    )
+}
+
 /// Last `ngx_current_msec` at which the "check exporter credentials" line was
 /// emitted (0 = never). Rate-limits the `Unauthorized` log to at most once per
 /// [`UNAUTHORIZED_LOG_INTERVAL_MS`] so a per-batch 401/403 storm cannot hammer
@@ -2300,6 +2416,17 @@ fn maybe_log_unauthorized(log: *mut nginx_sys::ngx_log_t, signal: &str) {
     );
 }
 
+/// Injectable clock override for unit tests. Non-zero values replace the
+/// `ngx_current_msec` read in `now_monotonic_msec()`, allowing tests to
+/// simulate pre-send and post-send clock advances without a real nginx event
+/// loop. Zero (the default) is a no-op: the real nginx global is read instead.
+///
+/// Tests that touch this field MUST reset it to 0 before returning so that
+/// sibling tests that rely on `ngx_current_msec == 0` (the test-process
+/// default) are not disturbed.
+#[cfg(test)]
+static TEST_CLOCK_MSEC: AtomicU64 = AtomicU64::new(0);
+
 /// Read the current monotonic millisecond basis used for defer timestamps.
 /// Reuses nginx's cached `CLOCK_MONOTONIC` (`ngx_current_msec`, updated by the
 /// event loop the exporter runs on) — the SAME basis `liveness` uses. No new
@@ -2310,9 +2437,28 @@ fn maybe_log_unauthorized(log: *mut nginx_sys::ngx_log_t, signal: &str) {
 /// single-threaded exporter process; a plain read is well-defined.
 #[inline]
 fn now_monotonic_msec() -> u64 {
+    // In test builds an injectable override lets unit tests simulate the
+    // pre-send/post-send clock advance without a real nginx event loop.
+    #[cfg(test)]
+    {
+        let t = TEST_CLOCK_MSEC.load(Ordering::Relaxed);
+        if t != 0 {
+            return t;
+        }
+    }
     // SAFETY: `ngx_current_msec` is an nginx global updated by the event loop
     // in this single-threaded exporter process; a plain read is well-defined.
     unsafe { nginx_sys::ngx_current_msec as u64 }
+}
+
+/// Separate named entry point for the post-send clock read in each fresh-send
+/// lane. All three lanes (metrics / logs / spans) call THIS function — not an
+/// inline `now_monotonic_msec()` — so the naming convention makes the
+/// post-send timing contract visible in code review, and tests can exercise
+/// the correct-vs-stale split without reaching into the async loop.
+#[inline]
+fn post_send_backoff_basis() -> u64 {
+    now_monotonic_msec()
 }
 
 // ── Retry-drain abstraction ───────────────────────────────────────────────────
@@ -3330,7 +3476,7 @@ fn collect_error_rate_metric(base: *mut u8, n_workers: usize, start_time_ns: u64
         // this iteration and all reads below go through `AtomicU64` fields.
         let slots = unsafe { &*worker_slots(base, w) };
         for (i, cnt) in slots.error_rate_counters.iter().enumerate() {
-            totals[i] = totals[i].saturating_add(cnt.load(Ordering::Acquire) as i64);
+            totals[i] = totals[i].saturating_add(counter_to_i64(cnt.load(Ordering::Acquire)));
         }
     }
 
@@ -5049,5 +5195,152 @@ mod tests {
              suppresses the orphaned-coalesced synthetic record), even though the \
              hash bytes are present"
         );
+    }
+
+    /// Call-site wiring guard for all three fresh-send lanes (metrics / logs /
+    /// spans). Each lane has a dedicated `apply_{signal}_fresh_send_outcome`
+    /// wrapper that reads the monotonic clock internally via
+    /// `post_send_backoff_basis()` — the call site cannot accidentally supply a
+    /// stale pre-send capture.
+    ///
+    /// This test uses the `TEST_CLOCK_MSEC` injectable clock to simulate the
+    /// clock advancing between the top of the iteration ("pre-send") and the
+    /// return of the send await ("post-send"), then calls each wrapper function
+    /// directly. Because the wrappers call `post_send_backoff_basis()` (which
+    /// reads `TEST_CLOCK_MSEC`) internally, the test observes the EXACT same
+    /// clock path the production call site uses.
+    ///
+    /// Mutation guide (execute manually to verify):
+    ///   • Replace `post_send_backoff_basis()` with `0` (or any stale constant)
+    ///     inside any of the three `apply_{signal}_fresh_send_outcome` wrappers.
+    ///   • Re-run this test: it FAILS on the `is_deferred` assertion for that
+    ///     signal because the deadline is placed at `0 + BACKOFF_CAP_MS`, which
+    ///     is still less than `real_now`.
+    ///   • Restore `post_send_backoff_basis()`: test PASSES again.
+    #[test]
+    fn fresh_send_backoff_basis_wiring_all_lanes() {
+        // Saturated backoff regime: defer_ms == BACKOFF_CAP_MS, making the
+        // stale-vs-fresh split deterministic.
+        let pre_send_now: u64 = 1_000_000;
+        let real_now: u64 = pre_send_now + 2 * PERIODIC_SEND_BUDGET.as_millis() as u64;
+
+        // Inject the post-send clock so that `post_send_backoff_basis()` —
+        // called inside each wrapper — returns `real_now`.
+        TEST_CLOCK_MSEC.store(real_now, Ordering::Relaxed);
+
+        // ── Metrics lane ──────────────────────────────────────────────────────
+        {
+            let mut backoff = SignalBackoff { not_before_msec: 0, consecutive_retryable: 60 };
+            let mut q = VecDeque::new();
+            let fc = AtomicU64::new(0);
+            let action = apply_metrics_fresh_send_outcome(
+                &Outcome::Retryable { retry_after: None },
+                &mut backoff,
+                &mut q,
+                std::vec![0u8],
+                1,
+                8,
+                &fc,
+                core::ptr::null_mut(),
+            );
+            assert_eq!(action, OutcomeAction::Requeue, "metrics: must Requeue");
+            assert!(
+                backoff.is_deferred(real_now),
+                "metrics: apply_metrics_fresh_send_outcome must place the defer \
+                 deadline in the future (post-send clock = {real_now}, \
+                 not_before = {}). Mutation: replace post_send_backoff_basis() \
+                 with a stale value inside apply_metrics_fresh_send_outcome \
+                 and confirm this assertion fails.",
+                backoff.not_before_msec
+            );
+        }
+
+        // ── Logs lane ─────────────────────────────────────────────────────────
+        {
+            let mut backoff = SignalBackoff { not_before_msec: 0, consecutive_retryable: 60 };
+            let mut q = VecDeque::new();
+            let fc = AtomicU64::new(0);
+            let action = apply_logs_fresh_send_outcome(
+                &Outcome::Retryable { retry_after: None },
+                &mut backoff,
+                &mut q,
+                std::vec![0u8],
+                1,
+                8,
+                &fc,
+                core::ptr::null_mut(),
+            );
+            assert_eq!(action, OutcomeAction::Requeue, "logs: must Requeue");
+            assert!(
+                backoff.is_deferred(real_now),
+                "logs: apply_logs_fresh_send_outcome must place the defer deadline \
+                 in the future (post-send clock = {real_now}, \
+                 not_before = {}). Mutation: replace post_send_backoff_basis() \
+                 with a stale value inside apply_logs_fresh_send_outcome \
+                 and confirm this assertion fails.",
+                backoff.not_before_msec
+            );
+        }
+
+        // ── Spans lane ────────────────────────────────────────────────────────
+        {
+            let mut backoff = SignalBackoff { not_before_msec: 0, consecutive_retryable: 60 };
+            let mut q = VecDeque::new();
+            let fc = AtomicU64::new(0);
+            let action = apply_spans_fresh_send_outcome(
+                &Outcome::Retryable { retry_after: None },
+                &mut backoff,
+                &mut q,
+                std::vec![0u8],
+                1,
+                8,
+                &fc,
+                core::ptr::null_mut(),
+            );
+            assert_eq!(action, OutcomeAction::Requeue, "spans: must Requeue");
+            assert!(
+                backoff.is_deferred(real_now),
+                "spans: apply_spans_fresh_send_outcome must place the defer deadline \
+                 in the future (post-send clock = {real_now}, \
+                 not_before = {}). Mutation: replace post_send_backoff_basis() \
+                 with a stale value inside apply_spans_fresh_send_outcome \
+                 and confirm this assertion fails.",
+                backoff.not_before_msec
+            );
+        }
+
+        // ── Stale-basis documentation (all three lanes, pre-fix behaviour) ────
+        // Show that passing `pre_send_now` (the stale pre-send capture) directly
+        // to the policy helper places the deadline in the past at `real_now`.
+        // This arm is a DOCUMENTATION assertion, not a call-site wiring check:
+        // it confirms the regression mode the wrappers above prevent.
+        for signal in ["metrics", "logs", "spans"] {
+            let mut stale_backoff = SignalBackoff { not_before_msec: 0, consecutive_retryable: 60 };
+            let mut q = VecDeque::new();
+            let fc = AtomicU64::new(0);
+            handle_fresh_send_outcome(
+                &Outcome::Retryable { retry_after: None },
+                &mut stale_backoff,
+                pre_send_now, // stale pre-send capture — the regressed wiring
+                &mut q,
+                std::vec![0u8],
+                1,
+                8,
+                &fc,
+                core::ptr::null_mut(),
+                signal,
+            );
+            assert!(
+                !stale_backoff.is_deferred(real_now),
+                "{signal}: a stale pre-send basis places the deadline in the past \
+                 at real_now ({real_now}), confirming the regression mode. \
+                 not_before = {}",
+                stale_backoff.not_before_msec
+            );
+        }
+
+        // Reset the injectable clock so sibling tests that depend on
+        // `ngx_current_msec == 0` (the test-process default) are unaffected.
+        TEST_CLOCK_MSEC.store(0, Ordering::Relaxed);
     }
 }
