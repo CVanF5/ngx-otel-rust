@@ -1,0 +1,23 @@
+ThreadSanitizer (TSAN) gate — code-review remediation
+======================================================
+
+GIT_COMMIT = e26fb2dad4ee40dbd2d211ea6a9294e9a7a0329c
+Branch     = fix/code-review-remediation (tip)
+Platform   = debian-vm, Linux aarch64 (the project's TSAN platform)
+Command    = make tsan-test
+Date       = 2026-06-20 (run 2026-06-19T23:xxZ)
+
+Scope: whole-range sanitizer gate for the 48-finding code-review remediation
+(12 batches A–L; product concurrency/FFI touched: reload successor_gen rollback,
+cross-zone shm worker_id guard, DRBG bounded retry, error-writer catch_unwind over
+the C boundary, hyper connection-future fuse, TLS poll_read EOF classification).
+
+Evidence (instrumentation present on the EXACT loaded artifact, then zero races):
+  [tsan-run] Step 3.5: __tsan_* symbol count in cdylib: 42
+  [tsan-run] Step 3.5: OK — 42 __tsan_* symbols confirmed in libngx_http_otel_module.so.
+  [tsan-run] Checking for ThreadSanitizer warnings in error logs...
+  [tsan-run] Zero ThreadSanitizer warnings.  TSAN gate: PASS.
+  TSAN_EXIT=0
+
+VERDICT: PASS — 42 __tsan_ symbols confirmed in the loaded cdylib; zero
+ThreadSanitizer warnings / data races across the suite; clean exit 0.
