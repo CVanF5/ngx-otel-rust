@@ -156,12 +156,15 @@ wait_for "${QUIT_DEADLINE}" \
     "! kill -0 ${NGINX_PID} 2>/dev/null"
 
 pass "Assertion 2: nginx master (PID=${NGINX_PID}) exited within ${QUIT_DEADLINE}s of 'nginx -s quit'"
+DEAD_MASTER_PID="${NGINX_PID}"
 NGINX_PID=""
 
-# Assertion 3: no leftover nginx or exporter processes.
-STRAY_EXP="$(ps -eo pid,args 2>/dev/null | awk '/nginx: otel exporter/ {print $1}')"
+# Assertion 3: no leftover exporter child of this test's master.
+# Scope the check to children of THIS test's master PID so that concurrent
+# test runs or other nginx instances do not cause false failures.
+STRAY_EXP="$(exporter_pid "${DEAD_MASTER_PID}")"
 if [[ -n "${STRAY_EXP}" ]]; then
-    fail "Stray 'otel exporter' process(es) still running: ${STRAY_EXP}"
+    fail "Stray 'otel exporter' process(es) still running (child of this test's master PID=${DEAD_MASTER_PID}): ${STRAY_EXP}"
 fi
 pass "Assertion 3: no stray otel exporter processes"
 

@@ -327,14 +327,19 @@ for m in all_metrics:
     for dp in exp.get("dataPoints", []):
         for attr in dp.get("attributes", []):
             if attr.get("key") == "http.response.status_class":
-                found_status_class = True
-                # Value must be a string (stringValue key).
+                # Value must be a stringValue matching "NNxx" pattern (len==3).
+                # Only set found_status_class when the value also passes validation
+                # so a wrong-typed or wrong-shaped value does not produce a false PASS.
                 val = attr.get("value", {})
                 if "stringValue" in val:
                     sv = val["stringValue"]
-                    # Check it ends in "xx" pattern.
                     if sv.endswith("xx") and len(sv) == 3:
+                        found_status_class = True
                         break
+        if found_status_class:
+            break
+    if found_status_class:
+        break
 if found_status_class:
     print(f"{PASS} C: http.response.status_class attribute found in dataPoints (string value)")
 else:

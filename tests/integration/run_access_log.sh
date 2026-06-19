@@ -392,23 +392,48 @@ if [[ -n "${NEW_LOGS}" ]]; then
 
     # HARD: tail records carry http.server.request.duration (double seconds).
     # The value must be present and plausible (> 0).
-    if echo "${NEW_LOGS}" | grep -q '"http.server.request.duration"'; then
-        # Extract the numeric value that immediately follows the key.
-        # Collector JSON format varies; look for a non-zero double after the key.
-        DURATION_LINE=$(echo "${NEW_LOGS}" | grep -o '"http.server.request.duration":[0-9.eE+-]*' | head -1 || true)
-        if [[ -n "${DURATION_LINE}" ]]; then
-            DURATION_VAL="${DURATION_LINE#*:}"
-            # Duration must be a positive number (> 0).
-            if [[ "${DURATION_VAL}" =~ ^[0-9] ]] && (( $(echo "${DURATION_VAL} > 0" | bc -l 2>/dev/null || echo 0) )); then
-                pass "logs.json: http.server.request.duration present with plausible value ${DURATION_VAL}s"
-            else
-                pass "logs.json: http.server.request.duration key present (value format varies by collector)"
-            fi
-        else
-            pass "logs.json: http.server.request.duration key present"
-        fi
-    else
+    # OTLP/JSON wraps attribute values as {"key":"...","value":{"doubleValue":N}};
+    # a bare "http.server.request.duration":N pattern never appears in the wire
+    # format, so we parse the actual attribute structure using python3.
+    DURATION_VAL=$(echo "${NEW_LOGS}" | python3 - <<'PYEOF'
+import sys, json
+val = None
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    for rl in obj.get("resourceLogs", []):
+        for sl in rl.get("scopeLogs", []):
+            for lr in sl.get("logRecords", []):
+                for attr in lr.get("attributes", []):
+                    if attr.get("key") == "http.server.request.duration":
+                        v = attr.get("value", {})
+                        n = v.get("doubleValue") or v.get("intValue")
+                        if n is not None:
+                            val = float(n)
+                            break
+                if val is not None:
+                    break
+            if val is not None:
+                break
+        if val is not None:
+            break
+    if val is not None:
+        break
+if val is not None:
+    print(val)
+PYEOF
+    )
+    if [[ -z "${DURATION_VAL}" ]]; then
         fail "logs.json: http.server.request.duration NOT found on tail LogRecord — duration attribute missing"
+    elif python3 -c "import sys; sys.exit(0 if float('${DURATION_VAL}') > 0 else 1)" 2>/dev/null; then
+        pass "logs.json: http.server.request.duration present with plausible value ${DURATION_VAL}s"
+    else
+        fail "logs.json: http.server.request.duration present but value is not > 0 (got ${DURATION_VAL})"
     fi
 else
     fail "logs.json: no new content — exception-tail records did not arrive at the collector"

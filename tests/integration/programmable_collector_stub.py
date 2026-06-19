@@ -44,22 +44,55 @@ def _sigterm_handler(signum, frame):
 
 
 def _read_scenario(scenario_file: str) -> tuple[int, dict]:
-    """Read the scenario file and return (status_code, extra_headers)."""
-    try:
-        with open(scenario_file) as f:
-            line = f.readline().strip()
-        if not line or line.startswith("#"):
-            return 200, {}
-        parts = line.split(None, 1)
-        code = int(parts[0])
-        extra = {}
-        if len(parts) > 1:
-            # e.g. "Retry-After: 2"
-            hdr_name, hdr_val = parts[1].split(":", 1)
-            extra[hdr_name.strip()] = hdr_val.strip()
-        return code, extra
-    except Exception:
+    """Read the scenario file and return (status_code, extra_headers).
+
+    Supported directives (first non-comment line wins):
+        503 Retry-After: 2   — respond 503 with a Retry-After header
+        503                  — respond 503 with no extra headers
+        400 / 401 / 403      — respond with that status
+        200                  — respond 200
+        200 N                — respond 200 for the next N requests;
+                               the file is rewritten to 200 N-1 (or bare 200
+                               when N reaches 1) so subsequent reads decrement
+                               the counter automatically.
+    """
+    with open(scenario_file) as f:
+        line = f.readline().strip()
+
+    if not line or line.startswith("#"):
         return 200, {}
+
+    parts = line.split(None, 2)
+    code = int(parts[0])  # ValueError propagates — caller must not swallow it
+    extra: dict[str, str] = {}
+
+    if len(parts) == 1:
+        # Bare status code, e.g. "200" or "503".
+        return code, extra
+
+    # parts[1] is either a plain integer (the N in "200 N") or the start of a
+    # header value (e.g. "Retry-After:" in "503 Retry-After: 2").
+    remainder = parts[1]
+
+    if remainder.isdigit():
+        # "200 N" form: serve 200 and decrement the counter in the file.
+        n = int(remainder)
+        if n > 1:
+            with open(scenario_file, "w") as f:
+                f.write(f"{code} {n - 1}\n")
+        else:
+            # Counter exhausted — rewrite to a bare status so the next read
+            # re-evaluates the scenario without a countdown.
+            with open(scenario_file, "w") as f:
+                f.write(f"{code}\n")
+        return code, extra
+
+    # Header continuation: reassemble the full header value from the split.
+    # "503 Retry-After: 2" → parts = ["503", "Retry-After:", "2"]
+    full_remainder = line[len(parts[0]):].strip()
+    hdr_name, hdr_val = full_remainder.split(":", 1)
+    extra[hdr_name.strip()] = hdr_val.strip()
+    return code, extra
 
 
 def _record_request(count_file: str, status: int) -> None:

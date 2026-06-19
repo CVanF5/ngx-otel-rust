@@ -130,8 +130,8 @@ workers_have_no_collector_sockets() {
                 # tcp column layout: idx local_addr remote_addr state ... inode (col 10)
                 # Remote port 4317=10DD hex, 4318=10DE hex.
                 while IFS= read -r inode; do
-                    if awk -v in="${inode}" \
-                        '$10==in && ($3 ~ /:10[Dd][Dd]$/ || $3 ~ /:10[Dd][Ee]$/)' \
+                    if awk -v ino="${inode}" \
+                        '$10==ino && ($3 ~ /:10[Dd][Dd]$/ || $3 ~ /:10[Dd][Ee]$/)' \
                         "/proc/net/tcp" 2>/dev/null | grep -q .; then
                         collector_found=1
                         break 2

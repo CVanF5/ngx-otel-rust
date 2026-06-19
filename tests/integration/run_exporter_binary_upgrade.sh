@@ -417,7 +417,9 @@ fi
 
 OVERLAP_IDS="$(instance_ids_from_metrics "${OVERLAP_CONTENT}")"
 info "service.instance.id values seen during overlap: $(echo "${OVERLAP_IDS}" | tr '\n' ' ')"
-OVERLAP_ID_COUNT="$(echo "${OVERLAP_IDS}" | grep -c . || echo 0)"
+# grep -c exits 1 when there are no matching lines (and prints "0"); || true
+# keeps set -e from aborting so the variable gets the clean "0" from grep.
+OVERLAP_ID_COUNT="$(echo "${OVERLAP_IDS}" | grep -c . || true)"
 
 # Assertion 2d: collector received BOTH instance ids during overlap.
 if [[ "${OVERLAP_ID_COUNT}" -lt 2 ]]; then
