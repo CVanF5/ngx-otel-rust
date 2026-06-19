@@ -93,6 +93,52 @@ ngx_otel_srv_ssl_certificates(void *ssl_srv_conf)
 }
 
 /*
+ * Resolve a config-order index for `cert` within `ssl->certs`.
+ *
+ * `ssl->certs` is the `ngx_array_t` of `X509 *` that nginx populates in
+ * `ssl_certificate` directive order (ngx_event_openssl.c, ngx_ssl_certificate)
+ * — 1:1 with the path list returned by ngx_otel_srv_ssl_certificates().  We
+ * cannot match by pointer identity: SSL_CTX_get0_certificate() (used by the
+ * enumeration below) returns OpenSSL's internal X509 object, a DIFFERENT
+ * pointer than the one nginx cached in ssl->certs.  Instead we match by cert
+ * IDENTITY using X509_cmp(3), which compares the certificates' canonical DER
+ * encodings and therefore matches the same logical cert across the two
+ * distinct X509 objects.
+ *
+ * This is required because the enumeration cursor is NOT in config order: the
+ * SSL_CTX current-cert cursor walks certs by key-type slot (ssl/ssl_cert.c
+ * ssl_cert_set_current() iterates c->pkeys[i] by SSL_PKEY_RSA, RSA_PSS, DSA,
+ * SSL_PKEY_ECC, ... slot index), so for a dual-cert block listed
+ * ECDSA-before-RSA the cursor still yields RSA first.  Mapping the enumeration
+ * position directly onto the config-order path list would mislabel the paths.
+ *
+ * Returns the 0-based config index of the matching cert, or -1 if `ssl`/`cert`
+ * is NULL, ssl->certs is empty, or no loaded cert matches.
+ */
+int
+ngx_otel_cert_config_index(ngx_ssl_t *ssl, X509 *cert)
+{
+    ngx_uint_t   j;
+    X509       **loaded;
+
+    if (ssl == NULL || cert == NULL || ssl->certs.nelts == 0
+        || ssl->certs.elts == NULL)
+    {
+        return -1;
+    }
+
+    loaded = ssl->certs.elts;
+
+    for (j = 0; j < ssl->certs.nelts; j++) {
+        if (loaded[j] != NULL && X509_cmp(cert, loaded[j]) == 0) {
+            return (int) j;
+        }
+    }
+
+    return -1;
+}
+
+/*
  * Enumerate EVERY leaf certificate installed in `ctx` (one per key-exchange
  * slot: RSA, ECDSA, Ed25519, ... — decision Q5: dual-cert blocks must yield
  * BOTH certs), invoking `cb(cert, data)` for each.
@@ -174,6 +220,14 @@ ngx_otel_srv_ssl_certificates(void *ssl_srv_conf)
 {
     (void) ssl_srv_conf;
     return NULL;
+}
+
+int
+ngx_otel_cert_config_index(void *ssl, void *cert)
+{
+    (void) ssl;
+    (void) cert;
+    return -1;
 }
 
 int

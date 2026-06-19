@@ -84,6 +84,12 @@ extern "C" {
     fn ngx_otel_srv_ssl(ssl_srv_conf: *mut c_void) -> *mut nginx_sys::ngx_ssl_t;
     /// `((ngx_http_ssl_srv_conf_t *) conf)->certificates`; may be NULL.
     fn ngx_otel_srv_ssl_certificates(ssl_srv_conf: *mut c_void) -> *mut ngx_array_t;
+    /// Config-order index of `cert` within `ssl->certs` (the configured-order
+    /// array, 1:1 with `certificates`/the path list), matched by `X509_cmp`
+    /// identity (DER encoding) — NOT pointer identity, since the enumeration
+    /// returns OpenSSL's internal X509 object.  `-1` when no loaded cert
+    /// matches.  See the shim header for why identity matching is required.
+    fn ngx_otel_cert_config_index(ssl: *mut nginx_sys::ngx_ssl_t, cert: *mut ossl::X509) -> c_int;
     /// Full leaf-cert enumeration via OpenSSL's `SSL_CTX_set_current_cert`
     /// cursor macros (config-time only; see the shim header).  `cb` returns 0
     /// to continue.  Returns the number of certificates visited.
@@ -310,7 +316,14 @@ unsafe fn collect_server_certs(
     };
 
     for (enum_idx, cert) in enumerated.iter().enumerate() {
-        let file_path = path_for_cert(enum_idx, &paths);
+        // Resolve the configured path by cert IDENTITY, not enumeration
+        // position: the cursor walks certs in OpenSSL key-type-slot order, not
+        // config order, so the enumeration index does not align with `paths`.
+        // SAFETY: `ssl` is the non-null `ngx_ssl_t*` (checked above); `*cert`
+        // is a live X509 borrowed from the SSL_CTX.  The shim only reads
+        // `ssl->certs` and calls `X509_cmp`.
+        let config_idx = unsafe { ngx_otel_cert_config_index(ssl, *cert) };
+        let file_path = path_for_cert(config_idx, &paths);
         // SAFETY: `cert` is a live X509 borrowed from the SSL_CTX (valid for
         // the whole config phase); extraction only reads it via openssl-sys.
         let Some(info) = (unsafe { extract_cert_info(*cert, file_path, server_name.clone()) })
@@ -349,27 +362,33 @@ unsafe extern "C" fn collect_cert_cb(cert: *mut ossl::X509, data: *mut c_void) -
     0 // continue
 }
 
-/// Map an enumerated cert back to its configured file path by enumeration index.
+/// Map an enumerated cert back to its configured file path by cert identity.
 ///
-/// `enum_idx` is the cert's position in the `ngx_otel_foreach_ctx_cert`
-/// enumeration (0-based).  nginx installs certs into the `SSL_CTX` in
-/// configured order (`ngx_ssl_certificate`, `ngx_event_openssl.c`), and
-/// OpenSSL's `SSL_CTX_set_current_cert` cursor enumerates them in that same
-/// insertion order, so `enum_idx` is index-aligned with the `paths` list.
+/// `config_idx` is the cert's position in nginx's configured-order `ssl->certs`
+/// array — 1:1 with the `paths` list — as resolved by `ngx_otel_cert_config_index`
+/// (an `X509_cmp` DER-identity match), or `-1` when no loaded cert matched.
 ///
-/// The old pointer-identity approach (`ssl->certs` vs `SSL_CTX_get0_certificate`
-/// result) was unreliable: OpenSSL stores the leaf cert internally and returns
-/// its own pointer from `get0`, which does not alias the pointer nginx cached in
-/// `ssl->certs` — so the identity lookup always missed for multi-cert servers,
-/// falling through to a `,`-joined join of ALL paths for EVERY cert.
+/// Identity matching (not enumeration position) is required because the
+/// `SSL_CTX` current-cert cursor used by `ngx_otel_foreach_ctx_cert` walks
+/// certs in OpenSSL key-type-slot order (`ssl/ssl_cert.c` `ssl_cert_set_current()`
+/// iterates `c->pkeys[i]` by `SSL_PKEY_RSA`, `RSA_PSS`, `DSA`, `SSL_PKEY_ECC`, …),
+/// NOT the config/insertion order of the `paths` list.  For a dual-cert block
+/// whose `ssl_certificate` directives are listed ECDSA-before-RSA, the cursor
+/// still yields RSA first, so the enumeration index would mislabel every path.
+///
+/// Fallbacks (a match should always be found for a config-loaded cert): a single
+/// configured path is the only candidate and is returned as-is; otherwise (no
+/// match, multiple paths) the path is left empty rather than guessing wrong.
 #[cfg(ngx_feature = "http_ssl")]
-fn path_for_cert(enum_idx: usize, paths: &[String]) -> String {
-    if let Some(p) = paths.get(enum_idx) {
-        return p.clone();
+fn path_for_cert(config_idx: c_int, paths: &[String]) -> String {
+    if config_idx >= 0 {
+        if let Some(p) = paths.get(config_idx as usize) {
+            return p.clone();
+        }
     }
-    // Fallback: index out of range (should not occur for a well-formed nginx
-    // config); if there is exactly one path it is the only candidate; otherwise
-    // we cannot determine which path is correct and return empty.
+    // No identity match (or out-of-range index): with exactly one configured
+    // path it is the only candidate; otherwise we cannot determine which path
+    // is correct and return empty (a missing label, never a wrong one).
     match paths {
         [single] => single.clone(),
         _ => String::new(),
@@ -873,27 +892,145 @@ mod tests {
         );
     }
 
-    // ── Fix 2: path_for_cert uses enumeration index (dual-cert path labeling) ─
+    // ── Fix 2: path resolution by cert IDENTITY (dual-cert path labeling) ─────
 
-    /// Regression: for a dual RSA+ECDSA server block (two `ssl_certificate`
-    /// directives, two enumerated certs) each cert must get its OWN configured
-    /// path, not a joined list of all paths.  Before the fix, pointer-identity
-    /// matching against `ssl->certs` always missed (OpenSSL returns its own
-    /// internal pointer from `SSL_CTX_get0_certificate`, which does not alias
-    /// the pointer nginx cached), causing the fallback to join all paths.
-    #[test]
-    fn path_for_cert_dual_cert_index_aligned() {
-        let paths = vec![String::from("rsa.crt"), String::from("ecdsa.crt")];
-        // Each cert's enumeration index must map to its own path.
-        assert_eq!(path_for_cert(0, &paths), "rsa.crt");
-        assert_eq!(path_for_cert(1, &paths), "ecdsa.crt");
+    /// Build a real, self-signed X509 carrying serial `serial` and a distinct
+    /// subject/issuer CN.  The cert is given an RSA public key, a validity
+    /// window and a signature so it is fully encodable — `X509_cmp` compares the
+    /// certificates' canonical DER (the same way the production code compares an
+    /// enumerated cert against nginx's disk-loaded `ssl->certs`), so two certs
+    /// built with different values compare unequal.  Caller frees with `X509_free`.
+    #[cfg(ngx_feature = "http_ssl")]
+    fn make_cert_with_serial(serial: i64, cn: &str) -> *mut ossl::X509 {
+        // SAFETY: all of the following construct a complete, signable X509 via
+        // openssl-sys FFI; each call's preconditions are noted inline and the
+        // return values are asserted non-NULL / success.
+        unsafe {
+            // RSA keypair for the cert's public key and self-signature.
+            let rsa = ossl::RSA_new();
+            assert!(!rsa.is_null());
+            let e = ossl::BN_new();
+            assert!(!e.is_null());
+            assert_eq!(ossl::BN_set_word(e, 65537), 1);
+            assert_eq!(ossl::RSA_generate_key_ex(rsa, 2048, e, ptr::null_mut()), 1);
+            ossl::BN_free(e);
+            let pkey = ossl::EVP_PKEY_new();
+            assert!(!pkey.is_null());
+            // EVP_PKEY_set1_RSA increments the RSA refcount, so we free our own.
+            assert_eq!(ossl::EVP_PKEY_set1_RSA(pkey, rsa), 1);
+            ossl::RSA_free(rsa);
+
+            let cert = ossl::X509_new();
+            assert!(!cert.is_null());
+            assert_eq!(ossl::ASN1_INTEGER_set(ossl::X509_get_serialNumber(cert), serial), 1);
+            // Validity window (required for a well-formed, encodable cert).
+            assert!(!ossl::X509_gmtime_adj(ossl::X509_getm_notBefore(cert), 0).is_null());
+            assert!(!ossl::X509_gmtime_adj(ossl::X509_getm_notAfter(cert), 86400).is_null());
+            assert_eq!(ossl::X509_set_pubkey(cert, pkey), 1);
+
+            // Distinct subject == issuer name (self-signed) so the DER differs
+            // between two certs built with different CNs.
+            let name = name_with_cn(Some(cn));
+            assert_eq!(ossl::X509_set_subject_name(cert, name), 1);
+            assert_eq!(ossl::X509_set_issuer_name(cert, name), 1);
+            ossl::X509_NAME_free(name);
+
+            // Self-sign: produces the signature and lets the cert be DER-encoded,
+            // which populates the cached digest that X509_cmp relies on.
+            assert!(ossl::X509_sign(cert, pkey, ossl::EVP_sha256()) > 0);
+            ossl::EVP_PKEY_free(pkey);
+            cert
+        }
     }
 
-    /// Single-cert server: index 0 returns the only path.
+    /// Rust mirror of the C shim `ngx_otel_cert_config_index`: find the config
+    /// index of `cert` in the configured-order `loaded` array by `X509_cmp`
+    /// (DER) identity, or `-1`.  Used to drive the full path-mapping test
+    /// without constructing an `ngx_ssl_t`.
+    #[cfg(ngx_feature = "http_ssl")]
+    fn config_index_by_identity(loaded: &[*mut ossl::X509], cert: *mut ossl::X509) -> c_int {
+        for (j, &l) in loaded.iter().enumerate() {
+            // SAFETY: `cert` and `l` are live X509 objects for this scope;
+            // X509_cmp only reads them.
+            if !l.is_null() && unsafe { ossl::X509_cmp(cert, l) } == 0 {
+                return j as c_int;
+            }
+        }
+        -1
+    }
+
+    /// Regression (THE Fix-2 bug): for a dual-cert server block, each enumerated
+    /// cert must get its OWN configured path resolved by IDENTITY, even when the
+    /// enumeration order differs from the config order.  The `SSL_CTX`
+    /// current-cert cursor walks certs in OpenSSL key-type-slot order
+    /// (`ssl/ssl_cert.c` `ssl_cert_set_current`), NOT config order — so a block
+    /// listed ECDSA-before-RSA still enumerates RSA first.  Mapping the
+    /// enumeration position directly onto the config path list (the reverted,
+    /// buggy behaviour) mislabels every path; resolving by `X509_cmp` identity
+    /// against the config-order `ssl->certs`/path list labels each correctly.
+    ///
+    /// This test FAILS if the loop reverts to positional indexing
+    /// (`path_for_cert(enum_idx, &paths)`): config order and enumeration order
+    /// are deliberately reversed here, so positional indexing swaps the labels.
+    #[cfg(ngx_feature = "http_ssl")]
+    #[test]
+    fn path_for_cert_resolves_by_identity_not_enum_position() {
+        // Config order (1:1 with paths / ssl->certs): [ECDSA, RSA].
+        let ecdsa = make_cert_with_serial(0xEC, "ecdsa.example"); // config slot 0
+        let rsa = make_cert_with_serial(0x5A, "rsa.example"); // config slot 1
+        let loaded = [ecdsa, rsa];
+        let paths = vec![String::from("ecdsa.crt"), String::from("rsa.crt")];
+
+        // Guard the test itself: the two certs MUST be distinguishable by
+        // X509_cmp (DER identity), else the assertions below prove nothing.
+        // SAFETY: `ecdsa` and `rsa` are live X509 objects for this scope;
+        // X509_cmp only reads them.
+        let cmp = unsafe { ossl::X509_cmp(ecdsa, rsa) };
+        assert_ne!(cmp, 0, "test precondition: the two certs must differ under X509_cmp");
+
+        // Enumeration order (key-type-slot): RSA first, then ECDSA — the
+        // OPPOSITE of config order.
+        let enumerated = [rsa, ecdsa];
+
+        let mut labelled: Vec<String> = Vec::new();
+        for &cert in &enumerated {
+            let idx = config_index_by_identity(&loaded, cert);
+            labelled.push(path_for_cert(idx, &paths));
+        }
+
+        // Identity mapping: enumerated[0]=RSA -> "rsa.crt", [1]=ECDSA -> "ecdsa.crt".
+        assert_eq!(
+            labelled,
+            vec![String::from("rsa.crt"), String::from("ecdsa.crt")],
+            "each enumerated cert must be labelled with its own path by identity; \
+             positional indexing would have produced [ecdsa.crt, rsa.crt]"
+        );
+
+        // SAFETY: both certs were allocated by make_cert_with_serial and not freed.
+        unsafe {
+            ossl::X509_free(ecdsa);
+            ossl::X509_free(rsa);
+        }
+    }
+
+    /// A resolved config index maps to its path; `-1` (no identity match) with
+    /// multiple paths yields an empty label (never a wrong one).
+    #[test]
+    fn path_for_cert_dual_cert_by_resolved_index() {
+        let paths = vec![String::from("rsa.crt"), String::from("ecdsa.crt")];
+        assert_eq!(path_for_cert(0, &paths), "rsa.crt");
+        assert_eq!(path_for_cert(1, &paths), "ecdsa.crt");
+        // No identity match with multiple candidates -> empty, not a guess.
+        assert_eq!(path_for_cert(-1, &paths), "");
+    }
+
+    /// Single-cert server: even an unresolved index (`-1`) falls back to the
+    /// only configured path; a resolved index 0 also returns it.
     #[test]
     fn path_for_cert_single_cert() {
         let paths = vec![String::from("only.crt")];
         assert_eq!(path_for_cert(0, &paths), "only.crt");
+        assert_eq!(path_for_cert(-1, &paths), "only.crt");
     }
 
     /// Out-of-range index (should not occur in practice): empty string.
