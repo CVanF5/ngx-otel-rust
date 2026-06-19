@@ -226,8 +226,8 @@ pub unsafe extern "C" fn ngx_otel_error_writer(
     //     closure and dropping the record is the least-bad safe outcome.
     // On a caught panic the record is silently dropped (the operator's own
     // `error_log` file is unaffected — the core chain node runs after us).
-    // `_guard` is dropped at the end of the `catch_unwind` closure, releasing
-    // `busy` before this function returns.
+    // `_guard` lives in the outer function scope and drops when this function
+    // returns (after `catch_unwind` completes), releasing `busy`.
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // SAFETY: all pointer dereferences below are safe within this closure
         // because `state` points to an `OtelErrorWriterState` that is valid for
