@@ -385,6 +385,148 @@ fn handshake_ok_and_roundtrip() {
     assert!(n > 0, "received some echoed bytes back over TLS");
 }
 
+/// In-process OpenSSL server (one connection) that completes a TLS handshake,
+/// writes `reply`, then closes the underlying TCP socket WITHOUT calling
+/// `SSL_shutdown` — i.e. an orderly TCP FIN with NO TLS close_notify alert.
+///
+/// This is the truncation case from SSL_read(3): the client's next `SSL_read`
+/// after consuming `reply` returns 0 with `SSL_get_error` ==
+/// `SSL_ERROR_SYSCALL` (premature EOF), distinct from the clean
+/// `SSL_ERROR_ZERO_RETURN` a close_notify would have produced. Driving it from
+/// a real OpenSSL peer (rather than a CLI tool we cannot stop mid-stream)
+/// makes the n==0/SYSCALL path deterministic.
+///
+/// Returns the bound port; the server runs on a detached thread and tears
+/// itself down after the single connection.
+fn spawn_truncating_server(certs: &Certs, reply: &'static [u8]) -> u16 {
+    use std::os::fd::AsRawFd;
+    use std::os::raw::{c_int, c_void};
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let cert_path = certs.server_cert();
+    let key_path = certs.server_key();
+
+    std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        // Keep the std::net stream alive (and thus the fd open) for the whole
+        // handshake + write; dropping it would close the fd early.
+        let fd = stream.as_raw_fd();
+
+        // SAFETY: all calls below are standard OpenSSL server-side setup over a
+        // freshly created CTX/SSL bound to the accepted socket `fd`. Pointers
+        // are checked for null where a failure would be fatal to the test.
+        unsafe {
+            use openssl_sys as ssl;
+            let method = ssl::TLS_server_method();
+            let ctx = ssl::SSL_CTX_new(method);
+            assert!(!ctx.is_null(), "server SSL_CTX_new");
+
+            let cert_c = std::ffi::CString::new(cert_path.to_string_lossy().into_owned()).unwrap();
+            let key_c = std::ffi::CString::new(key_path.to_string_lossy().into_owned()).unwrap();
+            assert_eq!(
+                ssl::SSL_CTX_use_certificate_file(ctx, cert_c.as_ptr(), ssl::SSL_FILETYPE_PEM),
+                1,
+                "load server cert"
+            );
+            assert_eq!(
+                ssl::SSL_CTX_use_PrivateKey_file(ctx, key_c.as_ptr(), ssl::SSL_FILETYPE_PEM),
+                1,
+                "load server key"
+            );
+
+            let s = ssl::SSL_new(ctx);
+            assert!(!s.is_null(), "server SSL_new");
+            assert_eq!(ssl::SSL_set_fd(s, fd as c_int), 1, "SSL_set_fd");
+            assert_eq!(ssl::SSL_accept(s), 1, "SSL_accept");
+
+            // Send the reply payload over TLS.
+            let mut off = 0usize;
+            while off < reply.len() {
+                let n = ssl::SSL_write(
+                    s,
+                    reply.as_ptr().add(off).cast::<c_void>(),
+                    (reply.len() - off) as c_int,
+                );
+                assert!(n > 0, "server SSL_write");
+                off += n as usize;
+            }
+
+            // Truncation: free the SSL (does NOT send close_notify on its own —
+            // only SSL_shutdown does) and let `stream` drop, closing the fd with
+            // an ordinary TCP FIN. The client therefore sees a premature EOF.
+            ssl::SSL_free(s);
+            ssl::SSL_CTX_free(ctx);
+        }
+        drop(stream);
+    });
+
+    port
+}
+
+/// Truncation / unclean close: the peer closes the TCP connection (orderly FIN)
+/// after sending data but WITHOUT a TLS close_notify alert. Per
+/// SSL_read(3)/SSL_get_error(3) this surfaces as a non-positive `SSL_read`
+/// return classified as `SSL_ERROR_SYSCALL` (an unexpected EOF; observed as a
+/// -1 return on OpenSSL 3.x) — NOT the clean `SSL_ERROR_ZERO_RETURN` that a
+/// real close_notify produces. It MUST be reported to hyper as an error, never
+/// as a clean Ok(()) EOF; doing the latter would let a cut-off response body be
+/// accepted as complete.
+///
+/// This guards the fix that routes every non-positive `SSL_read` return through
+/// `SSL_get_error` and treats ONLY `SSL_ERROR_ZERO_RETURN` as a clean Ok(())
+/// EOF. Mutation-checked: mapping the `SSL_ERROR_SYSCALL` truncation to Ok(())
+/// (the old "n <= 0 is EOF" behaviour) makes this test fail.
+#[test]
+fn unclean_close_without_close_notify_is_error() {
+    let _guard = super::S_SERVER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let certs = make_certs("DNS:localhost,IP:127.0.0.1");
+    let port = spawn_truncating_server(&certs, b"hello-payload");
+    let cfg = TlsConfig { ca_file: Some(certs.ca_pem()), ..Default::default() };
+    let c = ctx(&cfg);
+
+    let io = connect_nonblocking(port);
+    let mut tls = TlsNgxConnIo::new(io, &c, "localhost", true).expect("new");
+    block_on(core::future::poll_fn(|cx| tls.poll_handshake(cx))).expect("handshake ok");
+
+    // Read until we observe a terminal result. We expect: first the payload
+    // (Ok with n>0), then — because the peer closed WITHOUT close_notify — an
+    // ERROR (truncation), never a clean Ok(()) zero-byte EOF.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut saw_payload = false;
+    let mut buf = vec![0u8; 64];
+    loop {
+        assert!(Instant::now() < deadline, "no terminal read result before deadline");
+        let res = block_on(core::future::poll_fn(|cx| {
+            let mut rb = hyper::rt::ReadBuf::new(&mut buf);
+            match Pin::new(&mut tls).poll_read(cx, rb.unfilled()) {
+                Poll::Ready(Ok(())) => Poll::Ready(Ok(rb.filled().len())),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                // usize::MAX sentinel = Pending; retry after a short wait.
+                Poll::Pending => Poll::Ready(Ok(usize::MAX)),
+            }
+        }));
+        match res {
+            // Truncation surfaced as an error — the fix under test.
+            Err(_) => break,
+            Ok(usize::MAX) => {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Ok(0) => panic!(
+                "unclean close (no close_notify) returned a clean zero-byte EOF (Ok); \
+                 SSL_ERROR_SYSCALL must surface as an error"
+            ),
+            Ok(_) => {
+                // The payload read; keep reading to reach the truncation.
+                saw_payload = true;
+                continue;
+            }
+        }
+    }
+    assert!(saw_payload, "should have read the payload before the truncation error");
+}
+
 /// Server cert NOT signed by the configured trust anchor (`other-ca.pem`) →
 /// the handshake must FAIL cleanly (fail-closed). This is the mutation target:
 /// breaking verify-mode wiring (insecure→always NONE) makes this test pass when

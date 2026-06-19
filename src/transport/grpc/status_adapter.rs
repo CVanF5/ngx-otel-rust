@@ -188,18 +188,25 @@ fn extract_retry_info_from_details(raw: &[u8]) -> Option<Duration> {
 /// Returns `None` when the proto duration is non-positive (negative or zero
 /// delay is not a useful backoff hint) or out of range for `Duration`.
 fn proto_duration_to_std(d: prost_types::Duration) -> Option<Duration> {
-    // Clamp nanos to [0, 999_999_999] — negative nanos with positive seconds
-    // are valid in the proto3 encoding of sub-second durations, but
-    // Duration::from_secs + Duration::from_nanos is simpler with both >= 0.
-    let secs = d.seconds;
-    let nanos = d.nanos;
+    // Combine seconds and nanos into a single signed nanosecond total before
+    // judging the sign. Per the google.protobuf.Duration contract, for a
+    // duration of one second or more a non-zero `nanos` MUST carry the same
+    // sign as `seconds` (e.g. 1.5s = {seconds: 1, nanos: 500_000_000} and
+    // -1.5s = {seconds: -1, nanos: -500_000_000}); a non-normalized value such
+    // as {seconds: 1, nanos: -900_000_000} still denotes 0.1s. Clamping nanos
+    // to >= 0 (the previous behaviour) would read that as 1.0s — a ~10x
+    // over-estimate of the retry hint. Summing the signed parts handles both
+    // normalized and non-normalized encodings correctly.
+    // <https://protobuf.dev/reference/protobuf/google.protobuf/#duration>
+    let total_nanos = (d.seconds as i128) * 1_000_000_000 + (d.nanos as i128);
 
-    if secs < 0 || (secs == 0 && nanos <= 0) {
+    if total_nanos <= 0 {
         return None; // non-positive → no useful hint
     }
 
-    let nanos_u32 = nanos.clamp(0, 999_999_999) as u32;
-    Some(Duration::new(secs as u64, nanos_u32))
+    let secs = (total_nanos / 1_000_000_000) as u64;
+    let nanos = (total_nanos % 1_000_000_000) as u32;
+    Some(Duration::new(secs, nanos))
 }
 
 // ── Pure gRPC code classifier ─────────────────────────────────────────────────
@@ -349,6 +356,37 @@ mod tests {
         assert_eq!(
             proto_duration_to_std(prost_types::Duration { seconds: 0, nanos: 500_000_000 }),
             Some(Duration::from_millis(500))
+        );
+    }
+
+    // Non-normalized encoding where `nanos` carries the opposite sign to bring
+    // a whole-second value back below a second. {seconds: 1, nanos: -900ms} is
+    // 0.1s, NOT 1.0s. The previous nanos.clamp(0, ..) read this as 1.0s — a
+    // ~10x over-estimate of the retry hint.
+    #[test]
+    fn s3_proto_duration_negative_nanos_below_one_second() {
+        assert_eq!(
+            proto_duration_to_std(prost_types::Duration { seconds: 1, nanos: -900_000_000 }),
+            Some(Duration::from_millis(100))
+        );
+    }
+
+    // 1.5s expressed as {seconds: 1, nanos: 500ms} round-trips exactly.
+    #[test]
+    fn s3_proto_duration_normalized_fractional_seconds() {
+        assert_eq!(
+            proto_duration_to_std(prost_types::Duration { seconds: 1, nanos: 500_000_000 }),
+            Some(Duration::from_millis(1500))
+        );
+    }
+
+    // A genuinely negative sub-second duration ({seconds: 0, nanos: -100ms})
+    // remains "no useful hint".
+    #[test]
+    fn s3_proto_duration_negative_subsecond_returns_none() {
+        assert_eq!(
+            proto_duration_to_std(prost_types::Duration { seconds: 0, nanos: -100_000_000 }),
+            None
         );
     }
 

@@ -554,6 +554,40 @@ pub struct NgxConnIo {
 // SAFETY: Only used from NGINX's single-threaded worker event loop.
 unsafe impl Send for NgxConnIo {}
 
+/// Read the pending socket error of a connecting socket via `SO_ERROR`.
+///
+/// After a non-blocking `connect`, the OS reports the outcome through the
+/// `SO_ERROR` socket option: `0` (no pending error) means the connect
+/// succeeded; a non-zero `errno` means it failed (e.g. `ECONNREFUSED`). This
+/// matches nginx's own post-connect probe (`ngx_event_connect.c` /
+/// `ngx_http_upstream_test_connect`). Returns `Some(errno)` on a pending
+/// error, `None` when there is no error (or the probe itself fails — treated
+/// as "no observed error" so the caller falls through to its normal path).
+fn socket_connect_error(fd: libc::c_int) -> Option<libc::c_int> {
+    if fd < 0 {
+        return None;
+    }
+    let mut err: libc::c_int = 0;
+    let mut len = core::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `fd` is a valid socket fd from the nginx connection; `&mut err`
+    // is a writable `c_int` and `&mut len` its matching length, per the
+    // getsockopt(SO_ERROR) contract.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_ERROR,
+            (&raw mut err).cast::<libc::c_void>(),
+            &raw mut len,
+        )
+    };
+    if rc == 0 && err != 0 {
+        Some(err)
+    } else {
+        None
+    }
+}
+
 impl NgxConnIo {
     /// Create a new (unconnected) `NgxConnIo`.
     fn new(log: core::ptr::NonNull<ngx_log_t>) -> Result<Self, TransportError> {
@@ -635,6 +669,17 @@ impl NgxConnIo {
                 if (*(*c).read).timedout() != 0 || (*(*c).write).timedout() != 0 {
                     close_and_clear(&mut self.pc.connection);
                     Err(io::ErrorKind::TimedOut.into())
+                } else if let Some(err) = socket_connect_error((*c).fd) {
+                    // A non-blocking connect signals completion by making the
+                    // socket writable; on failure (e.g. ECONNREFUSED) it becomes
+                    // writable WITHOUT timing out, with the error retrievable via
+                    // SO_ERROR. nginx performs the same SO_ERROR probe after a
+                    // deferred connect (ngx_event_connect.c / ngx_http_upstream
+                    // _test_connect). Without it, a refused connect was treated
+                    // as success here and later mis-surfaced as a generic
+                    // WriteZero on the first write.
+                    close_and_clear(&mut self.pc.connection);
+                    Err(io::Error::from_raw_os_error(err))
                 } else {
                     (*(*c).read).handler = Some(ngx_otel_conn_read_handler);
                     (*(*c).write).handler = Some(ngx_otel_conn_write_handler);
@@ -728,6 +773,18 @@ impl hyper::rt::Read for NgxConnIo {
         // SAFETY: `rev` is the connection's live read event; `ngx_handle_read_event`
         // is the nginx FFI that re-registers it with the event mechanism (flags 0).
         if unsafe { ngx_handle_read_event(rev, 0) } != NGX_OK as ngx_int_t {
+            // Re-arming failed. If `recv` had already delivered `n > 0` bytes
+            // into `buf`, hand those bytes to hyper first (a failed re-arm does
+            // not invalidate data already read); otherwise the bytes would be
+            // silently dropped. The connection is no longer being monitored, so
+            // the failure surfaces on the next poll (recv on a non-rearmed fd).
+            if n > 0 {
+                // SAFETY: `recv` returned `n > 0` bytes written into the front
+                // of the `uninit` region; `n <= uninit.len()`, so advancing the
+                // cursor by `n` is sound.
+                unsafe { buf.advance(n as usize) };
+                return Poll::Ready(Ok(()));
+            }
             return Poll::Ready(Err(io::ErrorKind::UnexpectedEof.into()));
         }
 
@@ -1985,14 +2042,31 @@ async fn http_post_raw(
     let mut conn = core::pin::pin!(conn);
     let mut resp_fut = core::pin::pin!(resp_fut);
 
-    let resp = future::poll_fn(|cx| {
-        // Drive the connection task alongside the response future.  If the
-        // connection terminates with an error (TLS reset, peer RST, EOF) surface
-        // it instead of leaving resp_fut Pending until the read timeout fires.
-        if let Poll::Ready(Err(e)) = conn.as_mut().poll(cx) {
-            return Poll::Ready(Err(e));
+    type DriveErr = Box<dyn std::error::Error + Send + Sync>;
+    let resp = future::poll_fn(|cx| -> Poll<Result<_, DriveErr>> {
+        // Drive the connection task alongside the response future. First poll
+        // the response future: once it is Ready we have the response (or its
+        // error) and must stop polling the connection future. Polling the
+        // connection first risks observing its completion (below) and returning
+        // before the already-arrived response is taken.
+        if let Poll::Ready(r) = resp_fut.as_mut().poll(cx) {
+            return Poll::Ready(r.map_err(Into::into));
         }
-        resp_fut.as_mut().poll(cx)
+        // The response is not ready yet. Drive the connection task. If it
+        // terminates — whether with an error (TLS reset, peer RST) OR a clean
+        // Ok(()) close before any response arrived — surface it as an error
+        // rather than returning Pending: a completed Connection future must not
+        // be polled again (a futures contract violation), and leaving resp_fut
+        // Pending would otherwise stall until the read timeout fires.
+        match conn.as_mut().poll(cx) {
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),
+            Poll::Ready(Ok(())) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "connection closed before response",
+            )
+            .into())),
+            Poll::Pending => Poll::Pending,
+        }
     })
     .await
     .map_err(|e| TransportError::Connection { cause: e.to_string() })?;
@@ -2018,6 +2092,86 @@ async fn http_post_raw(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── socket_connect_error (SO_ERROR probe) ───────────────────────────────
+
+    /// A negative (invalid) fd yields no observed error.
+    #[test]
+    fn socket_connect_error_invalid_fd_is_none() {
+        assert_eq!(socket_connect_error(-1), None);
+    }
+
+    /// A healthy connected socket (one end of a socketpair) has no pending
+    /// `SO_ERROR`, so the probe returns `None` and the connect is treated as
+    /// successful.
+    #[test]
+    fn socket_connect_error_healthy_socket_is_none() {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `fds` is a writable 2-element array, matching socketpair's
+        // out-parameter contract.
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair must succeed");
+        assert_eq!(socket_connect_error(fds[0]), None);
+        // SAFETY: both fds are valid open descriptors from socketpair.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+    }
+
+    /// A refused NON-BLOCKING connect makes the socket writable WITHOUT timing
+    /// out and surfaces `ECONNREFUSED` via `SO_ERROR` — exactly the case
+    /// `poll_connect`'s already-connected branch must detect. The probe must
+    /// report it so the caller turns it into a real connect error rather than a
+    /// later generic WriteZero. 127.0.0.1 on a port with no listener is
+    /// reliably refused on Linux; the connect completes asynchronously, so we
+    /// poll for writability before probing (mirroring the event-loop wake).
+    #[test]
+    fn socket_connect_error_refused_reports_econnrefused() {
+        // SAFETY: standard libc socket creation; fd checked below.
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+        assert!(fd >= 0, "socket() must succeed");
+        // Make the connect non-blocking so it completes via the SO_ERROR path
+        // (the codepath under test), not synchronously.
+        // SAFETY: `fd` is a valid socket; setting O_NONBLOCK on it.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL, 0);
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+
+        // SAFETY: `sockaddr_in` is a plain-old-data C struct; an all-zero bit
+        // pattern is a valid (unspecified) value we immediately overwrite.
+        let mut addr: libc::sockaddr_in = unsafe { core::mem::zeroed() };
+        addr.sin_family = libc::AF_INET as libc::sa_family_t;
+        // Port 1 has no listener in the test environment.
+        addr.sin_port = 1u16.to_be();
+        // 127.0.0.1 in network byte order.
+        addr.sin_addr.s_addr = u32::from_be_bytes([127, 0, 0, 1]).to_be();
+
+        // SAFETY: `fd` is a valid socket; `&addr` is a populated sockaddr_in.
+        unsafe {
+            libc::connect(
+                fd,
+                (&raw const addr).cast::<libc::sockaddr>(),
+                core::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            );
+        }
+
+        // Wait (bounded) for the connect to complete (socket becomes writable).
+        let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+        // SAFETY: `pfd` is a valid single-element pollfd; 1s timeout.
+        let pr = unsafe { libc::poll(&raw mut pfd, 1, 1000) };
+
+        // On a refused connect the socket is writable but SO_ERROR carries the
+        // error. If poll timed out (unexpected on Linux) skip the assertion.
+        if pr > 0 {
+            assert_eq!(socket_connect_error(fd), Some(libc::ECONNREFUSED));
+        }
+        // SAFETY: `fd` is a valid open descriptor.
+        unsafe {
+            libc::close(fd);
+        }
+    }
 
     // ── IPv6 sockaddr + dual-stack literal branch ────────────────────────────
 

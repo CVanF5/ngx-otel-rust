@@ -909,11 +909,29 @@ impl<I: hyper::rt::Read + hyper::rt::Write + Unpin + 'static> hyper::rt::Read fo
             unsafe { buf.advance(n as usize) };
             return Poll::Ready(Ok(()));
         }
-        if n == 0 {
-            // Clean shutdown / EOF.
-            return Poll::Ready(Ok(()));
+        // SSL_read returned <= 0. Per SSL_read(3)/SSL_get_error(3), a return of
+        // 0 is NOT automatically a clean EOF: it must be classified via
+        // SSL_get_error. Only SSL_ERROR_ZERO_RETURN means the peer sent a TLS
+        // close_notify (a genuine clean stream EOF, reported to hyper as
+        // Ok(()) with zero bytes filled). SSL_ERROR_SYSCALL (e.g. a peer RST or
+        // a TCP FIN with no close_notify — common with TLS 1.3 behind proxies)
+        // is a truncation and MUST surface as an error so hyper does not treat
+        // a cut-off response as complete. WANT_READ/WANT_WRITE → Pending; all
+        // other codes → an I/O error (fail-closed).
+        // <https://docs.openssl.org/master/man3/SSL_read/>
+        // <https://docs.openssl.org/master/man3/SSL_get_error/>
+        // SAFETY: `this.ssl` is the owned SSL; `SSL_get_error` interprets `n`
+        // against the SSL's internal error state and is called immediately
+        // after the originating `SSL_read` above.
+        let err = unsafe { ssl::SSL_get_error(this.ssl, n) };
+        match err {
+            ssl::SSL_ERROR_WANT_READ | ssl::SSL_ERROR_WANT_WRITE => Poll::Pending,
+            ssl::SSL_ERROR_ZERO_RETURN => {
+                // Peer sent close_notify: clean stream EOF.
+                Poll::Ready(Ok(()))
+            }
+            _ => this.map_ssl_err(n, "read"),
         }
-        this.map_ssl_err(n, "read")
     }
 }
 
