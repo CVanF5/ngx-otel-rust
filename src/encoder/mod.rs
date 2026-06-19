@@ -328,7 +328,7 @@ fn convert_metric(m: &crate::data_model::Metric) -> metrics_proto::Metric {
 
     let data = match &m.data {
         MetricData::Histogram(h) => PD::Histogram(metrics_proto::Histogram {
-            data_points: h.data_points.iter().map(convert_hdp).collect(),
+            data_points: h.data_points.iter().filter_map(convert_hdp).collect(),
             aggregation_temporality: proto_temporality(h.aggregation_temporality),
         }),
         MetricData::ExponentialHistogram(h) => {
@@ -372,8 +372,20 @@ fn convert_ndp(dp: &crate::data_model::NumberDataPoint) -> metrics_proto::Number
     }
 }
 
-fn convert_hdp(dp: &crate::data_model::HistogramDataPoint) -> metrics_proto::HistogramDataPoint {
-    metrics_proto::HistogramDataPoint {
+fn convert_hdp(
+    dp: &crate::data_model::HistogramDataPoint,
+) -> Option<metrics_proto::HistogramDataPoint> {
+    // OTLP ExplicitBucketHistogram invariant: bucket_counts.len() must equal
+    // explicit_bounds.len() + 1 (one bucket per inter-boundary interval plus
+    // the overflow bucket).  A mismatch produces a structurally malformed data
+    // point; OTLP collectors may reject the *entire* export request on receipt,
+    // so we skip the offending point rather than corrupt the batch.
+    // Reference: https://opentelemetry.io/docs/specs/otel/metrics/data-model/#histogram
+    let expected_counts = dp.explicit_bounds.len().saturating_add(1);
+    if dp.bucket_counts.len() != expected_counts {
+        return None;
+    }
+    Some(metrics_proto::HistogramDataPoint {
         attributes: dp.attributes.iter().map(convert_kv).collect(),
         start_time_unix_nano: dp.start_time_unix_nano,
         time_unix_nano: dp.time_unix_nano,
@@ -385,7 +397,7 @@ fn convert_hdp(dp: &crate::data_model::HistogramDataPoint) -> metrics_proto::His
         flags: 0,
         min: None,
         max: None,
-    }
+    })
 }
 
 fn convert_exemplar(e: &crate::data_model::Exemplar) -> metrics_proto::Exemplar {
@@ -411,12 +423,20 @@ fn convert_exp_hdp(
         positive_counts.pop();
     }
 
+    // `sum` is always emitted — including for empty windows (count == 0,
+    // sum == 0.0) — to match the ExplicitBucketHistogram path, which
+    // unconditionally sets `sum: Some(dp.sum)`.  The OTLP metrics data model
+    // marks `sum` as optional but does not recommend omitting it for empty
+    // windows; keeping both histogram types symmetric avoids surprises in
+    // downstream consumers (e.g. the Prometheus remote-write receiver
+    // interprets a missing `sum` as "unknown" rather than zero).
+    // Reference: https://opentelemetry.io/docs/specs/otel/metrics/data-model/#exponentialhistogram
     metrics_proto::ExponentialHistogramDataPoint {
         attributes: dp.attributes.iter().map(convert_kv).collect(),
         start_time_unix_nano: dp.start_time_unix_nano,
         time_unix_nano: dp.time_unix_nano,
         count: dp.count,
-        sum: if dp.count > 0 { Some(dp.sum) } else { None },
+        sum: Some(dp.sum),
         scale: dp.scale,
         zero_count: dp.zero_count,
         positive: Some(Buckets { offset: dp.positive_offset, bucket_counts: positive_counts }),
@@ -792,5 +812,142 @@ mod tests {
         // Status.
         let status = s.status.as_ref().expect("status present");
         assert_eq!(status.code, StatusCode::Ok as i32);
+    }
+
+    /// An ExponentialHistogram data point with count == 0 (empty window) must
+    /// still emit `sum: Some(0.0)`.  This mirrors the ExplicitBucketHistogram
+    /// path, which unconditionally sets `sum: Some(dp.sum)`.  Downstream
+    /// consumers (e.g. the Prometheus remote-write receiver) treat a missing
+    /// `sum` field as "unknown" rather than zero.
+    ///
+    /// Regression guard for the fix that removed the `if count > 0` guard from
+    /// `convert_exp_hdp`.
+    #[test]
+    fn exp_histogram_empty_window_emits_sum() {
+        use crate::data_model::{
+            ExponentialHistogramData, ExponentialHistogramDataPoint, MetricData,
+        };
+        use crate::shm::{EXP_HISTOGRAM_BUCKET_OFFSET, EXP_HISTOGRAM_SCALE};
+
+        let dp = ExponentialHistogramDataPoint {
+            attributes: std::vec![],
+            start_time_unix_nano: 1_700_000_000_000_000_000,
+            time_unix_nano: 1_700_000_010_000_000_000,
+            count: 0,
+            sum: 0.0,
+            scale: EXP_HISTOGRAM_SCALE,
+            zero_count: 0,
+            positive_offset: EXP_HISTOGRAM_BUCKET_OFFSET,
+            positive_bucket_counts: std::vec![],
+            exemplars: std::vec![],
+        };
+
+        let batch = Batch {
+            resource: Resource::default(),
+            scope: Scope { name: "test".into(), version: "0".into() },
+            metrics: std::vec![Metric {
+                name: "http.server.request.duration".into(),
+                description: "test".into(),
+                unit: "s".into(),
+                data: MetricData::ExponentialHistogram(ExponentialHistogramData {
+                    aggregation_temporality: AggregationTemporality::Cumulative,
+                    data_points: std::vec![dp],
+                }),
+            }],
+        };
+
+        let enc = OtlpHttpEncoder;
+        let bytes = enc.encode(&batch);
+
+        let decoded =
+            ExportMetricsServiceRequest::decode(bytes.as_slice()).expect("decode without error");
+
+        let data = decoded.resource_metrics[0].scope_metrics[0].metrics[0]
+            .data
+            .as_ref()
+            .expect("data present");
+        match data {
+            super::metrics_proto::metric::Data::ExponentialHistogram(eh) => {
+                assert_eq!(eh.data_points.len(), 1);
+                let ehdp = &eh.data_points[0];
+                assert_eq!(ehdp.count, 0, "count is zero for empty window");
+                // sum must be Some(0.0) — not None — for an empty window.
+                assert_eq!(
+                    ehdp.sum,
+                    Some(0.0),
+                    "empty ExponentialHistogram window must emit sum: Some(0.0)"
+                );
+            }
+            other => panic!("expected ExponentialHistogram data, got {other:?}"),
+        }
+    }
+
+    /// A HistogramDataPoint where `bucket_counts.len() != explicit_bounds.len() + 1`
+    /// must be silently dropped (the malformed point is skipped, not emitted).
+    /// A correctly-formed sibling data point in the same metric must still appear.
+    ///
+    /// Regression guard for the defensive invariant check added to `convert_hdp`.
+    #[test]
+    fn histogram_malformed_bucket_count_is_dropped() {
+        use crate::data_model::HistogramData;
+
+        // Malformed: 3 bounds → need 4 bucket counts, but only 2 supplied.
+        let malformed = HistogramDataPoint {
+            attributes: std::vec![],
+            start_time_unix_nano: 1_700_000_000_000_000_000,
+            time_unix_nano: 1_700_000_010_000_000_000,
+            count: 5,
+            sum: 42.0,
+            bucket_counts: std::vec![2, 3],            // wrong: need 4
+            explicit_bounds: std::vec![1.0, 2.0, 3.0], // 3 bounds → need 4 counts
+        };
+
+        // Well-formed sibling: 2 bounds → 3 bucket counts.
+        let good = HistogramDataPoint {
+            attributes: std::vec![],
+            start_time_unix_nano: 1_700_000_000_000_000_000,
+            time_unix_nano: 1_700_000_010_000_000_000,
+            count: 10,
+            sum: 99.0,
+            bucket_counts: std::vec![4, 4, 2],
+            explicit_bounds: std::vec![5.0, 10.0],
+        };
+
+        let batch = Batch {
+            resource: Resource::default(),
+            scope: Scope { name: "test".into(), version: "0".into() },
+            metrics: std::vec![Metric {
+                name: "http.server.request.duration".into(),
+                description: "test".into(),
+                unit: "s".into(),
+                data: crate::data_model::MetricData::Histogram(HistogramData {
+                    aggregation_temporality: AggregationTemporality::Cumulative,
+                    data_points: std::vec![malformed, good],
+                }),
+            }],
+        };
+
+        let enc = OtlpHttpEncoder;
+        let bytes = enc.encode(&batch);
+
+        let decoded =
+            ExportMetricsServiceRequest::decode(bytes.as_slice()).expect("decode without error");
+
+        let hist = match decoded.resource_metrics[0].scope_metrics[0].metrics[0]
+            .data
+            .as_ref()
+            .expect("data present")
+        {
+            super::metrics_proto::metric::Data::Histogram(h) => h,
+            other => panic!("expected Histogram data, got {other:?}"),
+        };
+
+        // The malformed data point must be silently dropped; only the
+        // well-formed one survives.
+        assert_eq!(hist.data_points.len(), 1, "malformed point must be dropped");
+        assert_eq!(hist.data_points[0].count, 10, "surviving point is the well-formed one");
+        assert_eq!(hist.data_points[0].sum, Some(99.0));
+        assert_eq!(hist.data_points[0].bucket_counts, std::vec![4u64, 4, 2]);
+        assert_eq!(hist.data_points[0].explicit_bounds, std::vec![5.0f64, 10.0]);
     }
 }
