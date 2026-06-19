@@ -394,35 +394,14 @@ if [[ -n "${NEW_LOGS}" ]]; then
     # The value must be present and plausible (> 0).
     # OTLP/JSON wraps attribute values as {"key":"...","value":{"doubleValue":N}};
     # a bare "http.server.request.duration":N pattern never appears in the wire
-    # format, so we parse the actual attribute structure using python3.
-    DURATION_VAL=$(echo "${NEW_LOGS}" | python3 - <<'PYEOF'
-import sys, json
-# Read ALL of stdin up front: the producer is `echo "${NEW_LOGS}" | python3`,
-# so exiting/breaking early would close the pipe while echo is still writing
-# and raise SIGPIPE in echo (script abort under `set -o pipefail`). Consume
-# everything first, then scan, so the assertion completes deterministically.
-val = None
-for line in sys.stdin.read().splitlines():
-    line = line.strip()
-    if not line:
-        continue
-    try:
-        obj = json.loads(line)
-    except json.JSONDecodeError:
-        continue
-    for rl in obj.get("resourceLogs", []):
-        for sl in rl.get("scopeLogs", []):
-            for lr in sl.get("logRecords", []):
-                for attr in lr.get("attributes", []):
-                    if attr.get("key") == "http.server.request.duration":
-                        v = attr.get("value", {})
-                        n = v.get("doubleValue") or v.get("intValue")
-                        if n is not None:
-                            val = float(n)
-if val is not None:
-    print(val)
-PYEOF
-    )
+    # format. Match the wrapped shape with a tolerant text scan (like the sibling
+    # url.path/method checks): NEW_LOGS is a byte-delta of logs.json that may
+    # start mid-line, so a strict JSON-Lines parse can drop records that live in
+    # a partial leading line — a substring match is robust to that boundary.
+    DURATION_VAL=$(echo "${NEW_LOGS}" \
+        | grep -oE '"http\.server\.request\.duration","value":\{"(doubleValue|intValue)":[0-9.eE+-]+' \
+        | grep -oE '[0-9.eE+-]+$' \
+        | head -1)
     if [[ -z "${DURATION_VAL}" ]]; then
         fail "logs.json: http.server.request.duration NOT found on tail LogRecord — duration attribute missing"
     elif python3 -c "import sys; sys.exit(0 if float('${DURATION_VAL}') > 0 else 1)" 2>/dev/null; then
