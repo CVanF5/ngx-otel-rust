@@ -845,6 +845,7 @@ mod tests {
         // SAFETY: analogous for notAfter.
         let na = unsafe { ossl::X509_getm_notAfter(cert) };
         assert!(!na.is_null());
+        // SAFETY: `na` is valid; ASN1_TIME_set_string writes the time string.
         let ok = unsafe { ossl::ASN1_TIME_set_string(na, na_str.as_ptr()) };
         assert_eq!(ok, 1, "ASN1_TIME_set_string(notAfter) failed");
 
