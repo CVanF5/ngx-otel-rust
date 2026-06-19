@@ -2472,7 +2472,7 @@ extern "C" fn cmd_set_log_ring_size(
             // For both to be 8-byte aligned, cap must be a multiple of 8.
             // Round up to the next multiple of 8; use checked arithmetic to avoid
             // a panic on values near usize::MAX (e.g. usize::MAX - 3 would overflow).
-            let Some(aligned) = n.checked_next_multiple_of(8) else {
+            let Some(aligned) = align_ring_size(n) else {
                 ngx_conf_log_error!(
                     NGX_LOG_EMERG,
                     &raw mut *cf,
@@ -3009,6 +3009,18 @@ fn parse_size_bytes(s: &[u8]) -> Option<usize> {
     // producing a wrong (smaller) size without an error.
     let n_usize = usize::try_from(n).ok()?;
     n_usize.checked_mul(mult)
+}
+
+/// Round `n` up to the nearest multiple of 8, returning `None` if the result
+/// would overflow `usize`.
+///
+/// The log-ring-size directive stores three contiguous sections in shared
+/// memory at offsets that are multiples of `ring_size_bytes(cap)`; for
+/// `AtomicU64` alignment at each boundary `cap` must be a multiple of 8.
+/// Values near `usize::MAX` where rounding up would overflow are rejected
+/// here so the caller can surface an error rather than panic.
+fn align_ring_size(n: usize) -> Option<usize> {
+    n.checked_next_multiple_of(8)
 }
 
 /// Parse a decimal ASCII string → u64.
@@ -3600,51 +3612,41 @@ mod tests {
         assert_eq!(parse_size_bytes(b"1m"), Some(1024 * 1024));
     }
 
-    /// `n.checked_next_multiple_of(8)` must return `None` for values near
-    /// `usize::MAX` where rounding up would overflow, rather than panicking.
+    /// `align_ring_size` must return `None` for values near `usize::MAX` where
+    /// rounding up to the next multiple of 8 would overflow, rather than panicking.
     ///
-    /// The `cmd_set_log_ring_size` directive handler calls this on the parsed
-    /// size before storing it.  `parse_size_bytes` filters most extreme values
-    /// via `checked_mul`, but the alignment rounding is a separate step.
+    /// `cmd_set_log_ring_size` delegates the alignment step to `align_ring_size`
+    /// so that this test is genuine: reverting `align_ring_size` to use
+    /// `next_multiple_of(8)` instead of `checked_next_multiple_of(8)` causes
+    /// a panic in debug builds (overflow), which the test runner reports as a
+    /// test failure.  The directive handler itself is an FFI callback that cannot
+    /// be invoked in unit tests without a live nginx config context.
     ///
-    /// This test exercises the arithmetic directly (the directive handler itself
-    /// is an FFI callback and cannot be called in unit tests without a live
-    /// nginx config context).
-    ///
-    /// Mutation: revert `checked_next_multiple_of(8)` back to `next_multiple_of(8)`
-    /// — Rust's `next_multiple_of` panics in debug builds when the rounded value
-    /// overflows, so this mutation causes a panic instead of returning `None`.
-    /// The test would catch the panic as a test failure (unwrap on None panics, or
-    /// in the mutated form the checked call itself panics).
+    /// Mutation: replace `n.checked_next_multiple_of(8)` in `align_ring_size`
+    /// with `n.checked_next_multiple_of(8)` — panics on overflow values below,
+    /// turning these assertions into test failures.
     #[test]
     fn log_ring_size_alignment_overflow_returns_none() {
-        // Values that are already a multiple of 8 never need rounding → no overflow.
+        // usize::MAX is not itself a multiple of 8 (MAX % 8 = 7 on 64-bit),
+        // so rounding up would overflow → None.
         assert_eq!(
-            usize::MAX.checked_next_multiple_of(8),
+            align_ring_size(usize::MAX),
             None,
-            "usize::MAX rounded up to next multiple of 8 overflows and must return None"
+            "usize::MAX rounded up to next multiple of 8 overflows → must return None"
         );
 
-        // usize::MAX - 7 is a multiple of 8 itself only if (usize::MAX - 7) % 8 == 0.
-        // usize::MAX = 2^64-1 on 64-bit; (2^64-1) % 8 = 7, so usize::MAX - 6 is the
-        // last non-multiple before usize::MAX.  Any non-multiple near the top overflows.
-        let near_max = usize::MAX - 3; // not a multiple of 8 (MAX%8=7, MAX-3%8=4)
+        // usize::MAX - 3 is also not a multiple of 8 (MAX%8=7, so MAX-3%8=4),
+        // and rounding it up would also overflow → None.
+        let near_max = usize::MAX - 3;
         assert_eq!(
-            near_max.checked_next_multiple_of(8),
+            align_ring_size(near_max),
             None,
-            "value near usize::MAX whose aligned form would overflow must return None"
+            "value near usize::MAX whose aligned form overflows must return None"
         );
 
-        // A normal value rounds up without overflow.
-        assert_eq!(
-            usize::from(9u8).checked_next_multiple_of(8),
-            Some(16),
-            "normal value must round up to the next multiple of 8"
-        );
-        assert_eq!(
-            usize::from(8u8).checked_next_multiple_of(8),
-            Some(8),
-            "already-aligned value must be unchanged"
-        );
+        // Normal values round up correctly.
+        assert_eq!(align_ring_size(9), Some(16), "9 must round up to 16");
+        assert_eq!(align_ring_size(8), Some(8), "already-aligned value must be unchanged");
+        assert_eq!(align_ring_size(0), Some(0), "zero must stay zero (trivially aligned)");
     }
 }
