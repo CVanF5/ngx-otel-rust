@@ -878,7 +878,7 @@ impl ExemplarReservoir {
     /// benign lost-update: the worker's `fetch_add(Relaxed)` on `seen` and the
     /// exporter's `store(0, Release)` are both well-defined atomic operations,
     /// and a lost-update means one fewer exemplar for that interval — consistent
-    /// with the best-effort semantics described on [`snapshot`].
+    /// with the best-effort semantics described on [`Self::snapshot`].
     pub fn reset(&self) {
         self.seen.store(0, Ordering::Release);
     }

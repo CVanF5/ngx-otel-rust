@@ -400,7 +400,7 @@ fn hex_encode_into_slice(src: &[u8], dst: &mut [u8]) {
 /// Format: `"00-{32hex trace_id}-{16hex span_id}-{flags_hex}"`.
 /// `trace_flags` is the full 8-bit W3C trace-flags octet; all bits are
 /// preserved per W3C Trace Context §3.2
-/// (https://www.w3.org/TR/trace-context/#trace-flags).
+/// (<https://www.w3.org/TR/trace-context/#trace-flags>).
 ///
 /// Extracted from `inject_traceparent_header` so the encoding logic is
 /// unit-testable without requiring a live nginx request pool.
@@ -448,7 +448,7 @@ fn build_traceparent_value(trace_id: &[u8; 16], span_id: &[u8; 8], trace_flags: 
 /// a non-zero value is sufficient for the proxy module's generic header copy.
 ///
 /// **Flags field:** `trace_flags` is the full 8-bit W3C trace-flags octet
-/// (W3C Trace Context §3.2, https://www.w3.org/TR/trace-context/#trace-flags).
+/// (W3C Trace Context §3.2, <https://www.w3.org/TR/trace-context/#trace-flags>).
 /// All bits are preserved — callers MUST NOT collapse it to a 1-bit `sampled`
 /// boolean before passing, as that silently drops any future flag bits.
 ///
@@ -753,7 +753,7 @@ mod tests {
     /// collapsed to "00"/"01".
     ///
     /// W3C Trace Context §3.2 defines `trace-flags` as an 8-bit field:
-    /// https://www.w3.org/TR/trace-context/#trace-flags
+    /// <https://www.w3.org/TR/trace-context/#trace-flags>
     ///
     /// Mutation proof: replace `hex_encode_into_slice(&[trace_flags], …)` in
     /// `build_traceparent_value` with the OLD code:
