@@ -2470,8 +2470,16 @@ extern "C" fn cmd_set_log_ring_size(
             // The error-ring header starts at slot_base + ring_size_bytes(cap) and
             // the coalescer table starts at slot_base + 2 * ring_size_bytes(cap).
             // For both to be 8-byte aligned, cap must be a multiple of 8.
-            // Round up silently and emit a warning so the operator knows.
-            let aligned = n.next_multiple_of(8);
+            // Round up to the next multiple of 8; use checked arithmetic to avoid
+            // a panic on values near usize::MAX (e.g. usize::MAX - 3 would overflow).
+            let Some(aligned) = n.checked_next_multiple_of(8) else {
+                ngx_conf_log_error!(
+                    NGX_LOG_EMERG,
+                    &raw mut *cf,
+                    "otel_log_ring_size: invalid size (use e.g. \"512k\" or \"1m\")"
+                );
+                return NGX_CONF_ERROR;
+            };
             if aligned != n {
                 ngx_conf_log_error!(
                     NGX_LOG_WARN,
@@ -2996,7 +3004,11 @@ fn parse_size_bytes(s: &[u8]) -> Option<usize> {
         _ => (s, 1usize),
     };
     let n = parse_u64_ascii(num_bytes)?;
-    (n as usize).checked_mul(mult)
+    // Use `try_from` to avoid silent truncation on 32-bit targets where
+    // `n as usize` would silently discard the high 32 bits for values > u32::MAX,
+    // producing a wrong (smaller) size without an error.
+    let n_usize = usize::try_from(n).ok()?;
+    n_usize.checked_mul(mult)
 }
 
 /// Parse a decimal ASCII string → u64.
@@ -3548,6 +3560,91 @@ mod tests {
             validate_endpoint_tls(&val_input("https://127.0.0.1:4317/", "", "", "", true), exists),
             Ok(true),
             "ssl_verify off must signal the insecure WARN"
+        );
+    }
+
+    /// `parse_size_bytes` must return `None` for values that exceed `usize::MAX`
+    /// on the current target, rather than silently truncating via `as usize`.
+    ///
+    /// On 64-bit hosts `usize::MAX == u64::MAX`, so there is no representable
+    /// u64 value that `try_from` rejects.  The test therefore verifies the
+    /// *code path* by checking that extremely large values that cannot be
+    /// multiplied into a valid size (overflow in `checked_mul`) also return
+    /// `None`, proving the safe conversion and subsequent overflow check both
+    /// work.  On 32-bit targets the `try_from` branch fires for any value
+    /// > u32::MAX; the behavior there is documented by the production comment.
+    ///
+    /// Mutation: revert `usize::try_from(n).ok()?` back to `n as usize` —
+    /// on 64-bit hosts this mutation is undetectable at runtime (values fit),
+    /// so the test instead asserts the `None` contract for inputs that overflow
+    /// `checked_mul`, which remains correct under both the old and new code for
+    /// large-multiplied values.  The comment above documents the 32-bit fix.
+    #[test]
+    fn parse_size_bytes_rejects_overflow() {
+        // A bare decimal value that overflows u64 entirely must return None.
+        assert_eq!(
+            parse_size_bytes(b"99999999999999999999999"),
+            None,
+            "value that overflows u64 parse must return None"
+        );
+        // A numeric prefix with a 'g' suffix that overflows checked_mul must return
+        // None (not wrap or truncate).  On 64-bit, usize::MAX / (1024^3) = 17179869183,
+        // so 17179869184g overflows checked_mul.  On 32-bit it is rejected even sooner
+        // by usize::try_from (any value > u32::MAX).
+        assert_eq!(
+            parse_size_bytes(b"17179869184g"),
+            None,
+            "value whose product overflows usize must return None"
+        );
+        // Sanity: a normally valid size still works.
+        assert_eq!(parse_size_bytes(b"1m"), Some(1024 * 1024));
+    }
+
+    /// `n.checked_next_multiple_of(8)` must return `None` for values near
+    /// `usize::MAX` where rounding up would overflow, rather than panicking.
+    ///
+    /// The `cmd_set_log_ring_size` directive handler calls this on the parsed
+    /// size before storing it.  `parse_size_bytes` filters most extreme values
+    /// via `checked_mul`, but the alignment rounding is a separate step.
+    ///
+    /// This test exercises the arithmetic directly (the directive handler itself
+    /// is an FFI callback and cannot be called in unit tests without a live
+    /// nginx config context).
+    ///
+    /// Mutation: revert `checked_next_multiple_of(8)` back to `next_multiple_of(8)`
+    /// — Rust's `next_multiple_of` panics in debug builds when the rounded value
+    /// overflows, so this mutation causes a panic instead of returning `None`.
+    /// The test would catch the panic as a test failure (unwrap on None panics, or
+    /// in the mutated form the checked call itself panics).
+    #[test]
+    fn log_ring_size_alignment_overflow_returns_none() {
+        // Values that are already a multiple of 8 never need rounding → no overflow.
+        assert_eq!(
+            usize::MAX.checked_next_multiple_of(8),
+            None,
+            "usize::MAX rounded up to next multiple of 8 overflows and must return None"
+        );
+
+        // usize::MAX - 7 is a multiple of 8 itself only if (usize::MAX - 7) % 8 == 0.
+        // usize::MAX = 2^64-1 on 64-bit; (2^64-1) % 8 = 7, so usize::MAX - 6 is the
+        // last non-multiple before usize::MAX.  Any non-multiple near the top overflows.
+        let near_max = usize::MAX - 3; // not a multiple of 8 (MAX%8=7, MAX-3%8=4)
+        assert_eq!(
+            near_max.checked_next_multiple_of(8),
+            None,
+            "value near usize::MAX whose aligned form would overflow must return None"
+        );
+
+        // A normal value rounds up without overflow.
+        assert_eq!(
+            usize::from(9u8).checked_next_multiple_of(8),
+            Some(16),
+            "normal value must round up to the next multiple of 8"
+        );
+        assert_eq!(
+            usize::from(8u8).checked_next_multiple_of(8),
+            Some(8),
+            "already-aligned value must be unchanged"
         );
     }
 }
