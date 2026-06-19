@@ -38,21 +38,27 @@ REPO_ROOT="$(cd "${CRATE_DIR}/.." && pwd)"
 RESULTS_DIR="${SCRIPT_DIR}/results"
 
 NGINX_SOURCE_DIR="${NGINX_SOURCE_DIR:-${REPO_ROOT}/nginx}"
-# Bench must use the RELEASE binary (for accurate throughput measurement).
-# Prefer objs-release/nginx; fall back to objs-debug only if release is absent.
-if [[ -x "${CRATE_DIR}/objs-release/nginx" ]]; then
-    NGINX_BUILD_DIR="${NGINX_BUILD_DIR:-${CRATE_DIR}/objs-release}"
-    NGINX_BINARY="${NGINX_BINARY:-${CRATE_DIR}/objs-release/nginx}"
-else
-    NGINX_BUILD_DIR="${NGINX_BUILD_DIR:-${REPO_ROOT}/nginx/objs}"
+# This benchmark measures per-request overhead; a debug build invalidates
+# the numbers.  Require the release binary; hard-error if it is absent.
+if [[ -z "${NGINX_BINARY:-}" ]]; then
+    if [[ -x "${CRATE_DIR}/objs-release/nginx" ]]; then
+        NGINX_BINARY="${CRATE_DIR}/objs-release/nginx"
+        NGINX_BUILD_DIR="${NGINX_BUILD_DIR:-${CRATE_DIR}/objs-release}"
+    else
+        echo "ERROR: objs-release/nginx not found." >&2
+        echo "       Build NGINX in release mode first (make), or set NGINX_BINARY= to the" >&2
+        echo "       release binary explicitly.  A debug binary produces meaningless numbers." >&2
+        exit 1
+    fi
 fi
+NGINX_BUILD_DIR="${NGINX_BUILD_DIR:-${REPO_ROOT}/nginx/objs}"
 
 . "${CRATE_DIR}/test-harness/lib.sh"
-resolve_nginx_binary || true
 
 # Confirm we're using a real executable (not a stale path).
 if [[ ! -x "${NGINX_BINARY}" ]]; then
     echo "ERROR: NGINX_BINARY not executable: ${NGINX_BINARY}" >&2
+    echo "       The release binary is required for accurate throughput measurements." >&2
     exit 1
 fi
 
@@ -148,6 +154,17 @@ run_config() {
         -e "s|@MODULE_PATH@|${MODULE_PATH}|g" \
         -e "s|@PREFIX@|${prefix}|g" \
         "${conf_file}" > "${prefix}/nginx.conf"
+
+    # Pre-flight: ensure port 9102 (and 9103 for TD) is not already bound so a
+    # leftover from a previous run doesn't abort the whole bench silently.
+    local port; port="$(grep -Eo 'listen[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+' "${prefix}/nginx.conf" | head -1 | awk -F: '{print $NF}')"
+    port="${port:-9102}"
+    if nc -z 127.0.0.1 "${port}" 2>/dev/null; then
+        echo "ERROR: port ${port} is already bound before starting nginx for config ${label}." >&2
+        echo "       Kill any leftover process: lsof -ti :${port} | xargs kill -9" >&2
+        cleanup_run; trap - EXIT
+        exit 1
+    fi
 
     "${NGINX_BINARY}" -p "${prefix}" -c "${prefix}/nginx.conf" &
     nginx_pid=$!

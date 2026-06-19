@@ -46,7 +46,19 @@ NGINX_BUILD_DIR="${NGINX_BUILD_DIR:-${REPO_ROOT}/nginx/objs}"
 # Source the shared harness library.  Exposes ensure_collector_running
 # and resolve_nginx_binary.
 . "${CRATE_DIR}/test-harness/lib.sh"
-resolve_nginx_binary || true   # missing-binary error is produced by the preflight below
+
+# This benchmark measures per-request overhead; a debug build invalidates
+# the numbers.  Require the release binary explicitly.
+if [[ -z "${NGINX_BINARY:-}" ]]; then
+    if [[ -x "${CRATE_DIR}/objs-release/nginx" ]]; then
+        NGINX_BINARY="${CRATE_DIR}/objs-release/nginx"
+    else
+        echo "ERROR: objs-release/nginx not found." >&2
+        echo "       Build NGINX in release mode first (make), or set NGINX_BINARY= to the" >&2
+        echo "       release binary explicitly.  A debug binary produces meaningless numbers." >&2
+        exit 1
+    fi
+fi
 
 BENCH_ITERATIONS="${BENCH_ITERATIONS:-5}"
 SKIP_BUILD="${SKIP_BUILD:-0}"

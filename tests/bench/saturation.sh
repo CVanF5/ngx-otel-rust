@@ -226,7 +226,14 @@ parse_wrk() {
     _to_ms() {
         local v="$1" n u
         [[ "${v}" =~ ^([0-9]+\.?[0-9]*)([a-z]+)$ ]] && { n="${BASH_REMATCH[1]}"; u="${BASH_REMATCH[2]}"; } || { echo 0; return; }
-        case "${u}" in us) awk -v n="${n}" 'BEGIN{printf "%.4f", n/1000}';; ms) echo "${n}";; s) awk -v n="${n}" 'BEGIN{printf "%.4f", n*1000}';; *) echo 0;; esac
+        case "${u}" in
+            us) awk -v n="${n}" 'BEGIN{printf "%.4f", n/1000}' ;;
+            ms) echo "${n}" ;;
+            s)  awk -v n="${n}" 'BEGIN{printf "%.4f", n*1000}' ;;
+            m)  awk -v n="${n}" 'BEGIN{printf "%.4f", n*60000}' ;;
+            h)  awk -v n="${n}" 'BEGIN{printf "%.4f", n*3600000}' ;;
+            *)  echo 0 ;;
+        esac
     }
     p50="$(echo "${raw}" | grep -E '^\s+50%' | head -1 | awk '{print $2}')"
     p99="$(echo "${raw}" | grep -E '^\s+99%' | head -1 | awk '{print $2}')"
@@ -292,7 +299,21 @@ run_one() {
         if (( after > recv_before )); then
             recv_delta=$(( after - recv_before ))
         elif (( after < recv_before )); then
-            recv_delta=-1   # METRICS_LOG rotated (10MB cap) => heavy export confirmed
+            # The metrics log line count decreased.  This is only legitimate
+            # evidence of export if a rotation occurred AND the new file already
+            # has content (the collector wrote at least one record after rotating).
+            # A truncation, deletion, or reset with no new exports also produces
+            # a lower count — and in that case after==0 or after is very small
+            # with no evidence of a new write cycle.
+            #
+            # Require: the current file is non-empty (after >= 1) so we know the
+            # collector has written at least one fresh record into it.
+            if (( after >= 1 )); then
+                recv_delta=-1   # rotation confirmed: file rotated and new records present
+            else
+                fail "C3 (${cfg} r${round}): metrics log line count decreased to ${after} (was ${recv_before}) with no new records — possible reset/truncation, not a rotation. Comparison meaningless."
+                rm -rf "${prefix}"; trap - RETURN; exit 2
+            fi
         else
             fail "C3 (${cfg} r${round}) exported NOTHING to the collector (count unchanged at ${after}). Comparison meaningless."
             rm -rf "${prefix}"; trap - RETURN; exit 2
