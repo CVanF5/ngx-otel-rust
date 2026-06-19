@@ -162,11 +162,18 @@ fn send_otlp_to_live_collector() {
         std::fs::read_to_string(METRICS_LOG_PATH).expect("metrics.json must be readable");
 
     // Only examine bytes appended after we sent the request.
-    let new_content = if pre_size as usize <= log_content.len() {
-        &log_content[pre_size as usize..]
+    //
+    // `pre_size` is a byte offset from `std::fs::Metadata::len()`, which may
+    // not fall on a UTF-8 character boundary if the file happened to be
+    // written mid-codepoint.  Slice on bytes first, then convert lossily so
+    // the assertion produces a readable message rather than an opaque panic.
+    let log_bytes = log_content.as_bytes();
+    let new_bytes = if pre_size as usize <= log_bytes.len() {
+        &log_bytes[pre_size as usize..]
     } else {
-        &log_content
+        log_bytes
     };
+    let new_content = String::from_utf8_lossy(new_bytes);
 
     assert!(
         new_content.contains(&service_name),

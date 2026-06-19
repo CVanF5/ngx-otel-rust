@@ -76,24 +76,37 @@ pub static mut ngx_exiting: nginx_sys::ngx_uint_t = 0;
 #[no_mangle]
 pub static mut ngx_cycle: *mut nginx_sys::ngx_cycle_t = core::ptr::null_mut();
 
-// ngx_stat_* statics — each is a *mut ngx_atomic_t pointing at a zero value.
-static mut STUB_STAT_ZERO: core::ffi::c_ulong = 0;
+// ngx_stat_* statics — each pointer has its OWN backing cell so that a write
+// through one does not corrupt the others.
+static mut STUB_STAT_ACCEPTED: core::ffi::c_ulong = 0;
+static mut STUB_STAT_HANDLED: core::ffi::c_ulong = 0;
+static mut STUB_STAT_REQUESTS: core::ffi::c_ulong = 0;
+static mut STUB_STAT_ACTIVE: core::ffi::c_ulong = 0;
+static mut STUB_STAT_READING: core::ffi::c_ulong = 0;
+static mut STUB_STAT_WRITING: core::ffi::c_ulong = 0;
+static mut STUB_STAT_WAITING: core::ffi::c_ulong = 0;
 
-macro_rules! stat_ptr_stub {
-    ($name:ident) => {
-        #[no_mangle]
-        pub static mut $name: *mut nginx_sys::ngx_atomic_t =
-            unsafe { core::ptr::addr_of_mut!(STUB_STAT_ZERO) };
-    };
-}
-
-stat_ptr_stub!(ngx_stat_accepted);
-stat_ptr_stub!(ngx_stat_handled);
-stat_ptr_stub!(ngx_stat_requests);
-stat_ptr_stub!(ngx_stat_active);
-stat_ptr_stub!(ngx_stat_reading);
-stat_ptr_stub!(ngx_stat_writing);
-stat_ptr_stub!(ngx_stat_waiting);
+#[no_mangle]
+pub static mut ngx_stat_accepted: *mut nginx_sys::ngx_atomic_t =
+    unsafe { core::ptr::addr_of_mut!(STUB_STAT_ACCEPTED) };
+#[no_mangle]
+pub static mut ngx_stat_handled: *mut nginx_sys::ngx_atomic_t =
+    unsafe { core::ptr::addr_of_mut!(STUB_STAT_HANDLED) };
+#[no_mangle]
+pub static mut ngx_stat_requests: *mut nginx_sys::ngx_atomic_t =
+    unsafe { core::ptr::addr_of_mut!(STUB_STAT_REQUESTS) };
+#[no_mangle]
+pub static mut ngx_stat_active: *mut nginx_sys::ngx_atomic_t =
+    unsafe { core::ptr::addr_of_mut!(STUB_STAT_ACTIVE) };
+#[no_mangle]
+pub static mut ngx_stat_reading: *mut nginx_sys::ngx_atomic_t =
+    unsafe { core::ptr::addr_of_mut!(STUB_STAT_READING) };
+#[no_mangle]
+pub static mut ngx_stat_writing: *mut nginx_sys::ngx_atomic_t =
+    unsafe { core::ptr::addr_of_mut!(STUB_STAT_WRITING) };
+#[no_mangle]
+pub static mut ngx_stat_waiting: *mut nginx_sys::ngx_atomic_t =
+    unsafe { core::ptr::addr_of_mut!(STUB_STAT_WAITING) };
 
 // NGINX array API.
 #[no_mangle]
@@ -234,13 +247,19 @@ pub unsafe extern "C" fn ngx_conf_parse(
 // Minimal spin-loop executor for async transport tests.
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Drives a future to completion using a spin-loop executor.
+/// Drives a future to completion using a spin-loop executor with a 30-second
+/// wall-clock deadline.
 ///
-/// Works because `HyperHttpTransport` uses blocking I/O — both `poll_read`
-/// and `poll_write` always return `Poll::Ready` — so the future never
-/// returns `Poll::Pending`.
+/// The waker is a no-op; forward progress relies on the spin loop.  Each
+/// `Poll::Pending` arm yields the thread to avoid a hot spin.  If the future
+/// has not completed within the deadline the test panics with a clear timeout
+/// message rather than hanging indefinitely.
+///
+/// 30 seconds is intentionally generous: it must accommodate a slow CI box
+/// while still surfacing a genuinely stalled collector in a reasonable time.
 pub fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use std::time::Instant;
 
     unsafe fn noop_clone(_: *const ()) -> RawWaker {
         RawWaker::new(std::ptr::null(), &VTABLE)
@@ -251,11 +270,112 @@ pub fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
     let mut cx = Context::from_waker(&waker);
     let mut fut = std::pin::pin!(fut);
+    let deadline = Instant::now() + std::time::Duration::from_secs(30);
 
     loop {
         match fut.as_mut().poll(&mut cx) {
             Poll::Ready(val) => return val,
-            Poll::Pending => std::thread::yield_now(),
+            Poll::Pending => {
+                assert!(
+                    Instant::now() < deadline,
+                    "block_on: future did not complete within 30 s — \
+                     collector may have stalled or connection is hung"
+                );
+                std::thread::yield_now();
+            }
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Regression tests for the test-support helpers themselves.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Finding #3 regression: block_on must panic with a clear message when the
+    // future stays Pending past the deadline.  We use a short deadline via a
+    // helper that mirrors block_on but accepts an explicit duration, confirming
+    // the timeout path fires rather than spinning forever.
+    #[test]
+    fn block_on_times_out_on_stalled_future() {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        use std::time::{Duration, Instant};
+
+        // A future that never resolves.
+        struct NeverReady;
+        impl Future for NeverReady {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                Poll::Pending
+            }
+        }
+
+        // Inline copy of block_on with a 100 ms deadline so the test is fast.
+        fn block_on_with_deadline<F: Future>(fut: F, timeout: Duration) -> Option<F::Output> {
+            unsafe fn noop_clone(_: *const ()) -> RawWaker {
+                RawWaker::new(std::ptr::null(), &VTABLE)
+            }
+            unsafe fn noop(_: *const ()) {}
+            static VTABLE: RawWakerVTable = RawWakerVTable::new(noop_clone, noop, noop, noop);
+
+            let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
+            let mut cx = Context::from_waker(&waker);
+            let mut fut = std::pin::pin!(fut);
+            let deadline = Instant::now() + timeout;
+
+            loop {
+                match fut.as_mut().poll(&mut cx) {
+                    Poll::Ready(val) => return Some(val),
+                    Poll::Pending => {
+                        if Instant::now() >= deadline {
+                            return None; // timed out
+                        }
+                        std::thread::yield_now();
+                    }
+                }
+            }
+        }
+
+        // The stalled future must time out (return None) rather than looping forever.
+        let result = block_on_with_deadline(NeverReady, Duration::from_millis(100));
+        assert!(
+            result.is_none(),
+            "expected timeout (None) from a never-Ready future, got Some(())"
+        );
+    }
+
+    // Finding #4 regression: each ngx_stat_* pointer must point to a distinct
+    // memory location.  Writing through one must not be visible through any other.
+    #[test]
+    fn ngx_stat_pointers_are_distinct() {
+        // Collect raw pointer values for each stat pointer.
+        // Safety: we only read the pointer addresses, never dereference.
+        let ptrs: [*mut nginx_sys::ngx_atomic_t; 7] = unsafe {
+            [
+                ngx_stat_accepted,
+                ngx_stat_handled,
+                ngx_stat_requests,
+                ngx_stat_active,
+                ngx_stat_reading,
+                ngx_stat_writing,
+                ngx_stat_waiting,
+            ]
+        };
+
+        // Every address must be unique.
+        for i in 0..ptrs.len() {
+            for j in (i + 1)..ptrs.len() {
+                assert_ne!(
+                    ptrs[i], ptrs[j],
+                    "ngx_stat pointers[{}] and [{}] alias the same address {:p}",
+                    i, j, ptrs[i]
+                );
+            }
         }
     }
 }

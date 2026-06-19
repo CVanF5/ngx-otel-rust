@@ -146,6 +146,11 @@ where
 /// is polled unconditionally on each iteration).  `SpinTcpIo` calls
 /// `wake_by_ref()` on `WouldBlock`, which is safe here because the loop
 /// retries immediately.
+///
+/// A 30-second wall-clock deadline is enforced.  If the future has not
+/// resolved within that window the test panics with a clear message instead
+/// of hanging indefinitely.  30 seconds is generous enough for a slow CI
+/// box while still detecting a genuinely stalled collector.
 fn block_on_with_tasks<F: Future>(exec: &TaskQueueExecutor, fut: F) -> F::Output {
     unsafe fn noop_clone(_: *const ()) -> RawWaker {
         RawWaker::new(std::ptr::null(), &VTABLE)
@@ -156,8 +161,15 @@ fn block_on_with_tasks<F: Future>(exec: &TaskQueueExecutor, fut: F) -> F::Output
     let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
     let mut cx = Context::from_waker(&waker);
     let mut fut = std::pin::pin!(fut);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
 
     loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "block_on_with_tasks: future did not complete within 30 s — \
+             collector may have stalled or the connection is hung"
+        );
+
         // ① Move newly queued tasks into the running set.
         exec.running.borrow_mut().extend(exec.queue.borrow_mut().drain(..));
 
@@ -237,9 +249,18 @@ fn build_export_request() -> ExportMetricsServiceRequest {
 #[ignore = "requires OTel collector at 127.0.0.1:4317  (run with -- --ignored)"]
 fn grpc_smoke_unary_export() {
     // 1. Open a non-blocking TCP connection to the OTel collector.
+    //
+    //    Read/write timeouts are set so that a collector that accepts the
+    //    connection but then stalls on I/O causes the socket to return an
+    //    error rather than blocking the spin loop forever.  30 seconds matches
+    //    the wall-clock deadline in block_on_with_tasks.
     let addr: SocketAddr = "127.0.0.1:4317".parse().unwrap();
     let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
         .expect("cannot connect to 127.0.0.1:4317 — start OTel collector first");
+    stream.set_read_timeout(Some(Duration::from_secs(30))).expect("set_read_timeout must succeed");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(30)))
+        .expect("set_write_timeout must succeed");
     stream.set_nonblocking(true).unwrap();
     let io = SpinTcpIo::new(stream);
 

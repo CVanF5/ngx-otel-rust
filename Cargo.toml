@@ -108,6 +108,14 @@ name = "grpc_smoke"
 path = "tests/grpc_smoke.rs"
 required-features = ["test-support"]
 
+# Self-contained tests for the test-harness helpers (block_on timeout, stat
+# pointer aliasing).  No production library code is imported; these link
+# without a full NGINX object tree and run in standard CI.
+[[test]]
+name = "harness_self_check"
+path = "tests/harness_self_check.rs"
+required-features = ["test-support"]
+
 [dev-dependencies]
 # Test-only echo server for the bidi gRPC smoke test (see examples/bidi_echo_server.rs).  Dev-deps do NOT
 # propagate into release builds of the module dylib; `cargo tree --edges normal`
