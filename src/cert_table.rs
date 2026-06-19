@@ -1015,6 +1015,7 @@ mod tests {
 
     /// A resolved config index maps to its path; `-1` (no identity match) with
     /// multiple paths yields an empty label (never a wrong one).
+    #[cfg(ngx_feature = "http_ssl")]
     #[test]
     fn path_for_cert_dual_cert_by_resolved_index() {
         let paths = vec![String::from("rsa.crt"), String::from("ecdsa.crt")];
@@ -1026,6 +1027,7 @@ mod tests {
 
     /// Single-cert server: even an unresolved index (`-1`) falls back to the
     /// only configured path; a resolved index 0 also returns it.
+    #[cfg(ngx_feature = "http_ssl")]
     #[test]
     fn path_for_cert_single_cert() {
         let paths = vec![String::from("only.crt")];
@@ -1034,6 +1036,7 @@ mod tests {
     }
 
     /// Out-of-range index (should not occur in practice): empty string.
+    #[cfg(ngx_feature = "http_ssl")]
     #[test]
     fn path_for_cert_index_out_of_range_empty() {
         let paths = vec![String::from("a.crt"), String::from("b.crt")];
