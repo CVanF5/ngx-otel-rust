@@ -376,27 +376,42 @@ pub struct SelfMetricsSource {
     pub start_time_unix_nano: u64,
 }
 
+/// Convert an unsigned self-metric counter to the `i64` carried on the OTLP
+/// `NumberDataPoint`, saturating at `i64::MAX` rather than wrapping negative.
+///
+/// These counters are exported as OTLP monotonic Sums, which the OTLP/Metrics
+/// data model requires to be non-decreasing
+/// (<https://opentelemetry.io/docs/specs/otel/metrics/data-model/#sums>). A raw
+/// `as i64` cast of a `u64` past `i64::MAX` wraps to a negative value, which
+/// would both violate monotonicity and read as a huge backwards jump. Saturation
+/// keeps the series monotonic; the cap is only reachable at otherwise-impossible
+/// counts, so no realistic value is distorted.
+#[inline]
+fn counter_to_i64(v: u64) -> i64 {
+    i64::try_from(v).unwrap_or(i64::MAX)
+}
+
 impl MetricSource for SelfMetricsSource {
     fn collect(&self) -> std::vec::Vec<Metric> {
         let now = crate::util::now_unix_nano();
-        let dropped = DROPPED_RECORDS.load(Ordering::Acquire) as i64;
-        let failures = SEND_FAILURES.load(Ordering::Acquire) as i64;
+        let dropped = counter_to_i64(DROPPED_RECORDS.load(Ordering::Acquire));
+        let failures = counter_to_i64(SEND_FAILURES.load(Ordering::Acquire));
         // Emit in seconds (unit "s"), not ms.  The name stays
         // `ngx_otel.export_interval` — OTel convention is to NOT bake units
         // into metric names; the unit field carries the information instead.
-        let interval_s = (self.interval_ms / 1000) as i64;
+        let interval_s = counter_to_i64(self.interval_ms / 1000);
 
-        let backpressure_drops = BIDI_BACKPRESSURE_DROPS.load(Ordering::Acquire) as i64;
-        let access_logs_dropped = ACCESS_LOGS_DROPPED.load(Ordering::Acquire) as i64;
-        let error_logs_dropped = ERROR_LOGS_DROPPED.load(Ordering::Acquire) as i64;
+        let backpressure_drops = counter_to_i64(BIDI_BACKPRESSURE_DROPS.load(Ordering::Acquire));
+        let access_logs_dropped = counter_to_i64(ACCESS_LOGS_DROPPED.load(Ordering::Acquire));
+        let error_logs_dropped = counter_to_i64(ERROR_LOGS_DROPPED.load(Ordering::Acquire));
         let error_logs_coalesced_orphaned =
-            ERROR_LOGS_COALESCED_ORPHANED.load(Ordering::Acquire) as i64;
-        let logs_send_failures = LOGS_SEND_FAILURES.load(Ordering::Acquire) as i64;
-        let traces_dropped = TRACES_DROPPED_RECORDS.load(Ordering::Acquire) as i64;
-        let exporter_restarts = EXPORTER_RESTARTS.load(Ordering::Acquire) as i64;
-        let permanent_rejected = PERMANENT_REJECTED.load(Ordering::Acquire) as i64;
-        let partial_rejected = PARTIAL_REJECTED.load(Ordering::Acquire) as i64;
-        let unauthorized_rejected = UNAUTHORIZED_REJECTED.load(Ordering::Acquire) as i64;
+            counter_to_i64(ERROR_LOGS_COALESCED_ORPHANED.load(Ordering::Acquire));
+        let logs_send_failures = counter_to_i64(LOGS_SEND_FAILURES.load(Ordering::Acquire));
+        let traces_dropped = counter_to_i64(TRACES_DROPPED_RECORDS.load(Ordering::Acquire));
+        let exporter_restarts = counter_to_i64(EXPORTER_RESTARTS.load(Ordering::Acquire));
+        let permanent_rejected = counter_to_i64(PERMANENT_REJECTED.load(Ordering::Acquire));
+        let partial_rejected = counter_to_i64(PARTIAL_REJECTED.load(Ordering::Acquire));
+        let unauthorized_rejected = counter_to_i64(UNAUTHORIZED_REJECTED.load(Ordering::Acquire));
         std::vec![
             monotonic_sum_metric(
                 "ngx_otel.dropped_records",
@@ -1460,10 +1475,22 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             {
                 // Outcome-driven policy (release / requeue+defer / drop).
                 Ok(Ok(ref outcome)) => {
+                    // Re-read the monotonic clock here, AFTER the retry-drain and
+                    // fresh-send awaits (each capped at PERIODIC_SEND_BUDGET, so up
+                    // to two ~15s waits may have elapsed since `metrics_now_msec`
+                    // was captured at the top of this iteration). A `Retryable`
+                    // verdict computes `not_before_msec = basis + defer_ms`; with a
+                    // stale (pre-send) basis the deadline can already be in the past
+                    // once `defer_ms` is capped at `BACKOFF_CAP_MS`, so `is_deferred`
+                    // would return false and the next iteration would hammer a
+                    // failing collector at full cadence. The backoff basis must be a
+                    // fresh "now". `is_deferred` above intentionally keeps the
+                    // pre-send capture (it gates entry for THIS iteration).
+                    let metrics_backoff_basis_msec = now_monotonic_msec();
                     if handle_fresh_send_outcome(
                         outcome,
                         &mut metrics_backoff,
-                        metrics_now_msec,
+                        metrics_backoff_basis_msec,
                         &mut retry_queue,
                         bytes,
                         n_pts,
@@ -2806,19 +2833,18 @@ fn collect_log_records(
             let mut drained = 0usize;
             while drained < MAX_ERROR_RECORDS_PER_WORKER_PER_DRAIN && ring.pop_into(&mut record_buf)
             {
-                // Track the template_hash embedded in the ring record (non-zero means
-                // this record's count was already consumed from counts_map via the
-                // join in parse_error_record).
-                if record_buf.len() >= 18 {
-                    let th = u64::from_be_bytes(
-                        // SAFETY: checked len >= 18 above; [10..18] is 8 bytes.
-                        record_buf[10..18].try_into().unwrap_or([0u8; 8]),
-                    );
-                    if th != 0 {
+                // Parse FIRST, then mark the template_hash consumed only on a
+                // successful parse: a torn/rejected record that fails validation
+                // must NOT suppress the synthetic orphaned-coalesced record for the
+                // same hash below — otherwise a dropped record silently loses its
+                // occurrence count. `parse_error_record_consuming` bundles that
+                // ordering: the consumed-hash is `Some` only when the record parsed.
+                let (parsed, consumed) =
+                    parse_error_record_consuming(&record_buf, now, &counts_map);
+                if let Some(lr) = parsed {
+                    if let Some(th) = consumed {
                         consumed_hashes.insert(th);
                     }
-                }
-                if let Some(lr) = parse_error_record(&record_buf, now, &counts_map) {
                     logs.push(lr);
                 }
                 record_buf.clear();
@@ -3157,6 +3183,33 @@ fn parse_error_record(
         trace_id: std::vec::Vec::new(), // no trace context on error records
         span_id: std::vec::Vec::new(),  // no trace context on error records
     })
+}
+
+/// Parse an error ring record AND, only if it parsed, the non-zero
+/// `template_hash` the caller should mark consumed.
+///
+/// Returns `(parsed_record, consumed_hash)`. The hash is `Some` ONLY when
+/// `parse_error_record` returned `Some`: a torn/rejected record that fails
+/// validation MUST NOT consume its hash, otherwise it suppresses the synthetic
+/// orphaned-coalesced record emitted for the same hash and the occurrence count
+/// is silently lost. The `template_hash` lives at bytes `[10..18]` of the
+/// record; `None` when the hash is zero (untracked: high-sev / coalesce-off /
+/// table-full).
+fn parse_error_record_consuming(
+    buf: &[u8],
+    observed_now_ns: u64,
+    counts_map: &std::collections::HashMap<u64, u32>,
+) -> (Option<LogRecord>, Option<u64>) {
+    match parse_error_record(buf, observed_now_ns, counts_map) {
+        Some(lr) => {
+            // The record parsed (so it is at least HDR = 20 bytes), so [10..18]
+            // is in bounds; extract the hash to consume.
+            let th = u64::from_be_bytes(buf[10..18].try_into().unwrap_or([0u8; 8]));
+            (Some(lr), (th != 0).then_some(th))
+        }
+        // Rejected record: do NOT consume any hash.
+        None => (None, None),
+    }
 }
 
 /// Read a `u16`-length-prefixed byte run at `*pos`, advancing `*pos` past it.
@@ -4862,6 +4915,139 @@ mod tests {
             "bounded buffer must never exceed max_depth ({}); got {}",
             max_depth,
             queue.len()
+        );
+    }
+
+    /// Backoff basis freshness (fresh-send path). The fresh-metrics send awaits
+    /// can burn up to two `PERIODIC_SEND_BUDGET` windows before the outcome is
+    /// applied, so the backoff basis MUST be a clock read taken AFTER the send,
+    /// not the pre-send capture used to gate `is_deferred` at the top of the
+    /// iteration. With a stale basis and the deferral capped at `BACKOFF_CAP_MS`,
+    /// `not_before_msec = stale_basis + cap` can land in the past relative to the
+    /// real "now", so `is_deferred(real_now)` returns false and the exporter
+    /// hammers a failing collector at full cadence.
+    #[test]
+    fn fresh_send_backoff_basis_must_be_post_send_now() {
+        // Drive the backoff into the capped regime (sustained no-hint retryable),
+        // so defer_ms == BACKOFF_CAP_MS and a stale basis is provably in the past.
+        let mut backoff = SignalBackoff { not_before_msec: 0, consecutive_retryable: 60 };
+
+        // The iteration captured the pre-send clock here.
+        let pre_send_now = 1_000_000u64;
+        // Two ~15s send awaits elapsed before the outcome is applied; the real
+        // monotonic clock is now well past the pre-send capture.
+        let real_now = pre_send_now + 2 * PERIODIC_SEND_BUDGET.as_millis() as u64;
+
+        // CORRECT: basis is a fresh post-send clock read (what the fix passes).
+        let mut q: VecDeque<(std::vec::Vec<u8>, u64)> = VecDeque::new();
+        let fc = AtomicU64::new(0);
+        let action = handle_fresh_send_outcome(
+            &Outcome::Retryable { retry_after: None },
+            &mut backoff,
+            real_now, // fresh basis
+            &mut q,
+            std::vec![0u8],
+            1,
+            8,
+            &fc,
+            core::ptr::null_mut(),
+            "metrics",
+        );
+        assert_eq!(action, OutcomeAction::Requeue);
+        assert_eq!(
+            backoff.not_before_msec,
+            real_now + BACKOFF_CAP_MS,
+            "fresh basis must defer relative to post-send now"
+        );
+        assert!(
+            backoff.is_deferred(real_now),
+            "with a fresh basis the next drain is correctly deferred"
+        );
+
+        // Reproduce the bug: had the call site passed the STALE pre-send capture,
+        // the deadline would already be in the past at the real clock, so the gate
+        // would WRONGLY allow an immediate re-drain of the failing collector.
+        let mut stale_backoff = SignalBackoff { not_before_msec: 0, consecutive_retryable: 60 };
+        let mut q2: VecDeque<(std::vec::Vec<u8>, u64)> = VecDeque::new();
+        let fc2 = AtomicU64::new(0);
+        handle_fresh_send_outcome(
+            &Outcome::Retryable { retry_after: None },
+            &mut stale_backoff,
+            pre_send_now, // STALE basis (the pre-fix behaviour)
+            &mut q2,
+            std::vec![0u8],
+            1,
+            8,
+            &fc2,
+            core::ptr::null_mut(),
+            "metrics",
+        );
+        assert!(
+            !stale_backoff.is_deferred(real_now),
+            "a stale basis mis-classifies the deadline as already elapsed — the \
+             regression this fix prevents"
+        );
+    }
+
+    /// Counter→i64 saturation (self-metrics path). A monotonic Sum must never go
+    /// negative; a raw `as i64` cast wraps a `u64` past `i64::MAX` to a negative
+    /// value. `counter_to_i64` must saturate at `i64::MAX` instead.
+    #[test]
+    fn counter_to_i64_saturates_past_i64_max() {
+        assert_eq!(counter_to_i64(0), 0);
+        assert_eq!(counter_to_i64(42), 42);
+        assert_eq!(counter_to_i64(i64::MAX as u64), i64::MAX);
+        // The boundary the raw cast wraps negative at.
+        assert_eq!(
+            counter_to_i64(i64::MAX as u64 + 1),
+            i64::MAX,
+            "one past i64::MAX must saturate, not wrap to i64::MIN"
+        );
+        assert_eq!(counter_to_i64(u64::MAX), i64::MAX, "u64::MAX must saturate to i64::MAX");
+        // The value stays non-negative across the whole high range (Sum invariant).
+        for v in [i64::MAX as u64 + 1, u64::MAX / 2, u64::MAX - 1, u64::MAX] {
+            assert!(counter_to_i64(v) >= 0, "counter value must never be negative");
+        }
+    }
+
+    /// A torn/rejected error ring record must NOT consume its template_hash: the
+    /// hash may only be marked consumed once the record parses into a `LogRecord`.
+    /// Otherwise a dropped record suppresses the synthetic orphaned-coalesced
+    /// record emitted for the same hash, silently losing the occurrence count.
+    #[test]
+    fn torn_record_does_not_consume_template_hash() {
+        use crate::logs::error_writer::{ERROR_RECORD_HDR as HDR, KIND_ERROR};
+
+        let hash: u64 = 0xABCD_1234_5678_9F00;
+
+        // Build a VALID error record carrying `hash` (body_len = 0).
+        let mut valid = std::vec![0u8; HDR];
+        valid[0] = KIND_ERROR;
+        // [1..9] ts, [9] level, [10..18] template_hash, [18..20] body_len.
+        valid[10..18].copy_from_slice(&hash.to_be_bytes());
+        // body_len = 0 already (bytes 18,19).
+        let (parsed, consumed) =
+            parse_error_record_consuming(&valid, 1, &std::collections::HashMap::new());
+        assert!(parsed.is_some(), "the valid record must parse");
+        assert_eq!(consumed, Some(hash), "a parsed record consumes its non-zero template_hash");
+
+        // A TORN record: same hash bytes at [10..18], but truncated below HDR so
+        // `parse_error_record` rejects it (`buf.len() < HDR`). Critically the hash
+        // bytes ARE present and well-formed (`len >= 18`), so a naive extractor
+        // would still read `hash` — the parse gate is what must suppress it.
+        let mut torn = std::vec![0u8; HDR - 2];
+        torn[0] = KIND_ERROR;
+        torn[10..18].copy_from_slice(&hash.to_be_bytes());
+        assert!(torn.len() >= 18, "torn record still carries the hash bytes");
+
+        let (torn_parsed, torn_consumed) =
+            parse_error_record_consuming(&torn, 1, &std::collections::HashMap::new());
+        assert!(torn_parsed.is_none(), "the torn record must be rejected by validation");
+        assert_eq!(
+            torn_consumed, None,
+            "a torn/rejected record must NOT consume its template_hash (else it \
+             suppresses the orphaned-coalesced synthetic record), even though the \
+             hash bytes are present"
         );
     }
 }
