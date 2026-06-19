@@ -43,8 +43,9 @@ RESULTS_DIR="${SCRIPT_DIR}/results"
 NGINX_SOURCE_DIR="${NGINX_SOURCE_DIR:-${REPO_ROOT}/nginx}"
 NGINX_BUILD_DIR="${NGINX_BUILD_DIR:-${REPO_ROOT}/nginx/objs}"
 
-# Source the shared harness library.  Exposes ensure_collector_running
-# and resolve_nginx_binary.
+# Source the shared harness library (exposes ensure_collector_running).
+# resolve_nginx_binary is also available but not used here: this script
+# performs its own release-only check below.
 . "${CRATE_DIR}/test-harness/lib.sh"
 
 # This benchmark measures per-request overhead; a debug build invalidates
