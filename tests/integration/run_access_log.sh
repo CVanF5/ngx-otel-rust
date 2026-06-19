@@ -397,8 +397,12 @@ if [[ -n "${NEW_LOGS}" ]]; then
     # format, so we parse the actual attribute structure using python3.
     DURATION_VAL=$(echo "${NEW_LOGS}" | python3 - <<'PYEOF'
 import sys, json
+# Read ALL of stdin up front: the producer is `echo "${NEW_LOGS}" | python3`,
+# so exiting/breaking early would close the pipe while echo is still writing
+# and raise SIGPIPE in echo (script abort under `set -o pipefail`). Consume
+# everything first, then scan, so the assertion completes deterministically.
 val = None
-for line in sys.stdin:
+for line in sys.stdin.read().splitlines():
     line = line.strip()
     if not line:
         continue
@@ -415,15 +419,6 @@ for line in sys.stdin:
                         n = v.get("doubleValue") or v.get("intValue")
                         if n is not None:
                             val = float(n)
-                            break
-                if val is not None:
-                    break
-            if val is not None:
-                break
-        if val is not None:
-            break
-    if val is not None:
-        break
 if val is not None:
     print(val)
 PYEOF
