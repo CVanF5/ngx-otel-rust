@@ -565,6 +565,25 @@ unsafe fn n_workers_to_reserve(cf: *const ngx_conf_t) -> usize {
     }
 }
 
+/// Smallest worker-slot capacity across the metrics zone and the (optional)
+/// logs and spans rings — the bound the LOG-phase `worker_id` guard must use.
+///
+/// A registered logs/spans zone (capacity > 0) tightens the bound; a zone that
+/// is not registered (capacity 0) does not constrain it, because its ring is
+/// never indexed.  Factored out as a pure function so the min-capacity invariant
+/// is unit-testable without a live shm zone.
+#[inline]
+fn min_indexed_worker_capacity(metrics: usize, logs: usize, spans: usize) -> usize {
+    let mut cap = metrics;
+    if logs > 0 {
+        cap = cap.min(logs);
+    }
+    if spans > 0 {
+        cap = cap.min(spans);
+    }
+    cap
+}
+
 impl MainConfig {
     /// Returns `true` when `otel_exporter { endpoint ... }` was configured.
     pub fn is_configured(&self) -> bool {
@@ -1505,6 +1524,74 @@ impl MainConfig {
             return 0;
         };
         crate::shm::n_workers_from_zone_size(zone.shm.size)
+    }
+
+    /// Number of per-worker slots the logs shm zone was sized for, derived from
+    /// its registered `shm.size` and the active ring capacity.
+    ///
+    /// Returns 0 when the logs zone has not been registered (`logs_shm_zone` is
+    /// null) — log export disabled, so the logs ring is never indexed.
+    ///
+    /// Same zero-cost shape as [`shm_n_workers`](Self::shm_n_workers): one
+    /// pointer load + integer arithmetic, no alloc/lock/syscall.
+    pub fn logs_n_workers(&self) -> usize {
+        // SAFETY: `logs_shm_zone` is null (handled by `as_ref()`) or the
+        // `ngx_shm_zone_t*` from `register_logs_zone`; reading `shm.size`
+        // through it is sound.
+        let Some(zone) = (unsafe { self.logs_shm_zone.as_ref() }) else {
+            return 0;
+        };
+        // `shm.size` includes the slab-pool header; subtract it before dividing
+        // by the per-worker slot size (matches `logs_zone_size_for`).
+        let data_bytes = zone.shm.size.saturating_sub(crate::shm::data_offset());
+        let slot = crate::shm::logs_slot_size(self.log_ring_cap());
+        data_bytes.checked_div(slot).unwrap_or(0)
+    }
+
+    /// Number of per-worker slots the spans shm zone was sized for, derived from
+    /// its registered `shm.size` and the span ring capacity.
+    ///
+    /// Returns 0 when the spans zone has not been registered (`spans_shm_zone`
+    /// is null) — tracing disabled, so the spans ring is never indexed.
+    ///
+    /// Same zero-cost shape as [`shm_n_workers`](Self::shm_n_workers).
+    pub fn spans_n_workers(&self) -> usize {
+        // SAFETY: `spans_shm_zone` is null (handled by `as_ref()`) or the
+        // `ngx_shm_zone_t*` from `register_spans_zone`; reading `shm.size`
+        // through it is sound.
+        let Some(zone) = (unsafe { self.spans_shm_zone.as_ref() }) else {
+            return 0;
+        };
+        let data_bytes = zone.shm.size.saturating_sub(crate::shm::data_offset());
+        let slot = crate::shm::spans_slot_size(crate::shm::DEFAULT_SPAN_RING_CAP);
+        data_bytes.checked_div(slot).unwrap_or(0)
+    }
+
+    /// Smallest worker-slot capacity across every shm ring the LOG-phase handler
+    /// indexes by `worker_id`: the metrics zone plus whichever of the logs and
+    /// spans rings are registered.
+    ///
+    /// The metrics zone can be inflated past the reserved worker count via
+    /// `otel_zone_size` (`register_shm_zone` takes `zone_size.max(required)`),
+    /// but the logs and spans zones are sized strictly for the reserved worker
+    /// count (`n_workers_to_reserve`).  A `worker_id` that fits the inflated
+    /// metrics zone could therefore overflow the smaller logs/spans rings.
+    /// The hot-path guard validates against this MIN so a `worker_id` that would
+    /// overrun the *smallest* indexed ring is rejected before any ring write.
+    ///
+    /// A zone that is not registered (`*_n_workers()` returns 0) does not
+    /// constrain the bound — its ring is never indexed (the per-signal
+    /// `logs_shm_base()` / `spans_shm_base()` gates return `None`).
+    ///
+    /// # Hot-path note
+    /// Three pointer loads + integer `min`s; no alloc/lock/syscall.  Callers may
+    /// cache the result once per request (it is constant for the worker's life).
+    pub fn min_indexed_worker_capacity(&self) -> usize {
+        min_indexed_worker_capacity(
+            self.shm_n_workers(),
+            self.logs_n_workers(),
+            self.spans_n_workers(),
+        )
     }
 
     /// Returns a pointer to the `ControlShm` data in the control zone.
@@ -2930,6 +3017,47 @@ fn parse_u64_ascii(s: &[u8]) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The LOG-phase `worker_id` guard must validate against the MIN of every
+    /// shm ring it indexes (metrics zone + logs + spans), not just the metrics
+    /// zone.  `otel_zone_size` can inflate the metrics zone beyond the reserved
+    /// worker count, while the logs/spans zones are sized strictly for it, so a
+    /// `worker_id` that fits the inflated metrics zone could still overrun the
+    /// smaller logs/spans rings.
+    ///
+    /// Mutation: revert `min_indexed_worker_capacity` to return the metrics
+    /// capacity (e.g. `metrics`) and this test fails — the smaller logs/spans
+    /// capacities no longer tighten the bound, so a `worker_id` past them is
+    /// wrongly accepted.
+    #[test]
+    fn min_indexed_worker_capacity_uses_smallest_ring() {
+        // Metrics zone inflated to 8 workers; logs ring sized for 2; spans for 4.
+        let metrics = 8;
+        let logs = 2;
+        let spans = 4;
+        let cap = min_indexed_worker_capacity(metrics, logs, spans);
+        assert_eq!(cap, 2, "guard must use the smallest indexed ring capacity");
+
+        // worker_id = 3 fits the metrics zone (3 < 8) but overruns the logs ring
+        // (3 >= 2): the OLD metrics-only guard would ACCEPT it, the new guard
+        // REJECTS it.
+        assert!(3 >= cap, "worker_id within metrics zone but past logs ring must be rejected");
+        // worker_id = 1 fits every ring and is accepted.
+        assert!(1 < cap, "worker_id within the smallest ring must be accepted");
+
+        // A zone that is not registered (capacity 0) must NOT constrain the
+        // bound — its ring is never indexed.
+        assert_eq!(
+            min_indexed_worker_capacity(8, 0, 0),
+            8,
+            "unregistered logs/spans (cap 0) must not tighten the bound"
+        );
+        assert_eq!(
+            min_indexed_worker_capacity(8, 0, 3),
+            3,
+            "only registered rings constrain the bound"
+        );
+    }
 
     #[test]
     fn test_parse_duration_ms() {

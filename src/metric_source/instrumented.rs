@@ -127,11 +127,21 @@ impl HttpRequestHandler for LogPhaseHandler {
         // Bounds guard: if `check_zone_sizing` somehow didn't fire (e.g.
         // the module was loaded without going through init_module), catch the
         // out-of-range index here rather than writing past the zone end.
-        // `shm_n_workers()` derives the zone capacity from the registered zone
-        // size — zero cost: one pointer load + integer arithmetic, no alloc/lock.
-        let n_workers = amcf.shm_n_workers();
+        //
+        // The SAME `worker_id` indexes the metrics zone (`worker_slots`, just
+        // below), the logs access ring (`logs_access_ring`), and the spans ring
+        // (`spans_ring`).  The metrics zone may be inflated past the reserved
+        // worker count via `otel_zone_size`, but the logs/spans zones are sized
+        // strictly for the reserved worker count, so a `worker_id` that fits the
+        // metrics zone could still overrun the smaller logs/spans rings.
+        // Validate against the MIN of all three capacities (registered zones
+        // only) so the smallest indexed ring is covered before any ring write.
+        // `min_indexed_worker_capacity()` derives each capacity from the
+        // registered zone size — zero cost: a few pointer loads + integer
+        // arithmetic, no alloc/lock/syscall.
+        let n_workers = amcf.min_indexed_worker_capacity();
         if worker_id >= n_workers {
-            // Hard invariant violation: zone was undersized for this worker.
+            // Hard invariant violation: a zone was undersized for this worker.
             // Log at ALERT (once per request until restart — the init_module
             // check should have prevented this) and disable for this worker.
             let r = request.as_ref();
@@ -141,8 +151,8 @@ impl HttpRequestHandler for LogPhaseHandler {
             ngx::ngx_log_error!(
                 nginx_sys::NGX_LOG_ALERT,
                 log,
-                "otel: worker_id {} >= zone capacity {} — module disabled \
-                 for this worker; move worker_processes before http{{}}",
+                "otel: worker_id {} >= smallest shm ring capacity {} — module \
+                 disabled for this worker; move worker_processes before http{{}}",
                 worker_id,
                 n_workers
             );
@@ -303,48 +313,42 @@ impl HttpRequestHandler for LogPhaseHandler {
         slot.response_body_bytes.record(resp_bytes, &BYTES_BOUNDS);
 
         // ── upstream timings (if an upstream was used) ────────────────────
-        if let Some(upstream) = request.upstream() {
-            // SAFETY: `request.upstream()` returned `Some`, so `upstream` is a
-            // valid `ngx_http_upstream_t` for this handler; reading its `state`
-            // array pointer is sound.
-            let state = unsafe { (*upstream).state };
-            if !state.is_null() {
-                // SAFETY: `state` is non-null (checked above) and points to the
-                // upstream's `ngx_http_upstream_state_t` (the timing record nginx
-                // populates per upstream attempt), valid for this handler. This and
-                // the next four reads access plain numeric fields, so the
-                // dereferences are sound.
-                let resp_ms = unsafe { (*state).response_time as u64 };
-                // SAFETY: as above — non-null upstream state, plain field read.
-                let hdr_ms = unsafe { (*state).header_time as u64 };
-                // SAFETY: as above — non-null upstream state, plain field read.
-                let conn_ms = unsafe { (*state).connect_time as u64 };
-                // SAFETY: as above — non-null upstream state, plain field read.
-                let bytes_rx = unsafe { (*state).bytes_received as u64 };
-                // SAFETY: as above — non-null upstream state, plain field read.
-                let bytes_tx = unsafe { (*state).bytes_sent as u64 };
-
-                // nginx initialises all three timing fields to
-                // (ngx_msec_t)-1 (= NGX_MSEC_SENTINEL) when the upstream
-                // attempt did not complete the corresponding phase (e.g.
-                // connect_time remains sentinel on a refused connection).
-                // The nginx log module special-cases this sentinel and emits
-                // "-" rather than a time value
-                // (ngx_http_upstream.c:6074).
-                // Recording the sentinel as-is would add u64::MAX / usize::MAX
-                // to the cumulative sum, permanently poisoning the metric.
-                // Skip any timing field that nginx has not yet filled in.
-                if resp_ms != NGX_MSEC_SENTINEL {
+        // Sum the timings/bytes across ALL upstream attempts, not just the
+        // current (last) `u->state`.  When `proxy_next_upstream` retries a peer,
+        // nginx pushes a fresh `ngx_http_upstream_state_t` per attempt onto
+        // `r->upstream_states` (an `ngx_array_t`); `u->state` points only at the
+        // last one.  The core `$upstream_response_time` / `$upstream_*_bytes`
+        // variables iterate the whole `r->upstream_states` array
+        // (`ngx_http_upstream_response_time_variable` /
+        // `..._response_length_variable`, ngx_http_upstream.c:6027,6105), so
+        // reading only `u->state` undercounts multi-attempt requests.  Walk the
+        // same array and aggregate so the metric matches the total upstream cost
+        // those variables report.
+        // `request.upstream()` being `Some` confirms this request actually went
+        // through an upstream, so `r->upstream_states` is meaningful.
+        if request.upstream().is_some() {
+            // SAFETY: `r` is the live request for this LOG-phase handler;
+            // `upstream_states` is either null (no upstream attempts) or a valid
+            // `ngx_array_t*` of `ngx_http_upstream_state_t` in the request pool,
+            // valid for this handler.  The walk only reads plain numeric fields.
+            if let Some(sum) = unsafe { sum_upstream_states(r.upstream_states) } {
+                // nginx initialises the timing fields to (ngx_msec_t)-1
+                // (= NGX_MSEC_SENTINEL) when the attempt did not complete that
+                // phase (e.g. connect_time on a refused connection); the core
+                // variables emit "-" for it (ngx_http_upstream.c:6074).  The
+                // walk skips sentinel attempts per field, so a metric is recorded
+                // only when at least one attempt had a real measurement.
+                if let Some(resp_ms) = sum.response_ms {
                     slot.upstream_response_ms.record(resp_ms, &DURATION_BOUNDS_MS);
                 }
-                if hdr_ms != NGX_MSEC_SENTINEL {
+                if let Some(hdr_ms) = sum.header_ms {
                     slot.upstream_header_ms.record(hdr_ms, &DURATION_BOUNDS_MS);
                 }
-                if conn_ms != NGX_MSEC_SENTINEL {
+                if let Some(conn_ms) = sum.connect_ms {
                     slot.upstream_connect_ms.record(conn_ms, &DURATION_BOUNDS_MS);
                 }
-                slot.upstream_bytes_received.record(bytes_rx, &BYTES_BOUNDS);
-                slot.upstream_bytes_sent.record(bytes_tx, &BYTES_BOUNDS);
+                slot.upstream_bytes_received.record(sum.bytes_received, &BYTES_BOUNDS);
+                slot.upstream_bytes_sent.record(sum.bytes_sent, &BYTES_BOUNDS);
             }
         }
 
@@ -726,6 +730,89 @@ fn build_span_name(buf: &mut [u8; MAX_SPAN_NAME], method: &[u8], route: &[u8]) -
         off += rem;
     }
     off
+}
+
+/// Aggregated upstream timings/bytes summed across every attempt in
+/// `r->upstream_states`.
+///
+/// Each timing is `Some(sum)` only when at least one attempt recorded a real
+/// (non-sentinel) value for that phase; `None` means every attempt left the
+/// field at `(ngx_msec_t)-1` (so no metric is recorded, matching the core
+/// variables' `"-"` output).  Byte counters are always summed.
+struct UpstreamSum {
+    response_ms: Option<u64>,
+    header_ms: Option<u64>,
+    connect_ms: Option<u64>,
+    bytes_received: u64,
+    bytes_sent: u64,
+}
+
+/// Sum the per-attempt timings/bytes across the full `r->upstream_states`
+/// array, mirroring how the core `$upstream_response_time` /
+/// `$upstream_*_bytes` variables iterate the states
+/// (`ngx_http_upstream_response_time_variable` /
+/// `..._response_length_variable`, ngx_http_upstream.c:6027,6105).
+///
+/// Returns `None` when there are no upstream attempts (`states` null or empty).
+///
+/// Entries with a NULL `peer` are cache/internal-redirect boundary markers that
+/// nginx records in the same array (it prints them as `" : "` separators rather
+/// than a peer); they carry no real attempt timing, so they are skipped — only
+/// real peer attempts contribute to the sum.
+///
+/// Timing fields equal to `NGX_MSEC_SENTINEL` (`(ngx_msec_t)-1`) are skipped
+/// per field; a field stays `None` until some attempt supplies a real value, so
+/// the sentinel never poisons the cumulative metric sum.
+///
+/// # Safety
+/// `states` must be null or a valid `*mut ngx_array_t` whose `elts` points to
+/// `nelts` initialised `ngx_http_upstream_state_t` values, valid for the call.
+///
+/// # Hot-path note
+/// Iterates the existing in-pool array in place — no allocation, no lock, no
+/// syscall.  The attempt count is bounded by `proxy_next_upstream_tries`.
+unsafe fn sum_upstream_states(states: *mut nginx_sys::ngx_array_t) -> Option<UpstreamSum> {
+    if states.is_null() {
+        return None;
+    }
+    // SAFETY: `states` is non-null per the contract; reading the `ngx_array_t`
+    // header fields (`nelts`, `elts`) is sound.
+    let (nelts, elts) = unsafe { ((*states).nelts, (*states).elts) };
+    if nelts == 0 || elts.is_null() {
+        return None;
+    }
+    let base = elts.cast::<nginx_sys::ngx_http_upstream_state_t>();
+
+    let mut response_ms: Option<u64> = None;
+    let mut header_ms: Option<u64> = None;
+    let mut connect_ms: Option<u64> = None;
+    let mut bytes_received: u64 = 0;
+    let mut bytes_sent: u64 = 0;
+
+    #[inline]
+    fn accumulate(acc: &mut Option<u64>, raw: u64) {
+        if raw != NGX_MSEC_SENTINEL {
+            *acc = Some(acc.unwrap_or(0).saturating_add(raw));
+        }
+    }
+
+    for i in 0..nelts {
+        // SAFETY: `i < nelts` and `base` points to `nelts` initialised states
+        // (the array nginx populated), so `base.add(i)` is in-bounds; all reads
+        // below are of plain numeric/pointer fields on that state.
+        let st = unsafe { &*base.add(i) };
+        // Skip cache/redirect boundary markers (NULL peer) — not real attempts.
+        if st.peer.is_null() {
+            continue;
+        }
+        accumulate(&mut response_ms, st.response_time as u64);
+        accumulate(&mut header_ms, st.header_time as u64);
+        accumulate(&mut connect_ms, st.connect_time as u64);
+        bytes_received = bytes_received.saturating_add(st.bytes_received as u64);
+        bytes_sent = bytes_sent.saturating_add(st.bytes_sent as u64);
+    }
+
+    Some(UpstreamSum { response_ms, header_ms, connect_ms, bytes_received, bytes_sent })
 }
 
 /// A `MetricSource` that reads all per-worker shm slots and produces
@@ -2033,5 +2120,109 @@ mod tests {
         // Already-namespaced keys must remain unchanged.
         assert!(keys.contains(&"tls.server.subject"), "tls.server.subject must be present");
         assert!(keys.contains(&"tls.server.issuer"), "tls.server.issuer must be present");
+    }
+
+    /// `sum_upstream_states` must aggregate timings/bytes across ALL upstream
+    /// attempts (the `r->upstream_states` array), matching the core
+    /// `$upstream_response_time` / `$upstream_*_bytes` variables — not just read
+    /// the last (`u->state`) attempt.
+    ///
+    /// Mutation: revert the walk to read only the final state (the pre-fix
+    /// behaviour) and this test fails — the sum would report only attempt #2's
+    /// values instead of the total across both real attempts.
+    #[test]
+    fn upstream_states_summed_across_attempts() {
+        use nginx_sys::{ngx_array_t, ngx_http_upstream_state_t, ngx_str_t};
+
+        let sentinel = super::NGX_MSEC_SENTINEL as nginx_sys::ngx_msec_t;
+
+        // A dummy peer name so `peer` is non-null for the real attempts.
+        // SAFETY: `ngx_str_t` is a plain (len, data) C struct; a zeroed value is
+        // a valid empty string. Only its address is used (as a non-null marker).
+        let mut peer_name: ngx_str_t = unsafe { core::mem::zeroed() };
+        let peer_ptr = &raw mut peer_name;
+
+        // Build a synthetic upstream-states array with two real attempts plus a
+        // NULL-peer boundary marker (which must be skipped).
+        // SAFETY: `ngx_http_upstream_state_t` is a plain numeric/pointer C
+        // struct; a zeroed array is a valid all-zero initial state we then
+        // overwrite field-by-field. No nginx functions touch this memory.
+        let mut states: [ngx_http_upstream_state_t; 3] = unsafe { core::mem::zeroed() };
+
+        // Attempt 1: connect=5, header=10, response=20, rx=100, tx=40.
+        states[0].peer = peer_ptr;
+        states[0].connect_time = 5;
+        states[0].header_time = 10;
+        states[0].response_time = 20;
+        states[0].bytes_received = 100;
+        states[0].bytes_sent = 40;
+
+        // Boundary marker: NULL peer — must be ignored entirely.
+        states[1].peer = core::ptr::null_mut();
+        states[1].connect_time = 999;
+        states[1].header_time = 999;
+        states[1].response_time = 999;
+        states[1].bytes_received = 999;
+        states[1].bytes_sent = 999;
+
+        // Attempt 2 (the LAST / `u->state` one): connect=sentinel (refused),
+        // header=sentinel, response=7, rx=200, tx=60.
+        states[2].peer = peer_ptr;
+        states[2].connect_time = sentinel;
+        states[2].header_time = sentinel;
+        states[2].response_time = 7;
+        states[2].bytes_received = 200;
+        states[2].bytes_sent = 60;
+
+        // SAFETY: zeroed `ngx_array_t` is a valid empty array header we then
+        // point at the stack `states` slice; only plain fields are written.
+        let mut arr: ngx_array_t = unsafe { core::mem::zeroed() };
+        arr.elts = states.as_mut_ptr().cast();
+        arr.nelts = 3;
+        arr.size = core::mem::size_of::<ngx_http_upstream_state_t>();
+        arr.nalloc = 3;
+
+        // SAFETY: `arr` is a valid `ngx_array_t` whose `elts` points to 3
+        // initialised states for the duration of this call.
+        let sum = unsafe { super::sum_upstream_states(&raw mut arr) }.expect("non-empty states");
+
+        // response_time: 20 (attempt 1) + 7 (attempt 2) = 27.  Reading only the
+        // last attempt (`u->state`) would yield 7.
+        assert_eq!(sum.response_ms, Some(27), "response_time must sum across attempts");
+        // header_time: 10 (attempt 1) + sentinel (skipped) = 10.
+        assert_eq!(sum.header_ms, Some(10), "header_time sums non-sentinel attempts");
+        // connect_time: 5 (attempt 1) + sentinel (skipped) = 5.
+        assert_eq!(sum.connect_ms, Some(5), "connect_time sums non-sentinel attempts");
+        // bytes: 100 + 200 = 300 received, 40 + 60 = 100 sent.
+        assert_eq!(sum.bytes_received, 300, "bytes_received must sum across attempts");
+        assert_eq!(sum.bytes_sent, 100, "bytes_sent must sum across attempts");
+
+        // Empty / null arrays yield None (no upstream attempts).
+        // SAFETY: as for `arr` — a zeroed, then partially-filled, array header.
+        let mut empty: ngx_array_t = unsafe { core::mem::zeroed() };
+        empty.elts = states.as_mut_ptr().cast();
+        empty.nelts = 0;
+        // SAFETY: `empty` is a valid array header with nelts == 0.
+        assert!(unsafe { super::sum_upstream_states(&raw mut empty) }.is_none());
+        // SAFETY: a null `states` pointer is explicitly handled by the helper.
+        assert!(unsafe { super::sum_upstream_states(core::ptr::null_mut()) }.is_none());
+
+        // All-sentinel timing for a field → None (no metric recorded), matching
+        // the core variables' "-" output.
+        // SAFETY: zeroed plain C struct, then field-overwritten.
+        let mut all_sentinel: [ngx_http_upstream_state_t; 1] = unsafe { core::mem::zeroed() };
+        all_sentinel[0].peer = peer_ptr;
+        all_sentinel[0].connect_time = sentinel;
+        all_sentinel[0].response_time = 3;
+        all_sentinel[0].header_time = sentinel;
+        // SAFETY: zeroed array header, then pointed at `all_sentinel`.
+        let mut arr2: ngx_array_t = unsafe { core::mem::zeroed() };
+        arr2.elts = all_sentinel.as_mut_ptr().cast();
+        arr2.nelts = 1;
+        // SAFETY: `arr2` is a valid 1-element array header over `all_sentinel`.
+        let sum2 = unsafe { super::sum_upstream_states(&raw mut arr2) }.expect("non-empty");
+        assert_eq!(sum2.connect_ms, None, "all-sentinel connect_time → None");
+        assert_eq!(sum2.header_ms, None, "all-sentinel header_time → None");
+        assert_eq!(sum2.response_ms, Some(3));
     }
 }
