@@ -812,6 +812,66 @@ mod tests {
         assert_eq!(result, None, "unparseable ASN1_TIME must return None, not Some(0)");
     }
 
+    /// Regression: `extract_cert_info` must return `None` (not `Some` with
+    /// epoch-zero validity) when `notBefore` cannot be parsed.  This test
+    /// exercises `extract_cert_info` directly — the `asn1_bad_time_string_is_none`
+    /// test above only covers the lower-level `asn1_time_to_unix` helper and
+    /// would pass even if `extract_cert_info` had been reverted to `unwrap_or(0)`.
+    ///
+    /// We build a minimal X509 via openssl-sys raw FFI, set valid validity fields,
+    /// then corrupt `notBefore` so `asn1_time_to_unix` returns `None` — forcing
+    /// `extract_cert_info` to propagate `None` via the `?` operator.
+    #[cfg(ngx_feature = "http_ssl")]
+    #[test]
+    fn extract_cert_info_bad_time_is_none() {
+        // Build a minimal X509 using openssl-sys raw FFI (the high-level
+        // `openssl` crate is not a dependency).
+        // SAFETY: X509_new allocates a fresh, empty certificate.
+        let cert = unsafe { ossl::X509_new() };
+        assert!(!cert.is_null());
+
+        // Set notBefore and notAfter to syntactically valid strings so we have
+        // a well-formed cert to start with.
+        // UTCTime 1970-01-01 and 1999-12-31 — syntactically valid, will be
+        // corrupted below to trigger parse failure.
+        let nb_str = std::ffi::CString::new("700101000000Z").unwrap();
+        let na_str = std::ffi::CString::new("991231235959Z").unwrap();
+        // SAFETY: X509_getm_notBefore returns the internal mutable ASN1_TIME.
+        let nb = unsafe { ossl::X509_getm_notBefore(cert) };
+        assert!(!nb.is_null());
+        // SAFETY: `nb` is valid; ASN1_TIME_set_string writes the time string.
+        let ok = unsafe { ossl::ASN1_TIME_set_string(nb, nb_str.as_ptr()) };
+        assert_eq!(ok, 1, "ASN1_TIME_set_string(notBefore) failed");
+        // SAFETY: analogous for notAfter.
+        let na = unsafe { ossl::X509_getm_notAfter(cert) };
+        assert!(!na.is_null());
+        let ok = unsafe { ossl::ASN1_TIME_set_string(na, na_str.as_ptr()) };
+        assert_eq!(ok, 1, "ASN1_TIME_set_string(notAfter) failed");
+
+        // Corrupt notBefore's first data byte so ASN1_TIME_diff rejects it.
+        // SAFETY: `nb` is the internal ASN1_STRING buffer, writable (it was
+        // just written above); length is 13 bytes > 0.
+        unsafe {
+            let data_ptr = ossl::ASN1_STRING_get0_data(nb.cast()) as *mut u8;
+            assert!(!data_ptr.is_null());
+            *data_ptr = b'X'; // 'X' is not a valid UTCTime digit
+        }
+
+        // SAFETY: `cert` is a valid X509* for this scope; extract_cert_info
+        // only reads the cert via openssl-sys and does not free it.
+        let result =
+            unsafe { extract_cert_info(cert, "test.crt".to_string(), "test-server".to_string()) };
+        // SAFETY: `cert` was allocated by X509_new and not yet freed.
+        unsafe { ossl::X509_free(cert) };
+
+        assert!(
+            result.is_none(),
+            "extract_cert_info must return None (not Some with epoch-zero times) \
+             when notBefore is unparseable; before Fix 1 it returned Some({{..., \
+             not_before_unix: 0, ...}})"
+        );
+    }
+
     // ── Fix 2: path_for_cert uses enumeration index (dual-cert path labeling) ─
 
     /// Regression: for a dual RSA+ECDSA server block (two `ssl_certificate`
