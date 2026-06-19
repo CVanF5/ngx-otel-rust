@@ -289,22 +289,6 @@ unsafe fn collect_server_certs(
         }
     }
 
-    // nginx pushes exactly one X509* per config-loaded `ssl_certificate` into
-    // `ssl->certs`, in configured order (ngx_event_openssl.c,
-    // ngx_ssl_certificate) — index-aligned with `paths`.  Used below to map
-    // each enumerated cert back to its file path by pointer identity.
-    // SAFETY: `ssl` is non-null (checked above); `certs` is an embedded
-    // `ngx_array_t` of `X509*` whose nelts/elts describe its live elements
-    // (elts may be NULL when no cert was loaded).
-    let loaded: &[*mut c_void] = unsafe {
-        let certs = &(*ssl).certs;
-        if certs.elts.is_null() || certs.nelts == 0 {
-            &[]
-        } else {
-            core::slice::from_raw_parts(certs.elts.cast::<*mut c_void>(), certs.nelts)
-        }
-    };
-
     // THE bindgen↔openssl-sys boundary cast (single documented site): both
     // types describe the very same C `SSL_CTX` (`struct ssl_ctx_st`) — bindgen
     // generated one opaque-ish Rust type from nginx's headers, openssl-sys
@@ -325,11 +309,22 @@ unsafe fn collect_server_certs(
         )
     };
 
-    for cert in enumerated {
-        let file_path = path_for_cert(cert, loaded, &paths);
+    for (enum_idx, cert) in enumerated.iter().enumerate() {
+        let file_path = path_for_cert(enum_idx, &paths);
         // SAFETY: `cert` is a live X509 borrowed from the SSL_CTX (valid for
         // the whole config phase); extraction only reads it via openssl-sys.
-        let info = unsafe { extract_cert_info(cert, file_path, server_name.clone()) };
+        let Some(info) = (unsafe { extract_cert_info(*cert, file_path, server_name.clone()) })
+        else {
+            ngx_conf_log_error!(
+                NGX_LOG_NOTICE,
+                cf,
+                "otel: cert metrics: skipping cert[{}] server=\"{}\" \
+                 (validity window not parseable)",
+                enum_idx,
+                server_name
+            );
+            continue;
+        };
         ngx_conf_log_error!(
             NGX_LOG_NOTICE,
             cf,
@@ -354,24 +349,30 @@ unsafe extern "C" fn collect_cert_cb(cert: *mut ossl::X509, data: *mut c_void) -
     0 // continue
 }
 
-/// Map an enumerated cert back to its configured file path.
+/// Map an enumerated cert back to its configured file path by enumeration index.
 ///
-/// Exact match: pointer identity against `ssl->certs` (index-aligned with the
-/// configured path list — see `collect_server_certs`).  Fallbacks (should not
-/// occur for config-loaded certs): a single configured path is used as-is; an
-/// ambiguous multi-path block records the order-joined path list rather than
-/// guessing.
+/// `enum_idx` is the cert's position in the `ngx_otel_foreach_ctx_cert`
+/// enumeration (0-based).  nginx installs certs into the `SSL_CTX` in
+/// configured order (`ngx_ssl_certificate`, `ngx_event_openssl.c`), and
+/// OpenSSL's `SSL_CTX_set_current_cert` cursor enumerates them in that same
+/// insertion order, so `enum_idx` is index-aligned with the `paths` list.
+///
+/// The old pointer-identity approach (`ssl->certs` vs `SSL_CTX_get0_certificate`
+/// result) was unreliable: OpenSSL stores the leaf cert internally and returns
+/// its own pointer from `get0`, which does not alias the pointer nginx cached in
+/// `ssl->certs` — so the identity lookup always missed for multi-cert servers,
+/// falling through to a `,`-joined join of ALL paths for EVERY cert.
 #[cfg(ngx_feature = "http_ssl")]
-fn path_for_cert(cert: *mut ossl::X509, loaded: &[*mut c_void], paths: &[String]) -> String {
-    if let Some(idx) = loaded.iter().position(|&p| core::ptr::eq(p, cert.cast::<c_void>())) {
-        if let Some(p) = paths.get(idx) {
-            return p.clone();
-        }
+fn path_for_cert(enum_idx: usize, paths: &[String]) -> String {
+    if let Some(p) = paths.get(enum_idx) {
+        return p.clone();
     }
+    // Fallback: index out of range (should not occur for a well-formed nginx
+    // config); if there is exactly one path it is the only candidate; otherwise
+    // we cannot determine which path is correct and return empty.
     match paths {
         [single] => single.clone(),
-        [] => String::new(),
-        multiple => multiple.join(","),
+        _ => String::new(),
     }
 }
 
@@ -412,7 +413,12 @@ fn is_wildcard_name(name: &[u8]) -> bool {
 
 // ── Per-cert field extraction (openssl-sys only — no nginx types) ───────────
 
-/// Extract the scope-guard field set from one borrowed leaf cert.
+/// Extract the identity field set from one borrowed leaf cert.
+///
+/// Returns `None` when either `notBefore` or `notAfter` cannot be parsed —
+/// a cert whose validity window is unreadable cannot be tracked for expiry and
+/// must be skipped rather than recorded as epoch-zero (1970-01-01), which
+/// would appear as permanently expired in the `tls.certificate.*` gauges.
 ///
 /// # Safety
 /// `cert` must be a valid, live `X509*` (borrowed from the SSL_CTX).
@@ -421,13 +427,13 @@ unsafe fn extract_cert_info(
     cert: *mut ossl::X509,
     file_path: String,
     server_name: String,
-) -> CertInfo {
+) -> Option<CertInfo> {
     // SAFETY: `cert` is a valid X509 per the fn contract; X509_getm_notBefore
     // returns an internal pointer owned by the cert and asn1_time_to_unix
     // handles NULL.
-    let not_before = unsafe { asn1_time_to_unix(ossl::X509_getm_notBefore(cert)) }.unwrap_or(0);
+    let not_before = unsafe { asn1_time_to_unix(ossl::X509_getm_notBefore(cert)) }?;
     // SAFETY: as above.
-    let not_after = unsafe { asn1_time_to_unix(ossl::X509_getm_notAfter(cert)) }.unwrap_or(0);
+    let not_after = unsafe { asn1_time_to_unix(ossl::X509_getm_notAfter(cert)) }?;
     // SAFETY: `X509_get_subject_name` returns an internal (get0-style) pointer
     // owned by the cert; `x509_name_cn` handles NULL.
     let subject_cn = unsafe { x509_name_cn(ossl::X509_get_subject_name(cert.cast_const())) };
@@ -441,7 +447,7 @@ unsafe fn extract_cert_info(
     // SAFETY: `cert` is valid; `X509_get_signature_nid` only reads it.
     let sig_alg = unsafe { nid_short_name(ossl::X509_get_signature_nid(cert.cast_const())) };
 
-    CertInfo {
+    Some(CertInfo {
         file_path,
         server_name,
         not_before_unix: not_before,
@@ -451,7 +457,7 @@ unsafe fn extract_cert_info(
         serial,
         pubkey_alg,
         sig_alg,
-    }
+    })
 }
 
 /// Convert an `ASN1_TIME` (UTCTime or GeneralizedTime — `ASN1_TIME_diff`
@@ -539,6 +545,13 @@ unsafe fn asn1_string_lossy(s: *const ossl::ASN1_STRING) -> String {
 /// Serial number → uppercase hex string (via `ASN1_INTEGER_to_BN` →
 /// `BN_bn2hex`; both temporaries freed).  Empty string on NULL/failure.
 ///
+/// RFC 5280 §4.1.2.2 requires serial numbers to be positive; however, some
+/// legacy CAs issued certificates whose DER-encoded serial had the high bit
+/// set, which OpenSSL interprets as a negative BIGNUM.  `BN_bn2hex` (OpenSSL
+/// man page BN_bn2bin(3)) prepends a `-` sign for negative values.  We strip
+/// the leading `-` so the serial is always rendered as the canonical absolute
+/// hex value — matching the display convention used by `openssl x509 -serial`.
+///
 /// # Safety
 /// `ser` must be NULL or a valid `ASN1_INTEGER*`.
 unsafe fn asn1_integer_hex(ser: *const ossl::ASN1_INTEGER) -> String {
@@ -561,7 +574,13 @@ unsafe fn asn1_integer_hex(ser: *const ossl::ASN1_INTEGER) -> String {
         // SAFETY: `hex` was allocated by BN_bn2hex and must be released with
         // OPENSSL_free exactly once.
         unsafe { ossl::OPENSSL_free(hex.cast::<c_void>()) };
-        s
+        // Strip the leading `-` that BN_bn2hex emits for negative BIGNUMs
+        // (see BN_bn2bin(3): "BN_bn2hex() ... negative numbers are prefixed
+        // with a minus sign").  Serial numbers are rendered as their absolute
+        // hex value — matches `openssl x509 -serial` canonical output.  If
+        // the string has no leading `-`, `strip_prefix` returns None and `s`
+        // is returned as-is.
+        s.strip_prefix('-').map(String::from).unwrap_or(s)
     };
     // SAFETY: `bn` was allocated by ASN1_INTEGER_to_BN and not yet freed.
     unsafe { ossl::BN_free(bn) };
@@ -755,6 +774,74 @@ mod tests {
         assert_eq!(unsafe { x509_name_cn(ptr::null()) }, "");
     }
 
+    // ── Fix 1: ASN1 time parse failure → None (not zero / epoch-expired) ───────
+
+    /// Regression: when `ASN1_TIME_diff` cannot parse the time string, the
+    /// function must return `None` rather than `Some(0)`.  Before the fix,
+    /// `unwrap_or(0)` silently substituted the Unix epoch (1970-01-01), making
+    /// a cert with an unreadable validity field appear permanently expired in
+    /// the `tls.certificate.*` gauges.
+    #[test]
+    fn asn1_bad_time_string_is_none() {
+        // Build an ASN1_TIME whose string content is deliberately invalid so
+        // that ASN1_TIME_diff will fail to parse it.  We allocate a valid
+        // ASN1_TIME object first and then overwrite its data with garbage.
+        // SAFETY: ASN1_TIME_new allocates a fresh, initialised ASN1_TIME.
+        let t = unsafe { ossl::ASN1_TIME_new() };
+        assert!(!t.is_null());
+        // Set a syntactically valid string first so the object is initialised,
+        // then corrupt the data byte so ASN1_TIME_diff sees a bad encoding.
+        let cs = std::ffi::CString::new("700101000000Z").unwrap();
+        // SAFETY: `t` is valid; ASN1_TIME_set_string just writes the string.
+        let ok = unsafe { ossl::ASN1_TIME_set_string(t, cs.as_ptr()) };
+        assert_eq!(ok, 1);
+        // Overwrite the first byte (month digit) with an unparseable byte so
+        // that ASN1_TIME_diff will fail.  The ASN1_STRING data pointer is the
+        // mutable byte buffer we write through.
+        // SAFETY: `t` cast to ASN1_STRING is sound (ASN1_TIME is ASN1_STRING);
+        // the buffer was just allocated and is writable; length is > 0.
+        unsafe {
+            let data_ptr = ossl::ASN1_STRING_get0_data(t.cast()) as *mut u8;
+            assert!(!data_ptr.is_null());
+            *data_ptr = b'X'; // 'X' is not a valid digit — diff will reject it
+        }
+        // SAFETY: `t` is valid (though its content is intentionally corrupt).
+        let result = unsafe { asn1_time_to_unix(t) };
+        // SAFETY: `t` was allocated by ASN1_TIME_new and not yet freed.
+        unsafe { ossl::ASN1_TIME_free(t) };
+        assert_eq!(result, None, "unparseable ASN1_TIME must return None, not Some(0)");
+    }
+
+    // ── Fix 2: path_for_cert uses enumeration index (dual-cert path labeling) ─
+
+    /// Regression: for a dual RSA+ECDSA server block (two `ssl_certificate`
+    /// directives, two enumerated certs) each cert must get its OWN configured
+    /// path, not a joined list of all paths.  Before the fix, pointer-identity
+    /// matching against `ssl->certs` always missed (OpenSSL returns its own
+    /// internal pointer from `SSL_CTX_get0_certificate`, which does not alias
+    /// the pointer nginx cached), causing the fallback to join all paths.
+    #[test]
+    fn path_for_cert_dual_cert_index_aligned() {
+        let paths = vec![String::from("rsa.crt"), String::from("ecdsa.crt")];
+        // Each cert's enumeration index must map to its own path.
+        assert_eq!(path_for_cert(0, &paths), "rsa.crt");
+        assert_eq!(path_for_cert(1, &paths), "ecdsa.crt");
+    }
+
+    /// Single-cert server: index 0 returns the only path.
+    #[test]
+    fn path_for_cert_single_cert() {
+        let paths = vec![String::from("only.crt")];
+        assert_eq!(path_for_cert(0, &paths), "only.crt");
+    }
+
+    /// Out-of-range index (should not occur in practice): empty string.
+    #[test]
+    fn path_for_cert_index_out_of_range_empty() {
+        let paths = vec![String::from("a.crt"), String::from("b.crt")];
+        assert_eq!(path_for_cert(5, &paths), "");
+    }
+
     // ── Serial hex formatting ────────────────────────────────────────────────
 
     fn serial_of(v: i64) -> String {
@@ -788,6 +875,46 @@ mod tests {
     fn serial_null_is_empty() {
         // SAFETY: NULL is an accepted input per the fn contract.
         assert_eq!(unsafe { asn1_integer_hex(ptr::null()) }, "");
+    }
+
+    /// Regression: a cert whose DER-encoded serial has the high bit set is
+    /// interpreted by OpenSSL as a negative BIGNUM; `BN_bn2hex` (BN_bn2bin(3))
+    /// prefixes the hex string with `-` for negative values.  Before the fix,
+    /// that leading `-` was passed through unchanged.  After the fix, the sign
+    /// is stripped so the serial is rendered as the canonical absolute hex value
+    /// — matching `openssl x509 -serial` output (RFC 5280 §4.1.2.2 requires
+    /// positive serials; legacy CAs occasionally issued non-conformant ones).
+    ///
+    /// We construct the negative ASN1_INTEGER directly via BN: allocate a
+    /// BIGNUM, set it to the absolute value 0xDEADBEEF, mark it negative with
+    /// BN_set_negative, then convert to ASN1_INTEGER with BN_to_ASN1_INTEGER.
+    #[test]
+    fn serial_negative_bignum_no_leading_minus() {
+        // SAFETY: BN_new allocates a fresh, zeroed BIGNUM.
+        let bn = unsafe { ossl::BN_new() };
+        assert!(!bn.is_null());
+        // Set bn = 0xDEADBEEF (positive first, then flip sign).
+        // SAFETY: `bn` is valid; BN_set_word sets its magnitude.
+        let ok = unsafe { ossl::BN_set_word(bn, 0xDEAD_BEEF) };
+        assert_eq!(ok, 1);
+        // SAFETY: marks the BIGNUM as negative (BN_set_negative(3)).
+        unsafe { ossl::BN_set_negative(bn, 1) };
+
+        // Convert the negative BIGNUM to an ASN1_INTEGER.
+        // SAFETY: `bn` is valid; BN_to_ASN1_INTEGER with NULL `ai` allocates.
+        let ser = unsafe { ossl::BN_to_ASN1_INTEGER(bn, ptr::null_mut()) };
+        assert!(!ser.is_null());
+        // SAFETY: `bn` was allocated above and is no longer needed.
+        unsafe { ossl::BN_free(bn) };
+
+        // SAFETY: `ser` is the valid ASN1_INTEGER just constructed.
+        let got = unsafe { asn1_integer_hex(ser) };
+        // SAFETY: `ser` was allocated by BN_to_ASN1_INTEGER and not yet freed.
+        unsafe { ossl::ASN1_INTEGER_free(ser) };
+
+        // Must be the absolute hex value without any leading `-`.
+        assert_eq!(got, "DEADBEEF", "negative serial must render without leading `-`");
+        assert!(!got.starts_with('-'), "no leading minus sign in serial hex");
     }
 
     // ── Pubkey-alg mapping (pure) ────────────────────────────────────────────
