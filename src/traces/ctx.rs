@@ -20,6 +20,7 @@
 
 use nginx_sys::ngx_http_request_t;
 use ngx::core::Pool;
+use ngx::http::Request;
 
 // ── SpanCtx ──────────────────────────────────────────────────────────────────
 
@@ -231,8 +232,13 @@ pub unsafe fn recover_span_ctx(
                 .is_some_and(|h| core::ptr::fn_addr_eq(h, cleanup_span_ctx as NgxCleanupPt))
             {
                 let ctx = (*cln).data.cast::<SpanCtx>();
-                // Re-install into the (zeroed) module-ctx slot.
-                *(*r).ctx.add(module.ctx_index) = ctx.cast::<core::ffi::c_void>();
+                // Re-install into the (zeroed) module-ctx slot via the same
+                // `set_module_ctx` helper used everywhere else, ensuring
+                // consistent slot indexing and cleanup/altitude semantics.
+                // SAFETY: `r` is a valid request pointer; `Request` is a
+                // transparent newtype over `ngx_http_request_t`.
+                Request::from_ngx_http_request(r)
+                    .set_module_ctx(ctx.cast::<core::ffi::c_void>(), module);
                 return ctx;
             }
             cln = (*cln).next;
@@ -289,6 +295,16 @@ thread_local! {
     /// weak/predictable IDs ever reach the wire.  Metrics and logs are
     /// unaffected (they do not consult this flag).
     static TRACING_DISABLED: Cell<bool> = const { Cell::new(false) };
+
+    /// One-shot guard for the LAZY seed-failure EMERG log.
+    ///
+    /// The lazy path is entered when a thread calls `drbg64()` without having
+    /// run `eager_seed_drbg()` first.  Unlike the eager path (where the caller
+    /// holds a `cycle` pointer and emits the EMERG itself), the lazy path must
+    /// retrieve the log handle from the nginx global cycle.  This flag ensures
+    /// the resulting log line is emitted at most once per worker thread,
+    /// matching the eager path's EMERG-once guarantee.
+    static LAZY_SEED_EMERG_LOGGED: Cell<bool> = const { Cell::new(false) };
 }
 
 // Worker-local failure-injection switch for the seed path.
@@ -349,12 +365,59 @@ pub(crate) fn eager_seed_drbg() -> Result<(), getrandom::Error> {
     })
 }
 
+/// Emit a single NGX_LOG_EMERG line for a lazy DRBG seed failure.
+///
+/// Called ONLY on the cold seed-failure branch of `drbg64()`.  Retrieves the
+/// nginx worker log handle from the nginx global `ngx_cycle` pointer (set by
+/// nginx before any worker runs, valid for the process lifetime).  Guarded by
+/// `LAZY_SEED_EMERG_LOGGED` so the message is emitted at most once per worker
+/// thread — matching the eager path's EMERG-once contract.
+///
+/// **Must not be called on the hot path** — the `#[cold]` attribute ensures
+/// the optimiser does not inline this into the normal `drbg64()` return.
+#[cold]
+fn log_lazy_seed_failure_once(e: getrandom::Error) {
+    if LAZY_SEED_EMERG_LOGGED.with(Cell::get) {
+        return;
+    }
+    LAZY_SEED_EMERG_LOGGED.with(|f| f.set(true));
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        // SAFETY: `nginx_sys::ngx_cycle` is a process-global pointer set by
+        // nginx before `fork()`-ing workers; it remains valid for the worker
+        // lifetime.  `(*ngx_cycle).log` is the worker's primary log handle
+        // (always non-null at this point — nginx aborts worker start if log
+        // initialisation fails).  We read the pointer once, under a `#[cold]`
+        // path, and do not retain it.
+        let log = unsafe {
+            let cycle = nginx_sys::ngx_cycle;
+            if cycle.is_null() {
+                return;
+            }
+            (*cycle).log
+        };
+        if log.is_null() {
+            return;
+        }
+        ngx::ngx_log_error!(
+            nginx_sys::NGX_LOG_EMERG,
+            log,
+            "otel: trace-ID DRBG lazy seeding failed ({e}); OS RNG unavailable — \
+             tracing DISABLED for this worker (traffic unaffected, no spans emitted)"
+        );
+    }
+    // In test/test-support builds the log infrastructure is not initialised;
+    // the EMERG-once flag is still set so call-count assertions hold.
+    let _ = e;
+}
+
 /// Return the next pseudo-random `u64` from the per-thread ChaCha20 DRBG.
 ///
 /// In production the DRBG is eagerly seeded in `init_process`, so this is a
 /// pure ChaCha20 word extraction — lock-free, no syscall.  As a fallback (e.g.
 /// a thread that skipped eager seeding), it seeds lazily.  On seed failure it
-/// sets the tracing-disabled flag and returns 0 (callers must consult
+/// sets the tracing-disabled flag, emits a single NGX_LOG_EMERG line (see
+/// `log_lazy_seed_failure_once`), and returns 0 (callers must consult
 /// `tracing_disabled()` before relying on generated IDs — span-start does).
 ///
 /// **Hot-path note:** TLS lookup + ChaCha20 word extraction — effectively
@@ -373,8 +436,9 @@ pub(crate) fn drbg64() -> u64 {
                 c.set(Some(rng));
                 val
             }
-            Err(_) => {
+            Err(e) => {
                 TRACING_DISABLED.with(|d| d.set(true));
+                log_lazy_seed_failure_once(e);
                 0
             }
         },
@@ -402,35 +466,61 @@ fn try_seed_drbg() -> Result<ChaCha20Rng, getrandom::Error> {
 
 // ── ID generation ─────────────────────────────────────────────────────────────
 
+/// Maximum reroll attempts when `drbg64()` returns 0 for a W3C ID.
+///
+/// Under a healthy ChaCha20 DRBG the all-zero output has probability < 2^-64
+/// per call; three retries without a non-zero result means the DRBG is either
+/// completely broken (e.g. stuck outputting 0 due to a persistent OS-RNG fault)
+/// or seeding genuinely failed and `drbg64()` is returning its failure sentinel
+/// (0) on every call.  In either case further retries cannot help and looping
+/// forever would hang the worker.  Instead we treat exhaustion as a
+/// DRBG-unavailable condition and disable tracing for this request.
+const MAX_ID_RETRIES: u32 = 3;
+
 /// Generate a fresh 16-byte W3C trace ID.
 ///
-/// The all-zero trace ID is invalid per W3C spec; we reroll until non-zero
-/// (vanishingly unlikely in practice — < 1 in 2^128).
+/// Returns `Some(id)` on success — guaranteed non-zero per the W3C
+/// Trace Context spec (§3.3: "all-zeroes MUST be rejected").  Returns `None`
+/// when the DRBG appears broken: after [`MAX_ID_RETRIES`] attempts all
+/// returning zero (a DRBG fault / persistent OS-RNG failure), the
+/// worker-local tracing-disabled flag is set and the caller MUST NOT emit
+/// any ID to the wire.  Callers should decline the request exactly as they
+/// would when `tracing_disabled()` returns `true`.
 #[inline]
-pub(crate) fn gen_trace_id() -> [u8; 16] {
-    loop {
+pub(crate) fn gen_trace_id() -> Option<[u8; 16]> {
+    for _ in 0..MAX_ID_RETRIES {
         let a = drbg64();
         let b = drbg64();
         if a != 0 || b != 0 {
             let mut id = [0u8; 16];
             id[..8].copy_from_slice(&a.to_le_bytes());
             id[8..].copy_from_slice(&b.to_le_bytes());
-            return id;
+            return Some(id);
         }
     }
+    // All retries returned zero: DRBG is broken or persistently returning its
+    // failure sentinel.  Disable tracing so span-start declines this request
+    // and no all-zero (invalid) trace ID reaches the wire.
+    TRACING_DISABLED.with(|d| d.set(true));
+    None
 }
 
 /// Generate a fresh 8-byte W3C span ID.
 ///
-/// The all-zero span ID is invalid per W3C spec; we reroll until non-zero.
+/// Returns `Some(id)` on success — guaranteed non-zero per the W3C
+/// Trace Context spec (§3.3: "all-zeroes MUST be rejected").  Returns `None`
+/// after [`MAX_ID_RETRIES`] all returning zero; sets the tracing-disabled flag.
+/// Callers should decline the request rather than emit an invalid all-zero ID.
 #[inline]
-pub(crate) fn gen_span_id() -> [u8; 8] {
-    loop {
+pub(crate) fn gen_span_id() -> Option<[u8; 8]> {
+    for _ in 0..MAX_ID_RETRIES {
         let v = drbg64();
         if v != 0 {
-            return v.to_le_bytes();
+            return Some(v.to_le_bytes());
         }
     }
+    TRACING_DISABLED.with(|d| d.set(true));
+    None
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -540,7 +630,9 @@ mod tests {
     /// Trace IDs are 16 bytes, distinct across a batch of generations.
     #[test]
     fn trace_ids_batch_unique() {
-        let ids: std::vec::Vec<[u8; 16]> = (0..100).map(|_| gen_trace_id()).collect();
+        let ids: std::vec::Vec<[u8; 16]> = (0..100)
+            .map(|_| gen_trace_id().expect("gen_trace_id must succeed with healthy DRBG"))
+            .collect();
         let mut seen = std::collections::HashSet::new();
         for id in &ids {
             assert_ne!(*id, [0u8; 16], "trace ID must not be all-zero");
@@ -551,7 +643,9 @@ mod tests {
     /// Span IDs are 8 bytes, distinct across a batch of generations.
     #[test]
     fn span_ids_batch_unique() {
-        let ids: std::vec::Vec<[u8; 8]> = (0..100).map(|_| gen_span_id()).collect();
+        let ids: std::vec::Vec<[u8; 8]> = (0..100)
+            .map(|_| gen_span_id().expect("gen_span_id must succeed with healthy DRBG"))
+            .collect();
         let mut seen = std::collections::HashSet::new();
         for id in &ids {
             assert_ne!(*id, [0u8; 8], "span ID must not be all-zero");
@@ -562,14 +656,14 @@ mod tests {
     /// gen_trace_id returns 16 bytes, never all-zero.
     #[test]
     fn trace_id_nonzero() {
-        let id = gen_trace_id();
+        let id = gen_trace_id().expect("gen_trace_id must succeed with healthy DRBG");
         assert_ne!(id, [0u8; 16], "trace ID must not be all-zero");
     }
 
     /// gen_span_id returns 8 bytes, never all-zero.
     #[test]
     fn span_id_nonzero() {
-        let id = gen_span_id();
+        let id = gen_span_id().expect("gen_span_id must succeed with healthy DRBG");
         assert_ne!(id, [0u8; 8], "span ID must not be all-zero");
     }
 
@@ -654,7 +748,7 @@ mod tests {
             parse_traceparent_full(header).expect("valid traceparent must parse");
 
         // Simulate what REWRITE does: populate SpanCtx from the parse result.
-        let span_id = gen_span_id();
+        let span_id = gen_span_id().expect("gen_span_id must succeed with healthy DRBG");
         let ctx = SpanCtx {
             trace_id,
             span_id,
@@ -692,5 +786,90 @@ mod tests {
         let _ = ctx.flags;
         let _ = ctx.start_time_unix_nano;
         let _ = ctx.sampled;
+    }
+
+    // ── Regression: bounded reroll + fail-safe (finding #5) ─────────────────
+
+    /// With the DRBG in the (None, not-yet-disabled) state and OS-RNG injected
+    /// to always fail, `drbg64()` returns 0 on every call.  The OLD unbounded
+    /// reroll loop in `gen_trace_id` / `gen_span_id` would hang indefinitely
+    /// under this condition.  The NEW bounded loop must terminate and return
+    /// `None`, setting `TRACING_DISABLED`.
+    ///
+    /// Mutation proof: revert the `for _ in 0..MAX_ID_RETRIES` bound to an
+    /// unconditional `loop {}` and this test hangs (never reaches the assertion).
+    #[test]
+    fn gen_id_bounded_on_stuck_drbg_returns_none() {
+        std::thread::spawn(|| {
+            // Fresh thread: DRBG is None, flags are false.
+            // Arm seed-failure injection so every drbg64() call returns 0.
+            set_inject_seed_failure(true);
+            // tracing_disabled is NOT yet set — this models the (None, not-disabled)
+            // race window that the finding describes.
+            assert!(!tracing_disabled(), "flag must be clear at test start");
+
+            // gen_trace_id must terminate (not loop forever) and return None.
+            let tid = gen_trace_id();
+            assert!(tid.is_none(), "gen_trace_id must return None when DRBG is stuck at 0");
+            assert!(
+                tracing_disabled(),
+                "tracing must be disabled after gen_trace_id exhausts retries"
+            );
+        })
+        .join()
+        .expect("test thread must not panic (would indicate an infinite loop or panic)");
+    }
+
+    /// Same bounded-reroll guarantee for gen_span_id.
+    #[test]
+    fn gen_span_id_bounded_on_stuck_drbg_returns_none() {
+        std::thread::spawn(|| {
+            set_inject_seed_failure(true);
+            assert!(!tracing_disabled());
+            let sid = gen_span_id();
+            assert!(sid.is_none(), "gen_span_id must return None when DRBG is stuck at 0");
+            assert!(tracing_disabled());
+        })
+        .join()
+        .expect("test thread must not panic");
+    }
+
+    // ── Regression: lazy seed-failure EMERG-once flag (finding ~376) ─────────
+
+    /// When `drbg64()` triggers a lazy seed failure, `LAZY_SEED_EMERG_LOGGED`
+    /// must be set exactly once (EMERG-once contract).  In test builds the
+    /// actual `ngx_log_error!` call is skipped (no live nginx log handle), but
+    /// the guard flag is still set — so the flag count is the observable.
+    ///
+    /// Mutation proof: comment out `LAZY_SEED_EMERG_LOGGED.with(|f| f.set(true))`
+    /// in `log_lazy_seed_failure_once` and the second assertion (flag set after
+    /// call) fails.
+    #[test]
+    fn lazy_seed_failure_emerg_once_flag_set() {
+        std::thread::spawn(|| {
+            set_inject_seed_failure(true);
+            // Verify flag starts clear on this fresh thread.
+            assert!(
+                !LAZY_SEED_EMERG_LOGGED.with(Cell::get),
+                "LAZY_SEED_EMERG_LOGGED must start false on a fresh thread"
+            );
+            // Trigger lazy seed failure via drbg64 (DRBG is None on this thread).
+            let _ = drbg64(); // Err branch → log_lazy_seed_failure_once → sets flag
+            assert!(
+                LAZY_SEED_EMERG_LOGGED.with(Cell::get),
+                "LAZY_SEED_EMERG_LOGGED must be set after the first lazy seed failure"
+            );
+            // Second call: flag already set → log_lazy_seed_failure_once is a no-op.
+            // (Injection still armed, DRBG still None after the first 0-return.)
+            let flag_before = LAZY_SEED_EMERG_LOGGED.with(Cell::get);
+            let _ = drbg64();
+            assert_eq!(
+                LAZY_SEED_EMERG_LOGGED.with(Cell::get),
+                flag_before,
+                "LAZY_SEED_EMERG_LOGGED must not change on repeated calls (EMERG-once)"
+            );
+        })
+        .join()
+        .expect("test thread must not panic");
     }
 }

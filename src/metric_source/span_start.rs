@@ -294,11 +294,27 @@ impl HttpRequestHandler for SpanStartHandler {
         };
 
         // ── Assign trace/span IDs ────────────────────────────────────────────
+        // `gen_trace_id` / `gen_span_id` return `None` when the DRBG appears
+        // broken (exhausted retries on all-zero output), in which case they
+        // also set the tracing-disabled flag.  Treat that the same as a
+        // tracing-disabled worker: clear the ctx and decline.
         let trace_id = match parent_trace_id {
-            Some(tid) => tid,       // continue the inbound trace
-            None => gen_trace_id(), // root span: start a new trace
+            Some(tid) => tid, // continue the inbound trace
+            None => match gen_trace_id() {
+                Some(tid) => tid,
+                None => {
+                    request.set_module_ctx(core::ptr::null_mut(), module_ref);
+                    return Status::NGX_DECLINED;
+                }
+            },
         };
-        let span_id = gen_span_id();
+        let span_id = match gen_span_id() {
+            Some(sid) => sid,
+            None => {
+                request.set_module_ctx(core::ptr::null_mut(), module_ref);
+                return Status::NGX_DECLINED;
+            }
+        };
 
         // Flags to record: inbound flags (preserves sampled bit) or set sampled=1 for roots.
         let flags = if have_traceparent {
@@ -354,7 +370,9 @@ impl HttpRequestHandler for SpanStartHandler {
         {
             // SAFETY: `r_ptr` is valid and non-null; `(*r_ptr).pool` and
             // `(*r_ptr).headers_in.headers` are valid for the request lifetime.
-            unsafe { inject_traceparent_header(r_ptr, &trace_id, &span_id, sampled) };
+            // Pass the full trace-flags octet so all bits are preserved per
+            // W3C Trace Context §3.2 (https://www.w3.org/TR/trace-context/#trace-flags).
+            unsafe { inject_traceparent_header(r_ptr, &trace_id, &span_id, flags as u8) };
         }
 
         // NGX_DECLINED: SpanCtx set; pass to the next REWRITE handler (normal
@@ -375,6 +393,29 @@ fn hex_encode_into_slice(src: &[u8], dst: &mut [u8]) {
         dst[i * 2] = HEX[(byte >> 4) as usize];
         dst[i * 2 + 1] = HEX[(byte & 0xf) as usize];
     }
+}
+
+/// Build the 55-byte W3C `traceparent` header value.
+///
+/// Format: `"00-{32hex trace_id}-{16hex span_id}-{flags_hex}"`.
+/// `trace_flags` is the full 8-bit W3C trace-flags octet; all bits are
+/// preserved per W3C Trace Context §3.2
+/// (https://www.w3.org/TR/trace-context/#trace-flags).
+///
+/// Extracted from `inject_traceparent_header` so the encoding logic is
+/// unit-testable without requiring a live nginx request pool.
+#[cfg_attr(not(test), allow(dead_code))]
+fn build_traceparent_value(trace_id: &[u8; 16], span_id: &[u8; 8], trace_flags: u8) -> [u8; 55] {
+    let mut value = [0u8; 55];
+    value[0] = b'0';
+    value[1] = b'0';
+    value[2] = b'-';
+    hex_encode_into_slice(trace_id, &mut value[3..35]);
+    value[35] = b'-';
+    hex_encode_into_slice(span_id, &mut value[36..52]);
+    value[52] = b'-';
+    hex_encode_into_slice(&[trace_flags], &mut value[53..55]);
+    value
 }
 
 /// Injects (or *updates in place*) a W3C `traceparent` header in
@@ -406,6 +447,11 @@ fn hex_encode_into_slice(src: &[u8], dst: &mut [u8]) {
 /// We therefore intentionally do NOT mirror that call.  Setting `entry->hash` to
 /// a non-zero value is sufficient for the proxy module's generic header copy.
 ///
+/// **Flags field:** `trace_flags` is the full 8-bit W3C trace-flags octet
+/// (W3C Trace Context §3.2, https://www.w3.org/TR/trace-context/#trace-flags).
+/// All bits are preserved — callers MUST NOT collapse it to a 1-bit `sampled`
+/// boolean before passing, as that silently drops any future flag bits.
+///
 /// On pool-allocation failure the function silently returns — tracing continues;
 /// only the inject step is skipped.
 ///
@@ -415,22 +461,12 @@ unsafe fn inject_traceparent_header(
     r: *mut nginx_sys::ngx_http_request_t,
     trace_id: &[u8; 16],
     span_id: &[u8; 8],
-    sampled: bool,
+    trace_flags: u8,
 ) {
     // SAFETY: caller guarantees `r` is valid; `(*r).pool` is the request pool.
     let pool = unsafe { (*r).pool };
 
-    // Build the 55-byte value: "00-{32hex trace_id}-{16hex span_id}-{flags}".
-    let mut value: [u8; 55] = [0u8; 55];
-    value[0] = b'0';
-    value[1] = b'0';
-    value[2] = b'-';
-    hex_encode_into_slice(trace_id, &mut value[3..35]);
-    value[35] = b'-';
-    hex_encode_into_slice(span_id, &mut value[36..52]);
-    value[52] = b'-';
-    value[53] = b'0';
-    value[54] = if sampled { b'1' } else { b'0' };
+    let value = build_traceparent_value(trace_id, span_id, trace_flags);
 
     // ── Find an existing `traceparent` in headers_in (mirrors C++ findHeader) ──
     // SAFETY: `r` is valid; we walk the inbound headers list parts. The list is
@@ -597,8 +633,8 @@ mod tests {
     /// Root span path: generate non-zero trace_id and span_id.
     #[test]
     fn root_span_ids_nonzero() {
-        let tid = gen_trace_id();
-        let sid = gen_span_id();
+        let tid = gen_trace_id().expect("gen_trace_id must succeed with healthy DRBG");
+        let sid = gen_span_id().expect("gen_span_id must succeed with healthy DRBG");
         assert_ne!(tid, [0u8; 16]);
         assert_ne!(sid, [0u8; 8]);
     }
@@ -705,8 +741,66 @@ mod tests {
         // child span reuses parent's trace_id
         assert_eq!(parent_tid[0], 0x4b);
         // child span_id is newly generated
-        let new_span_id = gen_span_id();
+        let new_span_id = gen_span_id().expect("gen_span_id must succeed with healthy DRBG");
         assert_ne!(new_span_id, parent_sid, "child span_id should not equal parent span_id");
         assert_eq!(flags, 0x01);
+    }
+
+    // ── Regression: full trace-flags octet round-trip (finding ~433) ──────────
+
+    /// `build_traceparent_value` (and therefore `inject_traceparent_header`)
+    /// must carry the full 8-bit W3C trace-flags octet, not just bit-0
+    /// collapsed to "00"/"01".
+    ///
+    /// W3C Trace Context §3.2 defines `trace-flags` as an 8-bit field:
+    /// https://www.w3.org/TR/trace-context/#trace-flags
+    ///
+    /// Mutation proof: replace `hex_encode_into_slice(&[trace_flags], …)` in
+    /// `build_traceparent_value` with the OLD code:
+    ///   `value[53] = b'0'; value[54] = if (trace_flags & 0x01) != 0 { b'1' } else { b'0' };`
+    /// and the 0xf5/0x03/0xff assertions fail:
+    ///   0xf5 (sampled=true)  → old "01",  new "f5" ← fails here
+    ///   0x03 (sampled=true)  → old "01",  new "03" ← fails here
+    ///   0xff (sampled=true)  → old "01",  new "ff" ← fails here
+    #[test]
+    fn inject_traceparent_flags_full_octet_roundtrip() {
+        let trace_id: [u8; 16] = [
+            0x4b, 0xf9, 0x2f, 0x35, 0x77, 0xb3, 0x4d, 0xa6, 0xa3, 0xce, 0x92, 0x9d, 0x0e, 0x0e,
+            0x47, 0x36,
+        ];
+        let span_id: [u8; 8] = [0x00, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7];
+
+        // Each case: (flags_byte, expected last 2 chars in the value buffer).
+        // flags 0xf5 = 0b11110101: sampled bit set, plus several vendor bits.
+        let cases: &[(u8, &[u8])] = &[
+            (0x01, b"01"), // standard sampled
+            (0x00, b"00"), // standard not-sampled
+            (0xf5, b"f5"), // upper bits + sampled — the critical regression case
+            (0x03, b"03"), // bits 0+1
+            (0xff, b"ff"), // all bits
+        ];
+
+        for &(flags_byte, expected_suffix) in cases {
+            // Call the production helper directly — this is the same function
+            // that inject_traceparent_header uses, so mutations there are caught.
+            let value = build_traceparent_value(&trace_id, &span_id, flags_byte);
+
+            assert_eq!(
+                &value[53..55],
+                expected_suffix,
+                "flags 0x{flags_byte:02x} must encode to {expected_suffix:?} in traceparent value"
+            );
+            // Structural check: version must be "00".
+            assert_eq!(&value[0..2], b"00", "traceparent version must be 00");
+        }
+
+        // Explicit upper-bits check: the OLD collapsing code produced "01" for
+        // 0xf5 (sampled=true); the correct code must produce "f5".
+        let v_f5 = build_traceparent_value(&trace_id, &span_id, 0xf5);
+        assert_eq!(
+            &v_f5[53..55],
+            b"f5",
+            "0xf5 must encode to 'f5', not '01' (upper bits must not be dropped)"
+        );
     }
 }
