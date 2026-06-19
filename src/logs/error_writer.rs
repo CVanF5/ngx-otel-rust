@@ -40,6 +40,46 @@ use nginx_sys::{ngx_shm_zone_t, ngx_uint_t};
 use crate::logs::coalesce::{self, CoalesceResult, CoalesceSlot};
 use crate::logs::ring::LogsWorkerRing;
 
+// ── RAII busy-flag guard ──────────────────────────────────────────────────────
+
+/// RAII guard that clears the `busy` flag on drop.
+///
+/// Created after successfully acquiring `busy` (i.e. after `busy.swap(true,
+/// Acquire)` returns `false`).  Guarantees the flag is released on BOTH the
+/// normal return path AND on a caught panic — preventing a permanent wedge that
+/// would silence all future error-log emissions from this worker.
+///
+/// Without this guard, a panic inside the writer body (which runs in an
+/// `unsafe extern "C"` context) would either:
+/// - unwind across the FFI boundary → undefined behaviour per Rust Reference
+///   §"FFI and unwinding" and RFC 2945; or
+/// - abort the process (with `panic = "abort"` profile, which this crate does
+///   NOT set).
+///
+/// The guard is used together with `std::panic::catch_unwind` to contain any
+/// future panics safely (see `ngx_otel_error_writer`).
+///
+/// Declared before the writer so the compiler can verify the `Drop` impl is
+/// reachable from the `catch_unwind` closure.
+struct BusyGuard(*mut AtomicBool);
+
+// SAFETY: `BusyGuard` holds a raw pointer that is only ever created pointing
+// at an `AtomicBool` field inside an `OtelErrorWriterState` (pool-allocated,
+// never moved).  The guard is created, used, and dropped entirely within the
+// single `ngx_otel_error_writer` call, which is single-threaded per the
+// re-entrancy-guard discipline.  These invariants make the raw-pointer access
+// from `Drop::drop` sound.
+unsafe impl Send for BusyGuard {}
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is a valid `*mut AtomicBool` pointing into
+        // `OtelErrorWriterState::busy` (invariant upheld by the single
+        // constructor call site in `ngx_otel_error_writer`).
+        unsafe { (*self.0).store(false, Ordering::Release) };
+    }
+}
+
 // ── Error-ring wire-format constants ─────────────────────────────────────────
 
 /// Kind byte for error-log ring records (0x01; access records use 0x00).
@@ -157,88 +197,122 @@ pub unsafe extern "C" fn ngx_otel_error_writer(
     let state = (*log).wdata as *mut OtelErrorWriterState;
 
     // 1. Cycle teardown guard: drop late emissions after cleanup.
+    //    Checked before busy so a late post-cleanup call never sets busy.
     if (*state).cleanup.load(Ordering::Acquire) {
         return;
     }
 
     // 2. Re-entrancy guard: drop if already executing (signal handler / OOM).
+    //    `swap(true, Acquire)` returns the OLD value; `true` ⇒ already busy.
     if (*state).busy.swap(true, Ordering::Acquire) {
         return;
     }
 
-    // 3. Severity floor (cheapest volume filter, applied first).
-    //    nginx levels are inverted: 1=emerg .. 8=debug.
-    //    `level > level_floor` ⇒ less severe than configured threshold ⇒ drop.
-    if level > (*state).level_floor {
-        (*state).busy.store(false, Ordering::Release);
-        return;
-    }
-
-    // 4. Process-role guard.
-    //    The writer fires in EVERY nginx context (master, config-load, workers,
-    //    exporter helper) because the chain node is inserted before fork.  Only
-    //    worker processes have the logs shm mapped AND should touch the ring/coalescer.
-    //    For all other contexts we return here; the core file node handles the write.
+    // RAII guard: clears `busy` on drop regardless of how this scope exits,
+    // including a caught panic (see `catch_unwind` below).
     //
-    //    Predicate: Worker(_) AND logs_zone mapped (non-null).
-    //    The exporter is NGX_PROCESS_HELPER + IS_OTEL_EXPORTER — NOT Worker — so it
-    //    is excluded even though it also maps the logs shm.  A shm-presence check
-    //    alone would NOT exclude it.
-    if !matches!(crate::exporter::ngx_process(), crate::exporter::NgxProcess::Worker(_))
-        || (*state).logs_zone.is_null()
-    {
-        (*state).busy.store(false, Ordering::Release);
-        return;
-    }
+    // SAFETY: `state` is a valid, non-null `*mut OtelErrorWriterState` for the
+    // duration of this call (pool-allocated, never freed while nginx runs).
+    // `busy` is a field of that struct; the raw pointer into it is valid for
+    // the same lifetime.
+    let _guard = BusyGuard(core::ptr::addr_of_mut!((*state).busy));
 
-    // 4a. Companion error-rate metric bump.
-    //     Fires for EVERY floor-passing event, independent of coalescing — counts
-    //     the true event volume, not just the verbatim samples.
-    //     error_rate_ptr is null until init_process; no-op until then.
-    let error_rate = (*state).error_rate_ptr;
-    if !error_rate.is_null() {
-        let idx = crate::shm::severity_class_index(level as u8);
-        // Relaxed: no ordering needed with respect to the ring push; the exporter
-        // reads this counter independently with Acquire.
-        (*error_rate.add(idx)).fetch_add(1, Ordering::Relaxed);
-    }
-
-    // 5. Coalescer: exact-hash dedup with verbatim exception tail.
-    //    coalesce_table is null until init_process populates it.
-    //    When null, fall through (no record pushed).
-    let coalesce_table = (*state).coalesce_table;
-    if !coalesce_table.is_null() {
-        // SAFETY: buf is valid for `len` bytes per ngx_log_error_core contract.
-        let buf_slice = core::slice::from_raw_parts(buf as *const u8, len);
-        match coalesce::coalesce(coalesce_table, level as u8, buf_slice, (*state).coalesce_enabled)
-        {
-            CoalesceResult::Coalesced => {
-                // Duplicate suppressed. The coalescer already bumped the count.
-                (*state).busy.store(false, Ordering::Release);
+    // Wrap the writer body in `catch_unwind` to prevent an unexpected Rust panic
+    // from unwinding across the `extern "C"` boundary — which is undefined
+    // behaviour (Rust Reference, "Unwinding" §; RFC 2945 "C-unwind ABI").
+    // The closure captures raw pointers and is `AssertUnwindSafe` because:
+    //   - all shared state is accessed through atomics (no `&mut` aliases), and
+    //   - a panic inside the writer is already a logic error; aborting the
+    //     closure and dropping the record is the least-bad safe outcome.
+    // On a caught panic the record is silently dropped (the operator's own
+    // `error_log` file is unaffected — the core chain node runs after us).
+    // `_guard` is dropped at the end of the `catch_unwind` closure, releasing
+    // `busy` before this function returns.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: all pointer dereferences below are safe within this closure
+        // because `state` points to an `OtelErrorWriterState` that is valid for
+        // the duration of this call, and `buf` is valid for `len` bytes per
+        // the `ngx_log_error_core` caller contract.
+        unsafe {
+            // 3. Severity floor (cheapest volume filter, applied after busy acquire).
+            //    nginx levels are inverted: 1=emerg .. 8=debug.
+            //    `level > level_floor` ⇒ less severe than configured threshold ⇒ drop.
+            if level > (*state).level_floor {
                 return;
             }
-            CoalesceResult::EmitVerbatim { template_hash } => {
-                // Push the verbatim sample to the error ring.
-                // error_ring_ptr is null until init_process — skip silently.
-                let ring_ptr = (*state).error_ring_ptr;
-                if !ring_ptr.is_null() {
-                    // OTel timestamps are Unix-epoch nanoseconds. Use nginx's cached
-                    // WALL-CLOCK (`ngx_cached_time`), NOT `ngx_current_msec`: the latter
-                    // is monotonic (boot-relative), so an OTLP backend with a freshness
-                    // window (e.g. Loki rejects entries older than ~1 week) reads it as
-                    // 1970 and 400s the whole batch — silently dropping good records
-                    // alongside it. Mirrors the access path (instrumented.rs: start_sec).
-                    // SAFETY: ngx_cached_time is a valid nginx global pointing at the
-                    // cached `ngx_time_t`; reading it is signal-safe (cached globals, no
-                    // syscall) — same profile as the previous ngx_current_msec read.
-                    let ts_ns = cached_unix_nanos(nginx_sys::ngx_cached_time);
-                    push_error_record(ring_ptr, ts_ns, level as u8, template_hash, buf_slice);
+
+            // 4. Process-role guard.
+            //    The writer fires in EVERY nginx context (master, config-load, workers,
+            //    exporter helper) because the chain node is inserted before fork.  Only
+            //    worker processes have the logs shm mapped AND should touch the ring/coalescer.
+            //    For all other contexts we return here; the core file node handles the write.
+            //
+            //    Predicate: Worker(_) AND logs_zone mapped (non-null).
+            //    The exporter is NGX_PROCESS_HELPER + IS_OTEL_EXPORTER — NOT Worker — so it
+            //    is excluded even though it also maps the logs shm.  A shm-presence check
+            //    alone would NOT exclude it.
+            if !matches!(crate::exporter::ngx_process(), crate::exporter::NgxProcess::Worker(_))
+                || (*state).logs_zone.is_null()
+            {
+                return;
+            }
+
+            // 4a. Companion error-rate metric bump.
+            //     Fires for EVERY floor-passing event, independent of coalescing — counts
+            //     the true event volume, not just the verbatim samples.
+            //     error_rate_ptr is null until init_process; no-op until then.
+            let error_rate = (*state).error_rate_ptr;
+            if !error_rate.is_null() {
+                let idx = crate::shm::severity_class_index(level as u8);
+                // Relaxed: no ordering needed with respect to the ring push; the exporter
+                // reads this counter independently with Acquire.
+                (*error_rate.add(idx)).fetch_add(1, Ordering::Relaxed);
+            }
+
+            // 5. Coalescer: exact-hash dedup with verbatim exception tail.
+            //    coalesce_table is null until init_process populates it.
+            //    When null, fall through (no record pushed).
+            let coalesce_table = (*state).coalesce_table;
+            if !coalesce_table.is_null() {
+                // SAFETY: buf is valid for `len` bytes per ngx_log_error_core contract.
+                let buf_slice = core::slice::from_raw_parts(buf as *const u8, len);
+                match coalesce::coalesce(
+                    coalesce_table,
+                    level as u8,
+                    buf_slice,
+                    (*state).coalesce_enabled,
+                ) {
+                    CoalesceResult::Coalesced => {
+                        // Duplicate suppressed. The coalescer already bumped the count.
+                    }
+                    CoalesceResult::EmitVerbatim { template_hash } => {
+                        // Push the verbatim sample to the error ring.
+                        // error_ring_ptr is null until init_process — skip silently.
+                        let ring_ptr = (*state).error_ring_ptr;
+                        if !ring_ptr.is_null() {
+                            // OTel timestamps are Unix-epoch nanoseconds. Use nginx's cached
+                            // WALL-CLOCK (`ngx_cached_time`), NOT `ngx_current_msec`: the latter
+                            // is monotonic (boot-relative), so an OTLP backend with a freshness
+                            // window (e.g. Loki rejects entries older than ~1 week) reads it as
+                            // 1970 and 400s the whole batch — silently dropping good records
+                            // alongside it. Mirrors the access path (instrumented.rs: start_sec).
+                            // SAFETY: ngx_cached_time is a valid nginx global pointing at the
+                            // cached `ngx_time_t`; reading it is signal-safe (cached globals, no
+                            // syscall) — same profile as the previous ngx_current_msec read.
+                            let ts_ns = cached_unix_nanos(nginx_sys::ngx_cached_time);
+                            push_error_record(
+                                ring_ptr,
+                                ts_ns,
+                                level as u8,
+                                template_hash,
+                                buf_slice,
+                            );
+                        }
+                    }
                 }
             }
-        }
-    }
-
-    (*state).busy.store(false, Ordering::Release);
+        } // end unsafe
+    })); // end catch_unwind; `_guard` drops here, releasing `busy`
 }
 
 /// Unix-epoch nanoseconds from nginx's cached wall-clock (`ngx_time_t`).
@@ -616,6 +690,97 @@ mod tests {
 
         // The writer passed the floor and released busy normally.
         assert!(!state.busy.load(Ordering::SeqCst), "busy must be released after pass-through");
+    }
+
+    /// Regression: a caught panic inside the writer body MUST NOT leave `busy` stuck.
+    ///
+    /// Without the `BusyGuard` + `catch_unwind` fix, a panic unwinds across the
+    /// `extern "C"` boundary (UB per Rust Reference "Unwinding") and leaves `busy`
+    /// permanently set, silencing all future error-log emissions from this worker.
+    ///
+    /// This test verifies the fix by mirroring the exact pattern used in
+    /// `ngx_otel_error_writer`:
+    ///   1. Acquire `busy` via `swap(true, Acquire)`.
+    ///   2. Create a `BusyGuard` (as the writer does) in the OUTER scope.
+    ///   3. Run a panicking closure under `catch_unwind(AssertUnwindSafe(...))`.
+    ///   4. The closure panics; `catch_unwind` returns `Err` — NO unwind escapes.
+    ///   5. The guard drops at the end of the function scope, clearing `busy`.
+    ///   6. Assert `busy` is `false` AFTER the explicit `drop(guard)`.
+    ///
+    /// The guard does not need to live inside the closure: it lives in the same
+    /// function scope that continues after `catch_unwind` returns, so it runs
+    /// regardless of whether the closure panicked.  Without the guard (pre-fix),
+    /// a panic that propagated through the FFI boundary would leave `busy` stuck —
+    /// see `busy_stuck_without_guard_on_panic` for the pre-fix evidence.
+    #[test]
+    fn busy_guard_releases_on_panic() {
+        use core::sync::atomic::{AtomicBool, Ordering};
+        use std::panic::{self, AssertUnwindSafe};
+
+        let busy = AtomicBool::new(false);
+
+        // Acquire busy (as the writer does).
+        let was_busy = busy.swap(true, Ordering::Acquire);
+        assert!(!was_busy, "precondition: busy was free");
+
+        // Create the RAII guard pointing at `busy` in the outer scope — same
+        // pattern as `ngx_otel_error_writer`.
+        // SAFETY: `busy` is a local `AtomicBool` that outlives this block;
+        // the pointer is valid for the duration of the test.
+        let guard = super::BusyGuard(core::ptr::addr_of!(busy) as *mut AtomicBool);
+
+        // Run a panicking closure.  The closure panics; catch_unwind catches it.
+        // `busy` is still true here because the guard lives in the outer scope.
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            panic!("simulated writer panic");
+        }));
+
+        // The panic was caught — no unwind escaped the function boundary.
+        assert!(result.is_err(), "catch_unwind must catch the panic");
+
+        // `busy` is STILL true here: the guard hasn't dropped yet.
+        assert!(busy.load(Ordering::Acquire), "busy must still be set before the guard drops");
+
+        // Explicitly drop the guard (mirrors the end of `ngx_otel_error_writer`).
+        drop(guard);
+
+        // Now `busy` must be false: the guard's Drop impl cleared it.
+        assert!(
+            !busy.load(Ordering::Acquire),
+            "busy must be released by BusyGuard drop even after a caught panic"
+        );
+    }
+
+    /// Demonstrates the pre-fix failure mode: WITHOUT a guard, a panic leaves `busy`
+    /// permanently set.
+    ///
+    /// This test deliberately reproduces the bug to serve as mutation evidence:
+    /// if the `BusyGuard` is removed from `ngx_otel_error_writer`, the writer
+    /// wedges after any internal panic.
+    #[test]
+    fn busy_stuck_without_guard_on_panic() {
+        use core::sync::atomic::{AtomicBool, Ordering};
+        use std::panic::{self, AssertUnwindSafe};
+
+        let busy = AtomicBool::new(false);
+        busy.swap(true, Ordering::Acquire);
+
+        // Simulate the PRE-FIX pattern: no guard, manual clear only on normal path.
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            panic!("simulated writer panic");
+            // Without a guard, this line is never reached:
+            #[allow(unreachable_code)]
+            busy.store(false, Ordering::Release);
+        }));
+
+        assert!(result.is_err(), "catch_unwind must catch the panic");
+
+        // `busy` is still true: the manual clear was bypassed by the panic.
+        // This is the bug the BusyGuard fixes.
+        assert!(
+            busy.load(Ordering::Acquire),
+            "pre-fix: busy remains stuck when the manual store is bypassed by a panic"
+        );
     }
 
     /// Verify `parse_error_log_level` maps all nginx level names correctly.

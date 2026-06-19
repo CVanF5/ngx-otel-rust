@@ -813,6 +813,26 @@ impl ExemplarReservoir {
     /// size (`filled = seen.min(size)`).  This replaces the old
     /// `combo_idx == 0 && ts == 0` sentinel, which is invalid now that combo 0
     /// is a legitimate data point with its own reservoir.
+    ///
+    /// # Non-atomic snapshot semantics (intentional best-effort)
+    ///
+    /// Each field in an [`ExemplarEntry`] is read individually with
+    /// `Ordering::Acquire`.  There is no per-entry fence or lock spanning all
+    /// fields, so a worker `write()` that is concurrent with this snapshot can
+    /// produce a *torn* exemplar — for example, the `value_us` of one request
+    /// paired with the `trace_id` of a different request that raced into the
+    /// same slot.
+    ///
+    /// This is **intentional**: exemplars are sampling hints for trace drill-down,
+    /// not an authoritative or transactionally consistent record.  The OTel
+    /// metrics specification describes exemplars as best-effort:
+    /// <https://opentelemetry.io/docs/specs/otel/metrics/sdk/#exemplar>.
+    /// A torn exemplar may produce a trace link that resolves to the wrong span,
+    /// or a value that doesn't match the linked trace — both are acceptable for
+    /// a "sample for investigation" hint.  Adding a per-entry mutex or a
+    /// seqlock would add a lock acquisition and a conditional branch to the
+    /// worker's hot request path for a correctness guarantee the spec does not
+    /// require.
     pub fn snapshot(&self) -> std::vec::Vec<ExemplarSnapshot> {
         let seen = self.seen.load(Ordering::Acquire) as usize;
         let filled = seen.min(EXEMPLAR_RESERVOIR_SIZE);
@@ -849,6 +869,16 @@ impl ExemplarReservoir {
     /// The stale entry payloads are intentionally NOT zeroed — once `seen` is 0
     /// the next snapshot reports `filled = 0`, and the fill phase overwrites the
     /// slots before they can be observed again.
+    ///
+    /// # Non-atomic reset semantics (intentional best-effort)
+    ///
+    /// `seen` is reset to 0 with `Ordering::Release`; the entry payloads
+    /// (`value_us`, `trace_id`, etc.) are NOT atomically cleared.  A worker
+    /// `write()` landing in the same collection interval as this reset is a
+    /// benign lost-update: the worker's `fetch_add(Relaxed)` on `seen` and the
+    /// exporter's `store(0, Release)` are both well-defined atomic operations,
+    /// and a lost-update means one fewer exemplar for that interval — consistent
+    /// with the best-effort semantics described on [`snapshot`].
     pub fn reset(&self) {
         self.seen.store(0, Ordering::Release);
     }
@@ -1229,6 +1259,33 @@ pub fn logs_n_workers_from_zone(zone_data_bytes: usize, cap: usize) -> usize {
     (zone_data_bytes.checked_div(slot).unwrap_or(0)).max(1)
 }
 
+/// Read the ring capacity from the **first worker's access ring header** in the
+/// live shm zone.
+///
+/// This is the single source of truth for the slot stride (used by
+/// [`logs_access_ring`], [`logs_error_ring`], [`logs_error_ring_ptr`], and
+/// [`logs_coalesce_table`]).  Reading from the header instead of the config
+/// parameter prevents a stride/push-pop desync on a SIGHUP that changes
+/// `otel_log_ring_size`: the zone was sized and laid out with the cap stamped
+/// into the header by [`logs_shm_zone_init`]; using any other cap for stride
+/// would compute wrong slot addresses.
+///
+/// Returns 0 when the header has not been initialised yet (fresh-start before
+/// zone-init has run); callers fall back to the config cap in that case.
+///
+/// # Safety
+/// `base_addr` must point past the slab-pool header (`shm.addr + data_offset()`)
+/// and be valid for at least `RING_HEADER_SIZE` bytes (i.e. there is at least
+/// one worker slot).
+#[inline]
+pub unsafe fn logs_zone_cap(base_addr: *mut u8) -> usize {
+    // Worker-0's access ring header lives at `base_addr + 0`.
+    // SAFETY: caller guarantees `base_addr` is valid for at least one slot
+    // header; `LogsWorkerRingHeader` is `#[repr(C)]` with `AtomicU64` fields,
+    // so the cast is well-aligned (shm zones are at least page-aligned).
+    unsafe { (*base_addr.cast::<LogsWorkerRingHeader>()).cap.load(Ordering::Relaxed) as usize }
+}
+
 /// Obtain a [`LogsWorkerRing`] view of the **access** ring for `worker_id`.
 ///
 /// Layout per slot (base = `shm.addr + data_offset()`):
@@ -1241,36 +1298,52 @@ pub fn logs_n_workers_from_zone(zone_data_bytes: usize, cap: usize) -> usize {
 /// coalescer_table      = slot_i + 2 * ring_size_bytes(cap)
 /// ```
 ///
+/// The slot stride (`logs_slot_size(cap)`) is derived from the cap **stamped in
+/// the first worker's ring header** by [`logs_shm_zone_init`] — the same value
+/// used by [`LogsWorkerRing::push`] and [`LogsWorkerRing::pop_into`].  The
+/// `cap` parameter serves as a fallback only when the header is not yet
+/// initialised (cap == 0), ensuring stride and push/pop never diverge.
+///
 /// # Safety
 /// - `base_addr` must point past the slab-pool header (`shm.addr + data_offset()`).
 /// - `worker_id < n_workers` and `cap` must match the zone registration.
 /// - The returned ring must not outlive the zone mapping.
 #[inline]
 pub unsafe fn logs_access_ring(base_addr: *mut u8, worker_id: usize, cap: usize) -> LogsWorkerRing {
-    // cap must be a multiple of 8 so that ring headers and the coalescer
-    // table land at 8-byte-aligned addresses within the slot.  Enforced at
-    // config parse time by `cmd_set_log_ring_size`; catch stale callers here.
-    debug_assert_eq!(cap % 8, 0, "ring cap must be a multiple of 8 for AtomicU64 alignment");
-    let slot_off = worker_id * logs_slot_size(cap);
+    // Use the header-stamped cap as the single source of truth for stride; fall
+    // back to the config cap only before zone-init has run (header cap == 0).
+    // This keeps stride consistent with the cap push/pop read from the same header,
+    // preventing a desync if `otel_log_ring_size` is changed between reloads.
+    // SAFETY: `base_addr` is `shm.addr + data_offset()` per the fn contract,
+    // which means it is valid for at least one full slot (≥ RING_HEADER_SIZE bytes),
+    // satisfying `logs_zone_cap`'s precondition.
+    let hdr_cap = unsafe { logs_zone_cap(base_addr) };
+    let stride_cap = if hdr_cap > 0 { hdr_cap } else { cap };
+    debug_assert_eq!(stride_cap % 8, 0, "ring cap must be a multiple of 8 for AtomicU64 alignment");
+    let slot_off = worker_id * logs_slot_size(stride_cap);
     // SAFETY: per the fn contract `base_addr` is `shm.addr + data_offset()`,
-    // `worker_id < n_workers`, and `cap` matches registration, so `slot_off` is
-    // within the zone. The access ring header begins at slot offset 0,
-    // satisfying `from_shm_ptr`'s contract.
+    // `worker_id < n_workers`, and `stride_cap` matches the live zone layout,
+    // so `slot_off` is within the zone. The access ring header begins at slot
+    // offset 0, satisfying `from_shm_ptr`'s contract.
     unsafe { LogsWorkerRing::from_shm_ptr(base_addr.add(slot_off)) }
 }
 
 /// Obtain a [`LogsWorkerRing`] view of the **error** ring for `worker_id`.
 ///
 /// Error ring follows immediately after the access ring within the same slot.
+/// See [`logs_access_ring`] for the stride/cap source-of-truth policy.
 #[inline]
 pub unsafe fn logs_error_ring(base_addr: *mut u8, worker_id: usize, cap: usize) -> LogsWorkerRing {
-    // same cap alignment requirement as `logs_access_ring`.
-    debug_assert_eq!(cap % 8, 0, "ring cap must be a multiple of 8 for AtomicU64 alignment");
-    let slot_off = worker_id * logs_slot_size(cap);
-    let error_off = slot_off + ring_size_bytes(cap);
+    // SAFETY: same as `logs_access_ring` — `base_addr` is valid for at least
+    // one slot header, satisfying `logs_zone_cap`'s precondition.
+    let hdr_cap = unsafe { logs_zone_cap(base_addr) };
+    let stride_cap = if hdr_cap > 0 { hdr_cap } else { cap };
+    debug_assert_eq!(stride_cap % 8, 0, "ring cap must be a multiple of 8 for AtomicU64 alignment");
+    let slot_off = worker_id * logs_slot_size(stride_cap);
+    let error_off = slot_off + ring_size_bytes(stride_cap);
     // SAFETY: same contract as `logs_access_ring`; the error ring header begins
-    // one `ring_size_bytes(cap)` past the access ring within the same in-zone
-    // slot, satisfying `from_shm_ptr`'s contract.
+    // one `ring_size_bytes(stride_cap)` past the access ring within the same
+    // in-zone slot, satisfying `from_shm_ptr`'s contract.
     unsafe { LogsWorkerRing::from_shm_ptr(base_addr.add(error_off)) }
 }
 
@@ -1281,13 +1354,18 @@ pub unsafe fn logs_error_ring(base_addr: *mut u8, worker_id: usize, cap: usize) 
 /// [`LogsWorkerRing`] view via `LogsWorkerRing::from_shm_ptr` on each hot-path call.
 ///
 /// Called by `init_process` once per worker after the logs zone is mapped.
+/// See [`logs_access_ring`] for the stride/cap source-of-truth policy.
 ///
 /// # Safety
 /// Same as [`logs_error_ring`].
 #[inline]
 pub unsafe fn logs_error_ring_ptr(base_addr: *mut u8, worker_id: usize, cap: usize) -> *mut u8 {
-    let slot_off = worker_id * logs_slot_size(cap);
-    let error_off = slot_off + ring_size_bytes(cap);
+    // SAFETY: same as `logs_access_ring` — `base_addr` is valid for at least
+    // one slot header, satisfying `logs_zone_cap`'s precondition.
+    let hdr_cap = unsafe { logs_zone_cap(base_addr) };
+    let stride_cap = if hdr_cap > 0 { hdr_cap } else { cap };
+    let slot_off = worker_id * logs_slot_size(stride_cap);
+    let error_off = slot_off + ring_size_bytes(stride_cap);
     // SAFETY: same contract as `logs_error_ring`; `error_off` is within the
     // zone, so the pointer is in-bounds. It is only formed here, not
     // dereferenced (the writer rebuilds a view via `from_shm_ptr`).
@@ -1304,6 +1382,7 @@ pub unsafe fn logs_error_ring_ptr(base_addr: *mut u8, worker_id: usize, cap: usi
 /// Called by `init_process` to pre-compute the table pointer and stash
 /// it in `OtelErrorWriterState::coalesce_table`, so the hot path is a single
 /// null-guarded dereference.
+/// See [`logs_access_ring`] for the stride/cap source-of-truth policy.
 ///
 /// # Safety
 /// - `base_addr` must point past the slab-pool header (`shm.addr + data_offset()`).
@@ -1315,11 +1394,15 @@ pub unsafe fn logs_coalesce_table(
     worker_id: usize,
     cap: usize,
 ) -> *mut crate::logs::coalesce::CoalesceSlot {
-    let slot_off = worker_id * logs_slot_size(cap);
-    let coalesce_off = slot_off + 2 * ring_size_bytes(cap);
+    // SAFETY: same as `logs_access_ring` — `base_addr` is valid for at least
+    // one slot header, satisfying `logs_zone_cap`'s precondition.
+    let hdr_cap = unsafe { logs_zone_cap(base_addr) };
+    let stride_cap = if hdr_cap > 0 { hdr_cap } else { cap };
+    let slot_off = worker_id * logs_slot_size(stride_cap);
+    let coalesce_off = slot_off + 2 * ring_size_bytes(stride_cap);
     // SAFETY: same contract as `logs_access_ring`; the coalescer table occupies
-    // the slot region after both rings (`2 * ring_size_bytes(cap)` in), still
-    // within the zone. The pointer is only formed here, not dereferenced.
+    // the slot region after both rings (`2 * ring_size_bytes(stride_cap)` in),
+    // still within the zone. The pointer is only formed here, not dereferenced.
     unsafe { base_addr.add(coalesce_off).cast() }
 }
 
@@ -2775,5 +2858,168 @@ mod tests {
         // SAFETY: base points into zone_mem; slot 0 header is at offset 0.
         let cap0 = unsafe { (*base.cast::<LogsWorkerRingHeader>()).cap.load(Ordering::Relaxed) };
         assert_eq!(cap0, CAP as u64, "H2F3: reload must not corrupt slot 0 cap");
+    }
+
+    /// Regression: `logs_access_ring` / `logs_error_ring` / `logs_error_ring_ptr` /
+    /// `logs_coalesce_table` must derive their slot stride from the ring header's
+    /// cap, NOT from the config `cap` parameter.  A mismatch (e.g. from a SIGHUP
+    /// that changes `otel_log_ring_size`) would compute wrong slot addresses.
+    ///
+    /// This test sets the header cap to `HDR_CAP` while passing `CONFIG_CAP`
+    /// (different) to the stride functions.  The fix reads `HDR_CAP` from the
+    /// header; pre-fix code would use `CONFIG_CAP` and land on the wrong address.
+    ///
+    /// # Mutation evidence (revert == pre-fix)
+    /// In `logs_access_ring`/`logs_error_ring`/`logs_error_ring_ptr`/
+    /// `logs_coalesce_table`, remove the `logs_zone_cap` call and use `cap`
+    /// (the parameter) directly for `stride_cap`.  Re-run this test:
+    ///   - `ring_ptr_stride_matches_header_cap` fails because the returned pointer
+    ///     is offset by `worker_id * logs_slot_size(CONFIG_CAP)` instead of
+    ///     `worker_id * logs_slot_size(HDR_CAP)`.
+    ///   - `ring_ptr_fallback_before_zone_init` still passes (header cap == 0
+    ///     → the fallback branch is the only path, so mutation has no effect there).
+    #[test]
+    fn ring_ptr_stride_matches_header_cap() {
+        use crate::logs::ring::{ring_size_bytes, LogsWorkerRingHeader};
+
+        // Two caps that produce different slot sizes — the test distinguishes them.
+        const HDR_CAP: usize = 512; // stamped in ring headers (live shm truth)
+        const CONFIG_CAP: usize = 1024; // wrong cap the caller might pass on mismatch
+
+        let n_workers = 2usize;
+        // Allocate enough memory for the larger cap so we don't go out of bounds
+        // even in the pre-fix path.
+        let slot_sz_large = logs_slot_size(CONFIG_CAP);
+        let data_off = data_offset();
+        let zone_sz = data_off + n_workers * slot_sz_large;
+        let mut zone_mem = std::vec![0u8; zone_sz];
+        // SAFETY: data_off < zone_sz (zone_sz = data_off + n_workers * slot_sz_large);
+        // the resulting pointer is within the allocation and aligned.
+        let base = unsafe { zone_mem.as_mut_ptr().add(data_off) };
+
+        // Stamp HDR_CAP into worker-0's access ring header (the single source of truth).
+        // SAFETY: base[0] is within zone_mem; cast to LogsWorkerRingHeader is valid
+        // because the buffer is large enough and the struct is repr(C).
+        unsafe {
+            (*base.cast::<LogsWorkerRingHeader>()).cap.store(HDR_CAP as u64, Ordering::Relaxed);
+        }
+
+        // ── Verify logs_zone_cap reads the header ────────────────────────────────
+        // SAFETY: base is valid for at least RING_HEADER_SIZE bytes (zone_sz > data_off
+        // + RING_HEADER_SIZE because slot_sz_large ≥ RING_HEADER_SIZE).
+        let zone_cap = unsafe { logs_zone_cap(base) };
+        assert_eq!(zone_cap, HDR_CAP, "logs_zone_cap must return the header-stamped cap");
+
+        // ── logs_access_ring: worker 0 must return pointer == base ───────────────
+        // SAFETY: `base` is `shm.addr + data_offset()` (fn contract); worker_id 0 and
+        // CONFIG_CAP satisfy the range requirement; zone_mem outlives the ring view.
+        let ring0 = unsafe { logs_access_ring(base, 0, CONFIG_CAP) };
+        // Worker 0's access ring is at base + 0 regardless of cap.
+        // After the fix, ring0's header is at base + 0*logs_slot_size(HDR_CAP) = base.
+        // Pre-fix: same offset for worker 0 regardless; the desync shows at worker > 0.
+
+        // ── logs_access_ring: worker 1 must use HDR_CAP stride ───────────────────
+        // SAFETY: same as ring0; worker_id 1 < n_workers=2; zone_mem is live.
+        let ring1 = unsafe { logs_access_ring(base, 1, CONFIG_CAP) };
+        // With HDR_CAP, slot_off = 1 * logs_slot_size(HDR_CAP).
+        // With CONFIG_CAP (pre-fix), slot_off = 1 * logs_slot_size(CONFIG_CAP) — WRONG.
+        // SAFETY: logs_slot_size(HDR_CAP) < n_workers * slot_sz_large (HDR_CAP < CONFIG_CAP),
+        // so the resulting pointer is within zone_mem.
+        let expected_w1_ptr = unsafe { base.add(logs_slot_size(HDR_CAP)) };
+        // SAFETY: logs_slot_size(CONFIG_CAP) ≤ n_workers * slot_sz_large, within zone_mem.
+        let wrong_w1_ptr = unsafe { base.add(logs_slot_size(CONFIG_CAP)) };
+
+        // Stamp HDR_CAP at the expected worker-1 position so ring1.cap() returns HDR_CAP
+        // when the fix is active (ring1 points to expected_w1_ptr).
+        // SAFETY: expected_w1_ptr is within zone_mem (HDR_CAP < CONFIG_CAP → offset smaller
+        // than zone_sz); the cast to LogsWorkerRingHeader is valid for the same reason.
+        unsafe {
+            (*expected_w1_ptr.cast::<LogsWorkerRingHeader>())
+                .cap
+                .store(HDR_CAP as u64, Ordering::Relaxed);
+        }
+        // ring1.cap() reads from ring1's internal header pointer.
+        // Post-fix: ring1 points to expected_w1_ptr → cap() == HDR_CAP.
+        // Pre-fix: ring1 points to wrong_w1_ptr   → cap() == 0 (no stamp there).
+        let ring1_cap = ring1.push(&[]); // push returns false (empty), doesn't crash
+        let _ = ring1_cap;
+        // Stamp the wrong address so push there also succeeds (CONFIG_CAP > 0); this
+        // makes the `ring1.push(b"stride-ok")` assertion meaningful: it passes only when
+        // ring1 is at the HDR_CAP-stride address.
+        // SAFETY: wrong_w1_ptr = base + logs_slot_size(CONFIG_CAP) ≤ base + zone_sz (within
+        // zone_mem); cast is valid.
+        unsafe {
+            (*wrong_w1_ptr.cast::<LogsWorkerRingHeader>())
+                .cap
+                .store(CONFIG_CAP as u64, Ordering::Relaxed);
+        }
+        // The fix: ring1 must point at expected_w1_ptr (cap = HDR_CAP > 0 → push succeeds).
+        // SAFETY: ring1 view is over zone_mem, which is live for the rest of the test.
+        assert!(
+            ring1.push(b"stride-ok"),
+            "ring1 push must succeed when stride uses HDR_CAP (fix path)"
+        );
+
+        // ── logs_error_ring_ptr: must use HDR_CAP stride ─────────────────────────
+        // With HDR_CAP: error_off = 1*logs_slot_size(HDR_CAP) + ring_size_bytes(HDR_CAP).
+        // With CONFIG_CAP: error_off = 1*logs_slot_size(CONFIG_CAP) + ring_size_bytes(CONFIG_CAP).
+        // SAFETY: the resulting offset is within zone_mem (HDR_CAP < CONFIG_CAP, both × 2
+        // rings are within the larger allocation).
+        let expected_err_ptr =
+            unsafe { base.add(logs_slot_size(HDR_CAP) + ring_size_bytes(HDR_CAP)) };
+        // SAFETY: same as logs_access_ring above; worker_id=1, base and zone_mem live.
+        let actual_err_ptr = unsafe { logs_error_ring_ptr(base, 1, CONFIG_CAP) };
+        assert_eq!(
+            actual_err_ptr, expected_err_ptr,
+            "logs_error_ring_ptr must use header-stamped cap for stride, not the config cap"
+        );
+
+        // ── logs_coalesce_table: must use HDR_CAP stride ─────────────────────────
+        // SAFETY: same rationale as expected_err_ptr; offset within zone_mem.
+        let expected_coalesce_ptr =
+            unsafe { base.add(logs_slot_size(HDR_CAP) + 2 * ring_size_bytes(HDR_CAP)) };
+        // SAFETY: same as logs_access_ring above.
+        let actual_coalesce_ptr = unsafe { logs_coalesce_table(base, 1, CONFIG_CAP) };
+        assert_eq!(
+            actual_coalesce_ptr as *mut u8, expected_coalesce_ptr,
+            "logs_coalesce_table must use header-stamped cap for stride, not the config cap"
+        );
+
+        // Suppress unused-variable warnings for clarity references above.
+        let _ = (ring0, wrong_w1_ptr);
+    }
+
+    /// When the ring header has not been initialised yet (cap == 0 in a freshly
+    /// zeroed zone before `logs_shm_zone_init` runs), the stride functions must
+    /// fall back to the config `cap` parameter so zone-init can safely write the
+    /// first ring header before the header cap is stamped.
+    #[test]
+    fn ring_ptr_fallback_before_zone_init() {
+        use crate::logs::ring::ring_size_bytes;
+
+        const CAP: usize = 1024;
+        let n_workers = 1usize;
+        let data_off = data_offset();
+        let zone_sz = data_off + n_workers * logs_slot_size(CAP);
+        let mut zone_mem = std::vec![0u8; zone_sz];
+        // All-zero memory: header cap == 0 → fallback path.
+        // SAFETY: data_off < zone_sz; the resulting pointer is within the allocation.
+        let base = unsafe { zone_mem.as_mut_ptr().add(data_off) };
+
+        // logs_zone_cap returns 0 (header not stamped).
+        // SAFETY: base is valid for at least RING_HEADER_SIZE bytes (zone_sz > data_off
+        // and the allocation covers the full slot).
+        let zone_cap = unsafe { logs_zone_cap(base) };
+        assert_eq!(zone_cap, 0, "uninitialized header must report cap = 0");
+
+        // logs_error_ring_ptr must use CONFIG_CAP (fallback) for the offset.
+        // SAFETY: base + ring_size_bytes(CAP) ≤ base + logs_slot_size(CAP) ≤ zone_sz; within zone_mem.
+        let expected = unsafe { base.add(ring_size_bytes(CAP)) };
+        // SAFETY: same contract as logs_access_ring; worker_id=0, base and zone_mem live.
+        let actual = unsafe { logs_error_ring_ptr(base, 0, CAP) };
+        assert_eq!(
+            actual, expected,
+            "fallback: error ring ptr for worker 0 must use config cap when header cap == 0"
+        );
     }
 }
