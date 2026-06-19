@@ -125,6 +125,38 @@ pub struct ControlShm {
 impl ControlShm {
     /// Zone size: one OS page. Generous overhead for forward-compatible growth.
     pub const ZONE_SIZE: usize = 4096;
+
+    /// Byte extent past `data_offset()` written by the SIGHUP-reload branch of
+    /// [`control_shm_zone_init`], which stores `crash_count` (struct offset 16)
+    /// and `window_start_unix` (offset 24).  The accessed range is therefore
+    /// `[offset, offset + RELOAD_WRITE_EXTENT)`; the reload guard checks the
+    /// FULL extent so a smaller-than-expected zone cannot produce an OOB store.
+    pub const RELOAD_WRITE_EXTENT: usize = 32;
+
+    /// Announce a reload successor: bump `successor_gen` (Release) so the old
+    /// exporter abdicates and the about-to-be-forked new exporter snapshots the
+    /// new value.  Called by the master in `ngx_otel_init_module` BEFORE
+    /// `ngx_spawn_process` — the fork is the happens-before edge for the
+    /// child's snapshot.  Master is the sole writer of this field.
+    pub fn announce_successor(&self) {
+        self.successor_gen.fetch_add(1, Ordering::Release);
+    }
+
+    /// Roll back a successor announcement after a FAILED reload-spawn.
+    ///
+    /// If `ngx_spawn_process` returns `NGX_INVALID_PID` (RLIMIT_NPROC / ENOMEM)
+    /// no successor exists, so the old exporter must remain the sole live
+    /// consumer and keep draining the rings.  Leaving `successor_gen` bumped
+    /// would make the old exporter observe `current > my_gen` and latch
+    /// `periodic_abdicated = true` permanently (stopping log/span ring pops →
+    /// permanent telemetry loss).  Restores the counter to its pre-reload value
+    /// (master is the sole writer, so [`announce_successor`] + this call form an
+    /// exact round-trip).
+    ///
+    /// [`announce_successor`]: Self::announce_successor
+    pub fn rollback_successor(&self) {
+        self.successor_gen.fetch_sub(1, Ordering::Release);
+    }
 }
 
 /// Zone initialisation callback, called by nginx on each (re)start.
@@ -165,11 +197,19 @@ pub unsafe extern "C" fn control_shm_zone_init(
         // the same zone is re-mapped on reload, so `shm.addr` is the live mapping.
         let zone = unsafe { &*shm_zone };
         let offset = crate::shm::data_offset();
-        if zone.shm.size > offset {
+        // This branch dereferences `ControlShm` to write `crash_count`
+        // (struct offset 16) and `window_start_unix` (offset 24), so the
+        // accessed extent is `[offset, offset + 32)`.  Guard the FULL write
+        // extent, not merely `size > offset`: with a smaller-than-expected
+        // zone the latter would pass and the stores would write out of bounds.
+        // Today `ZONE_SIZE == 4096` masks this, but the bound is made exact so
+        // it cannot regress if the zone is ever resized.
+        if zone.shm.size >= offset + ControlShm::RELOAD_WRITE_EXTENT {
             // SAFETY: `offset == data_offset()` past the slab-pool header;
-            // `zone.shm.size > offset` was checked above. The cast is valid
-            // because the zone has at least `data_offset() + sizeof(ControlShm)`
-            // bytes (enforced by the `zone_size_fits_struct` unit test).
+            // `zone.shm.size >= offset + RELOAD_WRITE_EXTENT` was checked above,
+            // so the two stores stay in-bounds. The cast is valid because the
+            // zone has at least `data_offset() + sizeof(ControlShm)` bytes
+            // (enforced by the `zone_size_fits_struct` unit test).
             let ctrl = unsafe { &*zone.shm.addr.cast::<u8>().add(offset).cast::<ControlShm>() };
             ctrl.crash_count.store(0, Ordering::Relaxed);
             ctrl.window_start_unix.store(0, Ordering::Relaxed);
@@ -328,6 +368,83 @@ mod tests {
         let shutdown_gen: u64 = ctrl.successor_gen.load(Ordering::Relaxed);
         let current3 = ctrl.successor_gen.load(Ordering::Relaxed);
         assert!(current3 <= shutdown_gen, "no successor on pure shutdown");
+    }
+
+    /// Regression: a FAILED reload-spawn must NOT leave the old exporter
+    /// abdicating forever.
+    ///
+    /// On SIGHUP the master increments `successor_gen` BEFORE forking the new
+    /// exporter (the fork is the happens-before edge for the child's snapshot).
+    /// If the fork fails (NGX_INVALID_PID from RLIMIT_NPROC / ENOMEM) no
+    /// successor exists, yet the old exporter — still the sole live consumer —
+    /// would observe `current > my_gen`, latch `periodic_abdicated = true`, and
+    /// stop popping the log/span rings forever (permanent telemetry loss).
+    /// `ngx_otel_init_module` rolls the increment back on the spawn-error path;
+    /// this test models the announce → failed-spawn → rollback round-trip and
+    /// asserts the old exporter does NOT abdicate afterwards.
+    #[test]
+    fn failed_reload_spawn_rolls_back_successor_gen() {
+        let buf = std::vec![0u8; mem::size_of::<ControlShm>()];
+        // SAFETY: zero-initialised buffer of exactly the right size.
+        let ctrl = unsafe { &*buf.as_ptr().cast::<ControlShm>() };
+
+        // Old exporter snapshot at its startup.
+        let old_my_gen: u64 = ctrl.successor_gen.load(Ordering::Acquire);
+
+        // Master announces the successor before forking (matches
+        // `ngx_otel_init_module`; same production helper).
+        ctrl.announce_successor();
+        assert!(
+            ctrl.successor_gen.load(Ordering::Acquire) > old_my_gen,
+            "during a reload-in-progress the announcement is visible"
+        );
+
+        // Fork fails → roll back (the spawn-error path in `ngx_otel_init_module`;
+        // same production helper).
+        ctrl.rollback_successor();
+
+        // The old exporter's abdication decision is `current > my_gen`.  After
+        // rollback the counter is back to its pre-reload value, so the old
+        // exporter stays the sole consumer and keeps draining the rings.
+        let current = ctrl.successor_gen.load(Ordering::Acquire);
+        assert_eq!(
+            current, old_my_gen,
+            "rollback must restore successor_gen to its pre-reload value"
+        );
+        // The old exporter abdicates iff `current > my_gen`; after rollback it
+        // must not (the `<=` is that decision, negated).
+        assert!(
+            current <= old_my_gen,
+            "after a failed-spawn rollback the old exporter must NOT abdicate"
+        );
+    }
+
+    /// Regression: the reload-branch bound (`RELOAD_WRITE_EXTENT`) must cover
+    /// the FULL byte extent the branch writes.
+    ///
+    /// The reload branch of `control_shm_zone_init` stores `crash_count` and
+    /// `window_start_unix`; its guard must require
+    /// `size >= offset + RELOAD_WRITE_EXTENT`, not merely `size > offset`,
+    /// otherwise a smaller-than-expected zone would pass the guard yet store
+    /// out of bounds.  Pin the constant to the actual max-written field extent.
+    #[test]
+    fn reload_write_extent_covers_written_fields() {
+        let crash_end = mem::offset_of!(ControlShm, crash_count) + mem::size_of::<AtomicU64>();
+        let window_end =
+            mem::offset_of!(ControlShm, window_start_unix) + mem::size_of::<AtomicU64>();
+        let max_written = crash_end.max(window_end);
+        assert_eq!(
+            ControlShm::RELOAD_WRITE_EXTENT,
+            max_written,
+            "RELOAD_WRITE_EXTENT must equal the highest byte the reload branch writes"
+        );
+        // And the guard must be `>=` (full extent), so the smallest zone that
+        // passes is exactly `offset + RELOAD_WRITE_EXTENT` bytes from `addr`.
+        assert!(
+            ControlShm::RELOAD_WRITE_EXTENT
+                >= mem::offset_of!(ControlShm, window_start_unix) + mem::size_of::<AtomicU64>(),
+            "extent must include window_start_unix"
+        );
     }
 
     // ── Crash-backoff decision logic (pure function tests) ────────────────────

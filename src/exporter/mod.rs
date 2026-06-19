@@ -412,7 +412,27 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
             HttpOtelModule::main_conf(&*cycle).expect("exporter cycle: missing otel main conf");
         let task = ngx::async_::spawn(crate::export::export_loop(amcf));
         let pool = Pool::from_ngx_pool((*cycle).pool);
-        let _ = pool.allocate(task);
+        // `Pool::allocate` returns null when the underlying pool alloc OR the
+        // cleanup-handler registration fails; on null it has already dropped
+        // the value (here: the `Task` handle).  Dropping the Task cancels the
+        // export future, but the heartbeat timer set up below keeps stamping
+        // `last_beat_msec`, so workers would see a "live" exporter that exports
+        // nothing — telemetry silently off with no diagnostic.  Refuse to run
+        // in that state: log EMERG and abort so the master's crash-respawn
+        // (NGX_PROCESS_RESPAWN) restarts the exporter cleanly.
+        if pool.allocate(task).is_null() {
+            ngx::ngx_log_error!(
+                nginx_sys::NGX_LOG_EMERG,
+                (*cycle).log,
+                "otel exporter: failed to pin export task on the cycle pool \
+                 (out of memory) — aborting so the master respawns the exporter"
+            );
+            // SAFETY: `abort()` is always safe to call; it terminates the
+            // process immediately.  The export task was already dropped by the
+            // failed `allocate`, and the heartbeat timer has not been armed yet
+            // (set up below), so no live state outlives this call.
+            libc::abort();
+        }
 
         // 11.5. Dedicated liveness heartbeat timer.
         //

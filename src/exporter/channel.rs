@@ -109,7 +109,26 @@ pub unsafe extern "C" fn otel_exporter_channel_handler(ev: *mut ngx_event_t) {
             NGX_CMD_TERMINATE => unsafe { ngx_terminate = 1 },
             // SAFETY: as above — nginx's global log-reopen flag.
             NGX_CMD_REOPEN => unsafe { ngx_reopen = 1 },
-            _ => {} // OPEN_CHANNEL / CLOSE_CHANNEL — ignored
+            _ => {
+                // OPEN_CHANNEL / CLOSE_CHANNEL / any future command — not acted
+                // on (the exporter does not peer with workers via channels).
+                //
+                // NGX_CMD_OPEN_CHANNEL carries a received file descriptor in
+                // `ch.fd` (master sends a sibling's channel[0] via SCM_RIGHTS;
+                // `ngx_read_channel` recvmsg's it into our table —
+                // `nginx/src/os/unix/ngx_channel.c`).  nginx's own
+                // `ngx_channel_handler` stores that fd into the sibling slot or
+                // closes it on CLOSE_CHANNEL; if we silently drop the command
+                // the recvmsg'd fd would leak, accumulating toward
+                // RLIMIT_NOFILE if the master ever sent these to the exporter.
+                // Close it here to match nginx's fd-lifecycle discipline.
+                if ch.fd >= 0 {
+                    // SAFETY: `ch.fd` is an fd just received by `ngx_read_channel`
+                    // (>= 0 checked); closing it is sound and the exporter never
+                    // uses sibling-channel fds.
+                    unsafe { libc::close(ch.fd) };
+                }
+            }
         }
     }
 }

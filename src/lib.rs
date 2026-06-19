@@ -466,6 +466,21 @@ extern "C" fn ngx_otel_init_module(cycle: *mut nginx_sys::ngx_cycle_t) -> nginx_
     // Old exporter snapshot: `my_gen` captured at startup.
     // `current_gen > my_gen` → reload → abdicate ring pops (new exporter owns).
     // `current_gen == my_gen` → pure shutdown → full drain (sole consumer).
+    //
+    // The increment MUST happen before the fork below, not after: the new
+    // exporter reads `successor_gen` once at startup (`export_loop`'s `my_gen`
+    // snapshot) and the fork() in `ngx_spawn_process` is the happens-before
+    // edge that makes this store visible to that child read.  Incrementing
+    // after the fork would race the child's snapshot.  Because the increment
+    // therefore precedes the (fallible) spawn, a failed fork would otherwise
+    // leave `successor_gen` permanently bumped with NO new exporter present:
+    // the OLD exporter — still the sole live consumer — would then observe
+    // `current_gen > my_gen`, latch `periodic_abdicated = true` forever, and
+    // stop popping the log/span rings (rings fill → permanent telemetry loss
+    // after a failed reload).  We roll the increment back on the spawn-error
+    // path below to keep `successor_gen` consistent with the set of live
+    // exporters: incremented iff a successor was actually forked.
+    let mut announced_successor_ctrl: *const exporter::control_shm::ControlShm = core::ptr::null();
     if is_reload {
         if let Some(ctrl_ptr) = amcf.control_shm_ptr_mut() {
             // SAFETY: `control_shm_ptr_mut()` returns Some only when the zone is
@@ -474,7 +489,8 @@ extern "C" fn ngx_otel_init_module(cycle: *mut nginx_sys::ngx_cycle_t) -> nginx_
             // only reads this field after it receives NGX_CMD_QUIT (via channel),
             // which is sent after this function returns.
             let ctrl = unsafe { &*ctrl_ptr };
-            ctrl.successor_gen.fetch_add(1, core::sync::atomic::Ordering::Release);
+            ctrl.announce_successor();
+            announced_successor_ctrl = ctrl_ptr;
         }
     }
 
@@ -507,7 +523,25 @@ extern "C" fn ngx_otel_init_module(cycle: *mut nginx_sys::ngx_cycle_t) -> nginx_
     }
 
     // Spawn the exporter for both initial start and SIGHUP reload.
-    spawn_exporter_for_cycle(cycle, is_reload)
+    let spawn_status = spawn_exporter_for_cycle(cycle, is_reload);
+
+    // Roll back the successor announcement if the fork failed (NGX_INVALID_PID
+    // from RLIMIT_NPROC / ENOMEM).  No successor exists, so the old exporter
+    // must remain the sole consumer and keep draining the rings; leaving
+    // `successor_gen` bumped would latch its `periodic_abdicated` permanently
+    // (see the increment comment above).  This is a single Release decrement,
+    // mirroring the increment; the master is the sole writer of this field, so
+    // the round-trip leaves the counter at its pre-reload value.
+    let ok: nginx_sys::ngx_int_t = Status::NGX_OK.into();
+    if spawn_status != ok && !announced_successor_ctrl.is_null() {
+        // SAFETY: `announced_successor_ctrl` is non-null only when set from a
+        // valid `control_shm_ptr_mut()` above; same single-master-writer
+        // invariant as the increment.
+        let ctrl = unsafe { &*announced_successor_ctrl };
+        ctrl.rollback_successor();
+    }
+
+    spawn_status
 }
 
 impl HttpModule for HttpOtelModule {
