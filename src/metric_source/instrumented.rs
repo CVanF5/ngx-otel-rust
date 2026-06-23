@@ -838,12 +838,21 @@ fn build_span_name(buf: &mut [u8; MAX_SPAN_NAME], method: &[u8], route: &[u8]) -
 /// is present, else the live connection values
 /// (`ngx_http_realip_remote_addr_variable`, `ngx_http_realip_module.c:580,602`).
 ///
-/// We reproduce that exact selection by evaluating the `$realip_remote_addr`
-/// variable: it always yields the true socket peer regardless of realip
-/// rewriting, and degrades to the live `addr_text` when realip is not active or
-/// not compiled in.  The realip module's context type and its module descriptor
-/// are both file-`static` in nginx, so they cannot be referenced directly from
-/// Rust — the variable is the only sound public accessor.
+/// **Primary path** (realip compiled in): evaluate `$realip_remote_addr` /
+/// `$realip_remote_port` — this always yields the true socket peer regardless of
+/// whether a realip rewrite occurred, because the variable handler returns
+/// `ctx->addr_text` when a context exists (realip active and matched) and
+/// `connection->addr_text` otherwise (realip inactive or unmatched).
+///
+/// **Fallback path** (realip not compiled, or variable lookup returns empty):
+/// read `connection->addr_text` directly for the address and derive the port
+/// via `sockaddr_port(connection->sockaddr)`.  When realip is absent the
+/// connection's `addr_text` is never rewritten, so it equals the socket peer
+/// exactly — the same value `$realip_remote_addr` would have returned.
+///
+/// The realip module's context type and its module descriptor are both
+/// file-`static` in nginx, so they cannot be referenced directly from Rust —
+/// the variable is the only sound public accessor when realip is compiled in.
 ///
 /// Returns the peer address bytes (slice into request/connection memory, valid
 /// for this LOG-phase call) and the peer port (0 when unavailable).
@@ -853,8 +862,8 @@ fn build_span_name(buf: &mut [u8; MAX_SPAN_NAME], method: &[u8], route: &[u8]) -
 ///
 /// # Hot-path note
 /// Two `ngx_http_get_variable` evaluations (a hashed lookup) when realip is
-/// configured; on the no-realip path these resolve to the same `addr_text` the
-/// connection already holds.  Runs only on sampled spans.
+/// compiled in; a single `connection->addr_text` read on the fallback path.
+/// Runs only on sampled spans.
 unsafe fn realip_peer<'a>(r: *mut nginx_sys::ngx_http_request_t) -> (&'a [u8], u16) {
     /// Evaluate one request variable by name, returning its value bytes.
     ///
@@ -900,11 +909,39 @@ unsafe fn realip_peer<'a>(r: *mut nginx_sys::ngx_http_request_t) -> (&'a [u8], u
 
     // SAFETY: `r` is the valid request pointer per the contract.
     let addr = unsafe { get_var(r, b"realip_remote_addr") };
+
+    if !addr.is_empty() {
+        // Realip variable present and non-empty: use it for both address and port.
+        // SAFETY: `r` is the valid request pointer per the contract.
+        let port_bytes = unsafe { get_var(r, b"realip_remote_port") };
+        let port =
+            core::str::from_utf8(port_bytes).ok().and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
+        return (addr, port);
+    }
+
+    // Fallback: `$realip_remote_addr` is absent (realip not compiled) or returned
+    // empty.  Read `connection->addr_text` directly — it is the true socket peer
+    // whenever realip has not rewritten it, which is always the case here.
+    // Mirror the null-safety pattern from the `client.address` read above.
     // SAFETY: `r` is the valid request pointer per the contract.
-    let port_bytes = unsafe { get_var(r, b"realip_remote_port") };
-    let port =
-        core::str::from_utf8(port_bytes).ok().and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
-    (addr, port)
+    let conn_ptr = unsafe { (*r).connection };
+    if conn_ptr.is_null() {
+        return (b"", 0);
+    }
+    // SAFETY: `conn_ptr` is non-null and valid for the request lifetime.
+    unsafe {
+        let conn = &*conn_ptr;
+        let addr_fallback: &'a [u8] = if conn.addr_text.len > 0 && !conn.addr_text.data.is_null() {
+            core::slice::from_raw_parts(conn.addr_text.data, conn.addr_text.len)
+        } else {
+            b""
+        };
+        // SAFETY: `conn.sockaddr` is non-null (checked) and valid for the
+        // request lifetime per nginx's connection invariant.
+        let port_fallback: u16 =
+            if !conn.sockaddr.is_null() { sockaddr_port(conn.sockaddr) } else { 0 };
+        (addr_fallback, port_fallback)
+    }
 }
 
 /// Read the TCP/UDP port from a `struct sockaddr`, host byte order.

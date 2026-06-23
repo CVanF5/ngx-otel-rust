@@ -289,20 +289,74 @@ fi
 pass "Realip ON: client.address (${FAKE_CLIENT_IP}) ≠ network.peer.address (127.0.0.1) — divergence confirmed"
 
 # ─── Realip OFF assertions ────────────────────────────────────────────────────
+# Use Python JSON parsing (filtered by REALIP_OFF_TRACE_ID) for all OFF checks.
+# A plain grep on OFF_DATA is not safe here: the OTLP collector's batch processor
+# may combine ON and OFF spans into a single ExportTraceServiceRequest, emitting
+# one NDJSON line that carries both trace IDs.  OFF_DATA is built from lines
+# containing REALIP_OFF_TRACE_ID; if such a line also carries ON spans with
+# 203.0.113.7, a broad grep would falsely match.  The Python extractor filters
+# to spans whose own traceId matches REALIP_OFF_TRACE_ID before inspecting
+# attributes, so it is immune to co-batched spans from the ON scenario.
 
 # client.address must be the socket peer (127.0.0.1) since no realip is active.
-if echo "${OFF_DATA}" | grep -q '"127.0.0.1"'; then
-    pass "Realip OFF: client.address contains 127.0.0.1 (socket peer; no rewrite)"
+if echo "${NEW_TRACES}" | python3 -c "
+import sys, json
+found = False
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        obj = json.loads(line)
+    except Exception:
+        continue
+    for rs in obj.get('resourceSpans', []):
+        for ss in rs.get('scopeSpans', []):
+            for span in ss.get('spans', []):
+                if span.get('traceId', '') != '${REALIP_OFF_TRACE_ID}':
+                    continue
+                attrs = {a['key']: a.get('value', {}).get('stringValue', '') for a in span.get('attributes', [])}
+                if attrs.get('client.address') == '127.0.0.1':
+                    found = True
+if found:
+    sys.exit(0)
+sys.exit(1)
+" 2>/dev/null; then
+    pass "Realip OFF: client.address = 127.0.0.1 (socket peer; no realip rewrite)"
 else
-    fail "Realip OFF: client.address does NOT contain 127.0.0.1"
+    fail "Realip OFF: client.address is NOT 127.0.0.1 in OFF spans"
 fi
 
-# The fake client IP must NOT appear anywhere in the realip-OFF spans — the
-# XFF header was ignored.
-if echo "${OFF_DATA}" | grep -q "\"${FAKE_CLIENT_IP}\""; then
-    fail "Realip OFF: fake client IP ${FAKE_CLIENT_IP} found in span — XFF was not supposed to be trusted"
+# The fake client IP must NOT appear in any attribute of the realip-OFF spans.
+# Filtered strictly to spans whose traceId = REALIP_OFF_TRACE_ID to avoid
+# false matches from co-batched ON spans (which legitimately carry 203.0.113.7).
+if echo "${NEW_TRACES}" | python3 -c "
+import sys, json
+found_bad = False
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        obj = json.loads(line)
+    except Exception:
+        continue
+    for rs in obj.get('resourceSpans', []):
+        for ss in rs.get('scopeSpans', []):
+            for span in ss.get('spans', []):
+                if span.get('traceId', '') != '${REALIP_OFF_TRACE_ID}':
+                    continue
+                for a in span.get('attributes', []):
+                    v = a.get('value', {})
+                    sv = v.get('stringValue', '')
+                    if sv == '${FAKE_CLIENT_IP}':
+                        found_bad = True
+if found_bad:
+    sys.exit(1)
+" 2>/dev/null; then
+    pass "Realip OFF: fake client IP ${FAKE_CLIENT_IP} absent from OFF spans (XFF correctly ignored)"
 else
-    pass "Realip OFF: fake client IP ${FAKE_CLIENT_IP} absent from spans (XFF correctly ignored)"
+    fail "Realip OFF: fake client IP ${FAKE_CLIENT_IP} found in OFF span attributes — XFF was not supposed to be trusted"
 fi
 
 # ─── Port coherence ──────────────────────────────────────────────────────────
