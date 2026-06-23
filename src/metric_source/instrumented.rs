@@ -907,12 +907,44 @@ unsafe fn realip_peer<'a>(r: *mut nginx_sys::ngx_http_request_t) -> (&'a [u8], u
     (addr, port)
 }
 
+/// Read the TCP/UDP port from a `struct sockaddr`, host byte order.
+///
+/// Equivalent to nginx's `ngx_inet_get_port` (`src/core/ngx_inet.c`): switch on
+/// `sa_family` and return the family's port field converted from network byte
+/// order; any other family (incl. `AF_UNIX`) yields 0.  Inlined in Rust rather
+/// than calling the nginx C function so the value read is identical while the
+/// helper carries no external nginx dependency.  The `sockaddr_in` /
+/// `sockaddr_in6` layout (`sin_port` / `sin6_port` as a 16-bit big-endian port)
+/// is fixed by POSIX (`<netinet/in.h>`).
+///
+/// # Safety
+/// `sa` must be a valid, non-null `struct sockaddr` pointer whose storage is at
+/// least as large as the `sockaddr_in` / `sockaddr_in6` selected by its family.
+unsafe fn sockaddr_port(sa: *const nginx_sys::sockaddr) -> u16 {
+    // SAFETY: `sa` is a valid sockaddr per the contract; `sa_family` is always
+    // readable, and the family-specific cast below reads only the port field,
+    // which lies within the storage guaranteed for that family.
+    unsafe {
+        match u32::from((*sa).sa_family) {
+            f if f == libc::AF_INET as u32 => {
+                let sin = sa as *const libc::sockaddr_in;
+                u16::from_be((*sin).sin_port)
+            }
+            f if f == libc::AF_INET6 as u32 => {
+                let sin6 = sa as *const libc::sockaddr_in6;
+                u16::from_be((*sin6).sin6_port)
+            }
+            _ => 0,
+        }
+    }
+}
+
 /// Local listening (server) port for the `server.port` span attribute.
 ///
 /// Materialises the connection's local sockaddr (lazily filled by nginx via
 /// `getsockname` only when first requested — the same call the core
-/// `$server_port` variable makes) and reads the port with `ngx_inet_get_port`,
-/// mirroring `nginx-otel`'s `net.host.port` source (`http_module.cpp:450-451`).
+/// `$server_port` variable makes) and reads the port from it, mirroring
+/// `nginx-otel`'s `net.host.port` source (`http_module.cpp:450-451`).
 /// Returns 0 when the local address is unavailable.
 ///
 /// # Safety
@@ -933,7 +965,7 @@ unsafe fn server_port(conn: *mut nginx_sys::ngx_connection_t) -> u16 {
         if local.is_null() {
             0
         } else {
-            nginx_sys::ngx_inet_get_port(local)
+            sockaddr_port(local)
         }
     }
 }
@@ -955,7 +987,7 @@ unsafe fn client_port(conn: *mut nginx_sys::ngx_connection_t) -> u16 {
         if sa.is_null() {
             0
         } else {
-            nginx_sys::ngx_inet_get_port(sa)
+            sockaddr_port(sa)
         }
     }
 }
