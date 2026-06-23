@@ -1120,6 +1120,21 @@ mod tests {
             AnyValue::String(s) => assert_eq!(s, "2", "HTTP/2 → \"2\""),
             other => panic!("network.protocol.version must be String, got {other:?}"),
         }
+
+        // A 4xx span must NOT carry error.type — per the OTel HTTP semconv a
+        // server span leaves 4xx status unset (only 5xx is an error), so the
+        // exporter derives error.type from a status of 500 or above only.  This
+        // pins the >=500 threshold (a 2xx span is covered in span_golden_structural).
+        let rec_4xx = SpanRecord { http_status: 404, status_code: StatusCode::Unset as u8, ..rec };
+        let producer_4xx = VecProducer(std::sync::Mutex::new(std::vec::Vec::new()));
+        assert!(emit_span_record(&producer_4xx, &rec_4xx));
+        let raw_4xx = producer_4xx.0.lock().unwrap();
+        let len_4xx = u32::from_be_bytes(raw_4xx[..4].try_into().unwrap()) as usize;
+        let span_4xx = parse_span_record(&raw_4xx[4..4 + len_4xx], 0).expect("parse must succeed");
+        assert!(
+            !span_4xx.attributes.iter().any(|kv| kv.key == "error.type"),
+            "error.type must be absent on a 4xx span (only >=500 is an error)"
+        );
     }
 
     /// Parser sanity cap: a corrupted `n_extra` field must not cause the
