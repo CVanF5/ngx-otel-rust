@@ -535,73 +535,61 @@ autoconf system.  The canonical autoconf path passes
 `--no-default-features` and lets NGINX's `auto/module` generate the
 entry instead.
 
-### Configuration directives
+### Examples
 
-All directives are valid in the `http {}` context.  Example:
+#### 1. Basic tracing
+
+Send all HTTP request spans to a local OTLP/HTTP collector:
 
 ```nginx
 load_module modules/ngx_http_otel_module.so;
 
 http {
     otel_exporter {
-        endpoint http://127.0.0.1:4318;   # OTLP/HTTP: base URL; /v1/{metrics,logs,traces} appended per signal
-        # endpoint https://collector.example.com:4317; # OTLP/HTTP over TLS (default port 443)
-        # endpoint http://127.0.0.1:4317; # OTLP/gRPC: host:port only (path N/A for gRPC)
-        # endpoint unix:/run/otel-collector.sock;   # Unix socket (base path "/"; signals appended)
-
-        # TLS options (apply when endpoint uses https://):
-        # trusted_certificate /etc/ssl/certs/ca-bundle.pem;  # CA bundle; default = system trust store
-        # ssl_certificate     /etc/nginx/certs/client.crt;   # mTLS client cert
-        # ssl_certificate_key /etc/nginx/certs/client.key;   # mTLS client private key
-        # ssl_verify          on;                             # on (default) | off — off disables cert verification (INSECURE)
-
-        # C++ nginx-otel compatibility aliases (also available as top-level directives):
-        # header       authorization "Bearer ...";  # same as top-level otel_exporter_header
-        # interval     5s;                          # same as top-level otel_metric_interval (default: 5s)
-        # batch_size   512;                         # accepted for compatibility; has no effect (fixed ring)
-        # batch_count  4;                           # accepted for compatibility; has no effect (fixed ring)
-
-        # Per-signal overrides (optional; used as-is, no path appended):
-        # metrics_endpoint http://metrics-host:4318/v1/metrics;
-        # logs_endpoint    http://logs-host:4318/v1/logs;
-        # traces_endpoint  http://traces-host:4318/v1/traces;
+        endpoint http://127.0.0.1:4318;
     }
-    otel_export_protocol otlp_grpc;         # otlp_http (default) | otlp_grpc
-    otel_service_name my-nginx;             # if absent, defaults to "unknown_service:nginx"
-    otel_resource_attr deployment.environment production;
-    otel_exporter_header authorization "Bearer ...";
-    otel_metric_interval 5s;                # export interval (default: 5s; also configurable as `interval` inside otel_exporter {})
-    otel_metric_zone otel_metrics 1m;
-    otel_metrics on;                        # on (default) | off — set off to suppress all metrics (traces-only mode)
-    otel_metric_status_code_class on;       # emit method × status-class × protocol attrs on the duration series (live)
 
-    # Logs (off unless these are set; orthogonal to nginx's own access_log/error_log):
-    # otel_log_export is per-location/server (see server block below) — select which
-    # requests get an exception-tail LogRecord. Exemplars ride otel_trace, not this.
-    # otel_log_ring_size 512k;              # per-worker logs ring capacity (exception-tail substrate)
-    otel_error_log;                         # enable error-log export; floor defaults to `error`. e.g. `otel_error_log warn;`
-    # otel_error_log_coalesce off;          # default on; off = best-effort verbatim streaming (lossy under load — see TELEMETRY_MODEL.md)
-
-    # url.path + user_agent.original ride on the exception-tail LogRecord
-    # (when otel_log_export selects a request), never as metric dimensions.
+    otel_service_name my-nginx;
+    otel_trace on;
 
     server {
-        # Traces (Phase 3): per-location / per-server control.
-        # otel_trace, otel_trace_context, otel_span_name, otel_span_attr are
-        # valid in http, server, and location blocks; inner location wins.
-        otel_trace on;                      # complex value: literal / $var / split_clients
-        otel_trace_context propagate;       # ignore | extract (default) | inject | propagate
-        otel_log_export on;                 # exception-tail export: on | off | if=<expr>; valid http/server/location
+        location / {
+            proxy_pass http://backend;
+        }
+    }
+}
+```
 
+When `otel_exporter` is not configured the module is completely inert — no
+log-phase handler, no exporter process, zero per-request work.
+
+#### 2. Ratio / parent-based sampling
+
+Sample 10% of requests, or follow the caller's sampling decision:
+
+```nginx
+http {
+    otel_exporter {
+        endpoint http://127.0.0.1:4318;
+    }
+
+    # Ratio sampling: trace 10% of requests based on the trace ID.
+    split_clients $otel_trace_id $ratio_sampler {
+        10%     on;
+        *       off;
+    }
+
+    server {
         location /api {
-            otel_span_name "API $request_method"; # per-location span name override
-            otel_span_attr deployment.environment production; # custom span attribute
+            # Ratio: sample 10 % of root spans; propagate parent decisions.
+            otel_trace          $ratio_sampler;
+            otel_trace_context  propagate;
 
             proxy_pass http://backend;
         }
 
         location /healthz {
-            # Health checks: disable tracing entirely (zero cost).
+            # Health checks: tracing disabled (zero cost).
             otel_trace off;
             return 200 "ok\n";
         }
@@ -609,96 +597,69 @@ http {
 }
 ```
 
-Notes:
+`otel_trace_context propagate` reads the inbound `traceparent` header and
+writes it to upstream requests, so a sampled parent keeps the trace intact
+across services. The `$otel_parent_sampled` variable exposes the parent's
+sampling bit for use in `otel_trace` directly.
 
-- When `otel_exporter` is not configured the module is completely inert
-  (see the [zero-cost-when-disabled invariant](#architecture) and
-  `tests/bench/RESULTS.md`).
-- `endpoint` is the **base** URL.  For OTLP/HTTP the module appends
-  `/v1/metrics`, `/v1/logs`, `/v1/traces` to the base automatically
-  (OTel spec behaviour for `OTEL_EXPORTER_OTLP_ENDPOINT`).
-  Optional per-signal overrides (`metrics_endpoint`, `logs_endpoint`,
-  `traces_endpoint`) inside `otel_exporter {}` are used as-is (no path
-  appended), matching `OTEL_EXPORTER_OTLP_{SIGNAL}_ENDPOINT`.
-  For OTLP/gRPC, `endpoint` is `host:port` only; path is irrelevant
-  (routing is by gRPC service method).
-- `otel_export_protocol` selects the export wire protocol: `otlp_http`
-  (default, OTLP/HTTP over HTTP/1.1) or `otlp_grpc` (OTLP/gRPC unary over
-  HTTP/2).  The example above uses gRPC; omit the directive for HTTP.
-- All export work runs in the dedicated `nginx: otel exporter` process;
-  workers serve traffic and bump shm counters only.
-- Counters reset on `nginx -s reload`; downstream collectors handle
-  continuity via OTLP's `start_time_unix_nano`.
+#### 3. Traces-only mode (C++ drop-in)
 
-#### TLS directive reference
+Disable metrics to match the behaviour of the C++ `nginx/nginx-otel` module:
 
-TLS options are set inside `otel_exporter {}` and take effect when
-`endpoint` uses the `https://` scheme.  They have no effect for `http://`
-or `unix:` endpoints.
+```nginx
+http {
+    otel_exporter {
+        endpoint http://127.0.0.1:4317;  # gRPC
+    }
 
-| Directive                  | Context          | Default                    | Description                                                                              |
-|----------------------------|------------------|----------------------------|------------------------------------------------------------------------------------------|
-| `trusted_certificate <path>` | `otel_exporter` | System trust store         | CA bundle for validating the collector's server certificate. Absolute path to a PEM file (single CA or chain). When omitted, `SSL_CTX_set_default_verify_paths` loads the OS default trust store. |
-| `ssl_certificate <path>`   | `otel_exporter`  | (none — mTLS disabled)     | Client certificate chain for mTLS. PEM file. Must be set together with `ssl_certificate_key`. |
-| `ssl_certificate_key <path>` | `otel_exporter` | (none — mTLS disabled)     | Client private key for mTLS. PEM file. Must be set together with `ssl_certificate`. |
-| `ssl_verify on\|off`       | `otel_exporter`  | `on`                       | `off` disables collector certificate verification. **INSECURE — for testing only.** Emits a config-time WARN when set to `off`. |
+    otel_export_protocol otlp_grpc;
+    otel_service_name    my-nginx;
+    otel_metrics         off;            # suppress all metric export
 
-Key behaviours:
+    server {
+        location / {
+            otel_trace          on;
+            otel_trace_context  propagate;
+            proxy_pass          http://backend;
+        }
+    }
+}
+```
 
-- **Server cert verification** is enforced by default: the exporter validates
-  the collector's certificate against `trusted_certificate` (or the system
-  store) and checks hostname / IP-SAN against the endpoint host. A mismatch
-  causes a TLS handshake failure, `send_failed` error-log alerts, and retry
-  backoff — zero data is delivered and nginx continues serving normally.
-- **Hostname verification**: DNS-name endpoints use `X509_VERIFY_PARAM_set1_host`
-  (matches the cert's DNS SAN); IP-literal endpoints (e.g. `https://127.0.0.1:4317`)
-  use `X509_VERIFY_PARAM_set1_ip_asc` (matches the cert's iPAddress SAN).
-- **mTLS**: set both `ssl_certificate` and `ssl_certificate_key` together.
-  Setting only one is a config-time error. When not set, no client certificate
-  is presented (plain server-auth TLS).
-- **SIGHUP reload**: the new exporter generation spawned after a reload reads
-  the current `trusted_certificate`, `ssl_certificate`, and `ssl_certificate_key`
-  paths — cert/CA rotation takes effect at reload time.
-- **gRPC over TLS**: when `endpoint` is `https://` and `otel_export_protocol
-  otlp_grpc` is set, the gRPC transport negotiates `h2` via ALPN automatically.
-  No extra configuration is needed.
-- **Minimum OpenSSL version**: 1.1.1 (API `X509_VERIFY_PARAM_set1_host` and
-  `set1_ip_asc` first available in 1.0.2; 1.1.1+ recommended). See
-  [`OPENSSL_SUPPORT.md`](OPENSSL_SUPPORT.md) for the full support matrix.
+#### 4. Error-response log export (4xx/5xx only)
 
-#### Directive reference
+Export a thin `LogRecord` only for error responses, using nginx's `map` to
+build a truthy flag:
 
-The table below covers the directives added or changed since the C++
-`nginx/nginx-otel` baseline.  All pre-existing directives (`otel_trace`,
-`otel_trace_context`, `otel_span_name`, `otel_span_attr`, `otel_service_name`,
-`otel_resource_attr`) work identically; see the configuration example above.
+```nginx
+http {
+    otel_exporter {
+        endpoint http://127.0.0.1:4318;
+    }
 
-| Directive | Context | Default | Description |
-|---|---|---|---|
-| `otel_metrics on\|off` | `http` | `on` | Enable (`on`) or disable (`off`) all metric collection and export. Set `off` for a traces-and-logs-only configuration. Does not affect traces or log export. |
-| `otel_service_name <name>` | `http` | `"unknown_service:nginx"` | Sets `service.name` in the resource. When absent, the fallback `"unknown_service:nginx"` is used (matching the C++ `nginx-otel` default). |
-| `otel_metric_interval <time>` | `http` | `5s` | How often the exporter drains and exports metrics (nginx time string: `5s`, `1m`, etc.). Default is 5 seconds (matching the OTel SDK default). |
+    otel_trace on;
+    otel_error_log warn;   # coalesced nginx.error LogRecords over OTLP
 
-Sub-directives inside `otel_exporter {}` — compatibility aliases:
+    # Export a tail LogRecord only for error responses (4xx/5xx):
+    map $status $otel_export_tail {
+        default  "";      # 1xx/2xx/3xx -> not exported
+        ~^[45]   1;       # 4xx and 5xx -> exported
+    }
+    # Three forms: on (all requests) | if=$var (conditional) | off/omitted (none)
+    otel_log_export if=$otel_export_tail;
 
-| Sub-directive | Maps to | Notes |
-|---|---|---|
-| `header <name> <value>` | same as `otel_exporter_header <name> <value>` | Sets an HTTP request header sent with every export request |
-| `interval <time>` | same as `otel_metric_interval` | nginx time string; `5s` (default) or `500ms`, `1m`, etc. |
-| `batch_size <size>` | accepted, no effect | nginx size string (`512`, `1k`). Parsed for C++ config compatibility; this module uses a fixed ring. A `[warn]` is logged at config load. |
-| `batch_count <size>` | accepted, no effect | Same as `batch_size`. |
+    server {
+        location / {
+            proxy_pass http://backend;
+        }
+    }
+}
+```
 
-#### nginx variables
+---
 
-| Variable | Value |
-|---|---|
-| `$otel_trace_id` | 32-char lowercase hex trace ID of the current span; empty when tracing is not enabled for this request |
-| `$otel_span_id` | 16-char lowercase hex span ID of the current span; empty when tracing is not enabled |
-| `$otel_parent_id` | 16-char lowercase hex parent span ID from the inbound `traceparent`; `0000000000000000` (all-zero hex) for root spans; empty when tracing is not enabled |
-| `$otel_parent_sampled` | `"1"` when the current request is sampled (including root spans); empty when tracing is not enabled |
-
-All four variables are usable in `access_log` format strings, `if=` conditions,
-`otel_span_name`, and anywhere else nginx accepts a complex value.
+For the complete directive reference, defaults, variables, TLS options, and
+span attributes, see **[`docs/CONFIGURATION.md`](docs/CONFIGURATION.md)**.
 
 ### Running tests
 
