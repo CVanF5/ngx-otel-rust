@@ -288,6 +288,16 @@ pub struct MainConfig {
     pub zone_name: ngx_str_t,
     /// `otel_metric_zone <name> <size>` — size in bytes; 0 = not configured.
     pub zone_size: usize,
+    /// `otel_metrics on | off` — enable or disable metric collection and export.
+    ///
+    /// When `off`, the metrics shared memory zone is not registered, worker
+    /// log-phase histogram bumps are skipped (the zone pointer stays null), and
+    /// the exporter's metrics drain loop does not run.  Traces and logs are
+    /// unaffected.  This is the correct setting for operators migrating from the
+    /// C++ `nginx-otel` module, which is traces-only.
+    ///
+    /// `UNSET_FLAG` (−1) = directive absent; treated as `on` (default).
+    pub metrics_enabled: ngx_flag_t,
     /// `otel_metric_status_code_class on | off`
     /// UNSET_FLAG (-1) = not set (treated as on/default).
     pub status_code_class: ngx_flag_t,
@@ -462,6 +472,7 @@ impl Default for MainConfig {
             metric_interval_ms: UNSET_U64,
             zone_name: ngx_str_t::default(),
             zone_size: 0,
+            metrics_enabled: UNSET_FLAG,
             status_code_class: UNSET_FLAG,
             grpc_smoke_endpoint: ngx_str_t::default(),
             bidi_smoke_endpoint: ngx_str_t::default(),
@@ -566,23 +577,38 @@ unsafe fn n_workers_to_reserve(cf: *const ngx_conf_t) -> usize {
     }
 }
 
-/// Smallest worker-slot capacity across the metrics zone and the (optional)
-/// logs and spans rings — the bound the LOG-phase `worker_id` guard must use.
+/// Smallest worker-slot capacity across all registered shm rings — the bound
+/// the LOG-phase `worker_id` guard must use.
 ///
-/// A registered logs/spans zone (capacity > 0) tightens the bound; a zone that
-/// is not registered (capacity 0) does not constrain it, because its ring is
-/// never indexed.  Factored out as a pure function so the min-capacity invariant
-/// is unit-testable without a live shm zone.
+/// A zone is "registered" when its capacity is greater than zero.  Unregistered
+/// zones (capacity 0) do not constrain the bound because their rings are never
+/// indexed.  Any of the three zones may be absent (e.g. when `otel_metrics off`
+/// leaves the metrics zone unregistered).
+///
+/// Returns 0 when no zone is registered, which causes the LOG-phase bounds guard
+/// to skip all work.
+///
+/// Factored out as a pure function so the min-capacity invariant is
+/// unit-testable without a live shm zone.
 #[inline]
 fn min_indexed_worker_capacity(metrics: usize, logs: usize, spans: usize) -> usize {
-    let mut cap = metrics;
+    // Start from "no bound" and tighten only by registered (non-zero) zones.
+    let mut cap = usize::MAX;
+    if metrics > 0 {
+        cap = cap.min(metrics);
+    }
     if logs > 0 {
         cap = cap.min(logs);
     }
     if spans > 0 {
         cap = cap.min(spans);
     }
-    cap
+    // No zone registered → nothing to index → return 0 so the bounds guard fires.
+    if cap == usize::MAX {
+        0
+    } else {
+        cap
+    }
 }
 
 impl MainConfig {
@@ -613,6 +639,19 @@ impl MainConfig {
     /// breakdown on the duration histogram (default on; `UNSET`/`on` → true).
     ///
     /// Read in `export_loop` (`export/mod.rs`) to set
+    /// Returns `true` when metric collection and export is enabled.
+    ///
+    /// When the `otel_metrics` directive is absent (default) or set to `on`,
+    /// returns `true` — metrics are collected and exported normally.
+    /// When set to `off`, returns `false` — the metrics shm zone is not
+    /// registered, worker histogram bumps are skipped, and the exporter's
+    /// metrics drain loop does not run.
+    ///
+    /// `UNSET_FLAG` (−1) is the initial sentinel: treated as `on`.
+    pub fn metrics_enabled(&self) -> bool {
+        self.metrics_enabled != 0 // UNSET_FLAG (−1) or 1 → true; explicit 0 → false
+    }
+
     /// `InstrumentedSource.status_code_class_enabled` (`metric_source/instrumented.rs`);
     /// `off` collapses the per-combo data points. The hot path always buckets
     /// status class in the combo histogram regardless of this flag.
@@ -861,8 +900,14 @@ impl MainConfig {
             }
         }
 
-        // Register the metrics shared memory zone.
-        self.register_shm_zone(cf, module)?;
+        // Register the metrics shared memory zone when `otel_metrics on` (the
+        // default).  When the operator sets `otel_metrics off`, the zone is
+        // intentionally left null: worker log-phase handlers see `shm_base()`
+        // return `None` and skip all histogram bumps at zero cost; the exporter
+        // drain loop checks `metrics_enabled()` and skips metric collection.
+        if self.metrics_enabled() {
+            self.register_shm_zone(cf, module)?;
+        }
 
         // Register the control-plane shared memory zone.
         // This zone holds the ControlShm heartbeat counter and a reserved
@@ -1569,8 +1614,12 @@ impl MainConfig {
     }
 
     /// Smallest worker-slot capacity across every shm ring the LOG-phase handler
-    /// indexes by `worker_id`: the metrics zone plus whichever of the logs and
-    /// spans rings are registered.
+    /// indexes by `worker_id`.
+    ///
+    /// Covers the metrics zone (when registered), the logs ring (when registered),
+    /// and the spans ring (when registered).  Any of these zones may be absent —
+    /// for example, when `otel_metrics off` leaves the metrics zone unregistered.
+    /// Only registered zones (capacity > 0) constrain the bound.
     ///
     /// The metrics zone can be inflated past the reserved worker count via
     /// `otel_zone_size` (`register_shm_zone` takes `zone_size.max(required)`),
@@ -1580,9 +1629,8 @@ impl MainConfig {
     /// The hot-path guard validates against this MIN so a `worker_id` that would
     /// overrun the *smallest* indexed ring is rejected before any ring write.
     ///
-    /// A zone that is not registered (`*_n_workers()` returns 0) does not
-    /// constrain the bound — its ring is never indexed (the per-signal
-    /// `logs_shm_base()` / `spans_shm_base()` gates return `None`).
+    /// Returns 0 when no zone is registered, causing the bounds guard to skip
+    /// all LOG-phase work.
     ///
     /// # Hot-path note
     /// Three pointer loads + integer `min`s; no alloc/lock/syscall.  Callers may
@@ -2160,8 +2208,8 @@ extern "C" fn cmd_exporter_block_handler(
 
 /* ─────────────────────────── top-level commands ────────────────────────────── */
 
-// Production build: 19 commands + 1 terminator.
-// test-support build: 19 commands + otel_status_endpoint + 1 terminator.
+// Production build: 20 commands + 1 terminator.
+// test-support build: 20 commands + otel_status_endpoint + 1 terminator.
 // Two separate definitions so the string "otel_status_endpoint" is absent
 // from production .so files (verified by grep on objs-release/).
 
@@ -2388,25 +2436,41 @@ macro_rules! production_commands {
                 offset: 0,
                 post: ptr::null_mut(),
             },
+            // otel_metrics on | off;
+            // Enable or disable metric collection and export.  Default: on.
+            // Set to `off` to suppress metric emission when only traces (and
+            // optionally logs) are desired — for example, when migrating from
+            // the C++ nginx-otel module, which is traces-only and does not emit
+            // metrics.  When `off`, the per-worker metrics shm zone is not
+            // allocated, worker histogram bumps are skipped, and the exporter
+            // metrics drain loop does not run; traces and logs are unaffected.
+            ngx_command_t {
+                name: ngx_string!("otel_metrics"),
+                type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_FLAG) as ngx_uint_t,
+                set: Some(nginx_sys::ngx_conf_set_flag_slot),
+                conf: NGX_HTTP_MAIN_CONF_OFFSET,
+                offset: mem::offset_of!(MainConfig, metrics_enabled),
+                post: ptr::null_mut(),
+            },
         ]
     };
 }
 
-/// Production build: 19 production commands + terminator.
+/// Production build: 20 production commands + terminator.
 #[cfg(not(any(test, feature = "test-support")))]
-pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 20] = {
-    let mut cmds = [ngx_command_t::empty(); 20];
+pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 21] = {
+    let mut cmds = [ngx_command_t::empty(); 21];
     let prod = production_commands!();
     let mut i = 0;
-    while i < 19 {
+    while i < 20 {
         cmds[i] = prod[i];
         i += 1;
     }
-    // cmds[19] stays empty() — terminator
+    // cmds[20] stays empty() — terminator
     cmds
 };
 
-/// test-support build: 19 production commands + otel_status_endpoint + terminator.
+/// test-support build: 20 production commands + otel_status_endpoint + terminator.
 ///
 /// `otel_status_endpoint;` is a location-level directive (no args) that registers
 /// a content handler returning `control_shm.version` as plain text. Used by the
@@ -2414,16 +2478,16 @@ pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 20] = {
 /// process-level introspection. Absent from production builds (verified by grep
 /// on `objs-release/ngx_http_otel_module.so`).
 #[cfg(any(test, feature = "test-support"))]
-pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 21] = {
-    let mut cmds = [ngx_command_t::empty(); 21];
+pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 22] = {
+    let mut cmds = [ngx_command_t::empty(); 22];
     let prod = production_commands!();
     let mut i = 0;
-    while i < 19 {
+    while i < 20 {
         cmds[i] = prod[i];
         i += 1;
     }
-    // Index 19: otel_status_endpoint (test-support only).
-    cmds[19] = ngx_command_t {
+    // Index 20: otel_status_endpoint (test-support only).
+    cmds[20] = ngx_command_t {
         name: ngx_string!("otel_status_endpoint"),
         type_: (nginx_sys::NGX_HTTP_LOC_CONF | NGX_CONF_NOARGS) as ngx_uint_t,
         set: Some(cmd_set_otel_status_endpoint),
@@ -2431,7 +2495,7 @@ pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 21] = {
         offset: 0,
         post: ptr::null_mut(),
     };
-    // cmds[20] stays empty() — terminator.
+    // cmds[21] stays empty() — terminator.
     cmds
 };
 
@@ -3273,6 +3337,33 @@ mod tests {
             3,
             "only registered rings constrain the bound"
         );
+
+        // Metrics zone absent (capacity 0) — e.g. `otel_metrics off`.
+        // The bound must come from the registered logs/spans zones only.
+        // The OLD implementation started `cap = metrics` (= 0) and the
+        // subsequent `.min()` calls could only lower it further, so it
+        // incorrectly returned 0 and the bounds guard fired for every worker,
+        // silently suppressing traces and access-log tails.
+        assert_eq!(
+            min_indexed_worker_capacity(0, 4, 3),
+            3,
+            "metrics absent: bound must be min(logs=4, spans=3) = 3"
+        );
+        assert_eq!(
+            min_indexed_worker_capacity(0, 4, 0),
+            4,
+            "metrics absent, spans absent: bound must be logs=4"
+        );
+        assert_eq!(
+            min_indexed_worker_capacity(0, 0, 3),
+            3,
+            "metrics absent, logs absent: bound must be spans=3"
+        );
+        assert_eq!(
+            min_indexed_worker_capacity(0, 0, 0),
+            0,
+            "no zones registered: bound must be 0 (bounds guard fires, nothing indexed)"
+        );
     }
 
     #[test]
@@ -3815,6 +3906,36 @@ mod tests {
     ///
     /// `cmd_set_log_ring_size` delegates the alignment step to `align_ring_size`
     /// so that this test is genuine: reverting `align_ring_size` to use
+    /// Verify that `otel_metrics` defaults to enabled (UNSET_FLAG treated as on).
+    ///
+    /// The directive is absent from the default config; `metrics_enabled()` must
+    /// return `true` so that existing deployments that never set `otel_metrics`
+    /// continue to emit metrics unchanged.
+    #[test]
+    fn metrics_enabled_default_is_true() {
+        let cfg = MainConfig::default();
+        // UNSET_FLAG (−1) is the sentinel for "not configured"; treated as on.
+        assert_eq!(cfg.metrics_enabled, UNSET_FLAG, "initial sentinel must be UNSET_FLAG");
+        assert!(cfg.metrics_enabled(), "metrics must be enabled by default");
+    }
+
+    /// Verify that `otel_metrics off` (metrics_enabled = 0) disables metrics.
+    ///
+    /// `ngx_conf_set_flag_slot` writes 0 for `off` and 1 for `on`.
+    #[test]
+    fn metrics_enabled_off_disables_metrics() {
+        // Use struct-update syntax to satisfy clippy::field_reassign_with_default.
+        let cfg = MainConfig { metrics_enabled: 0, ..Default::default() };
+        assert!(!cfg.metrics_enabled(), "metrics_enabled = 0 must return false");
+    }
+
+    /// Verify that `otel_metrics on` (metrics_enabled = 1) explicitly enables metrics.
+    #[test]
+    fn metrics_enabled_on_is_true() {
+        let cfg = MainConfig { metrics_enabled: 1, ..Default::default() };
+        assert!(cfg.metrics_enabled(), "metrics_enabled = 1 must return true");
+    }
+
     /// `next_multiple_of(8)` instead of `checked_next_multiple_of(8)` causes
     /// a panic in debug builds (overflow), which the test runner reports as a
     /// test failure.  The directive handler itself is an FFI callback that cannot
