@@ -2728,14 +2728,18 @@ fn count_pdata_records(data: &Pdata) -> u64 {
 fn build_resource_attrs(amcf: &MainConfig) -> std::vec::Vec<KeyValue> {
     let mut attrs: std::vec::Vec<KeyValue> = std::vec::Vec::new();
 
-    // 1. service.name
-    if !amcf.service_name.is_empty() {
-        if let Ok(name) = core::str::from_utf8(amcf.service_name.as_bytes()) {
-            attrs.push(KeyValue {
-                key: "service.name".into(),
-                value: AnyValue::String(name.into()),
-            });
-        }
+    // 1. service.name — use configured value or fall back to "unknown_service:nginx".
+    // The fallback matches the behaviour specified in the OTel Resource semantic
+    // conventions (resource.md §service.name: "If none of these alternatives are
+    // applicable, unknown_service is used optionally suffixed with :process.executable.name").
+    // The C++ nginx-otel module uses "unknown_service:nginx" (cpp:818-827).
+    let svc_name = if !amcf.service_name.is_empty() {
+        core::str::from_utf8(amcf.service_name.as_bytes()).ok()
+    } else {
+        Some("unknown_service:nginx")
+    };
+    if let Some(name) = svc_name {
+        attrs.push(KeyValue { key: "service.name".into(), value: AnyValue::String(name.into()) });
     }
 
     // 2. Operator-supplied resource attrs (otel_resource_attr).
@@ -5342,5 +5346,63 @@ mod tests {
         // Reset the injectable clock so sibling tests that depend on
         // `ngx_current_msec == 0` (the test-process default) are unaffected.
         TEST_CLOCK_MSEC.store(0, Ordering::Relaxed);
+    }
+
+    // ── A4: service.name fallback ─────────────────────────────────────────────
+
+    /// (A4) When `otel_service_name` is absent, `build_resource_attrs` must emit
+    /// `service.name = "unknown_service:nginx"` — matching the C++ nginx-otel
+    /// module default (cpp:818-827) and the OTel Resource spec fallback.
+    ///
+    /// Mutation evidence: remove the `else { Some("unknown_service:nginx") }`
+    /// branch → the `service.name` attribute is absent when unconfigured →
+    /// `find_attr` returns `None` → the assertion panics.
+    #[test]
+    fn a4_service_name_fallback_when_unconfigured() {
+        let amcf = crate::config::MainConfig::default();
+        // service_name is empty by default (not configured).
+        assert!(amcf.service_name.is_empty(), "service_name must be empty in default config");
+
+        let attrs = build_resource_attrs(&amcf);
+        let val = find_attr(&attrs, "service.name")
+            .expect("service.name must be present when otel_service_name is absent");
+        assert_eq!(
+            *val,
+            AnyValue::String("unknown_service:nginx".into()),
+            "service.name fallback must be \"unknown_service:nginx\""
+        );
+
+        // Only one service.name attribute (no duplication).
+        let count = attrs.iter().filter(|kv| kv.key == "service.name").count();
+        assert_eq!(count, 1, "service.name must appear exactly once");
+    }
+
+    /// (A4) When `otel_service_name` is configured, the operator-supplied name
+    /// is used verbatim; the fallback must NOT appear.
+    ///
+    /// Mutation evidence: always emit `"unknown_service:nginx"` regardless of
+    /// whether `service_name` is set → the value assertion fails.
+    #[test]
+    fn a4_service_name_uses_configured_value_when_set() {
+        use nginx_sys::ngx_str_t;
+
+        let svc_bytes = b"my-nginx-service";
+        let amcf = crate::config::MainConfig {
+            service_name: ngx_str_t { len: svc_bytes.len(), data: svc_bytes.as_ptr().cast_mut() },
+            ..crate::config::MainConfig::default()
+        };
+
+        let attrs = build_resource_attrs(&amcf);
+        let val = find_attr(&attrs, "service.name")
+            .expect("service.name must be present when otel_service_name is configured");
+        assert_eq!(
+            *val,
+            AnyValue::String("my-nginx-service".into()),
+            "service.name must be the configured value, not the fallback"
+        );
+        // Ensure the fallback string does NOT appear anywhere.
+        let fallback_present =
+            attrs.iter().any(|kv| kv.value == AnyValue::String("unknown_service:nginx".into()));
+        assert!(!fallback_present, "fallback must not appear when service_name is configured");
     }
 }
