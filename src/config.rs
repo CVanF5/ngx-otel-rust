@@ -307,9 +307,13 @@ pub struct MainConfig {
     /// Worker 0's `init_process` fires one unary OTLP/gRPC export via
     /// `NgxExecutor` + `SendRequestService` + `NgxConnIo` to verify
     /// the export pipeline works end-to-end on real nginx event-loop
-    /// infrastructure under `--with-debug`.  In production (non-test)
-    /// builds the directive is parsed but ignored; documented as such
-    /// in `src/transport/grpc/smoke.rs`.
+    /// infrastructure under `--with-debug`.  The directive is registered
+    /// ONLY in test-support builds (absent from the production command table
+    /// and the production `.so`); documented as such in
+    /// `src/transport/grpc/smoke.rs`.  This field exists ONLY in test-support
+    /// builds (the directive that populates it and the harness that reads it are
+    /// both `#[cfg(any(test, feature = "test-support"))]`).
+    #[cfg(any(test, feature = "test-support"))]
     pub grpc_smoke_endpoint: ngx_str_t,
     /// `otel_grpc_bidi_smoke_endpoint <url>` — TEST-ONLY trigger for the
     /// bidi gRPC viability harness.  Parallel to
@@ -317,16 +321,16 @@ pub struct MainConfig {
     /// `test-support`), Worker 0's `init_process` fires one bidi
     /// `Echo.BidiEcho` call against the local echo server to verify that
     /// the send-half and receive-half are independently pollable through
-    /// `NgxConnIo`.  Parsed in all builds; acted on only with
-    /// `test-support`.
+    /// `NgxConnIo`.  Exists ONLY in test-support builds.
+    #[cfg(any(test, feature = "test-support"))]
     pub bidi_smoke_endpoint: ngx_str_t,
     /// `otel_grpc_bidi_overload_endpoint <url>` — TEST-ONLY trigger for the
     /// backpressure / livelock integration test.  Parallel
     /// to `bidi_smoke_endpoint`.  When set (and built with
     /// `test-support`), Worker 0's `init_process` fires a sustained bidi
     /// overload against the echo server, exercising the give-up path and
-    /// incrementing `BIDI_BACKPRESSURE_DROPS`.  Parsed in all builds; acted
-    /// on only with `test-support`.
+    /// incrementing `BIDI_BACKPRESSURE_DROPS`.  Exists ONLY in test-support builds.
+    #[cfg(any(test, feature = "test-support"))]
     pub bidi_overload_endpoint: ngx_str_t,
     /// `otel_export_protocol otlp_http | otlp_grpc;` — selects the export
     /// transport.  `None` means the directive was not set; treated as
@@ -474,8 +478,11 @@ impl Default for MainConfig {
             zone_size: 0,
             metrics_enabled: UNSET_FLAG,
             status_code_class: UNSET_FLAG,
+            #[cfg(any(test, feature = "test-support"))]
             grpc_smoke_endpoint: ngx_str_t::default(),
+            #[cfg(any(test, feature = "test-support"))]
             bidi_smoke_endpoint: ngx_str_t::default(),
+            #[cfg(any(test, feature = "test-support"))]
             bidi_overload_endpoint: ngx_str_t::default(),
             export_protocol: None,
             shm_zone: ptr::null_mut(),
@@ -2208,10 +2215,12 @@ extern "C" fn cmd_exporter_block_handler(
 
 /* ─────────────────────────── top-level commands ────────────────────────────── */
 
-// Production build: 20 commands + 1 terminator.
-// test-support build: 20 commands + otel_status_endpoint + 1 terminator.
-// Two separate definitions so the string "otel_status_endpoint" is absent
-// from production .so files (verified by grep on objs-release/).
+// Production build: 17 commands + 1 terminator.
+// test-support build: 17 commands + 4 test-only directives + 1 terminator.
+// Two separate definitions so the test-only directive strings
+// (otel_status_endpoint, otel_grpc_smoke_endpoint, otel_grpc_bidi_smoke_endpoint,
+// otel_grpc_bidi_overload_endpoint) are absent from production .so files
+// (verified by grep on objs-release/).
 
 /// Shared production commands.
 macro_rules! production_commands {
@@ -2278,34 +2287,6 @@ macro_rules! production_commands {
                 set: Some(nginx_sys::ngx_conf_set_flag_slot),
                 conf: NGX_HTTP_MAIN_CONF_OFFSET,
                 offset: mem::offset_of!(MainConfig, status_code_class),
-                post: ptr::null_mut(),
-            },
-            // otel_grpc_smoke_endpoint <url>;  TEST-ONLY (unary gRPC harness).
-            // Parsed in all builds but only acted on with test-support feature.
-            ngx_command_t {
-                name: ngx_string!("otel_grpc_smoke_endpoint"),
-                type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-                set: Some(nginx_sys::ngx_conf_set_str_slot),
-                conf: NGX_HTTP_MAIN_CONF_OFFSET,
-                offset: mem::offset_of!(MainConfig, grpc_smoke_endpoint),
-                post: ptr::null_mut(),
-            },
-            // otel_grpc_bidi_smoke_endpoint <url>;  TEST-ONLY (bidi gRPC harness).
-            ngx_command_t {
-                name: ngx_string!("otel_grpc_bidi_smoke_endpoint"),
-                type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-                set: Some(nginx_sys::ngx_conf_set_str_slot),
-                conf: NGX_HTTP_MAIN_CONF_OFFSET,
-                offset: mem::offset_of!(MainConfig, bidi_smoke_endpoint),
-                post: ptr::null_mut(),
-            },
-            // otel_grpc_bidi_overload_endpoint <url>;  TEST-ONLY (bidi backpressure test).
-            ngx_command_t {
-                name: ngx_string!("otel_grpc_bidi_overload_endpoint"),
-                type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-                set: Some(nginx_sys::ngx_conf_set_str_slot),
-                conf: NGX_HTTP_MAIN_CONF_OFFSET,
-                offset: mem::offset_of!(MainConfig, bidi_overload_endpoint),
                 post: ptr::null_mut(),
             },
             // otel_export_protocol otlp_http | otlp_grpc;
@@ -2456,43 +2437,74 @@ macro_rules! production_commands {
     };
 }
 
-/// Production build: 20 production commands + terminator.
+/// Production build: 17 production commands + terminator.
 #[cfg(not(any(test, feature = "test-support")))]
-pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 21] = {
-    let mut cmds = [ngx_command_t::empty(); 21];
+pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 18] = {
+    let mut cmds = [ngx_command_t::empty(); 18];
     let prod = production_commands!();
     let mut i = 0;
-    while i < 20 {
+    while i < 17 {
         cmds[i] = prod[i];
         i += 1;
     }
-    // cmds[20] stays empty() — terminator
+    // cmds[17] stays empty() — terminator
     cmds
 };
 
-/// test-support build: 20 production commands + otel_status_endpoint + terminator.
+/// test-support build: 17 production commands + 4 test-only directives + terminator.
 ///
-/// `otel_status_endpoint;` is a location-level directive (no args) that registers
-/// a content handler returning `control_shm.version` as plain text. Used by the
-/// heartbeat integration test to read the exporter's liveness counter without
-/// process-level introspection. Absent from production builds (verified by grep
-/// on `objs-release/ngx_http_otel_module.so`).
+/// The test-only directives exist ONLY in test-support builds and are absent from
+/// the production command table (and therefore from the production `.so`, verified
+/// by grep on `objs-release/ngx_http_otel_module.so`):
+///   - `otel_status_endpoint;` — location-level (no args) content handler returning
+///     `control_shm.version` as plain text; lets the heartbeat integration test read
+///     the exporter's liveness counter without process-level introspection.
+///   - `otel_grpc_smoke_endpoint <url>;` — unary gRPC send-path harness trigger.
+///   - `otel_grpc_bidi_smoke_endpoint <url>;` — bidi gRPC harness trigger.
+///   - `otel_grpc_bidi_overload_endpoint <url>;` — bidi backpressure / give-up test trigger.
 #[cfg(any(test, feature = "test-support"))]
 pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 22] = {
     let mut cmds = [ngx_command_t::empty(); 22];
     let prod = production_commands!();
     let mut i = 0;
-    while i < 20 {
+    while i < 17 {
         cmds[i] = prod[i];
         i += 1;
     }
-    // Index 20: otel_status_endpoint (test-support only).
-    cmds[20] = ngx_command_t {
+    // Index 17: otel_status_endpoint (test-support only).
+    cmds[17] = ngx_command_t {
         name: ngx_string!("otel_status_endpoint"),
         type_: (nginx_sys::NGX_HTTP_LOC_CONF | NGX_CONF_NOARGS) as ngx_uint_t,
         set: Some(cmd_set_otel_status_endpoint),
         conf: 0,
         offset: 0,
+        post: ptr::null_mut(),
+    };
+    // Index 18: otel_grpc_smoke_endpoint (test-support only).
+    cmds[18] = ngx_command_t {
+        name: ngx_string!("otel_grpc_smoke_endpoint"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(nginx_sys::ngx_conf_set_str_slot),
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+        offset: mem::offset_of!(MainConfig, grpc_smoke_endpoint),
+        post: ptr::null_mut(),
+    };
+    // Index 19: otel_grpc_bidi_smoke_endpoint (test-support only).
+    cmds[19] = ngx_command_t {
+        name: ngx_string!("otel_grpc_bidi_smoke_endpoint"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(nginx_sys::ngx_conf_set_str_slot),
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+        offset: mem::offset_of!(MainConfig, bidi_smoke_endpoint),
+        post: ptr::null_mut(),
+    };
+    // Index 20: otel_grpc_bidi_overload_endpoint (test-support only).
+    cmds[20] = ngx_command_t {
+        name: ngx_string!("otel_grpc_bidi_overload_endpoint"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(nginx_sys::ngx_conf_set_str_slot),
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+        offset: mem::offset_of!(MainConfig, bidi_overload_endpoint),
         post: ptr::null_mut(),
     };
     // cmds[21] stays empty() — terminator.
