@@ -538,7 +538,7 @@ location wins on merge.
 |---|---|---|
 | `$otel_trace_id` | string (32-char hex) | trace ID from the current request's `SpanCtx`, or empty string when tracing is disabled. |
 | `$otel_span_id` | string (16-char hex) | span ID of the current request's span, or empty string when tracing is disabled. |
-| `$otel_parent_id` | string (16-char hex) | parent span ID from the inbound `traceparent` header, or empty string for root spans or when tracing is disabled. |
+| `$otel_parent_id` | string (16-char hex) | parent span ID from the inbound `traceparent` header; `0000000000000000` (all-zero hex) for root spans; empty string only when tracing is disabled. |
 | `$otel_parent_sampled` | string `"1"` / empty | `"1"` when this request is sampled — including root spans with no inbound `traceparent`; empty only when tracing is disabled. (The name reads as a parent-only flag but reflects the sampling state of *this* request — see `span_start.rs`.) |
 
 ### Span shape
@@ -576,7 +576,7 @@ such as `http.method` and `http.status_code` are not emitted.
 | `user_agent.original` | `User-Agent` header value (≤ 128 bytes) | omitted when absent |
 | `http.request.body.size` | request body bytes (`Content-Length`; 0 when absent) | |
 | `http.response.body.size` | response body bytes sent, headers excluded | |
-| `server.address` | server name from the matched virtual host (≤ 256 bytes) | |
+| `server.address` | server name from the matched virtual host (≤ 64 bytes) | |
 | `server.port` | local listening port (integer) | omitted when absent |
 | `client.address` | logical client IP, realip-aware (`$remote_addr` equivalent) | |
 | `client.port` | logical client port (integer) | |

@@ -694,7 +694,7 @@ Sub-directives inside `otel_exporter {}` — compatibility aliases:
 |---|---|
 | `$otel_trace_id` | 32-char lowercase hex trace ID of the current span; empty when tracing is not enabled for this request |
 | `$otel_span_id` | 16-char lowercase hex span ID of the current span; empty when tracing is not enabled |
-| `$otel_parent_id` | 16-char lowercase hex parent span ID from the inbound `traceparent`; empty for root spans or when tracing is not enabled |
+| `$otel_parent_id` | 16-char lowercase hex parent span ID from the inbound `traceparent`; `0000000000000000` (all-zero hex) for root spans; empty when tracing is not enabled |
 | `$otel_parent_sampled` | `"1"` when the current request is sampled (including root spans); empty when tracing is not enabled |
 
 All four variables are usable in `access_log` format strings, `if=` conditions,
