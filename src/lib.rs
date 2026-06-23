@@ -1911,6 +1911,44 @@ mod nginx_test_stubs {
     pub unsafe extern "C" fn ngx_list_push(_l: *mut nginx_sys::ngx_list_t) -> *mut c_void {
         core::ptr::null_mut()
     }
+
+    // ── Stubs for the span-attribute peer/port lookup (instrumented.rs) ───────
+    //
+    // The log-phase span builder reads the realip-aware peer via two request
+    // variables (`ngx_http_get_variable` + the `ngx_hash_strlow` that hashes the
+    // variable name) and materialises the local sockaddr with
+    // `ngx_connection_local_sockaddr`.  On macOS flat-namespace linking these
+    // resolve from the loaded nginx binary; on a Linux ELF test binary every
+    // referenced symbol must exist at link time.  Unit tests build SpanRecords
+    // from synthetic requests and never drive this branch, so these stubs are
+    // never actually called — they only need to exist for the linker.
+
+    #[no_mangle]
+    pub unsafe extern "C" fn ngx_hash_strlow(
+        _dst: *mut core::ffi::c_uchar,
+        _src: *mut core::ffi::c_uchar,
+        _n: usize,
+    ) -> nginx_sys::ngx_uint_t {
+        0
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn ngx_http_get_variable(
+        _r: *mut nginx_sys::ngx_http_request_t,
+        _name: *mut nginx_sys::ngx_str_t,
+        _key: nginx_sys::ngx_uint_t,
+    ) -> *mut nginx_sys::ngx_http_variable_value_t {
+        core::ptr::null_mut()
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn ngx_connection_local_sockaddr(
+        _c: *mut nginx_sys::ngx_connection_t,
+        _s: *mut nginx_sys::ngx_str_t,
+        _port: nginx_sys::ngx_uint_t,
+    ) -> nginx_sys::ngx_int_t {
+        nginx_sys::NGX_ERROR as nginx_sys::ngx_int_t
+    }
 }
 
 #[cfg(test)]
