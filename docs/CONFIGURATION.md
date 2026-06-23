@@ -394,11 +394,12 @@ conditions, `otel_span_name`, `map` blocks, etc.
 | `$otel_trace_id` | 32-char lowercase hex trace ID of the current span. Empty when tracing is not enabled for this request. |
 | `$otel_span_id` | 16-char lowercase hex span ID of the current span. Empty when tracing is not enabled. |
 | `$otel_parent_id` | 16-char lowercase hex parent span ID from the inbound `traceparent` header. `0000000000000000` (all-zero hex) for root spans (no inbound parent). Empty only when tracing is not enabled. |
-| `$otel_parent_sampled` | `"1"` when this request is sampled (including root spans with no inbound `traceparent`). Empty only when tracing is not enabled. |
+| `$otel_parent_sampled` | `"1"` when this request is sampled; `"0"` when a span context exists but the W3C sampled bit is unset (traced-but-unsampled). Empty only when tracing is not enabled (no span context). |
 
 `$otel_parent_sampled` reflects the sampling state of **this** request, not
-just whether a parent was sampled. It is `"1"` for all sampled spans, including
-freshly-generated root spans.
+just whether a parent was sampled. It is `"1"` for sampled spans (including
+freshly-generated root spans), `"0"` for traced-but-unsampled requests, and
+empty only when tracing is disabled (no span context for the request).
 
 ---
 
