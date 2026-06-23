@@ -1,0 +1,25 @@
+ThreadSanitizer (TSAN) gate — C++ nginx-otel drop-in feature
+============================================================
+
+GIT_COMMIT = 4c14b86c6ebd756c7b0e3f2ec14ed8aa5059b61d
+Branch     = dropin-integration (tip)
+Platform   = debian-vm, Linux aarch64 (the project's TSAN platform)
+Command    = make tsan-test
+Date       = 2026-06-23 (run 2026-06-23T16:16:32Z)
+
+Scope: whole-range sanitizer gate for the C++ nginx-otel drop-in feature
+(Batch A exporter-block aliases + vars + service.name fallback; Batch B
+otel_metrics on|off gate; Batch C span coverage under current OTel HTTP
+semconv incl. the SpanRecord producer<->exporter wire-format change and the
+realip-aware client.address / network.peer.* addressing; Batch D docs). The
+concurrency-relevant surface is the shm span-record path (larger fixed
+MAX_SPAN_RECORD) and the metrics-gate shm-zone registration.
+
+Evidence (instrumentation present on the EXACT loaded artifact, then zero races):
+  [tsan-run] Step 3.5: OK — 42 __tsan_* symbols confirmed in libngx_http_otel_module.so.
+  [tsan-run] Checking for ThreadSanitizer warnings in error logs...
+  [tsan-run] Zero ThreadSanitizer warnings.  TSAN gate: PASS.
+  TSAN_EXIT=0
+
+VERDICT: PASS — 42 __tsan_ symbols confirmed in the loaded cdylib; zero
+ThreadSanitizer warnings / data races across the suite; clean exit 0.
