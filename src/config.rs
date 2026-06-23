@@ -576,23 +576,38 @@ unsafe fn n_workers_to_reserve(cf: *const ngx_conf_t) -> usize {
     }
 }
 
-/// Smallest worker-slot capacity across the metrics zone and the (optional)
-/// logs and spans rings — the bound the LOG-phase `worker_id` guard must use.
+/// Smallest worker-slot capacity across all registered shm rings — the bound
+/// the LOG-phase `worker_id` guard must use.
 ///
-/// A registered logs/spans zone (capacity > 0) tightens the bound; a zone that
-/// is not registered (capacity 0) does not constrain it, because its ring is
-/// never indexed.  Factored out as a pure function so the min-capacity invariant
-/// is unit-testable without a live shm zone.
+/// A zone is "registered" when its capacity is greater than zero.  Unregistered
+/// zones (capacity 0) do not constrain the bound because their rings are never
+/// indexed.  Any of the three zones may be absent (e.g. when `otel_metrics off`
+/// leaves the metrics zone unregistered).
+///
+/// Returns 0 when no zone is registered, which causes the LOG-phase bounds guard
+/// to skip all work.
+///
+/// Factored out as a pure function so the min-capacity invariant is
+/// unit-testable without a live shm zone.
 #[inline]
 fn min_indexed_worker_capacity(metrics: usize, logs: usize, spans: usize) -> usize {
-    let mut cap = metrics;
+    // Start from "no bound" and tighten only by registered (non-zero) zones.
+    let mut cap = usize::MAX;
+    if metrics > 0 {
+        cap = cap.min(metrics);
+    }
     if logs > 0 {
         cap = cap.min(logs);
     }
     if spans > 0 {
         cap = cap.min(spans);
     }
-    cap
+    // No zone registered → nothing to index → return 0 so the bounds guard fires.
+    if cap == usize::MAX {
+        0
+    } else {
+        cap
+    }
 }
 
 impl MainConfig {
@@ -1598,8 +1613,12 @@ impl MainConfig {
     }
 
     /// Smallest worker-slot capacity across every shm ring the LOG-phase handler
-    /// indexes by `worker_id`: the metrics zone plus whichever of the logs and
-    /// spans rings are registered.
+    /// indexes by `worker_id`.
+    ///
+    /// Covers the metrics zone (when registered), the logs ring (when registered),
+    /// and the spans ring (when registered).  Any of these zones may be absent —
+    /// for example, when `otel_metrics off` leaves the metrics zone unregistered.
+    /// Only registered zones (capacity > 0) constrain the bound.
     ///
     /// The metrics zone can be inflated past the reserved worker count via
     /// `otel_zone_size` (`register_shm_zone` takes `zone_size.max(required)`),
@@ -1609,9 +1628,8 @@ impl MainConfig {
     /// The hot-path guard validates against this MIN so a `worker_id` that would
     /// overrun the *smallest* indexed ring is rejected before any ring write.
     ///
-    /// A zone that is not registered (`*_n_workers()` returns 0) does not
-    /// constrain the bound — its ring is never indexed (the per-signal
-    /// `logs_shm_base()` / `spans_shm_base()` gates return `None`).
+    /// Returns 0 when no zone is registered, causing the bounds guard to skip
+    /// all LOG-phase work.
     ///
     /// # Hot-path note
     /// Three pointer loads + integer `min`s; no alloc/lock/syscall.  Callers may
@@ -3126,6 +3144,33 @@ mod tests {
             min_indexed_worker_capacity(8, 0, 3),
             3,
             "only registered rings constrain the bound"
+        );
+
+        // Metrics zone absent (capacity 0) — e.g. `otel_metrics off`.
+        // The bound must come from the registered logs/spans zones only.
+        // The OLD implementation started `cap = metrics` (= 0) and the
+        // subsequent `.min()` calls could only lower it further, so it
+        // incorrectly returned 0 and the bounds guard fired for every worker,
+        // silently suppressing traces and access-log tails.
+        assert_eq!(
+            min_indexed_worker_capacity(0, 4, 3),
+            3,
+            "metrics absent: bound must be min(logs=4, spans=3) = 3"
+        );
+        assert_eq!(
+            min_indexed_worker_capacity(0, 4, 0),
+            4,
+            "metrics absent, spans absent: bound must be logs=4"
+        );
+        assert_eq!(
+            min_indexed_worker_capacity(0, 0, 3),
+            3,
+            "metrics absent, logs absent: bound must be spans=3"
+        );
+        assert_eq!(
+            min_indexed_worker_capacity(0, 0, 0),
+            0,
+            "no zones registered: bound must be 0 (bounds guard fires, nothing indexed)"
         );
     }
 

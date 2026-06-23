@@ -5395,4 +5395,27 @@ mod tests {
             "per-worker http.server.request.* series must be absent when shm_zone is null"
         );
     }
+
+    /// Companion test: `metrics_enabled()` is false for value 0 and true for
+    /// default/unset (UNSET_FLAG = -1).
+    ///
+    /// This test is keyed on the `metrics_enabled()` accessor itself, not the
+    /// shm zone.  A mutation that makes `metrics_enabled()` unconditionally
+    /// return `true` causes this test to fail, whereas the shm-null test above
+    /// would still pass under that mutation (null shm → no instrumented series
+    /// regardless of the flag).
+    #[test]
+    fn metrics_enabled_flag_controls_accessor() {
+        let off = crate::config::MainConfig {
+            metrics_enabled: 0,
+            ..crate::config::MainConfig::default()
+        };
+        assert!(!off.metrics_enabled(), "metrics_enabled = 0 must return false (otel_metrics off)");
+
+        let default = crate::config::MainConfig::default();
+        assert!(
+            default.metrics_enabled(),
+            "metrics_enabled = UNSET_FLAG must return true (default on)"
+        );
+    }
 }

@@ -112,12 +112,6 @@ impl HttpRequestHandler for LogPhaseHandler {
             let _ = unsafe { (*ctrl).flags.load(Ordering::Relaxed) };
         }
 
-        // Obtain base address of the shm zone.
-        let base = match amcf.shm_base() {
-            Some(b) => b,
-            None => return Status::NGX_OK,
-        };
-
         // Determine current worker index (no syscall — nginx global).
         // SAFETY: `ngx_worker` is a `static mut` set once by nginx during worker
         // init and only ever read thereafter from this worker process, so reading
@@ -130,12 +124,12 @@ impl HttpRequestHandler for LogPhaseHandler {
         //
         // The SAME `worker_id` indexes the metrics zone (`worker_slots`, just
         // below), the logs access ring (`logs_access_ring`), and the spans ring
-        // (`spans_ring`).  The metrics zone may be inflated past the reserved
-        // worker count via `otel_zone_size`, but the logs/spans zones are sized
-        // strictly for the reserved worker count, so a `worker_id` that fits the
-        // metrics zone could still overrun the smaller logs/spans rings.
-        // Validate against the MIN of all three capacities (registered zones
-        // only) so the smallest indexed ring is covered before any ring write.
+        // (`spans_ring`).  Any of these zones may be absent (e.g. the metrics
+        // zone when `otel_metrics off`).  The metrics zone can also be inflated
+        // past the reserved worker count via `otel_zone_size`, so a `worker_id`
+        // that fits it could still overrun the smaller logs/spans rings.
+        // Validate against the MIN of all registered zone capacities so the
+        // smallest indexed ring is covered before any ring write.
         // `min_indexed_worker_capacity()` derives each capacity from the
         // registered zone size — zero cost: a few pointer loads + integer
         // arithmetic, no alloc/lock/syscall.
@@ -160,10 +154,6 @@ impl HttpRequestHandler for LogPhaseHandler {
         }
 
         debug_assert!(worker_id < n_workers, "worker_id out of zone bounds");
-        // Get our slot. No allocation; pointer arithmetic only.
-        // SAFETY: `worker_id < n_workers` (enforced by the bounds guard above);
-        // `n_workers` is derived from the zone size so the slot is within the zone.
-        let slot = unsafe { &*worker_slots(base, worker_id) };
 
         // Use AsRef to get a typed reference to the underlying ngx_http_request_t.
         let r = request.as_ref();
@@ -173,7 +163,7 @@ impl HttpRequestHandler for LogPhaseHandler {
         // SpanCtx.start_mono can drive the µs histogram when tracing is on.
         // Set by SpanStartHandler in REWRITE.  None when tracing is not configured.
         // Re-used for:
-        //   (1) µs duration histogram (this block).
+        //   (1) µs duration histogram (metrics block).
         //   (2) trace correlation on the access tail log / exemplar (below).
         //   (3) span record emission when sampled (the span block below).
         let span_ctx: Option<&crate::traces::ctx::SpanCtx> = {
@@ -223,17 +213,16 @@ impl HttpRequestHandler for LogPhaseHandler {
             let start_us = (r.start_sec as u64) * 1_000_000 + (r.start_msec as u64) * 1_000;
             end_us.saturating_sub(start_us)
         };
-        // ── request duration (decomposed tables) ─────────────────────────────
-        // Three independent histogram bumps — each O(1) fetch_add, no alloc, no lock.
+
+        // ── Shared request metadata ───────────────────────────────────────────
+        // Computed once; used by the metrics block, access-log tail, and span block.
         let method = HttpMethod::from_bytes(r.method_name.as_bytes());
         let status = r.headers_out.status as u16;
         let proto = ProtoVersion::from_ngx(r.http_version as core::ffi::c_uint);
 
-        // 1. Base table: {method × status_class × protocol} (160 combos).
-        //
-        // `status_class` and `base_idx` are always computed (O(1) arithmetic, hot-path
-        // safe) because the exemplar block below also needs `base_idx` even for
-        // status-0 latency outliers.
+        // `status_class` and `base_idx` are O(1) arithmetic, hot-path safe.
+        // `base_idx` is needed by the exemplar write (metrics) and the access-log
+        // tail (logs), so it is computed here even when the metrics zone is absent.
         //
         // Status 0 = client abort / no response sent.  `ngx_http_create_request`
         // allocates the request struct with `ngx_pcalloc` (nginx src/http/ngx_http_request.c:588),
@@ -251,53 +240,17 @@ impl HttpRequestHandler for LogPhaseHandler {
         // resources regardless of the abort.
         let status_class = StatusClass::from_status(status);
         let base_idx = combo_index(method, status_class, proto);
-        record_base_combo(slot, status, base_idx, duration_us);
 
-        // 2. Per-route table: http.route = location name.
+        // `route_idx` is needed by both the metrics per-route histogram and the span
+        // name builder — compute it once outside the metrics block.
         let route_idx = {
             let clcf_ptr =
                 NgxHttpCoreModule::location_conf(r).map(|c| c as *const _ as usize).unwrap_or(0);
             amcf.route_idx_for_clcf(clcf_ptr)
         };
-        slot.route_duration_combos[route_idx].record(duration_us);
 
-        // 3. Per-upstream table: nginx.upstream.zone.
-        //    Skip if no upstream (zone_ptr = 0 → UPSTREAM_IDX_OTHER).
-        let upstream_zone_ptr: usize = if let Some(upstream) = request.upstream() {
-            // SAFETY: `request.upstream()` returns `Some` only when nginx has set
-            // up the per-request upstream struct, so `upstream` is a valid
-            // `ngx_http_upstream_t` pointer for the duration of this handler.
-            let us = unsafe { (*upstream).upstream };
-            if !us.is_null() {
-                // SAFETY: `us` is the non-null `ngx_http_upstream_srv_conf_t`
-                // pointer just read from the live upstream struct; reading its
-                // `shm_zone` field is sound.
-                let zone = unsafe { (*us).shm_zone };
-                if !zone.is_null() {
-                    zone as usize
-                } else {
-                    0
-                }
-            } else {
-                0
-            }
-        } else {
-            0
-        };
-        let upstream_idx = amcf.upstream_idx_for_zone(upstream_zone_ptr);
-        // Only bump upstream histogram when request actually went through an upstream.
-        if upstream_zone_ptr != 0 && upstream_idx < UPSTREAM_IDX_OTHER {
-            slot.upstream_duration_combos[upstream_idx].record(duration_us);
-        } else if upstream_zone_ptr != 0 {
-            // Over-cap upstream: bump "other" slot (UPSTREAM_IDX_OTHER = UPSTREAM_CAP).
-            slot.upstream_duration_combos[UPSTREAM_IDX_OTHER].record(duration_us);
-        }
-        // zone_ptr == 0 → no upstream → skip upstream histogram.
-
-        // ── request body bytes ────────────────────────────────────────────
-        slot.request_body_bytes.record(r.request_length as u64, &BYTES_BOUNDS);
-
-        // ── response bytes ────────────────────────────────────────────────
+        // `resp_bytes` is needed by both the metrics response-bytes histogram and the
+        // access-log tail record — compute it once outside the metrics block.
         let resp_bytes = {
             let conn = request.connection();
             if conn.is_null() {
@@ -310,49 +263,106 @@ impl HttpRequestHandler for LogPhaseHandler {
                 unsafe { (*conn).sent as u64 }
             }
         };
-        slot.response_body_bytes.record(resp_bytes, &BYTES_BOUNDS);
 
-        // ── upstream timings (if an upstream was used) ────────────────────
-        // Sum the timings/bytes across ALL upstream attempts, not just the
-        // current (last) `u->state`.  When `proxy_next_upstream` retries a peer,
-        // nginx pushes a fresh `ngx_http_upstream_state_t` per attempt onto
-        // `r->upstream_states` (an `ngx_array_t`); `u->state` points only at the
-        // last one.  The core `$upstream_response_time` / `$upstream_*_bytes`
-        // variables iterate the whole `r->upstream_states` array
-        // (`ngx_http_upstream_response_time_variable` /
-        // `..._response_length_variable`, ngx_http_upstream.c:6027,6105), so
-        // reading only `u->state` undercounts multi-attempt requests.  Walk the
-        // same array and aggregate so the metric matches the total upstream cost
-        // those variables report.
-        // `request.upstream()` being `Some` confirms this request actually went
-        // through an upstream, so `r->upstream_states` is meaningful.
-        if request.upstream().is_some() {
-            // SAFETY: `r` is the live request for this LOG-phase handler;
-            // `upstream_states` is either null (no upstream attempts) or a valid
-            // `ngx_array_t*` of `ngx_http_upstream_state_t` in the request pool,
-            // valid for this handler.  The walk only reads plain numeric fields.
-            if let Some(sum) = unsafe { sum_upstream_states(r.upstream_states) } {
-                // nginx initialises the timing fields to (ngx_msec_t)-1
-                // (= NGX_MSEC_SENTINEL) when the attempt did not complete that
-                // phase (e.g. connect_time on a refused connection); the core
-                // variables emit "-" for it (ngx_http_upstream.c:6074).  The
-                // walk skips sentinel attempts per field, so a metric is recorded
-                // only when at least one attempt had a real measurement.
-                if let Some(resp_ms) = sum.response_ms {
-                    slot.upstream_response_ms.record(resp_ms, &DURATION_BOUNDS_MS);
+        // ── METRICS block ─────────────────────────────────────────────────────
+        // Skipped when the metrics shm zone is absent (e.g. `otel_metrics off`).
+        // Traces and access-log tails are unaffected — they have their own zones
+        // and are handled in the independent blocks below.
+        if let Some(metrics_base) = amcf.shm_base() {
+            // Get our per-worker slot. No allocation; pointer arithmetic only.
+            // SAFETY: `worker_id < n_workers` (enforced by the bounds guard above);
+            // `n_workers` is derived from the registered zone sizes so the slot is
+            // within the zone.
+            let slot = unsafe { &*worker_slots(metrics_base, worker_id) };
+
+            // 1. Base table: {method × status_class × protocol} (160 combos).
+            record_base_combo(slot, status, base_idx, duration_us);
+
+            // 2. Per-route table: http.route = location name.
+            slot.route_duration_combos[route_idx].record(duration_us);
+
+            // 3. Per-upstream table: nginx.upstream.zone.
+            //    Skip if no upstream (zone_ptr = 0 → UPSTREAM_IDX_OTHER).
+            let upstream_zone_ptr: usize = if let Some(upstream) = request.upstream() {
+                // SAFETY: `request.upstream()` returns `Some` only when nginx has set
+                // up the per-request upstream struct, so `upstream` is a valid
+                // `ngx_http_upstream_t` pointer for the duration of this handler.
+                let us = unsafe { (*upstream).upstream };
+                if !us.is_null() {
+                    // SAFETY: `us` is the non-null `ngx_http_upstream_srv_conf_t`
+                    // pointer just read from the live upstream struct; reading its
+                    // `shm_zone` field is sound.
+                    let zone = unsafe { (*us).shm_zone };
+                    if !zone.is_null() {
+                        zone as usize
+                    } else {
+                        0
+                    }
+                } else {
+                    0
                 }
-                if let Some(hdr_ms) = sum.header_ms {
-                    slot.upstream_header_ms.record(hdr_ms, &DURATION_BOUNDS_MS);
-                }
-                if let Some(conn_ms) = sum.connect_ms {
-                    slot.upstream_connect_ms.record(conn_ms, &DURATION_BOUNDS_MS);
-                }
-                slot.upstream_bytes_received.record(sum.bytes_received, &BYTES_BOUNDS);
-                slot.upstream_bytes_sent.record(sum.bytes_sent, &BYTES_BOUNDS);
+            } else {
+                0
+            };
+            let upstream_idx = amcf.upstream_idx_for_zone(upstream_zone_ptr);
+            // Only bump upstream histogram when request actually went through an upstream.
+            if upstream_zone_ptr != 0 && upstream_idx < UPSTREAM_IDX_OTHER {
+                slot.upstream_duration_combos[upstream_idx].record(duration_us);
+            } else if upstream_zone_ptr != 0 {
+                // Over-cap upstream: bump "other" slot (UPSTREAM_IDX_OTHER = UPSTREAM_CAP).
+                slot.upstream_duration_combos[UPSTREAM_IDX_OTHER].record(duration_us);
             }
-        }
+            // zone_ptr == 0 → no upstream → skip upstream histogram.
+
+            // ── request body bytes ────────────────────────────────────────────
+            slot.request_body_bytes.record(r.request_length as u64, &BYTES_BOUNDS);
+
+            // ── response bytes ────────────────────────────────────────────────
+            slot.response_body_bytes.record(resp_bytes, &BYTES_BOUNDS);
+
+            // ── upstream timings (if an upstream was used) ────────────────────
+            // Sum the timings/bytes across ALL upstream attempts, not just the
+            // current (last) `u->state`.  When `proxy_next_upstream` retries a peer,
+            // nginx pushes a fresh `ngx_http_upstream_state_t` per attempt onto
+            // `r->upstream_states` (an `ngx_array_t`); `u->state` points only at the
+            // last one.  The core `$upstream_response_time` / `$upstream_*_bytes`
+            // variables iterate the whole `r->upstream_states` array
+            // (`ngx_http_upstream_response_time_variable` /
+            // `..._response_length_variable`, ngx_http_upstream.c:6027,6105), so
+            // reading only `u->state` undercounts multi-attempt requests.  Walk the
+            // same array and aggregate so the metric matches the total upstream cost
+            // those variables report.
+            // `request.upstream()` being `Some` confirms this request actually went
+            // through an upstream, so `r->upstream_states` is meaningful.
+            if request.upstream().is_some() {
+                // SAFETY: `r` is the live request for this LOG-phase handler;
+                // `upstream_states` is either null (no upstream attempts) or a valid
+                // `ngx_array_t*` of `ngx_http_upstream_state_t` in the request pool,
+                // valid for this handler.  The walk only reads plain numeric fields.
+                if let Some(sum) = unsafe { sum_upstream_states(r.upstream_states) } {
+                    // nginx initialises the timing fields to (ngx_msec_t)-1
+                    // (= NGX_MSEC_SENTINEL) when the attempt did not complete that
+                    // phase (e.g. connect_time on a refused connection); the core
+                    // variables emit "-" for it (ngx_http_upstream.c:6074).  The
+                    // walk skips sentinel attempts per field, so a metric is recorded
+                    // only when at least one attempt had a real measurement.
+                    if let Some(resp_ms) = sum.response_ms {
+                        slot.upstream_response_ms.record(resp_ms, &DURATION_BOUNDS_MS);
+                    }
+                    if let Some(hdr_ms) = sum.header_ms {
+                        slot.upstream_header_ms.record(hdr_ms, &DURATION_BOUNDS_MS);
+                    }
+                    if let Some(conn_ms) = sum.connect_ms {
+                        slot.upstream_connect_ms.record(conn_ms, &DURATION_BOUNDS_MS);
+                    }
+                    slot.upstream_bytes_received.record(sum.bytes_received, &BYTES_BOUNDS);
+                    slot.upstream_bytes_sent.record(sum.bytes_sent, &BYTES_BOUNDS);
+                }
+            }
+        } // end metrics block
 
         // ── exception-tail / exemplar export ──────────────────────────────
+        // Independent of the metrics block: the logs shm zone is gated separately.
         // Gate 1 (cheap config check): no location selects export anywhere →
         //   any_log_export_enabled() = false, this entire block is skipped, so
         //   a deployment without `otel_log_export` pays only the single bool.
@@ -361,7 +371,6 @@ impl HttpRequestHandler for LogPhaseHandler {
         //   `if=<cond>` ⇒ export when the complex value is truthy; `off`/unset
         //   ⇒ nothing.  Nothing is hardcoded — the operator's condition is the
         //   only predicate (privacy-safe default of no export).
-        // The histogram bump above is always-on and is NOT gated here.
         let export_selected = if amcf.any_log_export_enabled() {
             match HttpOtelModule::location_conf(r) {
                 Some(lc) => match lc.log_export_mode() {
@@ -492,35 +501,37 @@ impl HttpRequestHandler for LogPhaseHandler {
         // Gate 1: request must be sampled (ctx.sampled=true).
         // Gate 2: spans shm zone must be available (otel_spans_zone configured).
         // Both gates false → zero work, no ring push.
-        // This block is INDEPENDENT of the access-log gate above — spans are emitted
-        // for all sampled requests, not only "interesting" tail ones.
+        // This block is INDEPENDENT of the metrics block above — spans are emitted
+        // regardless of whether `otel_metrics` is on or off.
         if let Some(ctx) = span_ctx.filter(|ctx| ctx.sampled) {
             // ── Exemplar write (OTel TraceBased exemplar filter) ───────────────
-            // Record an exemplar ONLY for sampled-trace requests, into this base
-            // data point's reservoir.  This implements the spec's default
-            // `TraceBased` ExemplarFilter (sample only from sampled spans) and
-            // means every exemplar carries a real, resolvable trace pointer —
-            // `has_trace = false` exemplars are never produced.
+            // Record an exemplar into the metrics slot ONLY when the metrics zone
+            // is present (exemplar reservoirs live in the metrics shm slot).
+            // Skipped when `otel_metrics off` — the span record below still runs.
             // <https://opentelemetry.io/docs/specs/otel/metrics/sdk/#exemplar-defaults>
-            // Hot path: one fetch_add + a branch + ≤ 6 Relaxed stores.
-            // Request start time in ns (ms precision from nginx's stored fields);
-            // the slim exemplar entry consumes only value/ts/combo/trace.
-            let exemplar_ts_ns: u64 = (r.start_sec as u64)
-                .saturating_mul(1_000_000_000)
-                .saturating_add(r.start_msec as u64 * 1_000_000);
-            slot.exemplar_reservoirs[base_idx].write(&SampledRequest {
-                ts_unix_nano: exemplar_ts_ns,
-                trace: Some((ctx.trace_id, ctx.span_id)),
-                url_path: b"",
-                user_agent: b"",
-                duration_us,
-                combo_idx: base_idx as u32,
-                method: r.method_name.as_bytes(),
-                status: r.headers_out.status as u16,
-                request_length: 0,
-                response_bytes: 0,
-                client_addr: b"",
-            });
+            // Hot path: one null-check + a branch + ≤ 6 Relaxed stores when enabled.
+            if let Some(metrics_base) = amcf.shm_base() {
+                // SAFETY: `worker_id < n_workers` (verified by the bounds guard above);
+                // the slot pointer is within the registered zone.
+                let metrics_slot = unsafe { &*worker_slots(metrics_base, worker_id) };
+                // Request start time in ns (ms precision from nginx's stored fields).
+                let exemplar_ts_ns: u64 = (r.start_sec as u64)
+                    .saturating_mul(1_000_000_000)
+                    .saturating_add(r.start_msec as u64 * 1_000_000);
+                metrics_slot.exemplar_reservoirs[base_idx].write(&SampledRequest {
+                    ts_unix_nano: exemplar_ts_ns,
+                    trace: Some((ctx.trace_id, ctx.span_id)),
+                    url_path: b"",
+                    user_agent: b"",
+                    duration_us,
+                    combo_idx: base_idx as u32,
+                    method: r.method_name.as_bytes(),
+                    status: r.headers_out.status as u16,
+                    request_length: 0,
+                    response_bytes: 0,
+                    client_addr: b"",
+                });
+            }
 
             if let Some(spans_base) = amcf.spans_shm_base() {
                 // Collect per-location config (span_name_cv + span_attrs).
