@@ -5348,17 +5348,16 @@ mod tests {
         TEST_CLOCK_MSEC.store(0, Ordering::Relaxed);
     }
 
-    // ── A4: service.name fallback ─────────────────────────────────────────────
-
-    /// (A4) When `otel_service_name` is absent, `build_resource_attrs` must emit
+    /// When `otel_service_name` is absent, `build_resource_attrs` must emit
     /// `service.name = "unknown_service:nginx"` — matching the C++ nginx-otel
-    /// module default (cpp:818-827) and the OTel Resource spec fallback.
+    /// module default (cpp:818-827) and the OTel Resource spec
+    /// [`resource.md §service.name`](https://opentelemetry.io/docs/specs/semconv/resource/#service).
     ///
     /// Mutation evidence: remove the `else { Some("unknown_service:nginx") }`
     /// branch → the `service.name` attribute is absent when unconfigured →
     /// `find_attr` returns `None` → the assertion panics.
     #[test]
-    fn a4_service_name_fallback_when_unconfigured() {
+    fn service_name_fallback_when_unconfigured() {
         let amcf = crate::config::MainConfig::default();
         // service_name is empty by default (not configured).
         assert!(amcf.service_name.is_empty(), "service_name must be empty in default config");
@@ -5377,13 +5376,13 @@ mod tests {
         assert_eq!(count, 1, "service.name must appear exactly once");
     }
 
-    /// (A4) When `otel_service_name` is configured, the operator-supplied name
+    /// When `otel_service_name` is configured, the operator-supplied name
     /// is used verbatim; the fallback must NOT appear.
     ///
     /// Mutation evidence: always emit `"unknown_service:nginx"` regardless of
     /// whether `service_name` is set → the value assertion fails.
     #[test]
-    fn a4_service_name_uses_configured_value_when_set() {
+    fn service_name_uses_configured_value_when_set() {
         use nginx_sys::ngx_str_t;
 
         let svc_bytes = b"my-nginx-service";

@@ -1913,8 +1913,6 @@ mod nginx_test_stubs {
     }
 }
 
-// ── A3: variable hex-encoding unit tests ─────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::hex_encode_into;
@@ -1927,7 +1925,7 @@ mod tests {
     /// Mutation evidence: swap `>> 4` with `& 0x0f` in `hex_encode_into` →
     /// the nibbles are reversed and the expected strings don't match.
     #[test]
-    fn a3_hex_encode_span_id_8bytes() {
+    fn hex_encode_span_id_8bytes() {
         // Span ID: 8 bytes → 16 lowercase hex chars.
         let span_id: [u8; 8] = [0x00, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7];
         let mut out = [0u8; 16];
@@ -1944,9 +1942,9 @@ mod tests {
     ///
     /// Mutation evidence: replace the HEX lookup with uppercase → output
     /// becomes `"0000000000000000"` (same) but any non-zero value would
-    /// uppercase → subsequent `a3_hex_encode_mixed` assertion fails.
+    /// uppercase → subsequent `hex_encode_mixed_nibbles` assertion fails.
     #[test]
-    fn a3_hex_encode_all_zeros_span_id() {
+    fn hex_encode_all_zeros_span_id() {
         let zero_id: [u8; 8] = [0u8; 8];
         let mut out = [0u8; 16];
         hex_encode_into(&zero_id, &mut out);
@@ -1955,7 +1953,7 @@ mod tests {
 
     /// Mixed-nibble value exercises every hex digit path in `hex_encode_into`.
     #[test]
-    fn a3_hex_encode_mixed_nibbles() {
+    fn hex_encode_mixed_nibbles() {
         // 0x0123456789abcdef covers nibbles 0-9 + a-f.
         let id: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
         let mut out = [0u8; 16];
@@ -1969,7 +1967,7 @@ mod tests {
     /// Mutation evidence: change the output length from 32 to 30 in
     /// `hex_encode_into` → `from_utf8` still passes but the content differs.
     #[test]
-    fn a3_hex_encode_trace_id_16bytes() {
+    fn hex_encode_trace_id_16bytes() {
         let trace_id: [u8; 16] = [
             0x4b, 0xf9, 0x2f, 0x35, 0x77, 0xb3, 0x4d, 0xa6, 0xa3, 0xce, 0x92, 0x9d, 0x0e, 0x0e,
             0x47, 0x36,

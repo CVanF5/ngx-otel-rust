@@ -2002,9 +2002,13 @@ extern "C" fn cmd_exporter_block_add_header(
 
 /// Handler for `interval <msec>` inside `otel_exporter { ... }`.
 ///
-/// Parses the value as a plain millisecond integer and writes
+/// Parses the value as a nginx time string and writes
 /// `MainConfig.metric_interval_ms` — the same field as the top-level
 /// `otel_metric_interval` directive.
+///
+/// Accepts the nginx msec grammar (`500ms`, `5s`, `5m`, `2h`, `1d`, or a bare
+/// integer treated as seconds), matching the C++ `nginx-otel` `interval`
+/// directive which binds to `ngx_conf_set_msec_slot` (cpp:131).
 ///
 /// The `conf` pointer is recovered to `MainConfig` via the same container-of
 /// pattern as [`cmd_exporter_block_add_header`].
@@ -2026,8 +2030,7 @@ extern "C" fn cmd_exporter_block_set_interval(
 
     // SAFETY: `cf` is the valid non-null directive parse context (TAKE1 arg).
     let args = unsafe { cf_args(cf) };
-    // The C++ `interval` directive takes a plain integer in milliseconds.
-    match parse_u64_ascii(args[1].as_bytes()) {
+    match parse_duration_ms(args[1].as_bytes()) {
         Some(ms) if ms > 0 => {
             amcf.metric_interval_ms = ms;
             NGX_CONF_OK
@@ -2036,7 +2039,7 @@ extern "C" fn cmd_exporter_block_set_interval(
             ngx_conf_log_error!(
                 NGX_LOG_EMERG,
                 &raw mut *cf,
-                "invalid millisecond value in \"interval\": \"{}\"",
+                "invalid time value in \"interval\": \"{}\"",
                 args[1]
             );
             NGX_CONF_ERROR
@@ -2046,9 +2049,10 @@ extern "C" fn cmd_exporter_block_set_interval(
 
 /// Handler for `batch_size <n>` inside `otel_exporter { ... }`.
 ///
-/// Accepted for C++ `nginx-otel` config compatibility and parsed, but
-/// ignored: this module uses a fixed-size ring; there is no per-batch-flush
-/// size knob.
+/// Accepted for C++ `nginx-otel` config compatibility and parsed with the
+/// nginx size-string grammar (`512`, `1k`, `2m`) matching the C++ binding to
+/// `ngx_conf_set_size_slot` (cpp:137), but the value is ignored: this module
+/// uses a fixed-size span ring with no per-batch-flush size knob.
 extern "C" fn cmd_exporter_block_ignore_batch_size(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
@@ -2056,11 +2060,11 @@ extern "C" fn cmd_exporter_block_ignore_batch_size(
 ) -> *mut c_char {
     // SAFETY: `cf` is the valid non-null directive parse context (TAKE1 arg).
     let args = unsafe { cf_args(cf) };
-    if parse_u64_ascii(args[1].as_bytes()).is_none() {
+    if parse_size_bytes(args[1].as_bytes()).is_none() {
         ngx_conf_log_error!(
             NGX_LOG_EMERG,
             &raw mut *cf,
-            "invalid value in \"batch_size\": \"{}\"",
+            "invalid size value in \"batch_size\": \"{}\"",
             args[1]
         );
         return NGX_CONF_ERROR;
@@ -2076,9 +2080,10 @@ extern "C" fn cmd_exporter_block_ignore_batch_size(
 
 /// Handler for `batch_count <n>` inside `otel_exporter { ... }`.
 ///
-/// Accepted for C++ `nginx-otel` config compatibility and parsed, but
-/// ignored: this module uses a fixed retry-buffer depth; the C++
-/// pending-batch count has no equivalent.
+/// Accepted for C++ `nginx-otel` config compatibility and parsed with the
+/// nginx size-string grammar (`4`, `1k`, `2m`) matching the C++ binding to
+/// `ngx_conf_set_size_slot` (cpp:143), but the value is ignored: this module
+/// uses a fixed retry-buffer depth with no pending-batch count knob.
 extern "C" fn cmd_exporter_block_ignore_batch_count(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
@@ -2086,11 +2091,11 @@ extern "C" fn cmd_exporter_block_ignore_batch_count(
 ) -> *mut c_char {
     // SAFETY: `cf` is the valid non-null directive parse context (TAKE1 arg).
     let args = unsafe { cf_args(cf) };
-    if parse_u64_ascii(args[1].as_bytes()).is_none() {
+    if parse_size_bytes(args[1].as_bytes()).is_none() {
         ngx_conf_log_error!(
             NGX_LOG_EMERG,
             &raw mut *cf,
-            "invalid value in \"batch_count\": \"{}\"",
+            "invalid size value in \"batch_count\": \"{}\"",
             args[1]
         );
         return NGX_CONF_ERROR;
@@ -3147,17 +3152,27 @@ fn cmd_nargs(cmd: &ngx_command_t) -> (usize, usize) {
     (1, usize::MAX)
 }
 
-/// Parse duration strings like `10s`, `5m`, `2h`, `1d` → milliseconds.
+/// Parse duration strings → milliseconds.
+///
+/// Accepted forms match the nginx `ngx_parse_time(value, /*is_sec=*/0)` grammar
+/// (millisecond mode): `500ms`, `5s`, `5m`, `2h`, `1d`, or a bare integer
+/// treated as **seconds** (e.g. `5` → 5000 ms).  This is the same grammar that
+/// the C++ `nginx-otel` `interval` directive uses via `ngx_conf_set_msec_slot`.
 fn parse_duration_ms(s: &[u8]) -> Option<u64> {
     if s.is_empty() {
         return None;
+    }
+    // Check for the two-character `ms` suffix first.
+    if s.ends_with(b"ms") {
+        let n = parse_u64_ascii(&s[..s.len() - 2])?;
+        return n.checked_mul(1); // already in milliseconds
     }
     let (num_bytes, suffix) = match s.last() {
         Some(b's') => (&s[..s.len() - 1], 1_000u64),
         Some(b'm') => (&s[..s.len() - 1], 60_000u64),
         Some(b'h') => (&s[..s.len() - 1], 3_600_000u64),
         Some(b'd') => (&s[..s.len() - 1], 86_400_000u64),
-        _ => (s, 1_000u64), // bare number treated as seconds
+        _ => (s, 1_000u64), // bare integer treated as seconds
     };
     let n = parse_u64_ascii(num_bytes)?;
     n.checked_mul(suffix)
@@ -3267,6 +3282,12 @@ mod tests {
         assert_eq!(parse_duration_ms(b"2h"), Some(7_200_000));
         assert_eq!(parse_duration_ms(b"1d"), Some(86_400_000));
         assert_eq!(parse_duration_ms(b"0s"), Some(0));
+        // `ms` suffix: nginx msec grammar used by `ngx_conf_set_msec_slot`.
+        assert_eq!(parse_duration_ms(b"500ms"), Some(500));
+        assert_eq!(parse_duration_ms(b"5000ms"), Some(5_000));
+        assert_eq!(parse_duration_ms(b"0ms"), Some(0));
+        // Bare integer treated as seconds (matching C++ `ngx_parse_time` bare semantics).
+        assert_eq!(parse_duration_ms(b"5"), Some(5_000));
         assert_eq!(parse_duration_ms(b""), None);
         assert_eq!(parse_duration_ms(b"abc"), None);
     }
@@ -3827,15 +3848,13 @@ mod tests {
         assert_eq!(align_ring_size(0), Some(0), "zero must stay zero (trivially aligned)");
     }
 
-    // ── Batch-A: exporter block aliases ──────────────────────────────────────
-
-    /// (A2) `DEFAULT_INTERVAL_MS` must be 5000 to match the OTel SDK / C++
+    /// `DEFAULT_INTERVAL_MS` must be 5000 to match the OTel SDK / C++
     /// nginx-otel module default of 5 s.
     ///
     /// Mutation evidence: change `DEFAULT_INTERVAL_MS` back to 10_000 →
     /// both the constant assertion and the `interval_ms()` default assertion fail.
     #[test]
-    fn a2_default_interval_is_5s() {
+    fn exporter_block_default_interval_is_5s() {
         assert_eq!(DEFAULT_INTERVAL_MS, 5_000, "default export interval must be 5 s (5000 ms)");
         let cfg = MainConfig::default();
         assert_eq!(
@@ -3845,7 +3864,7 @@ mod tests {
         );
     }
 
-    /// (A1) `cmd_exporter_block_add_header` appends to `exporter_headers`
+    /// `cmd_exporter_block_add_header` appends to `exporter_headers`
     /// via the container-of recovery of `MainConfig` from `&amcf.exporter`.
     ///
     /// The handler receives `conf = &amcf.exporter` (the same pointer
@@ -3858,7 +3877,7 @@ mod tests {
     /// wrong memory; subsequent `exporter_headers.push` corrupts `amcf` → the
     /// length assertion (or a later pointer deref) fails or panics.
     #[test]
-    fn a1_block_header_appends_to_main_config_exporter_headers() {
+    fn exporter_block_header_appends_to_main_config_exporter_headers() {
         use core::ffi::c_void;
 
         let mut amcf = MainConfig::default();
@@ -3904,50 +3923,66 @@ mod tests {
         assert_eq!(amcf.exporter_headers[0].value.as_bytes(), v_bytes, "header value must match");
     }
 
-    /// (A1) `cmd_exporter_block_set_interval` writes `metric_interval_ms` on the
-    /// containing `MainConfig` when given a valid positive integer (milliseconds).
+    /// `cmd_exporter_block_set_interval` parses the nginx time-string grammar and
+    /// writes `metric_interval_ms` on the containing `MainConfig`.
+    ///
+    /// Covers the C++ `ngx_conf_set_msec_slot` grammar:
+    /// - `5s` → 5000 ms (common documented form)
+    /// - `500ms` → 500 ms (explicit millisecond suffix)
+    /// - `5` (bare) → 5000 ms (bare integer treated as seconds, matching C++)
     ///
     /// Mutation evidence: break the container-of subtraction → wrong `amcf` →
     /// the `metric_interval_ms` field stays at `UNSET_U64` → assertion fails.
     #[test]
-    fn a1_block_interval_writes_metric_interval_ms() {
+    fn exporter_block_interval_parses_time_string() {
         use core::ffi::c_void;
 
-        let mut amcf = MainConfig::default();
-        assert_eq!(amcf.metric_interval_ms, UNSET_U64, "must start unset");
+        // Helper: run the handler with a given value string on a fresh MainConfig.
+        fn call_interval(val: &[u8]) -> (*mut c_char, u64) {
+            let mut amcf = MainConfig::default();
+            let fake_conf: *mut c_void = ptr::addr_of_mut!(amcf.exporter).cast();
+            let fake_args: [nginx_sys::ngx_str_t; 2] = [
+                nginx_sys::ngx_str_t { len: 8, data: b"interval".as_ptr().cast_mut() },
+                nginx_sys::ngx_str_t { len: val.len(), data: val.as_ptr().cast_mut() },
+            ];
+            let mut fake_arr = nginx_sys::ngx_array_t {
+                elts: fake_args.as_ptr().cast_mut().cast(),
+                nelts: 2,
+                size: core::mem::size_of::<nginx_sys::ngx_str_t>(),
+                nalloc: 2,
+                pool: core::ptr::null_mut(),
+            };
+            // SAFETY: `ngx_conf_t` is a POD struct; all-zero is valid for this test.
+            let mut fake_cf: nginx_sys::ngx_conf_t = unsafe { core::mem::zeroed() };
+            fake_cf.args = ptr::addr_of_mut!(fake_arr);
+            let rc = cmd_exporter_block_set_interval(
+                ptr::addr_of_mut!(fake_cf),
+                core::ptr::null_mut(),
+                fake_conf,
+            );
+            (rc, amcf.metric_interval_ms)
+        }
 
-        let fake_conf: *mut c_void = ptr::addr_of_mut!(amcf.exporter).cast();
+        // `5s` → 5000 ms: the form used in the C++ nginx-otel documentation.
+        let (rc, ms) = call_interval(b"5s");
+        assert!(rc.is_null(), "interval 5s must return NGX_CONF_OK");
+        assert_eq!(ms, 5_000, "5s must store 5000 ms");
 
-        let val_bytes = b"3000"; // 3000 ms
-        let fake_args: [nginx_sys::ngx_str_t; 2] = [
-            nginx_sys::ngx_str_t { len: 8, data: b"interval".as_ptr().cast_mut() },
-            nginx_sys::ngx_str_t { len: val_bytes.len(), data: val_bytes.as_ptr().cast_mut() },
-        ];
-        let mut fake_arr = nginx_sys::ngx_array_t {
-            elts: fake_args.as_ptr().cast_mut().cast(),
-            nelts: 2,
-            size: core::mem::size_of::<nginx_sys::ngx_str_t>(),
-            nalloc: 2,
-            pool: core::ptr::null_mut(),
-        };
-        // SAFETY: `ngx_conf_t` is a POD struct; all-zero is valid for this test.
-        let mut fake_cf: nginx_sys::ngx_conf_t = unsafe { core::mem::zeroed() };
-        fake_cf.args = ptr::addr_of_mut!(fake_arr);
+        // `500ms` → 500 ms: explicit millisecond suffix (nginx msec grammar).
+        let (rc, ms) = call_interval(b"500ms");
+        assert!(rc.is_null(), "interval 500ms must return NGX_CONF_OK");
+        assert_eq!(ms, 500, "500ms must store 500 ms");
 
-        let rc = cmd_exporter_block_set_interval(
-            ptr::addr_of_mut!(fake_cf),
-            core::ptr::null_mut(),
-            fake_conf,
-        );
-
-        assert!(rc.is_null(), "handler must return NGX_CONF_OK");
-        assert_eq!(amcf.metric_interval_ms, 3_000, "interval must be stored as 3000 ms");
+        // Bare `5` → 5000 ms: bare integer treated as seconds, matching C++.
+        let (rc, ms) = call_interval(b"5");
+        assert!(rc.is_null(), "bare interval 5 must return NGX_CONF_OK");
+        assert_eq!(ms, 5_000, "bare 5 must store 5000 ms (treated as seconds)");
     }
 
-    /// (A1) `cmd_exporter_block_set_interval` returns duplicate error when called
+    /// `cmd_exporter_block_set_interval` returns duplicate error when called
     /// twice on the same `MainConfig`.
     #[test]
-    fn a1_block_interval_duplicate_rejected() {
+    fn exporter_block_interval_duplicate_rejected() {
         use core::ffi::c_void;
 
         // Pre-set metric_interval_ms to simulate a duplicate directive.
@@ -3981,9 +4016,10 @@ mod tests {
         assert_eq!(amcf.metric_interval_ms, 5_000, "existing value must be unchanged");
     }
 
-    /// (A1) `batch_size` and `batch_count` handlers accept valid integer values
-    /// (return NGX_CONF_OK, store nothing) and reject non-integer values with
-    /// NGX_CONF_ERROR.
+    /// `batch_size` and `batch_count` handlers accept the nginx size-string
+    /// grammar (`512`, `1k`, `2m`) matching the C++ `ngx_conf_set_size_slot`
+    /// binding (cpp:137, cpp:143).  The value is parsed then discarded; the
+    /// return value is NGX_CONF_OK.  Unparseable values return NGX_CONF_ERROR.
     ///
     /// Both paths call `ngx_conf_log_error!`, which dereferences
     /// `cf->log->log_level` before reaching the no-op C stub.  A stub log with
@@ -3995,7 +4031,7 @@ mod tests {
     /// `rc.is_null()` assertions fail; return NGX_CONF_OK from the invalid path
     /// → the `!rc.is_null()` assertions fail.
     #[test]
-    fn a1_batch_size_and_batch_count_parse_valid_and_reject_invalid() {
+    fn exporter_block_batch_size_and_count_accept_size_string_and_reject_invalid() {
         // A minimal stub log: log_level high enough that any log level passes
         // the `level <= log_level` gate in the ngx_conf_log_error! macro.
         // SAFETY: `ngx_log_t` is a POD struct; all-zero is a valid initial state.
@@ -4005,7 +4041,7 @@ mod tests {
         // Each test case keeps its args array alive independently so that
         // arr.elts points to a live [ngx_str_t; 2] for the duration of the call.
 
-        // batch_size valid integer → NGX_CONF_OK.
+        // batch_size plain integer (C++ default is 512) → NGX_CONF_OK.
         {
             let ok_bytes = b"512";
             let args_a: [nginx_sys::ngx_str_t; 2] = [
@@ -4028,10 +4064,37 @@ mod tests {
                 core::ptr::null_mut(),
                 core::ptr::null_mut(),
             );
-            assert!(rc.is_null(), "batch_size with valid integer must return NGX_CONF_OK");
+            assert!(rc.is_null(), "batch_size 512 must return NGX_CONF_OK");
         }
 
-        // batch_count valid integer → NGX_CONF_OK.
+        // batch_size with `k` suffix (`1k` = 1024) → NGX_CONF_OK.
+        // Validates the fix: parse_u64_ascii rejected `1k`; parse_size_bytes accepts it.
+        {
+            let ok_bytes = b"1k";
+            let args_k: [nginx_sys::ngx_str_t; 2] = [
+                nginx_sys::ngx_str_t { len: 10, data: b"batch_size".as_ptr().cast_mut() },
+                nginx_sys::ngx_str_t { len: ok_bytes.len(), data: ok_bytes.as_ptr().cast_mut() },
+            ];
+            let mut arr_k = nginx_sys::ngx_array_t {
+                elts: args_k.as_ptr().cast_mut().cast(),
+                nelts: 2,
+                size: core::mem::size_of::<nginx_sys::ngx_str_t>(),
+                nalloc: 2,
+                pool: core::ptr::null_mut(),
+            };
+            // SAFETY: `ngx_conf_t` is a POD struct; all-zero is valid.
+            let mut cf_k: nginx_sys::ngx_conf_t = unsafe { core::mem::zeroed() };
+            cf_k.args = ptr::addr_of_mut!(arr_k);
+            cf_k.log = ptr::addr_of_mut!(stub_log);
+            let rc = cmd_exporter_block_ignore_batch_size(
+                ptr::addr_of_mut!(cf_k),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            );
+            assert!(rc.is_null(), "batch_size 1k must return NGX_CONF_OK (size-string accepted)");
+        }
+
+        // batch_count plain integer (C++ default is 4) → NGX_CONF_OK.
         {
             let ok_bytes = b"4";
             let args_b: [nginx_sys::ngx_str_t; 2] = [
@@ -4054,10 +4117,10 @@ mod tests {
                 core::ptr::null_mut(),
                 core::ptr::null_mut(),
             );
-            assert!(rc.is_null(), "batch_count with valid integer must return NGX_CONF_OK");
+            assert!(rc.is_null(), "batch_count 4 must return NGX_CONF_OK");
         }
 
-        // batch_size non-integer → NGX_CONF_ERROR.
+        // batch_size non-parseable value → NGX_CONF_ERROR.
         {
             let bad_bytes = b"notanumber";
             let args_c: [nginx_sys::ngx_str_t; 2] = [
@@ -4080,10 +4143,10 @@ mod tests {
                 core::ptr::null_mut(),
                 core::ptr::null_mut(),
             );
-            assert!(!rc.is_null(), "batch_size with non-integer must return NGX_CONF_ERROR");
+            assert!(!rc.is_null(), "batch_size with unparseable value must return NGX_CONF_ERROR");
         }
 
-        // batch_count non-integer → NGX_CONF_ERROR.
+        // batch_count non-parseable value → NGX_CONF_ERROR.
         {
             let bad_bytes = b"notanumber";
             let args_d: [nginx_sys::ngx_str_t; 2] = [
@@ -4106,7 +4169,7 @@ mod tests {
                 core::ptr::null_mut(),
                 core::ptr::null_mut(),
             );
-            assert!(!rc.is_null(), "batch_count with non-integer must return NGX_CONF_ERROR");
+            assert!(!rc.is_null(), "batch_count with unparseable value must return NGX_CONF_ERROR");
         }
     }
 }
