@@ -1443,12 +1443,14 @@ pub async fn export_loop(amcf: &'static MainConfig) {
         // Note: the per-retry-success INFO log ("queued batch sent successfully")
         // previously emitted only by this lane is intentionally omitted in the
         // shared helper — it was operational noise absent from the logs/spans lanes.
-        // Skip the metrics lane (retry drain AND fresh send) while a
-        // `Retryable` backoff defers it — deferring the DRAIN, not growing the
-        // buffer. Independent of the logs/spans lanes.
+        // Skip the entire metrics lane (retry drain AND fresh send) when
+        // `otel_metrics off` is configured — no shm zone was registered so
+        // there is nothing to drain.  Also skip while a `Retryable` backoff
+        // defers it — deferring the DRAIN, not growing the buffer. Independent
+        // of the logs/spans lanes.
         let metrics_now_msec = now_monotonic_msec();
         let metrics_deferred = metrics_backoff.is_deferred(metrics_now_msec);
-        if !metrics_deferred {
+        if amcf.metrics_enabled() && !metrics_deferred {
             drain_retry_queue_once(
                 &mut retry_queue,
                 retry_buffer_depth,
@@ -1483,6 +1485,10 @@ pub async fn export_loop(amcf: &'static MainConfig) {
 
         // ── Collect fresh metrics from all sources ────────────────────────
         // Pdata pipeline: wrap → process → encode → send (Step U2).
+        // Skipped entirely when `otel_metrics off` — no shm zone was registered.
+        if !amcf.metrics_enabled() {
+            continue;
+        }
         let mut metrics_pd =
             Pdata::Metrics(collect_all_sources(amcf, worker_start_ns, &collector_host));
         processor.process(&mut metrics_pd);
@@ -1730,83 +1736,89 @@ async fn graceful_drain(
         );
     }
 
-    // Flush metrics retry queue (one bounded attempt each, ignore errors).
-    while let Some((bytes, n_pts)) = queues.metrics.pop_front() {
-        match with_deadline(transport.send(bytes), GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET).await {
-            // Any Ok(outcome) is treated as release; the outcome-driven policy
-            // (release/requeue+defer/drop) applies.
-            Ok(Ok(_outcome)) => {}
-            Ok(Err(e)) => {
-                ngx::ngx_log_error!(
-                    NGX_LOG_ERR,
-                    log.as_ptr(),
-                    "otel export: drain: queued batch ({} pts) send failed: {}",
-                    n_pts,
-                    e
-                );
-                // Other queued batches likely fail too; stop and let the
-                // remainder be dropped when the loop returns.
-                let remaining: u64 = queues.metrics.iter().map(|(_, n)| n).sum();
-                if remaining > 0 {
-                    DROPPED_RECORDS.fetch_add(remaining, Ordering::Relaxed);
+    // Flush metrics retry queue and final metrics batch only when metrics are
+    // enabled.  When `otel_metrics off` the retry queue is always empty (no
+    // metrics were ever sent) and there is no shm zone to collect from.
+    if amcf.metrics_enabled() {
+        // Flush metrics retry queue (one bounded attempt each, ignore errors).
+        while let Some((bytes, n_pts)) = queues.metrics.pop_front() {
+            match with_deadline(transport.send(bytes), GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET).await {
+                // Any Ok(outcome) is treated as release; the outcome-driven policy
+                // (release/requeue+defer/drop) applies.
+                Ok(Ok(_outcome)) => {}
+                Ok(Err(e)) => {
+                    ngx::ngx_log_error!(
+                        NGX_LOG_ERR,
+                        log.as_ptr(),
+                        "otel export: drain: queued batch ({} pts) send failed: {}",
+                        n_pts,
+                        e
+                    );
+                    // Other queued batches likely fail too; stop and let the
+                    // remainder be dropped when the loop returns.
+                    let remaining: u64 = queues.metrics.iter().map(|(_, n)| n).sum();
+                    if remaining > 0 {
+                        DROPPED_RECORDS.fetch_add(remaining, Ordering::Relaxed);
+                    }
+                    queues.metrics.clear();
+                    break;
                 }
-                queues.metrics.clear();
-                break;
-            }
-            Err(DeadlineExceeded) => {
-                ngx::ngx_log_error!(
-                    NGX_LOG_NOTICE,
-                    log.as_ptr(),
-                    "otel export: drain: queued batch ({} pts) timed out after {:?}",
-                    n_pts,
-                    GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET
-                );
-                let remaining: u64 = queues.metrics.iter().map(|(_, n)| n).sum();
-                if remaining > 0 {
-                    DROPPED_RECORDS.fetch_add(remaining, Ordering::Relaxed);
+                Err(DeadlineExceeded) => {
+                    ngx::ngx_log_error!(
+                        NGX_LOG_NOTICE,
+                        log.as_ptr(),
+                        "otel export: drain: queued batch ({} pts) timed out after {:?}",
+                        n_pts,
+                        GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET
+                    );
+                    let remaining: u64 = queues.metrics.iter().map(|(_, n)| n).sum();
+                    if remaining > 0 {
+                        DROPPED_RECORDS.fetch_add(remaining, Ordering::Relaxed);
+                    }
+                    queues.metrics.clear();
+                    break;
                 }
-                queues.metrics.clear();
-                break;
             }
         }
-    }
 
-    // Final freshly-collected metrics batch (Pdata pipeline, Step U2).
-    let mut final_pd = Pdata::Metrics(collect_all_sources(amcf, worker_start_ns, collector_host));
-    processor.process(&mut final_pd);
-    let n_pts = count_pdata_records(&final_pd);
-    if n_pts > 0 {
-        let bytes = encode_pdata(&final_pd);
-        match with_deadline(
-            transport.send_pdata(&final_pd, bytes),
-            GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET,
-        )
-        .await
-        {
-            // Any Ok(outcome) treated as release (the outcome-driven policy applies).
-            Ok(Ok(_outcome)) => {
-                ngx::ngx_log_error!(
-                    NGX_LOG_NOTICE,
-                    log.as_ptr(),
-                    "otel export: drain: final batch sent ({} data points)",
-                    n_pts
-                );
-            }
-            Ok(Err(e)) => {
-                ngx::ngx_log_error!(
-                    NGX_LOG_ERR,
-                    log.as_ptr(),
-                    "otel export: drain: final batch failed: {}",
-                    e
-                );
-            }
-            Err(DeadlineExceeded) => {
-                ngx::ngx_log_error!(
-                    NGX_LOG_NOTICE,
-                    log.as_ptr(),
-                    "otel export: drain: final batch timed out after {:?}",
-                    GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET
-                );
+        // Final freshly-collected metrics batch (Pdata pipeline, Step U2).
+        let mut final_pd =
+            Pdata::Metrics(collect_all_sources(amcf, worker_start_ns, collector_host));
+        processor.process(&mut final_pd);
+        let n_pts = count_pdata_records(&final_pd);
+        if n_pts > 0 {
+            let bytes = encode_pdata(&final_pd);
+            match with_deadline(
+                transport.send_pdata(&final_pd, bytes),
+                GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET,
+            )
+            .await
+            {
+                // Any Ok(outcome) treated as release (the outcome-driven policy applies).
+                Ok(Ok(_outcome)) => {
+                    ngx::ngx_log_error!(
+                        NGX_LOG_NOTICE,
+                        log.as_ptr(),
+                        "otel export: drain: final batch sent ({} data points)",
+                        n_pts
+                    );
+                }
+                Ok(Err(e)) => {
+                    ngx::ngx_log_error!(
+                        NGX_LOG_ERR,
+                        log.as_ptr(),
+                        "otel export: drain: final batch failed: {}",
+                        e
+                    );
+                }
+                Err(DeadlineExceeded) => {
+                    ngx::ngx_log_error!(
+                        NGX_LOG_NOTICE,
+                        log.as_ptr(),
+                        "otel export: drain: final batch timed out after {:?}",
+                        GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET
+                    );
+                }
             }
         }
     }
@@ -5342,5 +5354,45 @@ mod tests {
         // Reset the injectable clock so sibling tests that depend on
         // `ngx_current_msec == 0` (the test-process default) are unaffected.
         TEST_CLOCK_MSEC.store(0, Ordering::Relaxed);
+    }
+
+    /// When `otel_metrics off` (`metrics_enabled = 0`), `collect_all_sources`
+    /// returns only the self-metrics batch (no shm-derived per-worker series, no
+    /// stub_status counters, no serving-cert gauges), AND the batch still contains
+    /// the self-metric series — confirming that gating metrics off suppresses only
+    /// the instrumented/stub/cert sources while the self-metrics source remains
+    /// unaffected.
+    ///
+    /// The production gate in `export_loop` checks `amcf.metrics_enabled()` before
+    /// calling `collect_all_sources` at all, so in production the function is not
+    /// even called when metrics are disabled.  This test exercises `collect_all_sources`
+    /// directly to verify its shm-derived sources are naturally absent when the shm
+    /// zone was never registered (shm_zone = null → shm_base() = None).
+    #[test]
+    fn collect_all_sources_with_metrics_disabled_yields_only_self_metrics() {
+        // Simulate `otel_metrics off;` — shm_zone stays null (default), so shm_base() = None.
+        // Use struct-update syntax to satisfy clippy::field_reassign_with_default.
+        let amcf = crate::config::MainConfig {
+            metrics_enabled: 0,
+            ..crate::config::MainConfig::default()
+        };
+
+        let batch = collect_all_sources(&amcf, 0, "");
+
+        // The self-metrics source always runs; the export-interval series must be present.
+        let has_self = batch.metrics.iter().any(|m| m.name == "ngx_otel.export_interval");
+        assert!(
+            has_self,
+            "self-metrics (ngx_otel.export_interval) must be present even when metrics_enabled=0"
+        );
+
+        // The per-worker instrumented series requires a mapped shm zone; with
+        // shm_zone = null, none of those series appear.
+        let has_instrumented =
+            batch.metrics.iter().any(|m| m.name.starts_with("http.server.request"));
+        assert!(
+            !has_instrumented,
+            "per-worker http.server.request.* series must be absent when shm_zone is null"
+        );
     }
 }
