@@ -15,7 +15,9 @@ TESTS		?= tests/integration/run.sh \
 		   tests/integration/run_traces.sh \
 		   tests/integration/run_redirect_safe.sh \
 		   tests/integration/run_a3_tls_e2e.sh \
-		   tests/integration/run_b1_collector_cert_gauge.sh
+		   tests/integration/run_b1_collector_cert_gauge.sh \
+		   tests/integration/run_cpp_dropin.sh \
+		   tests/integration/run_realip_address_split.sh
 NGX_CARGO	?= cargo
 
 # nginx configure base flags. --with-compat is required for loading a
@@ -27,7 +29,8 @@ NGINX_CONFIGURE_BASE	= \
 	auto/configure \
 		--with-compat \
 		--with-http_ssl_module \
-		--with-http_stub_status_module
+		--with-http_stub_status_module \
+		--with-http_realip_module
 
 NGINX_SOURCE_DIR	?= ../nginx
 # Upstream nginx-tests repo. Used by Test::Nginx in Phase B (`make full-test`).
