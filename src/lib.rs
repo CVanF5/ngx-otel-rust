@@ -580,6 +580,32 @@ impl HttpModule for HttpOtelModule {
         // in the http main conf variable hash, valid for the cycle).
         unsafe { (*var_trace_id).get_handler = Some(otel_var_get_trace_id) };
 
+        // $otel_span_id — 16-char lowercase hex span ID from SpanCtx.
+        let mut name_span_id: nginx_sys::ngx_str_t = ngx::ngx_string!("otel_span_id");
+        // SAFETY: same contract as the `name_trace_id` call above — `cf` valid,
+        // `name_span_id` is a local ngx_str_t valid for this call.
+        let var_span_id =
+            unsafe { nginx_sys::ngx_http_add_variable(cf, &raw mut name_span_id, flags) };
+        if var_span_id.is_null() {
+            return nginx_sys::NGX_ERROR as nginx_sys::ngx_int_t;
+        }
+        // SAFETY: `var_span_id` is the non-null `ngx_http_variable_t*` returned by
+        // `ngx_http_add_variable`; writing its `get_handler` is sound (same conf pool).
+        unsafe { (*var_span_id).get_handler = Some(otel_var_get_span_id) };
+
+        // $otel_parent_id — 16-char lowercase hex parent span ID from SpanCtx.
+        let mut name_parent_id: nginx_sys::ngx_str_t = ngx::ngx_string!("otel_parent_id");
+        // SAFETY: same contract as the `name_trace_id` call above — `cf` valid,
+        // `name_parent_id` is a local ngx_str_t valid for this call.
+        let var_parent_id =
+            unsafe { nginx_sys::ngx_http_add_variable(cf, &raw mut name_parent_id, flags) };
+        if var_parent_id.is_null() {
+            return nginx_sys::NGX_ERROR as nginx_sys::ngx_int_t;
+        }
+        // SAFETY: `var_parent_id` is the non-null `ngx_http_variable_t*` returned by
+        // `ngx_http_add_variable`; writing its `get_handler` is sound (same conf pool).
+        unsafe { (*var_parent_id).get_handler = Some(otel_var_get_parent_id) };
+
         // $otel_parent_sampled — "1" if the W3C sampled bit is set, else "0".
         let mut name_sampled: nginx_sys::ngx_str_t = ngx::ngx_string!("otel_parent_sampled");
         // SAFETY: same contract as the `name_trace_id` call above — `cf` valid,
@@ -699,6 +725,127 @@ unsafe extern "C" fn otel_var_get_trace_id(
             vv.set_no_cacheable(1);
             vv.set_not_found(0);
             vv.set_len(32);
+            vv.data = buf;
+        }
+        None => {
+            vv.set_not_found(1);
+        }
+    }
+    nginx_sys::NGX_OK as nginx_sys::ngx_int_t
+}
+
+/// nginx variable get-handler for `$otel_span_id`.
+///
+/// Returns the span ID of the current request's span as 16 lowercase hex
+/// characters.  Empty (not_found) when no `SpanCtx` is present.
+///
+/// # Safety
+/// nginx calls this with a valid non-null `ngx_http_request_t*` and a valid
+/// `ngx_variable_value_t*` during variable evaluation.
+unsafe extern "C" fn otel_var_get_span_id(
+    r: *mut nginx_sys::ngx_http_request_t,
+    v: *mut nginx_sys::ngx_variable_value_t,
+    _data: usize,
+) -> nginx_sys::ngx_int_t {
+    use crate::traces::ctx::SpanCtx;
+
+    // SAFETY: `r` is the non-null `ngx_http_request_t*` nginx passes to variable
+    // get-handlers; `Request::from_ngx_http_request` reinterprets it as the
+    // ngx-rust request wrapper (same repr) and yields a valid `&mut Request`.
+    let request = unsafe { ngx::http::Request::from_ngx_http_request(r) };
+    // SAFETY: `ngx_http_otel_module` is a `static` module descriptor valid for
+    // the full process lifetime; `addr_of!` yields a valid pointer.
+    let module = unsafe { &*::core::ptr::addr_of!(ngx_http_otel_module) };
+    let ctx: Option<&SpanCtx> = match request.get_module_ctx::<SpanCtx>(module) {
+        Some(c) => Some(c),
+        // SAFETY: `r` is the live request pointer nginx passed; `module` is the
+        // process-lifetime descriptor; the recovered pointer (if non-null) is a
+        // pool-anchored SpanCtx valid for the request lifetime.
+        None => unsafe {
+            crate::traces::ctx::recover_span_ctx(r, module, ::core::ptr::null_mut()).as_ref()
+        },
+    };
+
+    // SAFETY: `v` is the non-null `ngx_variable_value_t*` nginx supplies.
+    let vv = unsafe { &mut *v };
+    match ctx {
+        Some(span_ctx) => {
+            // SAFETY: `r` is valid; `(*r).pool` is the per-request pool.
+            let pool = unsafe { (*r).pool };
+            // SAFETY: `pool` is a valid nginx pool pointer; 16 bytes for the hex string.
+            let buf = unsafe { nginx_sys::ngx_pcalloc(pool, 16) } as *mut u8;
+            if buf.is_null() {
+                vv.set_not_found(1);
+                return nginx_sys::NGX_OK as nginx_sys::ngx_int_t;
+            }
+            // SAFETY: `buf` is a valid 16-byte pool allocation.
+            let s = unsafe { core::slice::from_raw_parts_mut(buf, 16) };
+            hex_encode_into(&span_ctx.span_id, s);
+            vv.set_valid(1);
+            vv.set_no_cacheable(1);
+            vv.set_not_found(0);
+            vv.set_len(16);
+            vv.data = buf;
+        }
+        None => {
+            vv.set_not_found(1);
+        }
+    }
+    nginx_sys::NGX_OK as nginx_sys::ngx_int_t
+}
+
+/// nginx variable get-handler for `$otel_parent_id`.
+///
+/// Returns the parent span ID from the request's `SpanCtx` as 16 lowercase hex
+/// characters.  Returns the all-zeros string `"0000000000000000"` when the span
+/// has no parent (root span).  Empty (not_found) when no `SpanCtx` is present.
+///
+/// # Safety
+/// nginx calls this with a valid non-null `ngx_http_request_t*` and a valid
+/// `ngx_variable_value_t*` during variable evaluation.
+unsafe extern "C" fn otel_var_get_parent_id(
+    r: *mut nginx_sys::ngx_http_request_t,
+    v: *mut nginx_sys::ngx_variable_value_t,
+    _data: usize,
+) -> nginx_sys::ngx_int_t {
+    use crate::traces::ctx::SpanCtx;
+
+    // SAFETY: `r` is the non-null `ngx_http_request_t*` nginx passes to variable
+    // get-handlers; `Request::from_ngx_http_request` reinterprets it as the
+    // ngx-rust request wrapper (same repr) and yields a valid `&mut Request`.
+    let request = unsafe { ngx::http::Request::from_ngx_http_request(r) };
+    // SAFETY: `ngx_http_otel_module` is a `static` module descriptor valid for
+    // the full process lifetime; `addr_of!` yields a valid pointer.
+    let module = unsafe { &*::core::ptr::addr_of!(ngx_http_otel_module) };
+    let ctx: Option<&SpanCtx> = match request.get_module_ctx::<SpanCtx>(module) {
+        Some(c) => Some(c),
+        // SAFETY: `r` is the live request pointer nginx passed; `module` is the
+        // process-lifetime descriptor; the recovered pointer (if non-null) is a
+        // pool-anchored SpanCtx valid for the request lifetime.
+        None => unsafe {
+            crate::traces::ctx::recover_span_ctx(r, module, ::core::ptr::null_mut()).as_ref()
+        },
+    };
+
+    // SAFETY: `v` is the non-null `ngx_variable_value_t*` nginx supplies.
+    let vv = unsafe { &mut *v };
+    match ctx {
+        Some(span_ctx) => {
+            // SAFETY: `r` is valid; `(*r).pool` is the per-request pool.
+            let pool = unsafe { (*r).pool };
+            // SAFETY: `pool` is a valid nginx pool pointer; 16 bytes for the hex string.
+            let buf = unsafe { nginx_sys::ngx_pcalloc(pool, 16) } as *mut u8;
+            if buf.is_null() {
+                vv.set_not_found(1);
+                return nginx_sys::NGX_OK as nginx_sys::ngx_int_t;
+            }
+            // SAFETY: `buf` is a valid 16-byte pool allocation.
+            let s = unsafe { core::slice::from_raw_parts_mut(buf, 16) };
+            hex_encode_into(&span_ctx.parent_span_id, s);
+            vv.set_valid(1);
+            vv.set_no_cacheable(1);
+            vv.set_not_found(0);
+            vv.set_len(16);
             vv.data = buf;
         }
         None => {
@@ -1763,5 +1910,73 @@ mod nginx_test_stubs {
     #[no_mangle]
     pub unsafe extern "C" fn ngx_list_push(_l: *mut nginx_sys::ngx_list_t) -> *mut c_void {
         core::ptr::null_mut()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hex_encode_into;
+
+    /// `hex_encode_into` encodes an 8-byte span ID to 16 lowercase hex chars.
+    ///
+    /// This is the core logic shared by `$otel_span_id` and `$otel_parent_id`
+    /// (both encode 8 bytes to 16 hex chars).
+    ///
+    /// Mutation evidence: swap `>> 4` with `& 0x0f` in `hex_encode_into` →
+    /// the nibbles are reversed and the expected strings don't match.
+    #[test]
+    fn hex_encode_span_id_8bytes() {
+        // Span ID: 8 bytes → 16 lowercase hex chars.
+        let span_id: [u8; 8] = [0x00, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7];
+        let mut out = [0u8; 16];
+        hex_encode_into(&span_id, &mut out);
+        assert_eq!(
+            &out, b"00f067aa0ba902b7",
+            "span_id hex encoding must be 16 lowercase hex chars"
+        );
+    }
+
+    /// All-zero span ID (root span / no parent) encodes to 16 zeros.
+    ///
+    /// `$otel_parent_id` emits this string for root spans.
+    ///
+    /// Mutation evidence: replace the HEX lookup with uppercase → output
+    /// becomes `"0000000000000000"` (same) but any non-zero value would
+    /// uppercase → subsequent `hex_encode_mixed_nibbles` assertion fails.
+    #[test]
+    fn hex_encode_all_zeros_span_id() {
+        let zero_id: [u8; 8] = [0u8; 8];
+        let mut out = [0u8; 16];
+        hex_encode_into(&zero_id, &mut out);
+        assert_eq!(&out, b"0000000000000000", "all-zero span_id must encode to 16 zeros");
+    }
+
+    /// Mixed-nibble value exercises every hex digit path in `hex_encode_into`.
+    #[test]
+    fn hex_encode_mixed_nibbles() {
+        // 0x0123456789abcdef covers nibbles 0-9 + a-f.
+        let id: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
+        let mut out = [0u8; 16];
+        hex_encode_into(&id, &mut out);
+        assert_eq!(&out, b"0123456789abcdef", "nibble encoding must cover all hex digits 0-9 a-f");
+    }
+
+    /// The 16-byte trace ID also encodes correctly (32 hex chars).
+    /// `$otel_trace_id` uses the same `hex_encode_into`; this guards regression.
+    ///
+    /// Mutation evidence: change the output length from 32 to 30 in
+    /// `hex_encode_into` → `from_utf8` still passes but the content differs.
+    #[test]
+    fn hex_encode_trace_id_16bytes() {
+        let trace_id: [u8; 16] = [
+            0x4b, 0xf9, 0x2f, 0x35, 0x77, 0xb3, 0x4d, 0xa6, 0xa3, 0xce, 0x92, 0x9d, 0x0e, 0x0e,
+            0x47, 0x36,
+        ];
+        let mut out = [0u8; 32];
+        hex_encode_into(&trace_id, &mut out);
+        assert_eq!(
+            &out, b"4bf92f3577b34da6a3ce929d0e0e4736",
+            "trace_id hex encoding must be 32 lowercase hex chars"
+        );
     }
 }
