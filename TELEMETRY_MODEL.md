@@ -13,7 +13,7 @@ proposal covers *why*.
 
 | Signal | Enabled by | Where |
 |---|---|---|
-| **Metrics** | on whenever `otel_exporter` is configured (no per-signal directive) | [Metrics](#metrics) |
+| **Metrics** | on by default when `otel_exporter` is configured; suppress with `otel_metrics off` | [Metrics](#metrics) |
 | **Logs — access (exception tail)** | `otel_log_export on \| if=<expr>` (bare `otel_log_export;` ⇒ `on`) | [Logs](#logs) |
 | **Metric exemplars** | trace sampling (`otel_trace`) | [Metrics](#metrics) |
 | **Logs — error (coalesced + rate metric)** | `otel_error_log [level]` | [Logs](#logs) |
@@ -537,6 +537,8 @@ location wins on merge.
 | Variable | Type | Value |
 |---|---|---|
 | `$otel_trace_id` | string (32-char hex) | trace ID from the current request's `SpanCtx`, or empty string when tracing is disabled. |
+| `$otel_span_id` | string (16-char hex) | span ID of the current request's span, or empty string when tracing is disabled. |
+| `$otel_parent_id` | string (16-char hex) | parent span ID from the inbound `traceparent` header, or empty string for root spans or when tracing is disabled. |
 | `$otel_parent_sampled` | string `"1"` / empty | `"1"` when this request is sampled — including root spans with no inbound `traceparent`; empty only when tracing is disabled. (The name reads as a parent-only flag but reflects the sampling state of *this* request — see `span_start.rs`.) |
 
 ### Span shape
@@ -558,21 +560,42 @@ One OTel **server span** per sampled request.
 
 ### Span attributes
 
-Standard OTel HTTP semconv attributes recorded on every span:
+Standard [OTel HTTP semconv][http-spans-semconv] attributes recorded on every span.
+All attribute keys are current semconv names (v1.21+); deprecated v1.16.0 names
+such as `http.method` and `http.status_code` are not emitted.
 
-| Attribute | Value | Source |
+| Attribute | Value | Notes |
 |---|---|---|
-| `http.request.method` | HTTP method string | `r->method_name` |
-| `url.path` | request URI path (≤ 64 bytes, `MAX_URL_PATH`) | `r->uri` |
-| `http.response.status_code` | raw status code | `r->headers_out.status` |
-| `http.server.request.duration` | request duration **in seconds** (derived from µs measurement; same field, same unit as the access-tail LogRecord — enables coherent metric→exemplar→log→trace drill-down) | `src/traces/mod.rs` |
-| Custom attrs | from `otel_span_attr` directives | `src/metric_source/location_conf.rs` |
+| `http.request.method` | HTTP method string (`GET`, `POST`, …) | |
+| `url.path` | request URI path (≤ 64 bytes) | path only — no query string |
+| `url.query` | query string without the leading `?` (≤ 128 bytes) | omitted when absent |
+| `http.response.status_code` | integer HTTP status code | |
+| `http.route` | matched `location` block name (≤ 128 bytes) | omitted when absent |
+| `url.scheme` | `"http"` or `"https"` | |
+| `network.protocol.version` | `"1.0"`, `"1.1"`, `"2"`, or `"3"` | |
+| `user_agent.original` | `User-Agent` header value (≤ 128 bytes) | omitted when absent |
+| `http.request.body.size` | request body bytes (`Content-Length`; 0 when absent) | |
+| `http.response.body.size` | response body bytes sent, headers excluded | |
+| `server.address` | server name from the matched virtual host (≤ 256 bytes) | |
+| `server.port` | local listening port (integer) | omitted when absent |
+| `client.address` | logical client IP, realip-aware (`$remote_addr` equivalent) | |
+| `client.port` | logical client port (integer) | |
+| `network.peer.address` | true TCP socket peer address | absent when realip not compiled in — see note |
+| `network.peer.port` | true TCP socket peer port (integer) | absent when realip not compiled in |
+| `error.type` | HTTP status code as string (e.g. `"503"`) | present only when status ≥ 500; derived at export, no worker cost |
+| `http.server.request.duration` | request duration **in seconds** | enables coherent metric→exemplar→span drill-down |
+| Custom attrs | from `otel_span_attr` directives | per-location, up to `MAX_SPAN_EXTRA_ATTRS` entries |
 
-> **Not recorded as span attributes:** `http.route` (the matched location name
-> appears in the span *name* `"METHOD route_name"`, and as `http.route` on the
-> `by_route` *metric* — but it is not a span attribute), `network.protocol.version`,
-> and `user_agent.original` / `client.address` (these ride on the access-tail
-> `LogRecord`). Add any of them to the span per location with `otel_span_attr`.
+> **`network.peer.*` and realip.** These attributes represent the immediate TCP
+> socket peer, distinct from the logical client. They are sourced via nginx's
+> `$realip_remote_addr` / `$realip_remote_port` variables, which require the
+> `realip` module to be compiled in (the default nginx build includes it). When
+> built `--without-http_realip_module` the variable is unregistered and the two
+> attributes are **absent** from the span — not degraded to the client address.
+> `client.address` is always present and equals the socket peer when realip is
+> not in use.
+
+[http-spans-semconv]: https://opentelemetry.io/docs/specs/semconv/http/http-spans/
 
 ### Sampling
 

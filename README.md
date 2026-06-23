@@ -33,7 +33,9 @@ What this module emits:
   a companion error-rate counter.
 - **Traces** (Phase 3, `otel_trace <expr>`): OTel server spans with W3C
   `traceparent` propagation, parent/ratio sampling, per-location span name and
-  attributes, and `$otel_trace_id` / `$otel_parent_sampled` nginx variables.
+  attributes, and `$otel_trace_id` / `$otel_span_id` / `$otel_parent_id` /
+  `$otel_parent_sampled` nginx variables. The full OTel HTTP semconv attribute
+  set is emitted on every span.
 
 Two production export transports (`otel_export_protocol`): **OTLP/HTTP** over
 HTTP/1.1 (`otlp_http`, default) and **OTLP/gRPC** unary over HTTP/2 (`otlp_grpc`).
@@ -288,11 +290,14 @@ design proposal to integrate. In brief:
 - **Logs — error** (`otel_error_log [level]`): coalesced `nginx.error` `LogRecord`s
   (one sample + count per template) with a companion error-rate metric.
 - **Traces** (`otel_trace <expr>` per location): OTel server spans. W3C
-  `traceparent` propagation (`otel_trace_context`); parent-based or ratio
-  sampling; per-location span name + custom attrs; `$otel_trace_id` /
-  `$otel_parent_sampled` nginx variables. Exemplars on the duration histogram
-  carry `trace_id` and `span_id` from the module's own spans, completing the
-  drill-down from a metric, through its exemplar, to the Tempo trace.
+  `traceparent` propagation (`otel_trace_context`, default `extract`);
+  parent-based or ratio sampling; per-location span name + custom attrs;
+  `$otel_trace_id` / `$otel_span_id` / `$otel_parent_id` /
+  `$otel_parent_sampled` nginx variables. Full OTel HTTP semconv attribute set
+  on every span (see `TELEMETRY_MODEL.md` for the complete table). Exemplars on
+  the duration histogram carry `trace_id` and `span_id` from the module's own
+  spans, completing the drill-down from a metric, through its exemplar, to the
+  Tempo trace.
 - **Exporter self-metrics**: `ngx_otel.dropped_records`, `ngx_otel.send_failures`,
   `ngx_otel.logs.access.dropped_records`, `ngx_otel.logs.error.dropped_records`,
   `ngx_otel.logs.error.coalesced_orphaned_records`, `ngx_otel.logs.send_failures`,
@@ -550,17 +555,24 @@ http {
         # ssl_certificate_key /etc/nginx/certs/client.key;   # mTLS client private key
         # ssl_verify          on;                             # on (default) | off — off disables cert verification (INSECURE)
 
+        # C++ nginx-otel compatibility aliases (also available as top-level directives):
+        # header       authorization "Bearer ...";  # same as top-level otel_exporter_header
+        # interval     5s;                          # same as top-level otel_metric_interval (default: 5s)
+        # batch_size   512;                         # accepted for compatibility; has no effect (fixed ring)
+        # batch_count  4;                           # accepted for compatibility; has no effect (fixed ring)
+
         # Per-signal overrides (optional; used as-is, no path appended):
         # metrics_endpoint http://metrics-host:4318/v1/metrics;
         # logs_endpoint    http://logs-host:4318/v1/logs;
         # traces_endpoint  http://traces-host:4318/v1/traces;
     }
     otel_export_protocol otlp_grpc;         # otlp_http (default) | otlp_grpc
-    otel_service_name my-nginx;
+    otel_service_name my-nginx;             # if absent, defaults to "unknown_service:nginx"
     otel_resource_attr deployment.environment production;
     otel_exporter_header authorization "Bearer ...";
-    otel_metric_interval 10s;
+    otel_metric_interval 5s;                # export interval (default: 5s; also configurable as `interval` inside otel_exporter {})
     otel_metric_zone otel_metrics 1m;
+    otel_metrics on;                        # on (default) | off — set off to suppress all metrics (traces-only mode)
     otel_metric_status_code_class on;       # emit method × status-class × protocol attrs on the duration series (live)
 
     # Logs (off unless these are set; orthogonal to nginx's own access_log/error_log):
@@ -653,6 +665,40 @@ Key behaviours:
 - **Minimum OpenSSL version**: 1.1.1 (API `X509_VERIFY_PARAM_set1_host` and
   `set1_ip_asc` first available in 1.0.2; 1.1.1+ recommended). See
   [`OPENSSL_SUPPORT.md`](OPENSSL_SUPPORT.md) for the full support matrix.
+
+#### Directive reference
+
+The table below covers the directives added or changed since the C++
+`nginx/nginx-otel` baseline.  All pre-existing directives (`otel_trace`,
+`otel_trace_context`, `otel_span_name`, `otel_span_attr`, `otel_service_name`,
+`otel_resource_attr`) work identically; see the configuration example above.
+
+| Directive | Context | Default | Description |
+|---|---|---|---|
+| `otel_metrics on\|off` | `http` | `on` | Enable (`on`) or disable (`off`) all metric collection and export. Set `off` for a traces-and-logs-only configuration. Does not affect traces or log export. |
+| `otel_service_name <name>` | `http` | `"unknown_service:nginx"` | Sets `service.name` in the resource. When absent, the fallback `"unknown_service:nginx"` is used (matching the C++ `nginx-otel` default). |
+| `otel_metric_interval <time>` | `http` | `5s` | How often the exporter drains and exports metrics (nginx time string: `5s`, `1m`, etc.). Default is 5 seconds (matching the OTel SDK default). |
+
+Sub-directives inside `otel_exporter {}` — compatibility aliases:
+
+| Sub-directive | Maps to | Notes |
+|---|---|---|
+| `header <name> <value>` | same as `otel_exporter_header <name> <value>` | Sets an HTTP request header sent with every export request |
+| `interval <time>` | same as `otel_metric_interval` | nginx time string; `5s` (default) or `500ms`, `1m`, etc. |
+| `batch_size <size>` | accepted, no effect | nginx size string (`512`, `1k`). Parsed for C++ config compatibility; this module uses a fixed ring. A `[warn]` is logged at config load. |
+| `batch_count <size>` | accepted, no effect | Same as `batch_size`. |
+
+#### nginx variables
+
+| Variable | Value |
+|---|---|
+| `$otel_trace_id` | 32-char lowercase hex trace ID of the current span; empty when tracing is not enabled for this request |
+| `$otel_span_id` | 16-char lowercase hex span ID of the current span; empty when tracing is not enabled |
+| `$otel_parent_id` | 16-char lowercase hex parent span ID from the inbound `traceparent`; empty for root spans or when tracing is not enabled |
+| `$otel_parent_sampled` | `"1"` when the current request is sampled (including root spans); empty when tracing is not enabled |
+
+All four variables are usable in `access_log` format strings, `if=` conditions,
+`otel_span_name`, and anywhere else nginx accepts a complex value.
 
 ### Running tests
 
@@ -877,6 +923,10 @@ ngx-otel-rust/
 
 ## Related
 
+- **[`MIGRATING_FROM_NGINX_OTEL.md`](MIGRATING_FROM_NGINX_OTEL.md)** — migration
+  guide for users moving from the C++ `nginx/nginx-otel` module: span attribute
+  renames, default differences, `otel_metrics off` for traces-only mode, and a
+  config diff.
 - F5-internal design proposal (Confluence):
   *Proposal: a high-performance observability module for NGINX (ngx-otel-rust)*
   <https://docs.f5net.com/spaces/~vandesande/pages/1241830506>
