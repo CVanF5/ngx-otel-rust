@@ -696,6 +696,19 @@ mod tests {
             http_status: 200,
             url_path: b"/root",
             duration_us: 1_000_000,
+            proto: 1, // ProtoVersion::Http11
+            scheme_https: false,
+            server_port: 0,
+            client_port: 0,
+            peer_port: 0,
+            req_body_size: 0,
+            resp_body_size: 0,
+            url_query: b"",
+            route: b"",
+            user_agent: b"",
+            server_address: b"",
+            client_address: b"",
+            peer_address: b"",
             extra_attrs: &[],
         };
 
@@ -715,6 +728,19 @@ mod tests {
             http_status: 200,
             url_path: b"/child",
             duration_us: 800_000,
+            proto: 1, // ProtoVersion::Http11
+            scheme_https: false,
+            server_port: 0,
+            client_port: 0,
+            peer_port: 0,
+            req_body_size: 0,
+            resp_body_size: 0,
+            url_query: b"",
+            route: b"",
+            user_agent: b"",
+            server_address: b"",
+            client_address: b"",
+            peer_address: b"",
             extra_attrs: &[],
         };
 

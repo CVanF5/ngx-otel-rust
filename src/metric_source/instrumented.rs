@@ -23,8 +23,8 @@ use core::sync::atomic::Ordering;
 use nginx_sys;
 use ngx::core::Status;
 use ngx::http::{
-    HttpModuleLocationConf, HttpModuleMainConf, HttpPhase, HttpRequestHandler, NgxHttpCoreModule,
-    Request,
+    HttpModuleLocationConf, HttpModuleMainConf, HttpModuleServerConf, HttpPhase,
+    HttpRequestHandler, NgxHttpCoreModule, Request,
 };
 
 use crate::logs::{
@@ -391,6 +391,55 @@ impl HttpRequestHandler for LogPhaseHandler {
         } else {
             false
         };
+
+        // ── Shared request detail (read ONCE, fed to BOTH the access tail and
+        //    the span record) ─────────────────────────────────────────────────
+        // The access tail (above) and the span record (below) both need the
+        // realip-aware client address and the User-Agent.  Per the single-phase
+        // (LOG) consumer rule, read each once here into a local and feed both
+        // sinks — no `SpanCtx` caching (that is reserved for cross-phase values
+        // like the parsed traceparent).  Gated on actually needing the detail:
+        // either the tail is selected OR the request is a sampled span.
+        let span_sampled = span_ctx.is_some_and(|ctx| ctx.sampled);
+        let need_detail = export_selected || span_sampled;
+
+        // Client address (realip-aware `$remote_addr`): the connection's
+        // `addr_text`, which nginx's realip module rewrites in place to the real
+        // client.  Same source the tail used previously.
+        let client_addr: &[u8] = if need_detail && !request.connection().is_null() {
+            // SAFETY: the connection pointer is non-null (checked) and points to
+            // the request's `ngx_connection_t`, valid for this handler.
+            // `addr_text` is an `ngx_str_t`; the slice is built only when `len >
+            // 0` and `data` is non-null, covering `len` initialised bytes that
+            // outlive this borrow.
+            unsafe {
+                let conn = &*request.connection();
+                if conn.addr_text.len > 0 && !conn.addr_text.data.is_null() {
+                    core::slice::from_raw_parts(conn.addr_text.data, conn.addr_text.len)
+                } else {
+                    b""
+                }
+            }
+        } else {
+            b""
+        };
+
+        // User-Agent header: one targeted header scan (not cached in SpanCtx —
+        // it is not needed for trace correlation).
+        let user_agent_raw: &[u8] = if need_detail {
+            let mut ua: &[u8] = b"";
+            for (key, value) in request.headers_in_iterator() {
+                let k = key.as_bytes();
+                if k.len() == 10 && k.eq_ignore_ascii_case(b"user-agent") {
+                    ua = value.as_bytes();
+                    break;
+                }
+            }
+            ua
+        } else {
+            b""
+        };
+
         if export_selected {
             if let Some(logs_base) = amcf.logs_shm_base() {
                 let cap = amcf.log_ring_cap();
@@ -404,26 +453,6 @@ impl HttpRequestHandler for LogPhaseHandler {
                 let req_len = r.request_length as u64;
                 let resp_bytes_acc = resp_bytes; // already computed above
 
-                // Client address from the connection.
-                let client_addr: &[u8] = if !request.connection().is_null() {
-                    // SAFETY: the connection pointer is non-null (checked above) and
-                    // points to the request's `ngx_connection_t`, valid for this
-                    // handler. `addr_text` is an `ngx_str_t` whose `data`/`len` nginx
-                    // fills with the client address text; the `from_raw_parts` slice
-                    // is only built when `len > 0` and `data` is non-null, so it
-                    // covers `len` initialised bytes that outlive this borrow.
-                    unsafe {
-                        let conn = &*request.connection();
-                        if conn.addr_text.len > 0 && !conn.addr_text.data.is_null() {
-                            core::slice::from_raw_parts(conn.addr_text.data, conn.addr_text.len)
-                        } else {
-                            b""
-                        }
-                    }
-                } else {
-                    b""
-                };
-
                 // Timestamp: request start time in nanoseconds.
                 // Derived from nginx's stored start fields (ms precision).
                 let ts_unix_nano: u64 = (r.start_sec as u64)
@@ -436,17 +465,6 @@ impl HttpRequestHandler for LogPhaseHandler {
                 // W3C propagation but do not stamp the access tail.
                 let trace_context: Option<([u8; 16], [u8; 8])> =
                     span_ctx.filter(|ctx| ctx.sampled).map(|ctx| (ctx.trace_id, ctx.span_id));
-
-                // User-Agent header: still requires one targeted header scan since it
-                // is NOT cached in SpanCtx (not needed for trace correlation).
-                let mut user_agent_raw: &[u8] = b"";
-                for (key, value) in request.headers_in_iterator() {
-                    let k = key.as_bytes();
-                    if k.len() == 10 && k.eq_ignore_ascii_case(b"user-agent") {
-                        user_agent_raw = value.as_bytes();
-                        break;
-                    }
-                }
 
                 // url.path: r.uri (decoded path, WITHOUT query string / args).
                 // Use r.uri, NOT r.unparsed_uri (= $request_uri, which includes
@@ -621,6 +639,59 @@ impl HttpRequestHandler for LogPhaseHandler {
                 let end_time_unix_nano =
                     ctx.start_time_unix_nano.saturating_add(duration_us.saturating_mul(1_000));
 
+                // ── HTTP semconv coverage sources (already materialized) ───────
+                let conn_ptr = request.connection();
+
+                // url.scheme: TLS connection ⇒ "https".
+                let scheme_https = if conn_ptr.is_null() {
+                    false
+                } else {
+                    // SAFETY: `conn_ptr` is non-null (checked); `ssl` is a pointer
+                    // nginx sets non-null on TLS connections.
+                    unsafe { !(*conn_ptr).ssl.is_null() }
+                };
+
+                // server.address: the matched server name, falling back to the
+                // request Host header (mirrors nginx-otel getServerName,
+                // http_module.cpp:395-406).
+                let server_address: &[u8] = {
+                    let from_srv = NgxHttpCoreModule::server_conf(r)
+                        .map(|cscf| cscf.server_name.as_bytes())
+                        .unwrap_or(b"");
+                    if from_srv.is_empty() {
+                        r.headers_in.server.as_bytes()
+                    } else {
+                        from_srv
+                    }
+                };
+
+                // server.port / client.port (local + client sockaddr ports).
+                // SAFETY: `conn_ptr` is the request connection pointer (may be
+                // null — `server_port` handles null).
+                let server_port_val = unsafe { server_port(conn_ptr) };
+                // SAFETY: `conn_ptr` is the request connection pointer (may be
+                // null — `client_port` handles null).
+                let client_port_val = unsafe { client_port(conn_ptr) };
+
+                // network.peer.{address,port}: the TRUE TCP socket peer via the
+                // realip-aware `$realip_remote_addr` selection (saved original
+                // when realip rewrote the connection, else the live peer).
+                let r_mut =
+                    r as *const nginx_sys::ngx_http_request_t as *mut nginx_sys::ngx_http_request_t;
+                // SAFETY: `r_mut` is the live request pointer for this handler.
+                let (peer_address, peer_port_val) = unsafe { realip_peer(r_mut) };
+
+                // http.request.body.size: content_length_n (-1 = absent ⇒ 0).
+                let req_body_size = if r.headers_in.content_length_n > 0 {
+                    r.headers_in.content_length_n as u64
+                } else {
+                    0
+                };
+                // http.response.body.size: bytes sent minus response headers
+                // (mirrors nginx-otel http.response_content_length,
+                // http_module.cpp:436).
+                let resp_body_size = resp_bytes.saturating_sub(r.header_size as u64);
+
                 let rec = SpanRecord {
                     trace_id: ctx.trace_id,
                     span_id: ctx.span_id,
@@ -635,6 +706,19 @@ impl HttpRequestHandler for LogPhaseHandler {
                     http_status: status,
                     url_path: r.uri.as_bytes(), // uri = path only; unparsed_uri = path+args
                     duration_us,
+                    proto: proto as u8,
+                    scheme_https,
+                    server_port: server_port_val,
+                    client_port: client_port_val,
+                    peer_port: peer_port_val,
+                    req_body_size,
+                    resp_body_size,
+                    url_query: r.args.as_bytes(), // url.query: args without leading '?'
+                    route: amcf.route_name(route_idx).as_bytes(),
+                    user_agent: user_agent_raw,
+                    server_address,
+                    client_address: client_addr,
+                    peer_address,
                     extra_attrs: &attrs_buf[..attrs_len],
                 };
 
@@ -741,6 +825,139 @@ fn build_span_name(buf: &mut [u8; MAX_SPAN_NAME], method: &[u8], route: &[u8]) -
         off += rem;
     }
     off
+}
+
+/// Realip-aware "true TCP socket peer" address + port for the
+/// `network.peer.address` / `network.peer.port` span attributes.
+///
+/// nginx's realip module (`real_ip_header` / PROXY protocol) rewrites
+/// `c->addr_text` / `c->sockaddr` **in place** to the logical client, but it
+/// first stashes the original socket peer in its per-request module context
+/// (`ngx_http_realip_module.c:285-292`).  The `$realip_remote_addr` /
+/// `$realip_remote_port` variables return that saved original when the context
+/// is present, else the live connection values
+/// (`ngx_http_realip_remote_addr_variable`, `ngx_http_realip_module.c:580,602`).
+///
+/// We reproduce that exact selection by evaluating the `$realip_remote_addr`
+/// variable: it always yields the true socket peer regardless of realip
+/// rewriting, and degrades to the live `addr_text` when realip is not active or
+/// not compiled in.  The realip module's context type and its module descriptor
+/// are both file-`static` in nginx, so they cannot be referenced directly from
+/// Rust — the variable is the only sound public accessor.
+///
+/// Returns the peer address bytes (slice into request/connection memory, valid
+/// for this LOG-phase call) and the peer port (0 when unavailable).
+///
+/// # Safety
+/// `r` must be the valid request pointer for the current LOG-phase handler.
+///
+/// # Hot-path note
+/// Two `ngx_http_get_variable` evaluations (a hashed lookup) when realip is
+/// configured; on the no-realip path these resolve to the same `addr_text` the
+/// connection already holds.  Runs only on sampled spans.
+unsafe fn realip_peer<'a>(r: *mut nginx_sys::ngx_http_request_t) -> (&'a [u8], u16) {
+    /// Evaluate one request variable by name, returning its value bytes.
+    ///
+    /// # Safety
+    /// `r` valid request pointer; `name` an ASCII-lowercase variable name.
+    unsafe fn get_var<'b>(r: *mut nginx_sys::ngx_http_request_t, name: &[u8]) -> &'b [u8] {
+        // `ngx_hash_strlow` lowercases into `dst` and returns the hash key; the
+        // name is already lowercase, so copy it into a local mutable buffer and
+        // hash in place (the C callers pass the variable's own mutable buffer,
+        // e.g. ngx_http_ssi_filter_module.c:2293).
+        let mut lower = [0u8; 32];
+        if name.len() > lower.len() {
+            return b"";
+        }
+        lower[..name.len()].copy_from_slice(name);
+        // SAFETY: `lower` holds `name.len()` initialised bytes; `ngx_hash_strlow`
+        // reads/writes exactly that many in place and returns the hash key.
+        let key = unsafe {
+            nginx_sys::ngx_hash_strlow(lower.as_mut_ptr(), lower.as_mut_ptr(), name.len())
+        };
+        let mut nm = nginx_sys::ngx_str_t { len: name.len(), data: lower.as_mut_ptr() };
+        // SAFETY: `r` is the valid request; `nm` names a variable (registered or
+        // not — a null/not_found return is handled); `key` is its hash.
+        let vv = unsafe { nginx_sys::ngx_http_get_variable(r, &raw mut nm, key) };
+        if vv.is_null() {
+            return b"";
+        }
+        // SAFETY: `vv` is non-null; `not_found()`/`len()`/`data` are valid reads
+        // on the returned variable-value struct.
+        unsafe {
+            if (*vv).not_found() != 0 {
+                return b"";
+            }
+            let len = (*vv).len() as usize;
+            let data = (*vv).data;
+            if len == 0 || data.is_null() {
+                b""
+            } else {
+                core::slice::from_raw_parts(data, len)
+            }
+        }
+    }
+
+    // SAFETY: `r` is the valid request pointer per the contract.
+    let addr = unsafe { get_var(r, b"realip_remote_addr") };
+    // SAFETY: `r` is the valid request pointer per the contract.
+    let port_bytes = unsafe { get_var(r, b"realip_remote_port") };
+    let port =
+        core::str::from_utf8(port_bytes).ok().and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
+    (addr, port)
+}
+
+/// Local listening (server) port for the `server.port` span attribute.
+///
+/// Materialises the connection's local sockaddr (lazily filled by nginx via
+/// `getsockname` only when first requested — the same call the core
+/// `$server_port` variable makes) and reads the port with `ngx_inet_get_port`,
+/// mirroring `nginx-otel`'s `net.host.port` source (`http_module.cpp:450-451`).
+/// Returns 0 when the local address is unavailable.
+///
+/// # Safety
+/// `conn` must be the request's valid (or null) `ngx_connection_t` pointer.
+unsafe fn server_port(conn: *mut nginx_sys::ngx_connection_t) -> u16 {
+    if conn.is_null() {
+        return 0;
+    }
+    // SAFETY: `conn` is the valid request connection per the contract;
+    // `ngx_connection_local_sockaddr` fills `local_sockaddr`/`local_socklen`.
+    unsafe {
+        if nginx_sys::ngx_connection_local_sockaddr(conn, core::ptr::null_mut(), 0)
+            != nginx_sys::NGX_OK as nginx_sys::ngx_int_t
+        {
+            return 0;
+        }
+        let local = (*conn).local_sockaddr;
+        if local.is_null() {
+            0
+        } else {
+            nginx_sys::ngx_inet_get_port(local)
+        }
+    }
+}
+
+/// Client (realip-aware `$remote_addr`-equivalent) port for the `client.port`
+/// span attribute, read from the connection's live `sockaddr` (which realip
+/// rewrites in place alongside `addr_text`).  Returns 0 when unavailable.
+///
+/// # Safety
+/// `conn` must be the request's valid (or null) `ngx_connection_t` pointer.
+unsafe fn client_port(conn: *mut nginx_sys::ngx_connection_t) -> u16 {
+    if conn.is_null() {
+        return 0;
+    }
+    // SAFETY: `conn` is valid; `sockaddr` is the (possibly realip-rewritten)
+    // client sockaddr nginx keeps for the connection lifetime.
+    unsafe {
+        let sa = (*conn).sockaddr;
+        if sa.is_null() {
+            0
+        } else {
+            nginx_sys::ngx_inet_get_port(sa)
+        }
+    }
 }
 
 /// Aggregated upstream timings/bytes summed across every attempt in

@@ -24,6 +24,25 @@
 //! [2]  url_path_len        (big-endian u16, ≤ MAX_URL_PATH from logs::access)
 //! [url_path_len] url_path  (url.path)
 //! [8]  duration_us         (big-endian u64, request duration in µs)
+//! [1]  proto               (ProtoVersion index: 0=1.0 1=1.1 2=2 3=3; network.protocol.version)
+//! [1]  scheme              (0 = "http", 1 = "https"; url.scheme)
+//! [2]  server_port         (big-endian u16, server.port; 0 = absent)
+//! [2]  client_port         (big-endian u16, client.port; 0 = absent)
+//! [2]  peer_port           (big-endian u16, network.peer.port; 0 = absent)
+//! [8]  req_body_size       (big-endian u64, http.request.body.size)
+//! [8]  resp_body_size      (big-endian u64, http.response.body.size)
+//! [2]  url_query_len       (big-endian u16, ≤ MAX_URL_QUERY)
+//! [url_query_len] url_query (url.query, args without leading '?')
+//! [2]  route_len           (big-endian u16, ≤ MAX_SPAN_ROUTE)
+//! [route_len] route        (http.route, matched location name)
+//! [2]  user_agent_len      (big-endian u16, ≤ MAX_USER_AGENT from logs::access)
+//! [user_agent_len] user_agent (user_agent.original)
+//! [2]  server_addr_len     (big-endian u16, ≤ MAX_SERVER_ADDR)
+//! [server_addr_len] server_addr (server.address)
+//! [2]  client_addr_len     (big-endian u16, ≤ MAX_CLIENT_ADDR from logs::access)
+//! [client_addr_len] client_addr (client.address; realip-aware $remote_addr)
+//! [2]  peer_addr_len       (big-endian u16, ≤ MAX_CLIENT_ADDR from logs::access)
+//! [peer_addr_len] peer_addr (network.peer.address; true TCP socket peer)
 //! [2]  n_attrs             (big-endian u16, number of extra attributes; 0 = none)
 //! For each attr (0..n_attrs):
 //!   [1]  key_len           (u8, ≤ MAX_SPAN_ATTR_KEY)
@@ -45,15 +64,25 @@
 pub mod ctx;
 
 use crate::logs::LogProducer;
-// method and url.path caps are single-homed in logs::access (same semantic
-// field on the same nginx request).  Import them here so span and access records
-// always use the same value — a bump to MAX_URL_PATH propagates automatically.
-use crate::logs::access::{MAX_METHOD, MAX_URL_PATH};
+// method/url.path/user_agent/client.address caps are single-homed in
+// logs::access (same semantic field on the same nginx request).  Import them
+// here so span and access records always use the same value — a bump to
+// MAX_URL_PATH (etc.) propagates automatically.
+use crate::logs::access::{MAX_CLIENT_ADDR, MAX_METHOD, MAX_URL_PATH, MAX_USER_AGENT};
 
 // ── Named field caps ──────────────────────────────────────────────────────────
 
 /// Maximum span name bytes stored in the record.
 pub const MAX_SPAN_NAME: usize = 64;
+/// Maximum `url.query` bytes stored in the record.
+///
+/// Query strings are high-cardinality and may carry credentials; the value is
+/// capped (and exported only on sampled spans) like the other detail fields.
+pub const MAX_URL_QUERY: usize = 128;
+/// Maximum `http.route` (matched location name) bytes stored in the record.
+pub const MAX_SPAN_ROUTE: usize = 64;
+/// Maximum `server.address` bytes stored in the record.
+pub const MAX_SERVER_ADDR: usize = 64;
 /// Maximum number of extra span attributes from `otel_span_attr` directives.
 pub const MAX_SPAN_EXTRA_ATTRS: usize = 4;
 /// Maximum attribute key length (bytes) per extra attribute.
@@ -73,16 +102,45 @@ pub const SPAN_RECORD_FIXED_HDR: usize = 16 + 8 + 8 + 4 + 8 + 8 + 1 + 1;
 ///
 /// Fixed header + name(2+MAX_SPAN_NAME) + method(2+MAX_METHOD)
 /// + http_status(2) + url_path(2+MAX_URL_PATH) + duration_us(8)
+/// + proto(1) + scheme(1) + server_port(2) + client_port(2) + peer_port(2)
+/// + req_body_size(8) + resp_body_size(8)
+/// + url_query(2+MAX_URL_QUERY) + route(2+MAX_SPAN_ROUTE)
+/// + user_agent(2+MAX_USER_AGENT) + server_addr(2+MAX_SERVER_ADDR)
+/// + client_addr(2+MAX_CLIENT_ADDR) + peer_addr(2+MAX_CLIENT_ADDR)
 /// + n_attrs(2) + MAX_SPAN_EXTRA_ATTRS × (1+MAX_SPAN_ATTR_KEY + 2+MAX_SPAN_ATTR_VAL)
 ///
-/// `MAX_METHOD` and `MAX_URL_PATH` are imported from `crate::logs::access`
-/// (single-homed there — same semantic field on the same nginx request).
+/// `MAX_METHOD`, `MAX_URL_PATH`, `MAX_USER_AGENT`, and `MAX_CLIENT_ADDR` are
+/// imported from `crate::logs::access` (single-homed there — the same semantic
+/// field on the same nginx request).
+///
+/// # Sizing / saturation note
+/// The HTTP-semconv coverage fields raise the worst-case record from 612 B to
+/// 1124 B.  `push` writes only the actually-formatted `pos` bytes, so a typical
+/// span (short/empty user-agent, no query) grows far less than the worst case;
+/// but a larger fixed worst case means fewer worst-case spans fit a fixed-size
+/// ring, modestly lowering the per-worker span saturation ceiling.  The coupled
+/// drain-budget / ring-size / send-chunk constants are intentionally left
+/// unchanged here; raise them together if span throughput at saturation
+/// regresses.
 pub const SPAN_RECORD_WORST_CASE: usize = SPAN_RECORD_FIXED_HDR
     + (2 + MAX_SPAN_NAME)
     + (2 + MAX_METHOD)
     + 2
     + (2 + MAX_URL_PATH)
     + 8
+    + 1 // proto
+    + 1 // scheme
+    + 2 // server_port
+    + 2 // client_port
+    + 2 // peer_port
+    + 8 // req_body_size
+    + 8 // resp_body_size
+    + (2 + MAX_URL_QUERY)
+    + (2 + MAX_SPAN_ROUTE)
+    + (2 + MAX_USER_AGENT)
+    + (2 + MAX_SERVER_ADDR)
+    + (2 + MAX_CLIENT_ADDR)
+    + (2 + MAX_CLIENT_ADDR)
     + 2
     + MAX_SPAN_EXTRA_ATTRS * (1 + MAX_SPAN_ATTR_KEY + 2 + MAX_SPAN_ATTR_VAL);
 
@@ -131,6 +189,33 @@ pub struct SpanRecord<'a> {
     pub url_path: &'a [u8],
     /// Request duration in microseconds.
     pub duration_us: u64,
+    /// `network.protocol.version` source — `ProtoVersion` index (0=1.0 1=1.1
+    /// 2=2 3=3); decoded to the semconv string at the exporter.
+    pub proto: u8,
+    /// `url.scheme`: `false` ⇒ `"http"`, `true` ⇒ `"https"`.
+    pub scheme_https: bool,
+    /// `server.port` (local listening port); 0 ⇒ omitted.
+    pub server_port: u16,
+    /// `client.port` (realip-aware logical client port); 0 ⇒ omitted.
+    pub client_port: u16,
+    /// `network.peer.port` (true TCP socket peer port); 0 ⇒ omitted.
+    pub peer_port: u16,
+    /// `http.request.body.size` (request body bytes).
+    pub req_body_size: u64,
+    /// `http.response.body.size` (response body bytes, headers excluded).
+    pub resp_body_size: u64,
+    /// `url.query` bytes (args, no leading `?`); empty ⇒ omitted.
+    pub url_query: &'a [u8],
+    /// `http.route` bytes (matched location name); empty ⇒ omitted.
+    pub route: &'a [u8],
+    /// `user_agent.original` bytes; empty ⇒ omitted.
+    pub user_agent: &'a [u8],
+    /// `server.address` bytes (server name / Host); empty ⇒ omitted.
+    pub server_address: &'a [u8],
+    /// `client.address` bytes (realip-aware `$remote_addr`); empty ⇒ omitted.
+    pub client_address: &'a [u8],
+    /// `network.peer.address` bytes (true TCP socket peer); empty ⇒ omitted.
+    pub peer_address: &'a [u8],
     /// Extra span attributes from `otel_span_attr` directives.
     ///
     /// Slice of `(key_bytes, value_bytes)` pairs built in `LogPhaseHandler` from
@@ -220,6 +305,21 @@ pub fn emit_span_record(producer: &dyn LogProducer, rec: &SpanRecord<'_>) -> boo
     write_u16_be!(rec.http_status);
     write_capped!(rec.url_path, MAX_URL_PATH, u16);
     write_u64_be!(rec.duration_us);
+
+    // HTTP semconv coverage fields.
+    write_u8!(rec.proto);
+    write_u8!(u8::from(rec.scheme_https));
+    write_u16_be!(rec.server_port);
+    write_u16_be!(rec.client_port);
+    write_u16_be!(rec.peer_port);
+    write_u64_be!(rec.req_body_size);
+    write_u64_be!(rec.resp_body_size);
+    write_capped!(rec.url_query, MAX_URL_QUERY, u16);
+    write_capped!(rec.route, MAX_SPAN_ROUTE, u16);
+    write_capped!(rec.user_agent, MAX_USER_AGENT, u16);
+    write_capped!(rec.server_address, MAX_SERVER_ADDR, u16);
+    write_capped!(rec.client_address, MAX_CLIENT_ADDR, u16);
+    write_capped!(rec.peer_address, MAX_CLIENT_ADDR, u16);
 
     // Extra attributes from otel_span_attr directives.
     let n = rec.extra_attrs.len().min(MAX_SPAN_EXTRA_ATTRS);
@@ -344,6 +444,61 @@ pub fn parse_span_record(buf: &[u8], observed_ns: u64) -> Option<crate::data_mod
     let duration_us = u64::from_be_bytes(buf[pos..pos + 8].try_into().ok()?);
     pos += 8;
 
+    // ── HTTP semconv coverage fields ──────────────────────────────────────────
+    // Read a capped, u16-length-prefixed UTF-8 string at `pos`; advance `pos`.
+    // Returns the empty string when the field is absent/zero-length.
+    macro_rules! read_capped_str {
+        () => {{
+            if pos + 2 > buf.len() {
+                return None;
+            }
+            let len = u16::from_be_bytes(buf[pos..pos + 2].try_into().ok()?) as usize;
+            pos += 2;
+            if pos + len > buf.len() {
+                return None;
+            }
+            let s = std::string::String::from_utf8_lossy(&buf[pos..pos + len]).into_owned();
+            pos += len;
+            s
+        }};
+    }
+
+    // proto + scheme (1 byte each)
+    if pos + 2 > buf.len() {
+        return None;
+    }
+    let proto_idx = buf[pos];
+    pos += 1;
+    let scheme_https = buf[pos] != 0;
+    pos += 1;
+
+    // server_port / client_port / peer_port (u16 each)
+    if pos + 6 > buf.len() {
+        return None;
+    }
+    let server_port = u16::from_be_bytes(buf[pos..pos + 2].try_into().ok()?);
+    pos += 2;
+    let client_port = u16::from_be_bytes(buf[pos..pos + 2].try_into().ok()?);
+    pos += 2;
+    let peer_port = u16::from_be_bytes(buf[pos..pos + 2].try_into().ok()?);
+    pos += 2;
+
+    // req_body_size / resp_body_size (u64 each)
+    if pos + 16 > buf.len() {
+        return None;
+    }
+    let req_body_size = u64::from_be_bytes(buf[pos..pos + 8].try_into().ok()?);
+    pos += 8;
+    let resp_body_size = u64::from_be_bytes(buf[pos..pos + 8].try_into().ok()?);
+    pos += 8;
+
+    let url_query = read_capped_str!();
+    let route = read_capped_str!();
+    let user_agent = read_capped_str!();
+    let server_address = read_capped_str!();
+    let client_address = read_capped_str!();
+    let peer_address = read_capped_str!();
+
     // Extra attributes — gracefully absent in older records.
     let n_extra = if pos + 2 <= buf.len() {
         let n = u16::from_be_bytes(buf[pos..pos + 2].try_into().ok()?) as usize;
@@ -400,6 +555,86 @@ pub fn parse_span_record(buf: &[u8], observed_ns: u64) -> Option<crate::data_mod
         });
     }
 
+    // ── HTTP semconv coverage attributes ──────────────────────────────────────
+    // Attribute keys follow the current OTel HTTP semantic conventions:
+    // <https://opentelemetry.io/docs/specs/semconv/http/http-spans/>
+    if !url_query.is_empty() {
+        attributes.push(KeyValue { key: "url.query".into(), value: AnyValue::String(url_query) });
+    }
+    if !route.is_empty() {
+        attributes.push(KeyValue { key: "http.route".into(), value: AnyValue::String(route) });
+    }
+    // url.scheme — always known ("http"/"https").
+    attributes.push(KeyValue {
+        key: "url.scheme".into(),
+        value: AnyValue::String(if scheme_https { "https".into() } else { "http".into() }),
+    });
+    // network.protocol.version — decode the ProtoVersion index to the semconv string.
+    attributes.push(KeyValue {
+        key: "network.protocol.version".into(),
+        value: AnyValue::String(
+            crate::shm::ProtoVersion::from_index(proto_idx as usize).as_str().into(),
+        ),
+    });
+    if !user_agent.is_empty() {
+        attributes.push(KeyValue {
+            key: "user_agent.original".into(),
+            value: AnyValue::String(user_agent),
+        });
+    }
+    // http.request.body.size / http.response.body.size — body bytes (semconv Int).
+    attributes.push(KeyValue {
+        key: "http.request.body.size".into(),
+        value: AnyValue::Int(req_body_size as i64),
+    });
+    attributes.push(KeyValue {
+        key: "http.response.body.size".into(),
+        value: AnyValue::Int(resp_body_size as i64),
+    });
+    if !server_address.is_empty() {
+        attributes.push(KeyValue {
+            key: "server.address".into(),
+            value: AnyValue::String(server_address),
+        });
+    }
+    if server_port > 0 {
+        attributes
+            .push(KeyValue { key: "server.port".into(), value: AnyValue::Int(server_port as i64) });
+    }
+    if !client_address.is_empty() {
+        attributes.push(KeyValue {
+            key: "client.address".into(),
+            value: AnyValue::String(client_address),
+        });
+    }
+    if client_port > 0 {
+        attributes
+            .push(KeyValue { key: "client.port".into(), value: AnyValue::Int(client_port as i64) });
+    }
+    if !peer_address.is_empty() {
+        attributes.push(KeyValue {
+            key: "network.peer.address".into(),
+            value: AnyValue::String(peer_address),
+        });
+    }
+    if peer_port > 0 {
+        attributes.push(KeyValue {
+            key: "network.peer.port".into(),
+            value: AnyValue::Int(peer_port as i64),
+        });
+    }
+    // error.type — derived (no worker-side field).  Per the OTel HTTP semconv,
+    // for a server span `error.type` is set when the request ended in error;
+    // for HTTP the canonical value is the response status code as a string, and
+    // a 5xx status is the error condition that also drives StatusCode::Error.
+    // <https://opentelemetry.io/docs/specs/semconv/http/http-spans/#status>
+    if http_status >= 500 {
+        attributes.push(KeyValue {
+            key: "error.type".into(),
+            value: AnyValue::String(std::format!("{http_status}")),
+        });
+    }
+
     // Use observed_ns as the span time stamp (used for de-dup / ordering).
     // The actual start/end are preserved in the span struct.
     let _ = observed_ns;
@@ -435,11 +670,18 @@ mod tests {
     fn span_record_size_constants() {
         // SPAN_RECORD_FIXED_HDR = 16+8+8+4+8+8+1+1 = 54
         assert_eq!(SPAN_RECORD_FIXED_HDR, 54);
-        // WORST_CASE = 54 + (2+64) + (2+16) + 2 + (2+64) + 8 + 2 + 4*(1+32+2+64)
-        //            = 54 + 66 + 18 + 2 + 66 + 8 + 2 + 396 = 612
-        assert_eq!(SPAN_RECORD_WORST_CASE, 612);
-        // MAX_SPAN_RECORD = round_up(612, 16) = 624
-        assert_eq!(MAX_SPAN_RECORD, 624);
+        // WORST_CASE = 54 (hdr) + (2+64) name + (2+16) method + 2 http_status
+        //   + (2+64) url_path + 8 duration
+        //   + 1 proto + 1 scheme + 2 server_port + 2 client_port + 2 peer_port
+        //   + 8 req_body + 8 resp_body
+        //   + (2+128) url_query + (2+64) route + (2+128) user_agent
+        //   + (2+64) server_addr + (2+46) client_addr + (2+46) peer_addr
+        //   + 2 n_attrs + 4*(1+32+2+64) extra
+        //   = 214 (thru duration) + 24 (proto..resp_body) + 488 (6 capped strs)
+        //     + 2 (n_attrs) + 396 (4 extra attrs) = 1124
+        assert_eq!(SPAN_RECORD_WORST_CASE, 1124);
+        // MAX_SPAN_RECORD = round_up(1124, 16) = 1136
+        assert_eq!(MAX_SPAN_RECORD, 1136);
         // The compile-time `const _: ()` guard covers the overflow relationship;
         // the eq assertions above are sufficient to pin any accidental change.
     }
@@ -477,6 +719,19 @@ mod tests {
             http_status: 200,
             url_path: b"/health",
             duration_us: 1000,
+            proto: crate::shm::ProtoVersion::Http11 as u8,
+            scheme_https: false,
+            server_port: 0,
+            client_port: 0,
+            peer_port: 0,
+            req_body_size: 0,
+            resp_body_size: 0,
+            url_query: b"",
+            route: b"",
+            user_agent: b"",
+            server_address: b"",
+            client_address: b"",
+            peer_address: b"",
             extra_attrs: &[],
         };
 
@@ -574,6 +829,19 @@ mod tests {
             http_status: 200,
             url_path: b"/api/v1/users",
             duration_us: 1_234_567,
+            proto: crate::shm::ProtoVersion::Http11 as u8,
+            scheme_https: true,
+            server_port: 8443,
+            client_port: 54321,
+            peer_port: 443,
+            req_body_size: 12,
+            resp_body_size: 3456,
+            url_query: b"a=1&b=2",
+            route: b"/api/v1/users",
+            user_agent: b"curl/8.1.2",
+            server_address: b"api.example.com",
+            client_address: b"203.0.113.7",
+            peer_address: b"198.51.100.9",
             extra_attrs: &extra,
         };
 
@@ -650,6 +918,90 @@ mod tests {
             }
         }
 
+        // ── HTTP semconv coverage attributes (current names) ──────────────────
+        match find_attr("url.query").expect("url.query must be present") {
+            AnyValue::String(s) => assert_eq!(s, "a=1&b=2", "url.query must round-trip"),
+            other => panic!("url.query must be String, got {other:?}"),
+        }
+        match find_attr("http.route").expect("http.route must be present") {
+            AnyValue::String(s) => assert_eq!(s, "/api/v1/users", "http.route must round-trip"),
+            other => panic!("http.route must be String, got {other:?}"),
+        }
+        match find_attr("url.scheme").expect("url.scheme must be present") {
+            AnyValue::String(s) => assert_eq!(s, "https", "url.scheme must be https"),
+            other => panic!("url.scheme must be String, got {other:?}"),
+        }
+        match find_attr("network.protocol.version")
+            .expect("network.protocol.version must be present")
+        {
+            AnyValue::String(s) => assert_eq!(s, "1.1", "network.protocol.version must be 1.1"),
+            other => panic!("network.protocol.version must be String, got {other:?}"),
+        }
+        match find_attr("user_agent.original").expect("user_agent.original must be present") {
+            AnyValue::String(s) => {
+                assert_eq!(s, "curl/8.1.2", "user_agent.original must round-trip")
+            }
+            other => panic!("user_agent.original must be String, got {other:?}"),
+        }
+        match find_attr("http.request.body.size").expect("http.request.body.size must be present") {
+            AnyValue::Int(v) => assert_eq!(*v, 12, "http.request.body.size must be 12"),
+            other => panic!("http.request.body.size must be Int, got {other:?}"),
+        }
+        match find_attr("http.response.body.size").expect("http.response.body.size must be present")
+        {
+            AnyValue::Int(v) => assert_eq!(*v, 3456, "http.response.body.size must be 3456"),
+            other => panic!("http.response.body.size must be Int, got {other:?}"),
+        }
+        match find_attr("server.address").expect("server.address must be present") {
+            AnyValue::String(s) => {
+                assert_eq!(s, "api.example.com", "server.address must round-trip")
+            }
+            other => panic!("server.address must be String, got {other:?}"),
+        }
+        match find_attr("server.port").expect("server.port must be present") {
+            AnyValue::Int(v) => assert_eq!(*v, 8443, "server.port must be 8443"),
+            other => panic!("server.port must be Int, got {other:?}"),
+        }
+        match find_attr("client.address").expect("client.address must be present") {
+            AnyValue::String(s) => assert_eq!(s, "203.0.113.7", "client.address must round-trip"),
+            other => panic!("client.address must be String, got {other:?}"),
+        }
+        match find_attr("client.port").expect("client.port must be present") {
+            AnyValue::Int(v) => assert_eq!(*v, 54321, "client.port must be 54321"),
+            other => panic!("client.port must be Int, got {other:?}"),
+        }
+        match find_attr("network.peer.address").expect("network.peer.address must be present") {
+            AnyValue::String(s) => assert_eq!(s, "198.51.100.9", "network.peer.address round-trip"),
+            other => panic!("network.peer.address must be String, got {other:?}"),
+        }
+        match find_attr("network.peer.port").expect("network.peer.port must be present") {
+            AnyValue::Int(v) => assert_eq!(*v, 443, "network.peer.port must be 443"),
+            other => panic!("network.peer.port must be Int, got {other:?}"),
+        }
+        // error.type is derived from a 5xx status only — absent on this 200 span.
+        assert!(find_attr("error.type").is_none(), "error.type must be absent on a 2xx span");
+
+        // No deprecated v1.16.0 keys may be emitted under any circumstances.
+        for dead in [
+            "http.method",
+            "http.target",
+            "http.status_code",
+            "net.sock.peer.addr",
+            "net.sock.peer.port",
+            "http.scheme",
+            "http.flavor",
+            "http.user_agent",
+            "http.request_content_length",
+            "http.response_content_length",
+            "net.host.name",
+            "net.host.port",
+        ] {
+            assert!(
+                find_attr(dead).is_none(),
+                "deprecated v1.16.0 key '{dead}' must not be emitted"
+            );
+        }
+
         // ── Extra attributes (golden covers the extra-attrs path) ─────────────
         match find_attr("env").expect("extra attr 'env' must be present") {
             AnyValue::String(s) => assert_eq!(s, "prod", "env attr value must be 'prod'"),
@@ -665,12 +1017,109 @@ mod tests {
                     "http.response.status_code",
                     "url.path",
                     "http.server.request.duration",
+                    "url.query",
+                    "http.route",
+                    "url.scheme",
+                    "network.protocol.version",
+                    "user_agent.original",
+                    "http.request.body.size",
+                    "http.response.body.size",
+                    "server.address",
+                    "server.port",
+                    "client.address",
+                    "client.port",
+                    "network.peer.address",
+                    "network.peer.port",
                 ]
                 .contains(&kv.key.as_str())
             })
             .map(|kv| kv.key.as_str())
             .collect();
         assert_eq!(extra_keys, vec!["env"], "only 'env' extra attr expected");
+    }
+
+    /// `error.type` is derived at the exporter from a 5xx status; assert it is
+    /// present on an errored span and that `user_agent.original` truncates at cap.
+    #[test]
+    fn span_error_type_and_user_agent_cap() {
+        use crate::data_model::{AnyValue, SpanKind, StatusCode};
+
+        struct VecProducer(std::sync::Mutex<std::vec::Vec<u8>>);
+        impl LogProducer for VecProducer {
+            fn push(&self, data: &[u8]) -> bool {
+                let mut v = self.0.lock().unwrap();
+                let len = data.len() as u32;
+                v.extend_from_slice(&len.to_be_bytes());
+                v.extend_from_slice(data);
+                true
+            }
+        }
+
+        // A user-agent longer than MAX_USER_AGENT to exercise truncation.
+        let long_ua = std::vec![b'x'; MAX_USER_AGENT + 50];
+        let rec = SpanRecord {
+            trace_id: [0x01u8; 16],
+            span_id: [0x02u8; 8],
+            parent_span_id: [0u8; 8],
+            flags: 0x01,
+            start_time_unix_nano: 1_000_000_000,
+            end_time_unix_nano: 2_000_000_000,
+            status_code: StatusCode::Error as u8,
+            kind: SpanKind::Server as u8,
+            name: b"GET /boom",
+            method: b"GET",
+            http_status: 503,
+            url_path: b"/boom",
+            duration_us: 500,
+            proto: crate::shm::ProtoVersion::Http2 as u8,
+            scheme_https: false,
+            server_port: 80,
+            client_port: 1234,
+            peer_port: 1234,
+            req_body_size: 0,
+            resp_body_size: 0,
+            url_query: b"",
+            route: b"/boom",
+            user_agent: &long_ua,
+            server_address: b"host",
+            client_address: b"10.0.0.1",
+            peer_address: b"10.0.0.1",
+            extra_attrs: &[],
+        };
+
+        let producer = VecProducer(std::sync::Mutex::new(std::vec::Vec::new()));
+        assert!(emit_span_record(&producer, &rec));
+        let raw = producer.0.lock().unwrap();
+        let len = u32::from_be_bytes(raw[..4].try_into().unwrap()) as usize;
+        let span = parse_span_record(&raw[4..4 + len], 0).expect("parse must succeed");
+
+        let find_attr = |key: &str| -> Option<&AnyValue> {
+            span.attributes.iter().find(|kv| kv.key == key).map(|kv| &kv.value)
+        };
+
+        // error.type present on a 5xx span, value = status code string.
+        match find_attr("error.type").expect("error.type must be present on a 5xx span") {
+            AnyValue::String(s) => {
+                assert_eq!(s, "503", "error.type must be the status code string")
+            }
+            other => panic!("error.type must be String, got {other:?}"),
+        }
+
+        // user_agent.original truncated at MAX_USER_AGENT.
+        match find_attr("user_agent.original").expect("user_agent.original must be present") {
+            AnyValue::String(s) => assert_eq!(
+                s.len(),
+                MAX_USER_AGENT,
+                "user_agent.original must be truncated to MAX_USER_AGENT bytes"
+            ),
+            other => panic!("user_agent.original must be String, got {other:?}"),
+        }
+
+        // network.protocol.version reflects HTTP/2.
+        match find_attr("network.protocol.version").expect("network.protocol.version present") {
+            AnyValue::String(s) => assert_eq!(s, "2", "HTTP/2 → \"2\""),
+            other => panic!("network.protocol.version must be String, got {other:?}"),
+        }
     }
 
     /// Parser sanity cap: a corrupted `n_extra` field must not cause the
@@ -711,6 +1160,19 @@ mod tests {
             http_status: 200,
             url_path: b"/s4",
             duration_us: 500,
+            proto: crate::shm::ProtoVersion::Http11 as u8,
+            scheme_https: false,
+            server_port: 0,
+            client_port: 0,
+            peer_port: 0,
+            req_body_size: 0,
+            resp_body_size: 0,
+            url_query: b"",
+            route: b"",
+            user_agent: b"",
+            server_address: b"",
+            client_address: b"",
+            peer_address: b"",
             extra_attrs: &extra,
         };
 
@@ -741,6 +1203,15 @@ mod tests {
         pos += 2 + path_len;
         // duration_us
         pos += 8;
+        // proto(1) + scheme(1) + server_port(2) + client_port(2) + peer_port(2)
+        //   + req_body_size(8) + resp_body_size(8)
+        pos += 1 + 1 + 2 + 2 + 2 + 8 + 8;
+        // six capped strings: url_query, route, user_agent, server_addr,
+        // client_addr, peer_addr.
+        for _ in 0..6 {
+            let l = u16::from_be_bytes(payload[pos..pos + 2].try_into().unwrap()) as usize;
+            pos += 2 + l;
+        }
         // pos now points at n_extra (u16 big-endian)
         let n_extra_offset = pos;
         assert!(n_extra_offset + 2 <= payload.len(), "n_extra offset out of bounds");
@@ -765,6 +1236,20 @@ mod tests {
                     "http.response.status_code",
                     "url.path",
                     "http.server.request.duration",
+                    "url.query",
+                    "http.route",
+                    "url.scheme",
+                    "network.protocol.version",
+                    "user_agent.original",
+                    "http.request.body.size",
+                    "http.response.body.size",
+                    "server.address",
+                    "server.port",
+                    "client.address",
+                    "client.port",
+                    "network.peer.address",
+                    "network.peer.port",
+                    "error.type",
                 ]
                 .contains(&kv.key.as_str())
             })
