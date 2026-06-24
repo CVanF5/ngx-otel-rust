@@ -108,12 +108,16 @@ macro_rules! debug {
     });
 }
 
+// No `trace!` call sites yet; this is a forward hook for verbose tracing gated
+// behind the `trace` feature. Suppress the unused-macro lint until the first
+// call site is added.
 #[cfg(feature = "trace")]
 #[allow(unused_macros)]
 macro_rules! trace {
     ($($arg:tt)+) => (debug!($($arg)+))
 }
 
+// No `trace!` call sites yet; this is a forward hook (see above).
 #[cfg(not(feature = "trace"))]
 #[allow(unused_macros)]
 macro_rules! trace {
