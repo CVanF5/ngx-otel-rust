@@ -41,14 +41,11 @@
 //! `exit_process` flush path on the worker side is needed.
 
 use core::future::Future;
-use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use core::task::{Context, Poll};
+use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
 use std::collections::VecDeque;
 
 use nginx_sys::{NGX_LOG_ERR, NGX_LOG_INFO, NGX_LOG_NOTICE, NGX_LOG_WARN};
-use pin_project_lite::pin_project;
 
 use crate::config::{ExportProtocol, MainConfig};
 use crate::data_model::{
@@ -73,113 +70,52 @@ use crate::transport::hyper_http::{extract_http_path, NgxConnector, ParsedEndpoi
 use crate::transport::tls::{TlsConfig, COLLECTOR_CERT_NOT_AFTER};
 use crate::transport::{GrpcTransport, HyperHttpTransport};
 
-// ── Self-metric atomics ──────────────────────────────────────────────────────
+// ── Submodules ────────────────────────────────────────────────────────────────
 
-/// Cumulative count of records (any signal — metrics, logs, spans) dropped
-/// because the per-signal retry buffer was full (oldest batch evicted) or
-/// because a drain-abort discarded queued batches on graceful shutdown.
-///
-/// All three retry lanes (`retry_queue`, `logs_retry_queue`,
-/// `spans_retry_queue`) credit this counter so the single self-metric
-/// `ngx_otel.dropped_records` gives the operator the total drop budget across
-/// all signals.  Per-signal ring-level drops are tracked separately
-/// (`ACCESS_LOGS_DROPPED`, `ERROR_LOGS_DROPPED`, `TRACES_DROPPED_RECORDS`).
-pub static DROPPED_RECORDS: AtomicU64 = AtomicU64::new(0);
+/// Self-metric counters and the [`SelfMetricsSource`] collector.
+pub mod self_metrics;
 
-/// Cumulative count of transport send failures since worker startup.
-pub static SEND_FAILURES: AtomicU64 = AtomicU64::new(0);
+/// Per-signal delivery-outcome policy engine and exponential backoff state.
+pub(super) mod backoff;
 
-/// Cumulative count of bidi outbound messages dropped because the outbound
-/// channel's `poll_ready` was `Pending` past the give-up deadline.  Indicates
-/// backpressure pushed back on the producer.  Bidi overload path only — not
-/// on the production OTLP/HTTP export loop.  Exposed as
-/// `ngx_otel.bidi_backpressure_drops` self-metric so the overload integration
-/// test can verify the counter is non-zero via the collector's metrics.json.
-pub static BIDI_BACKPRESSURE_DROPS: AtomicU64 = AtomicU64::new(0);
+/// Graceful drain, deadline-bounded future, and retry-queue helpers.
+pub(super) mod graceful;
 
-// ── Log-specific self-metric atomics ─────────────────────────────────────────
+// ── Re-exports ────────────────────────────────────────────────────────────────
+// Keep all items reachable via `crate::drain::X` so external callers are
+// unaffected by the internal module split.
 
-/// Access-log records dropped by the producer because the ring was full.
-/// Sum of per-worker `ring.drop_count()` snapshots at each drain cycle.
-pub static ACCESS_LOGS_DROPPED: AtomicU64 = AtomicU64::new(0);
+pub use self_metrics::{
+    SelfMetricsSource, ACCESS_LOGS_DROPPED, ERROR_LOGS_COALESCED_ORPHANED, ERROR_LOGS_DROPPED,
+    LOGS_SEND_FAILURES, MASTER_PID, SEND_FAILURES, TRACES_DROPPED_RECORDS, TRACES_SEND_FAILURES,
+};
+// These are used only by external callers (`crate::drain::X`), not within
+// this module — suppress the false-positive unused_imports lint.
+use self_metrics::counter_to_i64;
+#[allow(unused_imports)]
+pub use self_metrics::{
+    BIDI_BACKPRESSURE_DROPS, DROPPED_RECORDS, PARTIAL_REJECTED, PERMANENT_REJECTED,
+    UNAUTHORIZED_REJECTED,
+};
+pub(crate) use self_metrics::{EXPORTER_RESTARTS, EXPORT_LOOP_DONE};
 
-/// Error-log records dropped by the producer (kept here so the
-/// metric is exposed even before the error-log path is wired in).
-pub static ERROR_LOGS_DROPPED: AtomicU64 = AtomicU64::new(0);
+use backoff::{
+    apply_delivery_outcome, apply_fresh_send_outcome, is_permanent_rejection, now_monotonic_msec,
+    OutcomeAction, SignalBackoff,
+};
 
-/// Cumulative coalesced-count occurrences orphaned because the interval's
-/// verbatim ring push was dropped (ring full).  Incremented by
-/// `collect_log_records` once per drain cycle for each orphaned slot.
-///
-/// Unlike `ERROR_LOGS_DROPPED` (which snapshots the ring's cumulative drop
-/// counter via `store`), this is accumulated additively with `fetch_add`
-/// so it represents a true cumulative total across all drain cycles.
-pub static ERROR_LOGS_COALESCED_ORPHANED: AtomicU64 = AtomicU64::new(0);
+use graceful::{
+    enqueue_with_eviction, graceful_drain, successor_announced, with_deadline, DeadlineExceeded,
+    DrainQueues, WithDeadline,
+};
 
-/// Cumulative logs transport send failures since exporter startup.
-pub static LOGS_SEND_FAILURES: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+use backoff::{backoff_ms, handle_fresh_send_outcome};
 
-// ── Traces self-metric atomics ────────────────────────────────────────────────
+#[cfg(test)]
+use graceful::account_drops_and_clear;
 
-/// Span records dropped by the producer because the spans ring was full.
-/// Sum of per-worker `ring.drop_count()` snapshots at each drain cycle.
-pub static TRACES_DROPPED_RECORDS: AtomicU64 = AtomicU64::new(0);
-
-/// Cumulative traces transport send failures since exporter startup.
-pub static TRACES_SEND_FAILURES: AtomicU64 = AtomicU64::new(0);
-
-// ── Delivery-outcome self-metric atomics ──────────────────────────────────────
-//
-// These are the same single-writer exporter-local atomic pattern as the drop /
-// send-failure counters above (written only by the exporter task in the policy
-// engine, read later by `SelfMetricsSource`). They back the
-// `ngx_otel.delivery.{permanent_rejected, partial_rejected, unauthorized}`
-// self-metrics, which read these atomics rather than maintaining their own.
-
-/// Cumulative count of batches the peer rejected as **permanently** unacceptable
-/// (`DeliveryOutcome::Permanent`). These batches are dropped, never retried.
-pub static PERMANENT_REJECTED: AtomicU64 = AtomicU64::new(0);
-
-/// Cumulative count of individual records the peer reported it dropped on an
-/// otherwise-accepted batch (`DeliveryOutcome::PartialReject { rejected }`).
-/// Accumulates the `rejected` count; the batch itself is released.
-pub static PARTIAL_REJECTED: AtomicU64 = AtomicU64::new(0);
-
-/// Cumulative count of batches dropped because the peer reported an
-/// authentication/authorization failure (`DeliveryOutcome::Unauthorized`).
-/// Same policy action as `Permanent` (drop, no retry/backoff/pause); kept in a
-/// distinct counter for observability plus a rate-limited "check credentials"
-/// log.
-pub static UNAUTHORIZED_REJECTED: AtomicU64 = AtomicU64::new(0);
-
-/// Number of prior exporter crashes observed in the crash-loop window when
-/// this exporter process started.  Set once by `otel_exporter_cycle` before
-/// `export_loop` runs; 0 on a clean first start.  Exposed as the
-/// `ngx_otel.exporter.restarts` gauge so operators can observe crash-loop
-/// recovery without tailing the error log.
-pub(crate) static EXPORTER_RESTARTS: AtomicU64 = AtomicU64::new(0);
-
-/// Master (parent) PID captured once at exporter startup via `nginx_sys::ngx_parent`.
-///
-/// Written once by [`export_loop`] before the first export tick.  Used by
-/// [`build_resource_attrs`] to populate the `service.instance.id` resource
-/// attribute on **both** the metrics and logs OTLP Resource.
-///
-/// Key properties:
-/// - **Stable across crash-respawn**: the master re-forks the exporter with the
-///   same `ngx_parent`, so the id is unchanged and cumulative shm series continue.
-/// - **Distinct across USR2 live binary upgrade**: the new master (different PID)
-///   forks the new exporter; `ngx_parent` in the new child is the new master's PID.
-/// - **Zero** = loop not yet started (pre-init, or SIGQUIT before first tick).
-pub static MASTER_PID: AtomicI64 = AtomicI64::new(0);
-
-/// Set to `true` by [`export_loop`] just before it returns after a graceful
-/// drain on `ngx_quit`. The exporter cycle polls this flag in its `ngx_quit`
-/// branch to know when the drain has completed and it is safe to exit.
-///
-/// Process-global; the exporter process is single-instance so
-/// there is exactly one export_loop per process lifetime.
-pub(crate) static EXPORT_LOOP_DONE: AtomicBool = AtomicBool::new(false);
+// ── Export-loop done guard ────────────────────────────────────────────────────
 
 /// RAII guard that stores `true` to [`EXPORT_LOOP_DONE`] on every exit path of
 /// [`export_loop`], including early returns on startup failures.
@@ -200,6 +136,8 @@ impl Drop for ExportLoopDoneGuard {
         EXPORT_LOOP_DONE.store(true, Ordering::Release);
     }
 }
+
+// ── Timing constants ──────────────────────────────────────────────────────────
 
 /// Wall-clock budget for the graceful drain on `ngx_quit`. Each send attempt
 /// inside the drain is capped at this duration so a dead collector cannot
@@ -255,6 +193,8 @@ const BACKOFF_BASE_MS: u64 = 250;
 /// growing unbounded. A peer-supplied hint (`Retry-After`/`RetryInfo`/pushback)
 /// is honored verbatim and is NOT subject to this cap.
 const BACKOFF_CAP_MS: u64 = 30_000;
+
+// ── Transport enum ────────────────────────────────────────────────────────────
 
 /// Selects between the HTTP and gRPC production transports.
 ///
@@ -344,6 +284,8 @@ impl ExportTransport {
     }
 }
 
+// ── Shutdown detection ────────────────────────────────────────────────────────
+
 /// Why the chunked sleep terminated early, if it did.
 #[derive(Copy, Clone)]
 enum ShutdownKind {
@@ -363,178 +305,6 @@ fn shutdown_requested() -> bool {
     // globals, set on the master signal path and read here in the
     // single-threaded exporter process; plain reads are well-defined.
     unsafe { nginx_sys::ngx_quit != 0 || nginx_sys::ngx_terminate != 0 }
-}
-
-// ── Self-metrics source ──────────────────────────────────────────────────────
-
-/// [`MetricSource`] that exposes the export loop's own health as OTel metrics.
-pub struct SelfMetricsSource {
-    /// Configured export interval in milliseconds.  Emitted as a Gauge in
-    /// **seconds** (`"s"`) — OTel convention is to bake the unit into the
-    /// unit field, not into the metric name.  The name `ngx_otel.export_interval`
-    /// is unchanged; the value is `interval_ms / 1000` (integer seconds, rounded
-    /// down; sub-second intervals are uncommon in practice).
-    pub interval_ms: u64,
-    /// Worker startup time (Unix epoch, nanoseconds). Used as the
-    /// `start_time_unix_nano` for the cumulative monotonic Sums so that
-    /// downstream rate/delta-conversion processors can anchor windows
-    /// correctly. Captured once at [`export_loop`] init; see field
-    /// initialisation in [`collect_all_sources`].
-    pub start_time_unix_nano: u64,
-}
-
-/// Convert an unsigned self-metric counter to the `i64` carried on the OTLP
-/// `NumberDataPoint`, saturating at `i64::MAX` rather than wrapping negative.
-///
-/// These counters are exported as OTLP monotonic Sums, which the OTLP/Metrics
-/// data model requires to be non-decreasing
-/// (<https://opentelemetry.io/docs/specs/otel/metrics/data-model/#sums>). A raw
-/// `as i64` cast of a `u64` past `i64::MAX` wraps to a negative value, which
-/// would both violate monotonicity and read as a huge backwards jump. Saturation
-/// keeps the series monotonic; the cap is only reachable at otherwise-impossible
-/// counts, so no realistic value is distorted.
-#[inline]
-fn counter_to_i64(v: u64) -> i64 {
-    i64::try_from(v).unwrap_or(i64::MAX)
-}
-
-impl MetricSource for SelfMetricsSource {
-    fn collect(&self) -> std::vec::Vec<Metric> {
-        let now = crate::util::now_unix_nano();
-        let dropped = counter_to_i64(DROPPED_RECORDS.load(Ordering::Acquire));
-        let failures = counter_to_i64(SEND_FAILURES.load(Ordering::Acquire));
-        // Emit in seconds (unit "s"), not ms.  The name stays
-        // `ngx_otel.export_interval` — OTel convention is to NOT bake units
-        // into metric names; the unit field carries the information instead.
-        let interval_s = counter_to_i64(self.interval_ms / 1000);
-
-        let backpressure_drops = counter_to_i64(BIDI_BACKPRESSURE_DROPS.load(Ordering::Acquire));
-        let access_logs_dropped = counter_to_i64(ACCESS_LOGS_DROPPED.load(Ordering::Acquire));
-        let error_logs_dropped = counter_to_i64(ERROR_LOGS_DROPPED.load(Ordering::Acquire));
-        let error_logs_coalesced_orphaned =
-            counter_to_i64(ERROR_LOGS_COALESCED_ORPHANED.load(Ordering::Acquire));
-        let logs_send_failures = counter_to_i64(LOGS_SEND_FAILURES.load(Ordering::Acquire));
-        let traces_dropped = counter_to_i64(TRACES_DROPPED_RECORDS.load(Ordering::Acquire));
-        let exporter_restarts = counter_to_i64(EXPORTER_RESTARTS.load(Ordering::Acquire));
-        let permanent_rejected = counter_to_i64(PERMANENT_REJECTED.load(Ordering::Acquire));
-        let partial_rejected = counter_to_i64(PARTIAL_REJECTED.load(Ordering::Acquire));
-        let unauthorized_rejected = counter_to_i64(UNAUTHORIZED_REJECTED.load(Ordering::Acquire));
-        std::vec![
-            monotonic_sum_metric(
-                "ngx_otel.dropped_records",
-                "Records from any signal (metrics, logs, spans) dropped because the \
-                 per-signal retry buffer was full or a drain-abort discarded queued batches",
-                "{record}",
-                dropped,
-                self.start_time_unix_nano,
-                now,
-            ),
-            monotonic_sum_metric(
-                "ngx_otel.send_failures",
-                "Cumulative export send failures since worker startup",
-                "{failure}",
-                failures,
-                self.start_time_unix_nano,
-                now,
-            ),
-            monotonic_sum_metric(
-                "ngx_otel.bidi_backpressure_drops",
-                "Bidi outbound messages dropped due to channel backpressure",
-                "{message}",
-                backpressure_drops,
-                self.start_time_unix_nano,
-                now,
-            ),
-            monotonic_sum_metric(
-                "ngx_otel.logs.access.dropped_records",
-                "Access log records dropped because the per-worker ring was full",
-                "{record}",
-                access_logs_dropped,
-                self.start_time_unix_nano,
-                now,
-            ),
-            monotonic_sum_metric(
-                "ngx_otel.logs.error.dropped_records",
-                "Error log records dropped because the per-worker ring was full",
-                "{record}",
-                error_logs_dropped,
-                self.start_time_unix_nano,
-                now,
-            ),
-            monotonic_sum_metric(
-                "ngx_otel.logs.error.coalesced_orphaned_records",
-                "Error log coalesced-count occurrences orphaned because the verbatim \
-                 ring sample was dropped (ring full); a synthetic record is emitted \
-                 per orphaned slot so backends still receive the occurrence count",
-                "{record}",
-                error_logs_coalesced_orphaned,
-                self.start_time_unix_nano,
-                now,
-            ),
-            monotonic_sum_metric(
-                "ngx_otel.logs.send_failures",
-                "Cumulative logs transport send failures since exporter startup",
-                "{failure}",
-                logs_send_failures,
-                self.start_time_unix_nano,
-                now,
-            ),
-            monotonic_sum_metric(
-                "ngx_otel.traces.dropped_records",
-                "Span records dropped because the per-worker spans ring was full",
-                "{record}",
-                traces_dropped,
-                self.start_time_unix_nano,
-                now,
-            ),
-            gauge_metric(
-                "ngx_otel.export_interval",
-                "Configured metric export interval",
-                "s",
-                interval_s,
-                now,
-            ),
-            gauge_metric(
-                "ngx_otel.exporter.restarts",
-                "Prior exporter crashes in the current crash-loop window at this process start (0 = clean start; nginx request handling is never affected by the exporter crash-loop state)",
-                "{crash}",
-                exporter_restarts,
-                now,
-            ),
-            monotonic_sum_metric(
-                "ngx_otel.delivery.permanent_rejected",
-                "Batches the peer rejected as permanently unacceptable \
-                 (e.g. HTTP 400/413, gRPC INVALID_ARGUMENT/INTERNAL/UNIMPLEMENTED); \
-                 dropped and never retried",
-                "{batch}",
-                permanent_rejected,
-                self.start_time_unix_nano,
-                now,
-            ),
-            monotonic_sum_metric(
-                "ngx_otel.delivery.partial_rejected",
-                "Individual records the peer reported it dropped on an otherwise-accepted batch \
-                 (OTLP partial_success / gRPC partial-success body); the batch is released, \
-                 only the reported rejected count is accumulated here",
-                "{record}",
-                partial_rejected,
-                self.start_time_unix_nano,
-                now,
-            ),
-            monotonic_sum_metric(
-                "ngx_otel.delivery.unauthorized",
-                "Batches dropped because the peer reported an authentication or authorization \
-                 failure (HTTP 401/403, gRPC UNAUTHENTICATED/PERMISSION_DENIED); same drop \
-                 policy as permanent_rejected (no retry, no backoff, no auto-pause) but kept \
-                 in a distinct counter for observability — a non-zero value indicates a \
-                 credential or permission problem on the exporter endpoint",
-                "{batch}",
-                unauthorized_rejected,
-                self.start_time_unix_nano,
-                now,
-            ),
-        ]
-    }
 }
 
 // ── Main export loop ─────────────────────────────────────────────────────────
@@ -1115,1243 +885,469 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             // else (test-support with ticks > 0): fall through to inner loop
         }
 
-        // ── Chunked sleep for the configured export interval ──────────────────
-        // We must check ngx_quit at least every SHUTDOWN_POLL_INTERVAL so that
-        // SIGQUIT during a long sleep doesn't delay the drain significantly.
-        // Unlike workers, the exporter is not subject to
-        // ngx_event_no_timers_left, so cancelable timers fire reliably on quit.
-        //
-        // Logs are drained on EVERY sub-interval wake (SHUTDOWN_POLL_INTERVAL,
-        // default 250 ms), decoupled from the metric aggregation interval; metrics
-        // aggregate and export only at the full otel_metric_interval boundary.
-        // Rationale: the original motive was draining a
-        // per-request log firehose before the ring saturated under high RPS. The
-        // summary+samples redesign collapsed that volume (the ring now carries only the
-        // thin exception tail + coalesced error samples), so the fast cadence now exists
-        // for: (a) timeliness — ship the high-value tail/error records promptly instead
-        // of holding them up to a full (possibly long) metric interval; (b) incident-burst
-        // resilience — a spike of 5xx-tail / novel / high-severity records is exactly when
-        // the bounded ring could fill and drop; (c) it protects the
-        // `otel_error_log_coalesce off` verbatim opt-out. Near-free: it piggybacks the
-        // shutdown poll the loop already wakes on, and an empty ring sends nothing.
-        let interval = Duration::from_millis(amcf.interval_ms());
-        let mut slept = Duration::ZERO;
-        let mut shutdown_during_sleep = ShutdownKind::None;
-        while slept < interval {
-            let chunk = (interval - slept).min(SHUTDOWN_POLL_INTERVAL);
-            ngx::async_::sleep(chunk).await;
-            slept += chunk;
-            // SAFETY: `ngx_terminate` is a nginx-owned `sig_atomic_t` global;
-            // read here in the single-threaded exporter process, the read is
-            // well-defined.
-            if unsafe { nginx_sys::ngx_terminate } != 0 {
-                shutdown_during_sleep = ShutdownKind::Terminate;
+        // Run one full export interval: sub-interval log+span drain ticks,
+        // then post-sleep metrics drain and fresh send.
+        let shutdown = periodic_tick(
+            amcf,
+            &mut transport,
+            &mut retry_queue,
+            &mut logs_retry_queue,
+            &mut spans_retry_queue,
+            &mut quit_defer,
+            &mut periodic_abdicated,
+            my_gen,
+            &mut logs_backoff,
+            &mut spans_backoff,
+            &mut metrics_backoff,
+            retry_buffer_depth,
+            log,
+            worker_start_ns,
+            &processor,
+            &mut crash_counter_reset,
+            healthy_since_ns,
+            &collector_host,
+        )
+        .await;
+        match shutdown {
+            ShutdownKind::Terminate => return,
+            ShutdownKind::Exiting => return,
+            ShutdownKind::None => {}
+        }
+    }
+}
+
+/// One full export interval: chunked sleep with per-sub-interval log and span
+/// drain ticks, followed by the post-sleep metrics drain and fresh send.
+///
+/// Called once per outer-loop iteration in [`export_loop`]. Returns:
+/// - [`ShutdownKind::None`] — interval completed normally; outer loop continues.
+/// - [`ShutdownKind::Terminate`] — `ngx_terminate` set; outer loop must return.
+/// - [`ShutdownKind::Exiting`] — `ngx_quit` detected; graceful drain was
+///   performed inside this function; outer loop must return.
+#[allow(clippy::too_many_arguments)]
+async fn periodic_tick(
+    amcf: &'static MainConfig,
+    transport: &mut ExportTransport,
+    retry_queue: &mut VecDeque<(std::vec::Vec<u8>, u64)>,
+    logs_retry_queue: &mut VecDeque<(std::vec::Vec<u8>, u64)>,
+    spans_retry_queue: &mut VecDeque<(std::vec::Vec<u8>, u64)>,
+    quit_defer: &mut QuitDefer,
+    periodic_abdicated: &mut bool,
+    my_gen: u64,
+    logs_backoff: &mut SignalBackoff,
+    spans_backoff: &mut SignalBackoff,
+    metrics_backoff: &mut SignalBackoff,
+    retry_buffer_depth: usize,
+    log: core::ptr::NonNull<nginx_sys::ngx_log_t>,
+    worker_start_ns: u64,
+    processor: &Processor,
+    crash_counter_reset: &mut bool,
+    healthy_since_ns: u64,
+    collector_host: &str,
+) -> ShutdownKind {
+    // ── Chunked sleep for the configured export interval ──────────────────────
+    // We must check ngx_quit at least every SHUTDOWN_POLL_INTERVAL so that
+    // SIGQUIT during a long sleep doesn't delay the drain significantly.
+    // Unlike workers, the exporter is not subject to
+    // ngx_event_no_timers_left, so cancelable timers fire reliably on quit.
+    //
+    // Logs are drained on EVERY sub-interval wake (SHUTDOWN_POLL_INTERVAL,
+    // default 250 ms), decoupled from the metric aggregation interval; metrics
+    // aggregate and export only at the full otel_metric_interval boundary.
+    // Rationale: the original motive was draining a
+    // per-request log firehose before the ring saturated under high RPS. The
+    // summary+samples redesign collapsed that volume (the ring now carries only the
+    // thin exception tail + coalesced error samples), so the fast cadence now exists
+    // for: (a) timeliness — ship the high-value tail/error records promptly instead
+    // of holding them up to a full (possibly long) metric interval; (b) incident-burst
+    // resilience — a spike of 5xx-tail / novel / high-severity records is exactly when
+    // the bounded ring could fill and drop; (c) it protects the
+    // `otel_error_log_coalesce off` verbatim opt-out. Near-free: it piggybacks the
+    // shutdown poll the loop already wakes on, and an empty ring sends nothing.
+    let interval = Duration::from_millis(amcf.interval_ms());
+    let mut slept = Duration::ZERO;
+    let mut shutdown_during_sleep = ShutdownKind::None;
+    while slept < interval {
+        let chunk = (interval - slept).min(SHUTDOWN_POLL_INTERVAL);
+        ngx::async_::sleep(chunk).await;
+        slept += chunk;
+        // SAFETY: `ngx_terminate` is a nginx-owned `sig_atomic_t` global;
+        // read here in the single-threaded exporter process, the read is
+        // well-defined.
+        if unsafe { nginx_sys::ngx_terminate } != 0 {
+            shutdown_during_sleep = ShutdownKind::Terminate;
+            break;
+        }
+        // SAFETY: `ngx_quit` is a nginx-owned `sig_atomic_t` global; read
+        // here in the single-threaded exporter process, the read is
+        // well-defined.
+        if unsafe { nginx_sys::ngx_quit } != 0 {
+            // test-support: QUIT-DEFER — consume one tick; the periodic
+            // drain code below the check still runs this sub-interval.
+            // When ticks reach zero we fall through to the normal exit.
+            // In production `consume_tick()` always returns false → break.
+            if !quit_defer.consume_tick() {
+                shutdown_during_sleep = ShutdownKind::Exiting;
                 break;
             }
-            // SAFETY: `ngx_quit` is a nginx-owned `sig_atomic_t` global; read
-            // here in the single-threaded exporter process, the read is
-            // well-defined.
-            if unsafe { nginx_sys::ngx_quit } != 0 {
-                // test-support: QUIT-DEFER — consume one tick; the periodic
-                // drain code below the check still runs this sub-interval.
-                // When ticks reach zero we fall through to the normal exit.
-                // In production `consume_tick()` always returns false → break.
-                if !quit_defer.consume_tick() {
-                    shutdown_during_sleep = ShutdownKind::Exiting;
-                    break;
-                }
-                // Do NOT break — let periodic drain fire this tick.
-            }
-
-            // Whether a QUIT-DEFER overlap window is currently active.
-            // When active (test-support only), shutdown is being deliberately
-            // deferred to keep ring drains alive during a successor overlap, so
-            // the inter-send shutdown short-circuits below must NOT fire — they
-            // would skip exactly the drains the defer window exists to run.
-            // Always false in production builds (no defer mechanism compiled in).
-            let defer_active: bool = quit_defer.active();
-
-            // Check for successor before periodic ring pops.
-            // One Acquire load of successor_gen; sets the latch permanently on first
-            // abdication.  The load is on the cold path (occurs only once per drain tick;
-            // the latch short-circuits immediately after the first true result).
-            if !periodic_abdicated && successor_announced(amcf, my_gen) {
-                periodic_abdicated = true;
-                ngx::ngx_log_error!(
-                    NGX_LOG_NOTICE,
-                    log.as_ptr(),
-                    "otel export: successor announced — abdicating periodic ring pops \
-                     (my_gen={})",
-                    my_gen
-                );
-            }
-
-            // Monotonic basis for the per-signal backoff defer checks this
-            // tick (one read; reused across all lanes). Reuses nginx's cached
-            // CLOCK_MONOTONIC (`ngx_current_msec`) — no new clock.
-            let now_msec = now_monotonic_msec();
-
-            // ── Log drain: every sub-interval wake ──────────────────────────
-            // Skip the entire logs lane (retry drain AND fresh send) while a
-            // `Retryable` backoff defers it. Deferring the DRAIN — not growing
-            // the buffer — is how a peer backoff hint / exponential backoff is
-            // honored. Other signals are unaffected.
-            let logs_deferred = logs_backoff.is_deferred(now_msec);
-            if !logs_deferred {
-                // Drain the logs retry queue first (best-effort; stop on failure).
-                drain_retry_queue_once(
-                    &mut logs_retry_queue,
-                    retry_buffer_depth,
-                    log.as_ptr(),
-                    &LOGS_SEND_FAILURES,
-                    "logs",
-                    &mut LogsRetry(&mut transport),
-                    &mut logs_backoff,
-                )
-                .await;
-            }
-
-            // Inter-send shutdown check — a quit/terminate that arrived
-            // while the logs-retry drain above was in flight is honoured now,
-            // before chaining further (deadline-bounded) sends in this same tick.
-            // Break out of the chunked sleep so the post-loop shutdown handling
-            // (graceful drain on quit, immediate return on terminate) runs.
-            if shutdown_requested() && !defer_active {
-                // SAFETY: nginx-owned `sig_atomic_t` global, read in the
-                // single-threaded exporter process — a plain read is well-defined.
-                shutdown_during_sleep = if unsafe { nginx_sys::ngx_terminate } != 0 {
-                    ShutdownKind::Terminate
-                } else {
-                    ShutdownKind::Exiting
-                };
-                break;
-            }
-
-            // Drain fresh log records from all workers' rings and ship them.
-            // Skipped on abdication — new exporter is sole consumer.
-            // Gate on log export OR error_log — either enables the logs shm path.
-            if !periodic_abdicated
-                && !logs_deferred
-                && (amcf.any_log_export_enabled() || amcf.error_log_enabled)
-            {
-                if let Some(logs_base) = amcf.logs_shm_base() {
-                    // SAFETY: `logs_shm_base()` returned `Some`, so the logs zone
-                    // was registered and mapped; `amcf.logs_shm_zone` therefore
-                    // points to a live `ngx_shm_zone_t` valid for the exporter's
-                    // lifetime (cycle-pool allocated). The `&*` borrow does not
-                    // escape this block, and `shm.size` is a plain field read.
-                    // Use n_active_workers to drain only active slots; the
-                    // zone may be reserved for more (ncpu-headroom) but inactive
-                    // slots are OS-zeroed pages — scanning them faults RAM in.
-                    // SAFETY: `logs_shm_base()` returned `Some`, so `logs_shm_zone`
-                    // is non-null and points to a live, mapped zone for the
-                    // exporter's lifetime (see the block comment above).
-                    let n_workers = unsafe {
-                        get_n_workers(&amcf.n_active_workers, amcf.logs_shm_zone, |avail| {
-                            logs_n_workers_from_zone(avail, amcf.log_ring_cap())
-                        })
-                    };
-                    // Pdata pipeline: wrap → process → encode → send (Step U2).
-                    let (logs_batch, logs_drops) =
-                        collect_log_records(amcf, logs_base, n_workers, worker_start_ns);
-                    ACCESS_LOGS_DROPPED.store(logs_drops.access_dropped, Ordering::Relaxed);
-                    ERROR_LOGS_DROPPED.store(logs_drops.error_dropped, Ordering::Relaxed);
-                    if logs_drops.error_coalesced_orphaned > 0 {
-                        ERROR_LOGS_COALESCED_ORPHANED
-                            .fetch_add(logs_drops.error_coalesced_orphaned, Ordering::Relaxed);
-                    }
-                    let mut logs_pd = Pdata::Logs(logs_batch);
-                    processor.process(&mut logs_pd);
-                    send_fresh_batch(
-                        &mut transport,
-                        &logs_pd,
-                        &mut logs_backoff,
-                        &mut logs_retry_queue,
-                        retry_buffer_depth,
-                        &LOGS_SEND_FAILURES,
-                        log.as_ptr(),
-                        "logs",
-                        "logs ",
-                        "log records",
-                    )
-                    .await;
-                }
-            }
-
-            // Inter-send shutdown check before the span lane (see logs lane).
-            if shutdown_requested() && !defer_active {
-                // SAFETY: nginx-owned `sig_atomic_t` global; single-threaded read.
-                shutdown_during_sleep = if unsafe { nginx_sys::ngx_terminate } != 0 {
-                    ShutdownKind::Terminate
-                } else {
-                    ShutdownKind::Exiting
-                };
-                break;
-            }
-
-            // ── Span drain: every sub-interval wake ─────────────────────────
-            // Skip the entire spans lane while a `Retryable` backoff defers
-            // it (deferring the DRAIN, not growing the buffer). Independent of
-            // the other lanes.
-            let spans_deferred = spans_backoff.is_deferred(now_msec);
-            if !spans_deferred {
-                // Drain the spans retry queue first (best-effort; stop on failure).
-                drain_retry_queue_once(
-                    &mut spans_retry_queue,
-                    retry_buffer_depth,
-                    log.as_ptr(),
-                    &TRACES_SEND_FAILURES,
-                    "spans",
-                    &mut SpansRetry(&mut transport),
-                    &mut spans_backoff,
-                )
-                .await;
-            }
-
-            // Inter-send shutdown check before the fresh-span send.
-            if shutdown_requested() && !defer_active {
-                // SAFETY: nginx-owned `sig_atomic_t` global; single-threaded read.
-                shutdown_during_sleep = if unsafe { nginx_sys::ngx_terminate } != 0 {
-                    ShutdownKind::Terminate
-                } else {
-                    ShutdownKind::Exiting
-                };
-                break;
-            }
-
-            // Drain fresh span records from all workers' rings and ship them.
-            // Skipped on abdication — new exporter is sole consumer.
-            if !periodic_abdicated && !spans_deferred {
-                if let Some(spans_base) = amcf.spans_shm_base() {
-                    // SAFETY: `spans_shm_base()` returned `Some`, so the spans zone
-                    // was registered and mapped; `amcf.spans_shm_zone` therefore
-                    // points to a live `ngx_shm_zone_t` valid for the exporter's
-                    // lifetime. The `&*` borrow does not escape this block, and
-                    // `shm.size` is a plain field read.
-                    // Use n_active_workers (same rationale as logs above).
-                    // SAFETY: `spans_shm_base()` returned `Some`, so `spans_shm_zone`
-                    // is non-null and points to a live, mapped zone for the
-                    // exporter's lifetime (see the block comment above).
-                    let n_workers = unsafe {
-                        get_n_workers(&amcf.n_active_workers, amcf.spans_shm_zone, |avail| {
-                            spans_n_workers_from_zone(avail, DEFAULT_SPAN_RING_CAP)
-                        })
-                    };
-                    // Pdata pipeline: wrap → process → encode → send (Step U2).
-                    let (spans_batch, spans_dropped) =
-                        collect_span_records(amcf, spans_base, n_workers);
-                    TRACES_DROPPED_RECORDS.store(spans_dropped, Ordering::Relaxed);
-                    let mut spans_pd = Pdata::Spans(spans_batch);
-                    processor.process(&mut spans_pd);
-                    send_fresh_batch(
-                        &mut transport,
-                        &spans_pd,
-                        &mut spans_backoff,
-                        &mut spans_retry_queue,
-                        retry_buffer_depth,
-                        &TRACES_SEND_FAILURES,
-                        log.as_ptr(),
-                        "spans",
-                        "spans ",
-                        "span records",
-                    )
-                    .await;
-                }
-            }
+            // Do NOT break — let periodic drain fire this tick.
         }
 
-        // ── Re-check shutdown flags after sleep ───────────────────────────
-        if matches!(shutdown_during_sleep, ShutdownKind::Terminate)
-            // SAFETY: nginx-owned `sig_atomic_t` global, read in the
-            // single-threaded exporter process — a plain read is well-defined.
-            || unsafe { nginx_sys::ngx_terminate } != 0
-        {
-            return;
-        }
-        if matches!(shutdown_during_sleep, ShutdownKind::Exiting)
-            // SAFETY: nginx-owned `sig_atomic_t` global, read in the
-            // single-threaded exporter process — a plain read is well-defined.
-            || unsafe { nginx_sys::ngx_quit } != 0
-        {
-            // test-support: QUIT-DEFER — if the inner loop exhausted the
-            // full sleep interval (slept >= interval, no break) while quit
-            // was set and ticks were still being consumed, we need to
-            // continue the outer loop for another round of periodic drains.
-            // `active()` is `const false` in production builds, so this never
-            // fires there.
-            if quit_defer.active() {
-                // shutdown_during_sleep is re-declared at the top of each
-                // outer loop iteration, so no reset needed — just continue.
-                continue; // outer loop: back to top
-            }
+        // Whether a QUIT-DEFER overlap window is currently active.
+        // When active (test-support only), shutdown is being deliberately
+        // deferred to keep ring drains alive during a successor overlap, so
+        // the inter-send shutdown short-circuits below must NOT fire — they
+        // would skip exactly the drains the defer window exists to run.
+        // Always false in production builds (no defer mechanism compiled in).
+        let defer_active: bool = quit_defer.active();
+
+        // Check for successor before periodic ring pops.
+        // One Acquire load of successor_gen; sets the latch permanently on first
+        // abdication.  The load is on the cold path (occurs only once per drain tick;
+        // the latch short-circuits immediately after the first true result).
+        if !*periodic_abdicated && successor_announced(amcf, my_gen) {
+            *periodic_abdicated = true;
             ngx::ngx_log_error!(
                 NGX_LOG_NOTICE,
                 log.as_ptr(),
-                "otel export: ngx_quit set during sleep, starting graceful drain"
+                "otel export: successor announced — abdicating periodic ring pops \
+                 (my_gen={})",
+                my_gen
             );
-            graceful_drain(
-                &mut transport,
-                &mut DrainQueues {
-                    metrics: &mut retry_queue,
-                    logs: &mut logs_retry_queue,
-                    spans: &mut spans_retry_queue,
-                },
-                amcf,
-                worker_start_ns,
-                &processor,
-                my_gen,
-                &collector_host,
+        }
+
+        // Monotonic basis for the per-signal backoff defer checks this
+        // tick (one read; reused across all lanes). Reuses nginx's cached
+        // CLOCK_MONOTONIC (`ngx_current_msec`) — no new clock.
+        let now_msec = now_monotonic_msec();
+
+        // ── Log drain: every sub-interval wake ──────────────────────────
+        // Skip the entire logs lane (retry drain AND fresh send) while a
+        // `Retryable` backoff defers it. Deferring the DRAIN — not growing
+        // the buffer — is how a peer backoff hint / exponential backoff is
+        // honored. Other signals are unaffected.
+        let logs_deferred = logs_backoff.is_deferred(now_msec);
+        if !logs_deferred {
+            // Drain the logs retry queue first (best-effort; stop on failure).
+            drain_retry_queue_once(
+                logs_retry_queue,
+                retry_buffer_depth,
+                log.as_ptr(),
+                &LOGS_SEND_FAILURES,
+                "logs",
+                &mut LogsRetry(transport),
+                logs_backoff,
             )
             .await;
-            EXPORT_LOOP_DONE.store(true, Ordering::Release);
-            return;
         }
 
-        // ── Control-shm heartbeat ───────────────────────────────────────────
-        // Bump version once per drain cycle as a liveness heartbeat.
-        // A future reconfig path will reuse this increment after applying a
-        // reconfig to signal delivery convergence to the collector.
-        // TODO: also write reconfig payload from the control channel
-        // into control_shm.flags before/after this bump.
-        if let Some(ctrl) = amcf.control_shm_ptr() {
-            // SAFETY: `control_shm_ptr()` returned `Some`, so `ctrl` points to a
-            // live control-shm header in the mapped zone (valid for the
-            // exporter's lifetime). `version` is an `AtomicU64`, so the
-            // cross-process `fetch_add` is well-defined.
-            unsafe { (*ctrl).version.fetch_add(1, Ordering::Relaxed) };
+        // Inter-send shutdown check — a quit/terminate that arrived
+        // while the logs-retry drain above was in flight is honoured now,
+        // before chaining further (deadline-bounded) sends in this same tick.
+        // Break out of the chunked sleep so the post-loop shutdown handling
+        // (graceful drain on quit, immediate return on terminate) runs.
+        if shutdown_requested() && !defer_active {
+            // SAFETY: nginx-owned `sig_atomic_t` global, read in the
+            // single-threaded exporter process — a plain read is well-defined.
+            shutdown_during_sleep = if unsafe { nginx_sys::ngx_terminate } != 0 {
+                ShutdownKind::Terminate
+            } else {
+                ShutdownKind::Exiting
+            };
+            break;
         }
 
-        // ── Crash-loop healthy-reset ──────────────────────────────────────────
-        // Once the export loop has run for a full CRASH_WINDOW_SECS without
-        // crashing, clear the crash counter in shm.  This ensures a single crash
-        // after a long healthy run is not counted against stale in-window crashes,
-        // and prevents a legitimate SIGHUP-triggered exporter from being penalised
-        // for crashes that happened much earlier in a previous short session.
-        // The reset fires at most once per process lifetime (idempotent flag).
-        if !crash_counter_reset {
-            let elapsed_ns = crate::util::now_unix_nano().saturating_sub(healthy_since_ns);
-            // CRASH_WINDOW_SECS from exporter/mod.rs converted to nanoseconds.
-            const CRASH_WINDOW_NS: u64 = crate::exporter::CRASH_WINDOW_SECS * 1_000_000_000;
-            if elapsed_ns >= CRASH_WINDOW_NS {
-                if let Some(ctrl_ptr) = amcf.control_shm_ptr_mut() {
-                    // SAFETY: `control_shm_ptr_mut()` returned a valid, non-null
-                    // pointer to the live control-shm zone (mapped before fork,
-                    // valid for the exporter's lifetime). `crash_count` and
-                    // `window_start_unix` are `AtomicU64`; the stores are safe.
-                    let ctrl = unsafe { &*ctrl_ptr };
-                    ctrl.crash_count.store(0, Ordering::Relaxed);
-                    ctrl.window_start_unix.store(0, Ordering::Relaxed);
+        // Drain fresh log records from all workers' rings and ship them.
+        // Skipped on abdication — new exporter is sole consumer.
+        // Gate on log export OR error_log — either enables the logs shm path.
+        if !*periodic_abdicated
+            && !logs_deferred
+            && (amcf.any_log_export_enabled() || amcf.error_log_enabled)
+        {
+            if let Some(logs_base) = amcf.logs_shm_base() {
+                // SAFETY: `logs_shm_base()` returned `Some`, so the logs zone
+                // was registered and mapped; `amcf.logs_shm_zone` therefore
+                // points to a live `ngx_shm_zone_t` valid for the exporter's
+                // lifetime (cycle-pool allocated). The `&*` borrow does not
+                // escape this block, and `shm.size` is a plain field read.
+                // Use n_active_workers to drain only active slots; the
+                // zone may be reserved for more (ncpu-headroom) but inactive
+                // slots are OS-zeroed pages — scanning them faults RAM in.
+                // SAFETY: `logs_shm_base()` returned `Some`, so `logs_shm_zone`
+                // is non-null and points to a live, mapped zone for the
+                // exporter's lifetime (see the block comment above).
+                let n_workers = unsafe {
+                    get_n_workers(&amcf.n_active_workers, amcf.logs_shm_zone, |avail| {
+                        logs_n_workers_from_zone(avail, amcf.log_ring_cap())
+                    })
+                };
+                // Pdata pipeline: wrap → process → encode → send (Step U2).
+                let (logs_batch, logs_drops) =
+                    collect_log_records(amcf, logs_base, n_workers, worker_start_ns);
+                ACCESS_LOGS_DROPPED.store(logs_drops.access_dropped, Ordering::Relaxed);
+                ERROR_LOGS_DROPPED.store(logs_drops.error_dropped, Ordering::Relaxed);
+                if logs_drops.error_coalesced_orphaned > 0 {
+                    ERROR_LOGS_COALESCED_ORPHANED
+                        .fetch_add(logs_drops.error_coalesced_orphaned, Ordering::Relaxed);
                 }
-                crash_counter_reset = true;
-                ngx::ngx_log_error!(
-                    NGX_LOG_INFO,
+                let mut logs_pd = Pdata::Logs(logs_batch);
+                processor.process(&mut logs_pd);
+                send_fresh_batch(
+                    transport,
+                    &logs_pd,
+                    logs_backoff,
+                    logs_retry_queue,
+                    retry_buffer_depth,
+                    &LOGS_SEND_FAILURES,
                     log.as_ptr(),
-                    "otel export: exporter healthy for {}s — crash counter reset",
-                    crate::exporter::CRASH_WINDOW_SECS,
-                );
+                    "logs",
+                    "logs ",
+                    "log records",
+                )
+                .await;
             }
         }
 
-        // ── Drain retry queue before collecting fresh data ────────────────
-        // Stop draining as soon as a send fails — transport may still be down.
-        // Note: the per-retry-success INFO log ("queued batch sent successfully")
-        // previously emitted only by this lane is intentionally omitted in the
-        // shared helper — it was operational noise absent from the logs/spans lanes.
-        // Skip the entire metrics lane (retry drain AND fresh send) when
-        // `otel_metrics off` is configured — no shm zone was registered so
-        // there is nothing to drain.  Also skip while a `Retryable` backoff
-        // defers it — deferring the DRAIN, not growing the buffer. Independent
-        // of the logs/spans lanes.
-        let metrics_now_msec = now_monotonic_msec();
-        let metrics_deferred = metrics_backoff.is_deferred(metrics_now_msec);
-        if amcf.metrics_enabled() && !metrics_deferred {
+        // Inter-send shutdown check before the span lane (see logs lane).
+        if shutdown_requested() && !defer_active {
+            // SAFETY: nginx-owned `sig_atomic_t` global; single-threaded read.
+            shutdown_during_sleep = if unsafe { nginx_sys::ngx_terminate } != 0 {
+                ShutdownKind::Terminate
+            } else {
+                ShutdownKind::Exiting
+            };
+            break;
+        }
+
+        // ── Span drain: every sub-interval wake ─────────────────────────
+        // Skip the entire spans lane while a `Retryable` backoff defers
+        // it (deferring the DRAIN, not growing the buffer). Independent of
+        // the other lanes.
+        let spans_deferred = spans_backoff.is_deferred(now_msec);
+        if !spans_deferred {
+            // Drain the spans retry queue first (best-effort; stop on failure).
             drain_retry_queue_once(
-                &mut retry_queue,
+                spans_retry_queue,
                 retry_buffer_depth,
                 log.as_ptr(),
-                &SEND_FAILURES,
-                "metrics",
-                &mut MetricsRetry(&mut transport),
-                &mut metrics_backoff,
+                &TRACES_SEND_FAILURES,
+                "spans",
+                &mut SpansRetry(transport),
+                spans_backoff,
             )
             .await;
         }
 
-        // Inter-send shutdown check between the metrics retry drain and the
-        // fresh-metrics send. A quit/terminate arriving while the (deadline-bounded)
-        // retry drain was in flight loops back to the top of the outer loop, which
-        // immediately runs graceful_drain (quit) or returns (terminate) rather than
-        // chaining the fresh-metrics send first. Skipped during a QUIT-DEFER window
-        // so the overlap-window drains complete (test-support only; never in prod).
-        if shutdown_requested() && !quit_defer.active() {
-            continue;
+        // Inter-send shutdown check before the fresh-span send.
+        if shutdown_requested() && !defer_active {
+            // SAFETY: nginx-owned `sig_atomic_t` global; single-threaded read.
+            shutdown_during_sleep = if unsafe { nginx_sys::ngx_terminate } != 0 {
+                ShutdownKind::Terminate
+            } else {
+                ShutdownKind::Exiting
+            };
+            break;
         }
 
-        // ── Collect fresh metrics from all sources ────────────────────────
-        // Pdata pipeline: wrap → process → encode → send (Step U2).
-        // Skipped entirely when `otel_metrics off` — no shm zone was registered.
-        if !amcf.metrics_enabled() {
-            continue;
+        // Drain fresh span records from all workers' rings and ship them.
+        // Skipped on abdication — new exporter is sole consumer.
+        if !*periodic_abdicated && !spans_deferred {
+            if let Some(spans_base) = amcf.spans_shm_base() {
+                // SAFETY: `spans_shm_base()` returned `Some`, so the spans zone
+                // was registered and mapped; `amcf.spans_shm_zone` therefore
+                // points to a live `ngx_shm_zone_t` valid for the exporter's
+                // lifetime. The `&*` borrow does not escape this block, and
+                // `shm.size` is a plain field read.
+                // Use n_active_workers (same rationale as logs above).
+                // SAFETY: `spans_shm_base()` returned `Some`, so `spans_shm_zone`
+                // is non-null and points to a live, mapped zone for the
+                // exporter's lifetime (see the block comment above).
+                let n_workers = unsafe {
+                    get_n_workers(&amcf.n_active_workers, amcf.spans_shm_zone, |avail| {
+                        spans_n_workers_from_zone(avail, DEFAULT_SPAN_RING_CAP)
+                    })
+                };
+                // Pdata pipeline: wrap → process → encode → send (Step U2).
+                let (spans_batch, spans_dropped) =
+                    collect_span_records(amcf, spans_base, n_workers);
+                TRACES_DROPPED_RECORDS.store(spans_dropped, Ordering::Relaxed);
+                let mut spans_pd = Pdata::Spans(spans_batch);
+                processor.process(&mut spans_pd);
+                send_fresh_batch(
+                    transport,
+                    &spans_pd,
+                    spans_backoff,
+                    spans_retry_queue,
+                    retry_buffer_depth,
+                    &TRACES_SEND_FAILURES,
+                    log.as_ptr(),
+                    "spans",
+                    "spans ",
+                    "span records",
+                )
+                .await;
+            }
         }
-        let mut metrics_pd =
-            Pdata::Metrics(collect_all_sources(amcf, worker_start_ns, &collector_host));
-        processor.process(&mut metrics_pd);
-        // Skip the fresh send while a `Retryable` backoff defers the lane
-        // (deferring the send, not growing the buffer). `send_fresh_batch`
-        // sends nothing for a zero-record batch. The metrics success line has
-        // no lane word ("otel export: sent N data points to collector"); the
-        // metrics failure/timeout lines likewise carry no lane prefix, matched
-        // verbatim by the chaos harness.
-        if !metrics_deferred {
-            send_fresh_batch(
-                &mut transport,
-                &metrics_pd,
-                &mut metrics_backoff,
-                &mut retry_queue,
-                retry_buffer_depth,
-                &SEND_FAILURES,
-                log.as_ptr(),
-                "metrics",
-                "",
-                "data points",
-            )
-            .await;
-        }
-
-        // (Log drain happens every SHUTDOWN_POLL_INTERVAL inside the chunked
-        // sleep above — no separate log drain here.)
     }
-}
 
-// ── Graceful drain ────────────────────────────────────────────────────────────
-
-/// F6: Credits `counter` for all pending `(bytes, n_records)` batches in
-/// `queue`, then clears it.
-///
-/// Called from `graceful_drain`'s send-failure and timeout arms for the logs
-/// and spans retry queues.  Pre-fix, `clear()` ran without accumulating the
-/// count — queued records were silently discarded without incrementing any
-/// drop counter.
-///
-/// Extracted to a named function so the test can call the production logic
-/// directly rather than re-implementing the pattern inline.
-fn account_drops_and_clear(
-    queue: &mut VecDeque<(std::vec::Vec<u8>, u64)>,
-    counter: &core::sync::atomic::AtomicU64,
-) {
-    let remaining: u64 = queue.iter().map(|(_, n)| *n).sum();
-    if remaining > 0 {
-        counter.fetch_add(remaining, Ordering::Relaxed);
+    // ── Re-check shutdown flags after sleep ───────────────────────────
+    if matches!(shutdown_during_sleep, ShutdownKind::Terminate)
+        // SAFETY: nginx-owned `sig_atomic_t` global, read in the
+        // single-threaded exporter process — a plain read is well-defined.
+        || unsafe { nginx_sys::ngx_terminate } != 0
+    {
+        return ShutdownKind::Terminate;
     }
-    queue.clear();
-}
-
-/// Returns `true` when a successor exporter generation has been
-/// announced — `ControlShm::successor_gen > my_gen` — meaning this exporter
-/// must abdicate mutating ring pops (logs/spans).
-///
-/// Used by both the periodic drain path (see `export_loop`) and
-/// [`graceful_drain`] — one definition, two call sites, no inline copy
-/// (a second copy would let the two callers drift apart).
-///
-/// # Safety
-/// `control_shm_ptr()` returns `Some` only when the zone is registered and
-/// mapped; `successor_gen` is read with `Acquire` ordering.
-fn successor_announced(amcf: &MainConfig, my_gen: u64) -> bool {
-    amcf.control_shm_ptr()
-        .map(|p| {
-            // SAFETY: `control_shm_ptr()` returns `Some` only when the control
-            // shm zone is registered and mapped; the raw pointer is valid for
-            // this exporter's lifetime (cycle-pool allocated).
-            (unsafe { (*p).successor_gen.load(core::sync::atomic::Ordering::Acquire) }) > my_gen
-        })
-        .unwrap_or(false)
-}
-
-/// Retry queues for all three signal transports — metrics, logs, and spans.
-///
-/// Bundled into a single argument to keep [`graceful_drain`]'s signature
-/// concise.  Each field is a mutable borrow of the queue owned by
-/// [`export_loop`], so the queues are drained in-place during the flush.
-struct DrainQueues<'a> {
-    /// Retry queue for OTLP metrics batches.
-    metrics: &'a mut VecDeque<(std::vec::Vec<u8>, u64)>,
-    /// Retry queue for OTLP logs batches.
-    logs: &'a mut VecDeque<(std::vec::Vec<u8>, u64)>,
-    /// Retry queue for OTLP spans batches.
-    spans: &'a mut VecDeque<(std::vec::Vec<u8>, u64)>,
-}
-
-/// Called when `ngx_quit` is detected from inside [`export_loop`].
-///
-/// Runs on the **exporter's** `ngx_quit` path, not a worker's
-/// `ngx_exiting` path. The exporter receives SIGQUIT via master's channel
-/// write (`NGX_CMD_QUIT` → `ngx_quit`).
-///
-/// Best-effort: attempt to flush the retry queue (one send per queued batch)
-/// and then send one final freshly-collected batch. Each send is wrapped in a
-/// short wall-clock budget ([`GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET`]) so that an
-/// unreachable collector cannot stall exporter shutdown.
-///
-/// # Lifetime safety
-///
-/// `ngx_quit` only marks the process as quitting — the event loop is still
-/// running (the exporter cycle continues calling `ngx_process_events_and_timers`
-/// until `EXPORT_LOOP_DONE` is set), the cycle pool is still live, and our
-/// spawned task is still being polled. The Task handle is dropped at cycle-pool
-/// teardown, which happens *after* this function returns. Awaiting
-/// `transport.send()` here is safe.
-///
-/// # Why the chunked sleep timer fires on quit
-///
-/// `ngx_event_no_timers_left()` returns `NGX_OK` (worker may exit) when the
-/// only pending timers are `cancelable`. The ngx-rust SDK marks every
-/// [`ngx::async_::sleep`] timer as cancelable
-/// (`ngx-rust/src/async_/sleep.rs:94: ev.set_cancelable(1)`), so a worker
-/// between intervals would be treated as idle and exit before its timer fired.
-/// The exporter, however, is not a worker and is not subject to
-/// `ngx_event_no_timers_left`. When SIGQUIT arrives while the exporter is
-/// between intervals, nginx's event loop does NOT cancel the sleep timer — it
-/// fires normally, the export loop detects `ngx_quit`, and runs this drain.
-/// The chunked sleep ([`SHUTDOWN_POLL_INTERVAL`]) caps detection latency at
-/// 250 ms.
-///
-/// This async drain is the sole final-flush path. The exporter cycle waits
-/// for [`EXPORT_LOOP_DONE`] before calling `process::exit`, ensuring the
-/// drain always completes.
-///
-/// # Reload-safe graceful drain.
-///
-/// On SIGHUP reload the master announces a successor by incrementing
-/// `ControlShm::successor_gen` (with Release ordering) BEFORE forking the new
-/// exporter AND before sending `NGX_CMD_QUIT` to the old exporter.  The channel
-/// write/read provides the happens-before ordering that makes this visible.
-///
-/// When `current_gen > my_gen` (a successor is in place) this function
-/// **abdicates** log/span ring drains:
-/// - Already-popped in-process retry buffers are flushed (private memory, safe).
-/// - Final cumulative-metrics batch is sent (pure WorkerSlots reads, always safe).
-/// - Log/span ring `pop_into` calls and the coalesce-table reset are SKIPPED;
-///   the new exporter picks those up as the sole consumer.
-///
-/// When `current_gen == my_gen` (pure shutdown, no successor) the old exporter
-/// is the sole consumer and performs a full drain including ring pops.
-///
-/// Note on dedup: deduping by `time_unix_nano` is safe ONLY for cumulative
-/// metrics (the collector can dedup identical counter data points by
-/// {start_time, time} range). It does NOT hold for length-prefixed log/span
-/// rings: two concurrent `pop_into` callers race on `read_offset` (Relaxed
-/// load + Release store, no CAS) and can yield garbage record lengths (up to
-/// 4 GiB on a producer wrap-around). Making the new exporter the sole ring
-/// consumer on reload restores the SPSC invariant.
-async fn graceful_drain(
-    transport: &mut ExportTransport,
-    queues: &mut DrainQueues<'_>,
-    amcf: &'static MainConfig,
-    worker_start_ns: u64,
-    processor: &Processor,
-    my_gen: u64,
-    collector_host: &str,
-) {
-    let log = ngx::log::ngx_cycle_log();
-    let queued = queues.metrics.len();
-
-    // Check whether a successor was announced (reload) or not (shutdown).
-    // Use the shared successor_announced() check — one definition for both
-    // the periodic drain path and graceful_drain.
-    let has_successor = successor_announced(amcf, my_gen);
-
-    ngx::ngx_log_error!(
-        NGX_LOG_NOTICE,
-        log.as_ptr(),
-        "otel export: graceful drain starting ({} queued batch(es), successor={})",
-        queued,
-        has_successor as u8
-    );
-    if has_successor {
-        // Abdication path — log/span ring pops are skipped (new exporter owns).
-        // Still flush in-process retry buffers and final cumulative-metrics batch.
+    if matches!(shutdown_during_sleep, ShutdownKind::Exiting)
+        // SAFETY: nginx-owned `sig_atomic_t` global, read in the
+        // single-threaded exporter process — a plain read is well-defined.
+        || unsafe { nginx_sys::ngx_quit } != 0
+    {
+        // test-support: QUIT-DEFER — if the inner loop exhausted the
+        // full sleep interval (slept >= interval, no break) while quit
+        // was set and ticks were still being consumed, we need to
+        // continue the outer loop for another round of periodic drains.
+        // `active()` is `const false` in production builds, so this never
+        // fires there.
+        if quit_defer.active() {
+            // Caller (export_loop) will `continue` to the next outer iteration.
+            return ShutdownKind::None;
+        }
         ngx::ngx_log_error!(
             NGX_LOG_NOTICE,
             log.as_ptr(),
-            "otel export: successor announced — abdicating log/span ring drains \
-             (new exporter is sole consumer)"
+            "otel export: ngx_quit set during sleep, starting graceful drain"
         );
+        graceful_drain(
+            transport,
+            &mut DrainQueues {
+                metrics: retry_queue,
+                logs: logs_retry_queue,
+                spans: spans_retry_queue,
+            },
+            amcf,
+            worker_start_ns,
+            processor,
+            my_gen,
+            collector_host,
+        )
+        .await;
+        return ShutdownKind::Exiting;
     }
 
-    // Flush metrics retry queue and final metrics batch only when metrics are
-    // enabled.  When `otel_metrics off` the retry queue is always empty (no
-    // metrics were ever sent) and there is no shm zone to collect from.
-    if amcf.metrics_enabled() {
-        // Flush metrics retry queue (one bounded attempt each, ignore errors).
-        while let Some((bytes, n_pts)) = queues.metrics.pop_front() {
-            match with_deadline(transport.send(bytes), GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET).await {
-                // Any Ok(outcome) is treated as release; the outcome-driven policy
-                // (release/requeue+defer/drop) applies.
-                Ok(Ok(_outcome)) => {}
-                Ok(Err(e)) => {
-                    ngx::ngx_log_error!(
-                        NGX_LOG_ERR,
-                        log.as_ptr(),
-                        "otel export: drain: queued batch ({} pts) send failed: {}",
-                        n_pts,
-                        e
-                    );
-                    // Other queued batches likely fail too; stop and let the
-                    // remainder be dropped when the loop returns.
-                    let remaining: u64 = queues.metrics.iter().map(|(_, n)| n).sum();
-                    if remaining > 0 {
-                        DROPPED_RECORDS.fetch_add(remaining, Ordering::Relaxed);
-                    }
-                    queues.metrics.clear();
-                    break;
-                }
-                Err(DeadlineExceeded) => {
-                    ngx::ngx_log_error!(
-                        NGX_LOG_NOTICE,
-                        log.as_ptr(),
-                        "otel export: drain: queued batch ({} pts) timed out after {:?}",
-                        n_pts,
-                        GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET
-                    );
-                    let remaining: u64 = queues.metrics.iter().map(|(_, n)| n).sum();
-                    if remaining > 0 {
-                        DROPPED_RECORDS.fetch_add(remaining, Ordering::Relaxed);
-                    }
-                    queues.metrics.clear();
-                    break;
-                }
+    // ── Control-shm heartbeat ───────────────────────────────────────────
+    // Bump version once per drain cycle as a liveness heartbeat.
+    // A future reconfig path will reuse this increment after applying a
+    // reconfig to signal delivery convergence to the collector.
+    // TODO: also write reconfig payload from the control channel
+    // into control_shm.flags before/after this bump.
+    if let Some(ctrl) = amcf.control_shm_ptr() {
+        // SAFETY: `control_shm_ptr()` returned `Some`, so `ctrl` points to a
+        // live control-shm header in the mapped zone (valid for the
+        // exporter's lifetime). `version` is an `AtomicU64`, so the
+        // cross-process `fetch_add` is well-defined.
+        unsafe { (*ctrl).version.fetch_add(1, Ordering::Relaxed) };
+    }
+
+    // ── Crash-loop healthy-reset ──────────────────────────────────────────
+    // Once the export loop has run for a full CRASH_WINDOW_SECS without
+    // crashing, clear the crash counter in shm.  This ensures a single crash
+    // after a long healthy run is not counted against stale in-window crashes,
+    // and prevents a legitimate SIGHUP-triggered exporter from being penalised
+    // for crashes that happened much earlier in a previous short session.
+    // The reset fires at most once per process lifetime (idempotent flag).
+    if !*crash_counter_reset {
+        let elapsed_ns = crate::util::now_unix_nano().saturating_sub(healthy_since_ns);
+        // CRASH_WINDOW_SECS from exporter/mod.rs converted to nanoseconds.
+        const CRASH_WINDOW_NS: u64 = crate::exporter::CRASH_WINDOW_SECS * 1_000_000_000;
+        if elapsed_ns >= CRASH_WINDOW_NS {
+            if let Some(ctrl_ptr) = amcf.control_shm_ptr_mut() {
+                // SAFETY: `control_shm_ptr_mut()` returned a valid, non-null
+                // pointer to the live control-shm zone (mapped before fork,
+                // valid for the exporter's lifetime). `crash_count` and
+                // `window_start_unix` are `AtomicU64`; the stores are safe.
+                let ctrl = unsafe { &*ctrl_ptr };
+                ctrl.crash_count.store(0, Ordering::Relaxed);
+                ctrl.window_start_unix.store(0, Ordering::Relaxed);
             }
-        }
-
-        // Final freshly-collected metrics batch (Pdata pipeline, Step U2).
-        let mut final_pd =
-            Pdata::Metrics(collect_all_sources(amcf, worker_start_ns, collector_host));
-        processor.process(&mut final_pd);
-        let n_pts = count_pdata_records(&final_pd);
-        if n_pts > 0 {
-            let bytes = encode_pdata(&final_pd);
-            match with_deadline(
-                transport.send_pdata(&final_pd, bytes),
-                GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET,
-            )
-            .await
-            {
-                // Any Ok(outcome) treated as release (the outcome-driven policy applies).
-                Ok(Ok(_outcome)) => {
-                    ngx::ngx_log_error!(
-                        NGX_LOG_NOTICE,
-                        log.as_ptr(),
-                        "otel export: drain: final batch sent ({} data points)",
-                        n_pts
-                    );
-                }
-                Ok(Err(e)) => {
-                    ngx::ngx_log_error!(
-                        NGX_LOG_ERR,
-                        log.as_ptr(),
-                        "otel export: drain: final batch failed: {}",
-                        e
-                    );
-                }
-                Err(DeadlineExceeded) => {
-                    ngx::ngx_log_error!(
-                        NGX_LOG_NOTICE,
-                        log.as_ptr(),
-                        "otel export: drain: final batch timed out after {:?}",
-                        GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET
-                    );
-                }
-            }
+            *crash_counter_reset = true;
+            ngx::ngx_log_error!(
+                NGX_LOG_INFO,
+                log.as_ptr(),
+                "otel export: exporter healthy for {}s — crash counter reset",
+                crate::exporter::CRASH_WINDOW_SECS,
+            );
         }
     }
 
-    // Drain pending logs retry queue (one bounded attempt each).
-    while let Some((bytes, n_logs)) = queues.logs.pop_front() {
-        match with_deadline(transport.send_logs(bytes), GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET).await {
-            // Any Ok(outcome) is treated as release; the outcome-driven policy
-            // (release/requeue+defer/drop) applies.
-            Ok(Ok(_outcome)) => {}
-            Ok(Err(e)) => {
-                ngx::ngx_log_error!(
-                    NGX_LOG_ERR,
-                    log.as_ptr(),
-                    "otel export: drain: logs queued batch ({} records) send failed: {}",
-                    n_logs,
-                    e
-                );
-                // F6: credit remaining queued logs records to DROPPED_RECORDS before
-                // clearing so the self-metric reflects the full drop, not just the
-                // current batch.  Mirrors the metrics-lane drain-abort pattern.
-                account_drops_and_clear(queues.logs, &DROPPED_RECORDS);
-                break;
-            }
-            Err(DeadlineExceeded) => {
-                ngx::ngx_log_error!(
-                    NGX_LOG_NOTICE,
-                    log.as_ptr(),
-                    "otel export: drain: logs queued batch ({} records) timed out",
-                    n_logs
-                );
-                // F6: same as the error arm above.
-                account_drops_and_clear(queues.logs, &DROPPED_RECORDS);
-                break;
-            }
-        }
+    // ── Drain retry queue before collecting fresh data ────────────────
+    // Stop draining as soon as a send fails — transport may still be down.
+    // Note: the per-retry-success INFO log ("queued batch sent successfully")
+    // previously emitted only by this lane is intentionally omitted in the
+    // shared helper — it was operational noise absent from the logs/spans lanes.
+    // Skip the entire metrics lane (retry drain AND fresh send) when
+    // `otel_metrics off` is configured — no shm zone was registered so
+    // there is nothing to drain.  Also skip while a `Retryable` backoff
+    // defers it — deferring the DRAIN, not growing the buffer. Independent
+    // of the logs/spans lanes.
+    let metrics_now_msec = now_monotonic_msec();
+    let metrics_deferred = metrics_backoff.is_deferred(metrics_now_msec);
+    if amcf.metrics_enabled() && !metrics_deferred {
+        drain_retry_queue_once(
+            retry_queue,
+            retry_buffer_depth,
+            log.as_ptr(),
+            &SEND_FAILURES,
+            "metrics",
+            &mut MetricsRetry(transport),
+            metrics_backoff,
+        )
+        .await;
     }
 
-    // Final freshly-collected logs batch (access + error rings).
-    // Skipped on abdication — new exporter is sole consumer of the rings.
-    if !has_successor && (amcf.any_log_export_enabled() || amcf.error_log_enabled) {
-        if let Some(logs_base) = amcf.logs_shm_base() {
-            // Use n_active_workers (same rationale as export path).
-            // SAFETY: `logs_shm_base()` returned `Some`, so `logs_shm_zone` is
-            // non-null and points to a live, mapped zone for the exporter's
-            // lifetime.
-            let n_workers = unsafe {
-                get_n_workers(&amcf.n_active_workers, amcf.logs_shm_zone, |avail| {
-                    logs_n_workers_from_zone(avail, amcf.log_ring_cap())
-                })
-            };
-            // Pdata pipeline: wrap → process → encode → send (Step U2).
-            let (logs_batch, logs_drops) =
-                collect_log_records(amcf, logs_base, n_workers, worker_start_ns);
-            ACCESS_LOGS_DROPPED.store(logs_drops.access_dropped, Ordering::Relaxed);
-            ERROR_LOGS_DROPPED.store(logs_drops.error_dropped, Ordering::Relaxed);
-            if logs_drops.error_coalesced_orphaned > 0 {
-                ERROR_LOGS_COALESCED_ORPHANED
-                    .fetch_add(logs_drops.error_coalesced_orphaned, Ordering::Relaxed);
-            }
-            let mut logs_pd = Pdata::Logs(logs_batch);
-            processor.process(&mut logs_pd);
-            let n_logs = count_pdata_records(&logs_pd);
-            if n_logs > 0 {
-                let logs_bytes = encode_pdata(&logs_pd);
-                match with_deadline(
-                    transport.send_pdata(&logs_pd, logs_bytes),
-                    GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET,
-                )
-                .await
-                {
-                    // Any Ok(outcome) treated as release (the outcome-driven policy applies).
-                    Ok(Ok(_outcome)) => {
-                        ngx::ngx_log_error!(
-                            NGX_LOG_NOTICE,
-                            log.as_ptr(),
-                            "otel export: drain: final logs batch sent ({} records)",
-                            n_logs
-                        );
-                    }
-                    Ok(Err(e)) => {
-                        ngx::ngx_log_error!(
-                            NGX_LOG_ERR,
-                            log.as_ptr(),
-                            "otel export: drain: final logs batch failed: {}",
-                            e
-                        );
-                    }
-                    Err(DeadlineExceeded) => {
-                        ngx::ngx_log_error!(
-                            NGX_LOG_NOTICE,
-                            log.as_ptr(),
-                            "otel export: drain: final logs batch timed out"
-                        );
-                    }
-                }
-            }
-        }
+    // Inter-send shutdown check between the metrics retry drain and the
+    // fresh-metrics send. A quit/terminate arriving while the (deadline-bounded)
+    // retry drain was in flight loops back to the top of the outer loop, which
+    // immediately runs graceful_drain (quit) or returns (terminate) rather than
+    // chaining the fresh-metrics send first. Skipped during a QUIT-DEFER window
+    // so the overlap-window drains complete (test-support only; never in prod).
+    if shutdown_requested() && !quit_defer.active() {
+        return ShutdownKind::None;
     }
 
-    // Drain pending spans retry queue (one bounded attempt each).
-    while let Some((bytes, n_spans)) = queues.spans.pop_front() {
-        match with_deadline(transport.send_traces(bytes), GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET).await {
-            // Any Ok(outcome) is treated as release; the outcome-driven policy
-            // (release/requeue+defer/drop) applies.
-            Ok(Ok(_outcome)) => {}
-            Ok(Err(e)) => {
-                ngx::ngx_log_error!(
-                    NGX_LOG_ERR,
-                    log.as_ptr(),
-                    "otel export: drain: spans queued batch ({} records) send failed: {}",
-                    n_spans,
-                    e
-                );
-                // F6: credit remaining queued spans records before clearing.
-                account_drops_and_clear(queues.spans, &DROPPED_RECORDS);
-                break;
-            }
-            Err(DeadlineExceeded) => {
-                ngx::ngx_log_error!(
-                    NGX_LOG_NOTICE,
-                    log.as_ptr(),
-                    "otel export: drain: spans queued batch ({} records) timed out",
-                    n_spans
-                );
-                // F6: same as the error arm above.
-                account_drops_and_clear(queues.spans, &DROPPED_RECORDS);
-                break;
-            }
-        }
+    // ── Collect fresh metrics from all sources ────────────────────────
+    // Pdata pipeline: wrap → process → encode → send (Step U2).
+    // Skipped entirely when `otel_metrics off` — no shm zone was registered.
+    if !amcf.metrics_enabled() {
+        return ShutdownKind::None;
+    }
+    let mut metrics_pd = Pdata::Metrics(collect_all_sources(amcf, worker_start_ns, collector_host));
+    processor.process(&mut metrics_pd);
+    // Skip the fresh send while a `Retryable` backoff defers the lane
+    // (deferring the send, not growing the buffer). `send_fresh_batch`
+    // sends nothing for a zero-record batch. The metrics success line has
+    // no lane word ("otel export: sent N data points to collector"); the
+    // metrics failure/timeout lines likewise carry no lane prefix, matched
+    // verbatim by the chaos harness.
+    if !metrics_deferred {
+        send_fresh_batch(
+            transport,
+            &metrics_pd,
+            metrics_backoff,
+            retry_queue,
+            retry_buffer_depth,
+            &SEND_FAILURES,
+            log.as_ptr(),
+            "metrics",
+            "",
+            "data points",
+        )
+        .await;
     }
 
-    // Final freshly-collected spans batch (Pdata pipeline, Step U2).
-    // Skipped on abdication — new exporter is sole consumer of the rings.
-    if !has_successor {
-        if let Some(spans_base) = amcf.spans_shm_base() {
-            // Use n_active_workers (same rationale as export path).
-            // SAFETY: `spans_shm_base()` returned `Some`, so `spans_shm_zone` is
-            // non-null and points to a live, mapped zone for the exporter's
-            // lifetime.
-            let n_workers = unsafe {
-                get_n_workers(&amcf.n_active_workers, amcf.spans_shm_zone, |avail| {
-                    spans_n_workers_from_zone(avail, DEFAULT_SPAN_RING_CAP)
-                })
-            };
-            let (spans_batch, spans_dropped) = collect_span_records(amcf, spans_base, n_workers);
-            TRACES_DROPPED_RECORDS.store(spans_dropped, Ordering::Relaxed);
-            let mut spans_pd = Pdata::Spans(spans_batch);
-            processor.process(&mut spans_pd);
-            let n_spans = count_pdata_records(&spans_pd);
-            if n_spans > 0 {
-                let spans_bytes = encode_pdata(&spans_pd);
-                match with_deadline(
-                    transport.send_pdata(&spans_pd, spans_bytes),
-                    GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET,
-                )
-                .await
-                {
-                    // Any Ok(outcome) treated as release (the outcome-driven policy applies).
-                    Ok(Ok(_outcome)) => {
-                        ngx::ngx_log_error!(
-                            NGX_LOG_NOTICE,
-                            log.as_ptr(),
-                            "otel export: drain: final spans batch sent ({} records)",
-                            n_spans
-                        );
-                    }
-                    Ok(Err(e)) => {
-                        ngx::ngx_log_error!(
-                            NGX_LOG_ERR,
-                            log.as_ptr(),
-                            "otel export: drain: final spans batch failed: {}",
-                            e
-                        );
-                    }
-                    Err(DeadlineExceeded) => {
-                        ngx::ngx_log_error!(
-                            NGX_LOG_NOTICE,
-                            log.as_ptr(),
-                            "otel export: drain: final spans batch timed out"
-                        );
-                    }
-                }
-            }
-        }
-    } // end `if !has_successor` for spans ring drain
-
-    ngx::ngx_log_error!(NGX_LOG_NOTICE, log.as_ptr(), "otel export: graceful drain complete");
-}
-
-// ── Deadline-bounded future ─────────────────────────────────────────────────
-
-/// Sentinel returned by [`with_deadline`] when the timer fires before the
-/// inner future completes.
-struct DeadlineExceeded;
-
-pin_project! {
-    /// Races an inner future against a timer future. Whichever resolves first
-    /// wins. No allocation, no `select!` machinery.
-    ///
-    /// Generic over the timer type `T` so that production passes
-    /// [`ngx::async_::Sleep`] (driven by the NGINX event loop) while unit tests
-    /// can inject a deterministic, runtime-free timer (e.g. ready-on-first-poll)
-    /// to exercise the deadline-expiry arm without a real wall-clock wait.
-    struct WithDeadline<F, T> {
-        #[pin]
-        fut: F,
-        #[pin]
-        timer: T,
-    }
-}
-
-impl<F: Future, T: Future<Output = ()>> Future for WithDeadline<F, T> {
-    type Output = Result<F::Output, DeadlineExceeded>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-        if let Poll::Ready(output) = this.fut.poll(cx) {
-            return Poll::Ready(Ok(output));
-        }
-        if let Poll::Ready(()) = this.timer.poll(cx) {
-            return Poll::Ready(Err(DeadlineExceeded));
-        }
-        Poll::Pending
-    }
-}
-
-/// Wraps `fut` so it resolves at most after `timeout`. On timeout the inner
-/// future is dropped — for a hyper send this means the in-flight connection
-/// future is cancelled cleanly via [`Drop`].
-fn with_deadline<F: Future>(fut: F, timeout: Duration) -> WithDeadline<F, ngx::async_::Sleep> {
-    WithDeadline { fut, timer: ngx::async_::sleep(timeout) }
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Enqueue a batch for retry.  If the queue is already at `max_depth`,
-/// the oldest entry is evicted and `DROPPED_RECORDS` is incremented (F6:
-/// `DROPPED_RECORDS` covers all three signal lanes — metrics, logs, spans).
-///
-/// Returns the number of records dropped (0 if the queue was not full).
-///
-/// `log` may be null; the eviction-logging path is guarded against that so the
-/// unit test can call this directly without constructing an `ngx_log_t`.
-#[inline]
-fn enqueue_with_eviction(
-    retry_queue: &mut VecDeque<(std::vec::Vec<u8>, u64)>,
-    bytes: std::vec::Vec<u8>,
-    n_pts: u64,
-    max_depth: usize,
-    log: *mut nginx_sys::ngx_log_t,
-) -> u64 {
-    if retry_queue.len() >= max_depth {
-        if let Some((_, dropped_pts)) = retry_queue.pop_front() {
-            DROPPED_RECORDS.fetch_add(dropped_pts, Ordering::Relaxed);
-            if !log.is_null() {
-                ngx::ngx_log_error!(
-                    NGX_LOG_ERR,
-                    log,
-                    "otel export: retry buffer full, dropped {} records",
-                    dropped_pts
-                );
-            }
-            retry_queue.push_back((bytes, n_pts));
-            return dropped_pts;
-        }
-    }
-    retry_queue.push_back((bytes, n_pts));
-    0
-}
-
-/// Returns true if the transport error is a permanent 4xx HTTP rejection that
-/// must be dropped rather than re-queued.
-#[inline]
-fn is_permanent_rejection(e: &crate::transport::TransportError) -> bool {
-    matches!(e, crate::transport::TransportError::HttpStatus { code, .. } if *code >= 400 && *code < 500)
-}
-
-// ── Outcome-driven policy engine ───────────────────────────────────────────────
-//
-// The policy is written ONCE against the protocol-agnostic `DeliveryOutcome`
-// (the transport adapters already mapped native HTTP/gRPC status into it). The
-// engine NEVER branches on an HTTP code or a gRPC code here.
-//
-// Defer mechanism: a per-signal "not before"
-// monotonic timestamp + a per-signal consecutive-`Retryable`-failure counter.
-// Honoring a backoff DEFERS THE NEXT DRAIN of that signal — it does NOT grow the
-// buffer or add any unbounded store. The bounded per-signal retry buffer with
-// drop-oldest eviction remains the backstop, unchanged.
-
-/// Per-signal backoff/defer state. Lives in `export_loop` locals (one per
-/// signal lane) — single-task, exporter-local; never shared across threads.
-#[derive(Debug, Default, Clone, Copy)]
-struct SignalBackoff {
-    /// Monotonic `ngx_current_msec` value before which this signal must NOT be
-    /// drained again. `0` = no active deferral. The drain loop reuses nginx's
-    /// existing cached `CLOCK_MONOTONIC` millisecond basis (`ngx_current_msec`)
-    /// — no new clock is introduced.
-    not_before_msec: u64,
-    /// Count of consecutive `Retryable` verdicts for this signal since the last
-    /// `Accepted`. Drives the no-hint exponential backoff doubling; reset to 0
-    /// on the next `Accepted`.
-    consecutive_retryable: u32,
-}
-
-impl SignalBackoff {
-    /// Whether a drain of this signal is currently deferred at `now_msec`.
-    /// `not_before_msec == 0` means no deferral is active.
-    #[inline]
-    fn is_deferred(&self, now_msec: u64) -> bool {
-        self.not_before_msec != 0 && now_msec < self.not_before_msec
-    }
-}
-
-/// The action the policy engine prescribes for a drained/sent batch. The caller
-/// performs the buffer mutation (release = drop the in-hand batch; requeue =
-/// `enqueue_with_eviction`; drop = discard); the defer/backoff bookkeeping has
-/// already been applied to the `SignalBackoff` by [`apply_delivery_outcome`].
-#[derive(Debug, PartialEq, Eq)]
-enum OutcomeAction {
-    /// Release the batch (delivered). Backoff was reset.
-    Release,
-    /// Re-queue the batch into the bounded buffer; the next drain of this signal
-    /// is deferred (see the `SignalBackoff`).
-    Requeue,
-    /// Drop the batch permanently (Permanent / Unauthorized); do NOT retry.
-    Drop,
-}
-
-/// Compute the no-hint exponential backoff duration (ms) for the
-/// `consecutive_retryable`-th consecutive retryable failure: `base << (n-1)`,
-/// saturating at `cap`. `n == 0` is treated as the first failure.
-#[inline]
-fn backoff_ms(consecutive_retryable: u32, base_ms: u64, cap_ms: u64) -> u64 {
-    if base_ms == 0 {
-        return 0;
-    }
-    let shift = consecutive_retryable.saturating_sub(1);
-    // `<<` can both wrap (shift ≥ 64) and silently overflow the value (shift <
-    // 64 but `base << shift` exceeds u64). Guard both with a saturating shift:
-    // if the shift exceeds the headroom in `base_ms`, the product would exceed
-    // u64, so saturate straight to the cap.
-    if shift >= base_ms.leading_zeros() {
-        return cap_ms;
-    }
-    (base_ms << shift).min(cap_ms)
-}
-
-/// The outcome-driven policy, written ONCE against `DeliveryOutcome`. Updates
-/// `backoff` (defer timestamp + consecutive-failure counter) and the
-/// delivery-outcome self-metric counters, and returns the buffer action for the
-/// caller to perform.
-///
-/// `now_msec` is the current monotonic basis (`ngx_current_msec` in production;
-/// an injected value in tests). `signal` and `log` are used only for the
-/// rate-limited `Unauthorized` "check credentials" log.
-fn apply_delivery_outcome(
-    outcome: &crate::transport::DeliveryOutcome,
-    backoff: &mut SignalBackoff,
-    now_msec: u64,
-    log: *mut nginx_sys::ngx_log_t,
-    signal: &str,
-) -> OutcomeAction {
-    use crate::transport::DeliveryOutcome as DO;
-    match outcome {
-        DO::Accepted => {
-            // Success resets the backoff for this signal.
-            backoff.consecutive_retryable = 0;
-            backoff.not_before_msec = 0;
-            OutcomeAction::Release
-        }
-        DO::PartialReject { rejected } => {
-            // Accepted overall → release the batch + reset backoff; the peer
-            // dropped `rejected` records it could not store (counts only).
-            backoff.consecutive_retryable = 0;
-            backoff.not_before_msec = 0;
-            PARTIAL_REJECTED.fetch_add(*rejected, Ordering::Relaxed);
-            OutcomeAction::Release
-        }
-        DO::Retryable { retry_after } => {
-            // Transient: re-queue into the bounded buffer (caller) AND defer the
-            // next drain of this signal. Honor a peer hint verbatim; otherwise
-            // apply the hardcoded exponential backoff (doubling per consecutive
-            // retryable failure, capped). The defer NEVER grows the buffer.
-            backoff.consecutive_retryable = backoff.consecutive_retryable.saturating_add(1);
-            let defer_ms = match retry_after {
-                Some(hint) => {
-                    // Hint honored verbatim (NOT subject to the no-hint cap).
-                    // Round up sub-ms hints to at least one tick so a defer is
-                    // always observable.
-                    let ms = hint.as_millis();
-                    u64::try_from(ms).unwrap_or(u64::MAX).max(1)
-                }
-                None => backoff_ms(backoff.consecutive_retryable, BACKOFF_BASE_MS, BACKOFF_CAP_MS),
-            };
-            backoff.not_before_msec = now_msec.saturating_add(defer_ms).max(1);
-            OutcomeAction::Requeue
-        }
-        DO::Permanent => {
-            // Permanent rejection — drop + count, never retry. Backoff is not a
-            // factor (we are not deferring; the batch is gone).
-            PERMANENT_REJECTED.fetch_add(1, Ordering::Relaxed);
-            OutcomeAction::Drop
-        }
-        DO::Unauthorized => {
-            // SAME policy action as Permanent (drop + count, NO retry, NO
-            // backoff, NO auto-pause) — auth failures are a config/credential
-            // problem retrying cannot fix. Distinct counter + a rate-limited
-            // "check credentials" log so the real signal is not buried, and so
-            // we never silently stop the exporter or the other signals.
-            UNAUTHORIZED_REJECTED.fetch_add(1, Ordering::Relaxed);
-            maybe_log_unauthorized(log, signal);
-            OutcomeAction::Drop
-        }
-    }
-}
-
-/// Apply the outcome-driven policy to a *fresh* (newly-collected) batch
-/// send result. Shared by the metrics/logs/spans fresh-send sites so the policy
-/// is written once. On `Requeue`/transient the batch is re-queued into the
-/// bounded buffer (drop-oldest backstop, unchanged) and `failure_counter` is
-/// bumped; on `Drop` the batch is discarded (the dedicated delivery counter was
-/// bumped inside [`apply_delivery_outcome`]); on `Release` nothing is queued.
-///
-/// Returns the [`OutcomeAction`] so the caller can emit its signal-specific
-/// success log with the original wording (a chaos test parses those exact
-/// "sent N {log,span} records to collector" lines).
-///
-/// `now_msec` is the monotonic basis for the defer timestamp recorded in
-/// `backoff`. `bytes`/`n_records` are the fresh batch (consumed only when
-/// re-queued).
-#[allow(clippy::too_many_arguments)]
-fn handle_fresh_send_outcome(
-    outcome: &crate::transport::DeliveryOutcome,
-    backoff: &mut SignalBackoff,
-    now_msec: u64,
-    queue: &mut VecDeque<(std::vec::Vec<u8>, u64)>,
-    bytes: std::vec::Vec<u8>,
-    n_records: u64,
-    retry_buffer_depth: usize,
-    failure_counter: &AtomicU64,
-    log: *mut nginx_sys::ngx_log_t,
-    signal: &'static str,
-) -> OutcomeAction {
-    let action = apply_delivery_outcome(outcome, backoff, now_msec, log, signal);
-    match action {
-        // Caller logs the success line (signal-specific wording).
-        OutcomeAction::Release => {}
-        OutcomeAction::Requeue => {
-            if !log.is_null() {
-                ngx::ngx_log_error!(
-                    NGX_LOG_ERR,
-                    log,
-                    "otel export: {} send retryable; queuing for retry and deferring next drain",
-                    signal
-                );
-            }
-            enqueue_with_eviction(queue, bytes, n_records, retry_buffer_depth, log);
-            failure_counter.fetch_add(1, Ordering::Relaxed);
-        }
-        OutcomeAction::Drop => {
-            if !log.is_null() {
-                ngx::ngx_log_error!(
-                    NGX_LOG_ERR,
-                    log,
-                    "otel export: dropping fresh {} batch — non-retryable verdict",
-                    signal
-                );
-            }
-        }
-    }
-    action
-}
-
-/// Apply the send outcome for a **fresh batch** of any signal, re-reading the
-/// monotonic clock internally (after the send await) so the backoff deadline is
-/// computed from a fresh "now", not a pre-send stale capture.
-///
-/// The basis is always read here — immediately before delegating to
-/// [`handle_fresh_send_outcome`] — so a call site cannot accidentally pass a
-/// stale pre-send clock value regardless of which signal lane invokes it.
-/// `signal` is the lane name ("metrics" / "logs" / "spans") used only for the
-/// diagnostic log wording.
-#[allow(clippy::too_many_arguments)]
-fn apply_fresh_send_outcome(
-    outcome: &crate::transport::DeliveryOutcome,
-    backoff: &mut SignalBackoff,
-    queue: &mut VecDeque<(std::vec::Vec<u8>, u64)>,
-    bytes: std::vec::Vec<u8>,
-    n_records: u64,
-    retry_buffer_depth: usize,
-    failure_counter: &AtomicU64,
-    log: *mut nginx_sys::ngx_log_t,
-    signal: &'static str,
-) -> OutcomeAction {
-    // Re-read the clock AFTER the send await returns. See `post_send_backoff_basis`.
-    let basis = post_send_backoff_basis();
-    handle_fresh_send_outcome(
-        outcome,
-        backoff,
-        basis,
-        queue,
-        bytes,
-        n_records,
-        retry_buffer_depth,
-        failure_counter,
-        log,
-        signal,
-    )
-}
-
-/// Last `ngx_current_msec` at which the "check exporter credentials" line was
-/// emitted (0 = never). Rate-limits the `Unauthorized` log to at most once per
-/// [`UNAUTHORIZED_LOG_INTERVAL_MS`] so a per-batch 401/403 storm cannot hammer
-/// the error log. Exporter-local single-writer atomic (same pattern as the
-/// other counters); the read-modify-write is benign even if it ever raced.
-static UNAUTHORIZED_LOG_LAST_MSEC: AtomicU64 = AtomicU64::new(0);
-
-/// Minimum spacing between successive `Unauthorized` "check credentials" log
-/// lines (60 s).
-const UNAUTHORIZED_LOG_INTERVAL_MS: u64 = 60_000;
-
-/// Emit the "check exporter credentials" error line at most once per
-/// [`UNAUTHORIZED_LOG_INTERVAL_MS`]. Uses the same monotonic
-/// `ngx_current_msec` basis as the defer timestamps.
-fn maybe_log_unauthorized(log: *mut nginx_sys::ngx_log_t, signal: &str) {
-    if log.is_null() {
-        return;
-    }
-    // SAFETY: `ngx_current_msec` is an nginx global updated by the event loop
-    // in this single-threaded exporter process; a plain read is well-defined.
-    let now = unsafe { nginx_sys::ngx_current_msec } as u64;
-    let last = UNAUTHORIZED_LOG_LAST_MSEC.load(Ordering::Relaxed);
-    // First occurrence (last == 0) always logs; thereafter respect the interval.
-    if last != 0 && now.saturating_sub(last) < UNAUTHORIZED_LOG_INTERVAL_MS {
-        return;
-    }
-    UNAUTHORIZED_LOG_LAST_MSEC.store(now.max(1), Ordering::Relaxed);
-    ngx::ngx_log_error!(
-        NGX_LOG_ERR,
-        log,
-        "otel export: {} batch rejected — authentication/authorization failed; \
-         check exporter credentials (dropping, not retrying)",
-        signal
-    );
-}
-
-/// Injectable clock override for unit tests. Non-zero values replace the
-/// `ngx_current_msec` read in `now_monotonic_msec()`, allowing tests to
-/// simulate pre-send and post-send clock advances without a real nginx event
-/// loop. Zero (the default) is a no-op: the real nginx global is read instead.
-///
-/// Tests that touch this field MUST reset it to 0 before returning so that
-/// sibling tests that rely on `ngx_current_msec == 0` (the test-process
-/// default) are not disturbed.
-#[cfg(test)]
-static TEST_CLOCK_MSEC: AtomicU64 = AtomicU64::new(0);
-
-/// Read the current monotonic millisecond basis used for defer timestamps.
-/// Reuses nginx's cached `CLOCK_MONOTONIC` (`ngx_current_msec`, updated by the
-/// event loop the exporter runs on) — the SAME basis `liveness` uses. No new
-/// clock is introduced.
-///
-/// # Safety
-/// `ngx_current_msec` is an nginx global updated by the event loop in this
-/// single-threaded exporter process; a plain read is well-defined.
-#[inline]
-fn now_monotonic_msec() -> u64 {
-    // In test builds an injectable override lets unit tests simulate the
-    // pre-send/post-send clock advance without a real nginx event loop.
-    #[cfg(test)]
-    {
-        let t = TEST_CLOCK_MSEC.load(Ordering::Relaxed);
-        if t != 0 {
-            return t;
-        }
-    }
-    // SAFETY: `ngx_current_msec` is an nginx global updated by the event loop
-    // in this single-threaded exporter process; a plain read is well-defined.
-    unsafe { nginx_sys::ngx_current_msec as u64 }
-}
-
-/// Separate named entry point for the post-send clock read in each fresh-send
-/// lane. All three lanes (metrics / logs / spans) call THIS function — not an
-/// inline `now_monotonic_msec()` — so the naming convention makes the
-/// post-send timing contract visible in code review, and tests can exercise
-/// the correct-vs-stale split without reaching into the async loop.
-#[inline]
-fn post_send_backoff_basis() -> u64 {
-    now_monotonic_msec()
+    // (Log drain happens every SHUTDOWN_POLL_INTERVAL inside the chunked
+    // sleep above — no separate log drain here.)
+    ShutdownKind::None
 }
 
 // ── Retry-drain abstraction ───────────────────────────────────────────────────
@@ -3447,6 +2443,8 @@ fn collect_error_rate_metric(base: *mut u8, n_workers: usize, start_time_ns: u64
 
 #[cfg(test)]
 mod tests {
+    #[cfg(test)]
+    use super::backoff::TEST_CLOCK_MSEC;
     use super::*;
 
     /// Verify that the retry queue never exceeds the configured depth and that
