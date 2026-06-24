@@ -3,7 +3,14 @@
 // This source code is licensed under the Apache License, Version 2.0 license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! Export loop running in the `nginx: otel exporter` process.
+//! Drain loop running in the `nginx: otel exporter` process.
+//!
+//! This module (`drain/`) implements the cold-path drain loop that runs
+//! **inside the exporter process** — it is the consumer side of the shm
+//! ring buffers written by workers.  The `exporter/` module handles the
+//! exporter process lifecycle (spawn, signals, privilege drop); the one-letter
+//! difference between `export` and `exporter` made those two modules easy to
+//! confuse at a glance.
 //!
 //! [`export_loop`] runs inside the **exporter process**, spawned by
 //! `otel_exporter_cycle` in `src/exporter/mod.rs`. It:
@@ -2404,9 +2411,9 @@ impl RetrySend for MetricsRetry<'_> {
 /// and stops attempting sends for the rest of this drain pass.
 ///
 /// Called by:
-///   logs lane    — src/export/mod.rs (logs retry drain, `&LOGS_SEND_FAILURES`)
-///   spans lane   — src/export/mod.rs (spans retry drain, `&TRACES_SEND_FAILURES`)
-///   metrics lane — src/export/mod.rs (metrics retry drain, `&SEND_FAILURES`)
+///   logs lane    — src/drain/mod.rs (logs retry drain, `&LOGS_SEND_FAILURES`)
+///   spans lane   — src/drain/mod.rs (spans retry drain, `&TRACES_SEND_FAILURES`)
+///   metrics lane — src/drain/mod.rs (metrics retry drain, `&SEND_FAILURES`)
 ///
 /// # Safety
 /// `log` must point to a valid `ngx_log_t` or be `null_mut()`.  All log calls

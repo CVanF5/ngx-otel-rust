@@ -28,7 +28,7 @@
 //! # Static dispatch
 //!
 //! [`Processor`] is a concrete enum over all built-in processor implementations.
-//! This keeps dispatch static and matches the pattern used by [`crate::export`]'s
+//! This keeps dispatch static and matches the pattern used by [`crate::drain`]'s
 //! `ExportTransport` — the exporter is already on the heap; one enum avoids a
 //! `Box<dyn ProcessorImpl>` indirection.
 

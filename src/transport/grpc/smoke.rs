@@ -516,7 +516,7 @@ pub async fn fire_bidi_overload(
     endpoint_str: &str,
     log: core::ptr::NonNull<nginx_sys::ngx_log_t>,
 ) -> Result<(), SmokeError> {
-    use crate::export::BIDI_BACKPRESSURE_DROPS;
+    use crate::drain::BIDI_BACKPRESSURE_DROPS;
     use crate::transport::grpc::echo_proto::ngx_otel_echo_v1::{echo_client::EchoClient, Ping};
     use core::sync::atomic::Ordering;
 

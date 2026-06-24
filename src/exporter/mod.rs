@@ -255,7 +255,7 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
 
                     // Publish the restart count so the self-metric is visible on
                     // the first export tick (count - 1 = prior crashes in window).
-                    crate::export::EXPORTER_RESTARTS.store(count - 1, Ordering::Relaxed);
+                    crate::drain::EXPORTER_RESTARTS.store(count - 1, Ordering::Relaxed);
                 }
 
                 // Capture crash count for the test-support hook at step 10.
@@ -410,7 +410,7 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
         //     by workers via fork-shared pages. The exporter owns the export loop.
         let amcf =
             HttpOtelModule::main_conf(&*cycle).expect("exporter cycle: missing otel main conf");
-        let task = ngx::async_::spawn(crate::export::export_loop(amcf));
+        let task = ngx::async_::spawn(crate::drain::export_loop(amcf));
         let pool = Pool::from_ngx_pool((*cycle).pool);
         // `Pool::allocate` returns null when the underlying pool alloc OR the
         // cleanup-handler registration fails; on null it has already dropped
@@ -574,7 +574,7 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
                 nginx_sys::ngx_add_timer(&raw mut backstop_ev, backstop_ms);
 
                 let drain_deadline = std::time::Instant::now() + GRACEFUL_DRAIN_BACKSTOP;
-                while !crate::export::EXPORT_LOOP_DONE.load(Ordering::Acquire)
+                while !crate::drain::EXPORT_LOOP_DONE.load(Ordering::Acquire)
                     && std::time::Instant::now() < drain_deadline
                 {
                     nginx_sys::ngx_process_events_and_timers(cycle);
@@ -587,7 +587,7 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
                     // the rbtree.
                     nginx_sys::ngx_del_timer(&raw mut backstop_ev);
                 }
-                let drained = crate::export::EXPORT_LOOP_DONE.load(Ordering::Relaxed);
+                let drained = crate::drain::EXPORT_LOOP_DONE.load(Ordering::Relaxed);
                 ngx::ngx_log_error!(
                     nginx_sys::NGX_LOG_NOTICE,
                     (*cycle).log,

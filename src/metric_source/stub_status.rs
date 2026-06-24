@@ -14,7 +14,7 @@
 use core::sync::atomic::Ordering;
 
 use crate::data_model::{Metric, MetricData};
-use crate::export::monotonic_sum_metric;
+use crate::drain::monotonic_sum_metric;
 use crate::metric_source::MetricSource;
 
 /// A `MetricSource` that reads NGINX's internal connection/request counters.

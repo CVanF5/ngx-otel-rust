@@ -645,7 +645,7 @@ impl MainConfig {
     /// Whether to emit the decomposed `method × status_class × protocol`
     /// breakdown on the duration histogram (default on; `UNSET`/`on` → true).
     ///
-    /// Read in `export_loop` (`export/mod.rs`) to set
+    /// Read in `export_loop` (`drain/mod.rs`) to set
     /// Returns `true` when metric collection and export is enabled.
     ///
     /// When the `otel_metrics` directive is absent (default) or set to `on`,

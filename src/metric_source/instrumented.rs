@@ -1561,7 +1561,7 @@ fn ms_to_s_hist_sum(sum_ms: u64) -> f64 {
 /// The worker buckets seconds directly (`shm::ExpHistogramSlot`) but accumulates
 /// the scalar sum in raw µs; this is the lossless convert-at-export step (same
 /// `duration_us / 1_000_000.0` pattern the access-log/span duration attributes
-/// use in `export/mod.rs` and `traces/mod.rs`).
+/// use in `drain/mod.rs` and `traces/mod.rs`).
 #[inline]
 fn us_to_seconds(value_us: u64) -> f64 {
     value_us as f64 / 1_000_000.0
@@ -2297,7 +2297,7 @@ mod tests {
     #[test]
     fn f5_export_interval_unit_is_seconds() {
         use crate::data_model::{MetricData, NumberValue};
-        use crate::export::SelfMetricsSource;
+        use crate::drain::SelfMetricsSource;
         use crate::metric_source::MetricSource;
 
         let src = SelfMetricsSource {

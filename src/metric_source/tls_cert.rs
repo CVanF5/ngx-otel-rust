@@ -40,7 +40,7 @@ pub const TIME_TO_EXPIRATION: &str = "ngx_otel.tls.certificate.time_to_expiratio
 /// A `MetricSource` over the config-time serving-certificate table.
 ///
 /// Borrows `MainConfig::cert_table`; constructed per collection tick in
-/// `export::collect_all_sources`, exporter process only (never workers,
+/// `drain::collect_all_sources`, exporter process only (never workers,
 /// never the request hot path).
 pub struct ServingCertSource<'a> {
     pub certs: &'a [CertInfo],
