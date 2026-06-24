@@ -941,7 +941,9 @@ use crate::logs::ring::{ring_size_bytes, WorkerSignalRing, WorkerSignalRingHeade
 //   2. coalesce_table_bytes() % 8 == 0  (so slot stride is 8-aligned)
 //   3. data_offset() % 8 == 0  (so slot 0 starts 8-aligned inside the mmap zone)
 //
-// cap % 8 == 0 is enforced at config-parse time by `cmd_set_log_ring_size`.
+// cap % 8 == 0 holds by construction: the production ring cap is the fixed,
+// 8-aligned `DEFAULT_LOG_RING_CAP`; any test-only ring-size override aligns its
+// argument to 8 at parse time.
 const _: () = assert!(
     crate::logs::ring::RING_HEADER_SIZE % 8 == 0,
     "WorkerSignalRingHeader size must be a multiple of 8: error-ring header alignment depends on this",

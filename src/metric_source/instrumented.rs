@@ -188,9 +188,9 @@ impl LogPhaseHandler {
         // The SAME `worker_id` indexes the metrics zone (`worker_slots`, just
         // below), the logs access ring (`logs_access_ring`), and the spans ring
         // (`spans_ring`).  Any of these zones may be absent (e.g. the metrics
-        // zone when `otel_metrics off`).  The metrics zone can also be inflated
-        // past the reserved worker count via `otel_zone_size`, so a `worker_id`
-        // that fits it could still overrun the smaller logs/spans rings.
+        // zone when `otel_metrics off`), and they are sized independently, so
+        // their per-worker capacities can differ.  A `worker_id` that fits the
+        // largest registered zone could still overrun a smaller ring.
         // Validate against the MIN of all registered zone capacities so the
         // smallest indexed ring is covered before any ring write.
         // `min_indexed_worker_capacity()` derives each capacity from the
