@@ -228,8 +228,7 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
 
                 // (c) Give-up: too many crashes in this window → degrade + exit.
                 if count > MAX_CRASH_RESTARTS {
-                    ngx::ngx_log_error!(
-                        nginx_sys::NGX_LOG_ALERT,
+                    alert!(
                         (*cycle).log,
                         "otel exporter: disabled after {} crashes in {}s \
                          — telemetry OFF, nginx request handling UNAFFECTED",
@@ -244,8 +243,7 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
                 // (d) Backoff: throttle the re-crash rate before risky init.
                 if count > 1 {
                     let backoff_ms = crash_backoff_ms(count);
-                    ngx::ngx_log_error!(
-                        nginx_sys::NGX_LOG_WARN,
+                    warn!(
                         (*cycle).log,
                         "otel exporter: crash #{} in window, backing off {}ms before init",
                         count,
@@ -317,8 +315,7 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
             if let Some(init_process_fn) = (*m).init_process {
                 let rc = init_process_fn(cycle);
                 if rc == nginx_sys::NGX_ERROR as nginx_sys::ngx_int_t {
-                    ngx::ngx_log_error!(
-                        nginx_sys::NGX_LOG_EMERG,
+                    emerg!(
                         (*cycle).log,
                         "otel exporter: module[{}] init_process returned NGX_ERROR",
                         i
@@ -349,11 +346,7 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
         if rc == nginx_sys::NGX_ERROR as nginx_sys::ngx_int_t {
             // Fatal: if we can't receive channel commands, master can't signal
             // us to quit. exit(2) disables respawn so we don't loop forever.
-            ngx::ngx_log_error!(
-                nginx_sys::NGX_LOG_EMERG,
-                (*cycle).log,
-                "otel exporter: ngx_add_channel_event failed; aborting"
-            );
+            emerg!((*cycle).log, "otel exporter: ngx_add_channel_event failed; aborting");
             std::process::exit(2);
         }
 
@@ -390,8 +383,7 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
                 // the master time to enter ngx_master_process_cycle + sigsuspend.
                 let sleep_ms: u64 = if tcc == 1 { 500 } else { 300 };
                 std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
-                ngx::ngx_log_error!(
-                    nginx_sys::NGX_LOG_WARN,
+                warn!(
                     (*cycle).log,
                     "otel exporter: [test-support] NGX_OTEL_CRASH_ON_STARTUP set \
                      — calling abort() to simulate crash #{} (proctitle set)",
@@ -421,8 +413,7 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
         // in that state: log EMERG and abort so the master's crash-respawn
         // (NGX_PROCESS_RESPAWN) restarts the exporter cleanly.
         if pool.allocate(task).is_null() {
-            ngx::ngx_log_error!(
-                nginx_sys::NGX_LOG_EMERG,
+            emerg!(
                 (*cycle).log,
                 "otel exporter: failed to pin export task on the cycle pool \
                  (out of memory) — aborting so the master respawns the exporter"
@@ -464,8 +455,7 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
                 // Non-fatal: telemetry export still works; only the worker-side
                 // stale detection is unavailable (workers see last_beat == 0 or
                 // the pre-fork value and apply startup grace).
-                ngx::ngx_log_error!(
-                    nginx_sys::NGX_LOG_WARN,
+                warn!(
                     (*cycle).log,
                     "otel exporter: heartbeat timer allocation failed; \
                      liveness stale-detection disabled for this generation"
@@ -495,8 +485,7 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
         // no extra unsafe block.
         let pid = nginx_sys::ngx_pid;
         let parent = nginx_sys::ngx_parent;
-        ngx::ngx_log_error!(
-            nginx_sys::NGX_LOG_NOTICE,
+        notice!(
             (*cycle).log,
             "otel exporter: cycle entered, pid={}, parent={}, endpoint={}",
             pid,
@@ -510,11 +499,7 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
         //     (signalled via EXPORT_LOOP_DONE) before exiting.
         loop {
             if nginx_sys::ngx_terminate != 0 {
-                ngx::ngx_log_error!(
-                    nginx_sys::NGX_LOG_NOTICE,
-                    (*cycle).log,
-                    "otel exporter: ngx_terminate, exit"
-                );
+                notice!((*cycle).log, "otel exporter: ngx_terminate, exit");
                 std::process::exit(0);
             }
             if nginx_sys::ngx_quit != 0 {
@@ -588,22 +573,13 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
                     nginx_sys::ngx_del_timer(&raw mut backstop_ev);
                 }
                 let drained = crate::drain::EXPORT_LOOP_DONE.load(Ordering::Relaxed);
-                ngx::ngx_log_error!(
-                    nginx_sys::NGX_LOG_NOTICE,
-                    (*cycle).log,
-                    "otel exporter: ngx_quit, drain_done={}, exit",
-                    drained
-                );
+                notice!((*cycle).log, "otel exporter: ngx_quit, drain_done={}, exit", drained);
                 std::process::exit(0);
             }
             if nginx_sys::ngx_reopen != 0 {
                 nginx_sys::ngx_reopen = 0;
                 nginx_sys::ngx_reopen_files(cycle, -1i32 as nginx_sys::ngx_uid_t);
-                ngx::ngx_log_error!(
-                    nginx_sys::NGX_LOG_NOTICE,
-                    (*cycle).log,
-                    "otel exporter: reopening logs"
-                );
+                notice!((*cycle).log, "otel exporter: reopening logs");
             }
             nginx_sys::ngx_process_events_and_timers(cycle);
         }
@@ -687,8 +663,7 @@ unsafe fn close_sibling_channels(cycle: *mut nginx_sys::ngx_cycle_t) {
             continue; // no write end to close
         }
         if libc::close(ch1) == -1 {
-            ngx::ngx_log_error!(
-                nginx_sys::NGX_LOG_ALERT,
+            alert!(
                 (*cycle).log,
                 "otel exporter: close() channel[1] for slot {} (pid={}) failed",
                 n,
@@ -701,11 +676,7 @@ unsafe fn close_sibling_channels(cycle: *mut nginx_sys::ngx_cycle_t) {
     // (ngx_channel) — that's the fd we registered for channel events.
     let ch0 = nginx_sys::ngx_processes[slot].channel[0];
     if ch0 != -1 && libc::close(ch0) == -1 {
-        ngx::ngx_log_error!(
-            nginx_sys::NGX_LOG_ALERT,
-            (*cycle).log,
-            "otel exporter: close() channel[0] for our slot failed"
-        );
+        alert!((*cycle).log, "otel exporter: close() channel[0] for our slot failed");
     }
 }
 
@@ -755,12 +726,7 @@ unsafe fn drop_privileges_and_chdir(cycle: *mut nginx_sys::ngx_cycle_t) {
 
     // setgid MUST come before setuid (once setuid drops, setgid is locked).
     if libc::setgid((*ccf).group as libc::gid_t) == -1 {
-        ngx::ngx_log_error!(
-            nginx_sys::NGX_LOG_EMERG,
-            (*cycle).log,
-            "otel exporter: setgid({}) failed",
-            (*ccf).group
-        );
+        emerg!((*cycle).log, "otel exporter: setgid({}) failed", (*ccf).group);
         // Fatal: exit(2) disables respawn — privilege-drop failure is
         // unrecoverable (ngx_process.c:551-557).
         std::process::exit(2);
@@ -775,23 +741,14 @@ unsafe fn drop_privileges_and_chdir(cycle: *mut nginx_sys::ngx_cycle_t) {
     #[cfg(not(target_os = "linux"))]
     let initgroups_gid = (*ccf).group as libc::c_int;
     if libc::initgroups((*ccf).username, initgroups_gid) == -1 {
-        ngx::ngx_log_error!(
-            nginx_sys::NGX_LOG_ALERT,
-            (*cycle).log,
-            "otel exporter: initgroups() failed (non-fatal)"
-        );
+        alert!((*cycle).log, "otel exporter: initgroups() failed (non-fatal)");
     }
 
     // TODO: skip NGX_HAVE_CAPABILITIES + transparent branch.
     // The exporter does not proxy with transparent addresses today.
 
     if libc::setuid((*ccf).user as libc::uid_t) == -1 {
-        ngx::ngx_log_error!(
-            nginx_sys::NGX_LOG_EMERG,
-            (*cycle).log,
-            "otel exporter: setuid({}) failed",
-            (*ccf).user
-        );
+        emerg!((*cycle).log, "otel exporter: setuid({}) failed", (*ccf).user);
         std::process::exit(2);
     }
 
@@ -800,11 +757,7 @@ unsafe fn drop_privileges_and_chdir(cycle: *mut nginx_sys::ngx_cycle_t) {
     // production diagnostics demand it.
 
     if (*ccf).working_directory.len > 0 && libc::chdir((*ccf).working_directory.data.cast()) == -1 {
-        ngx::ngx_log_error!(
-            nginx_sys::NGX_LOG_ALERT,
-            (*cycle).log,
-            "otel exporter: chdir() failed"
-        );
+        alert!((*cycle).log, "otel exporter: chdir() failed");
         std::process::exit(2);
     }
 }
