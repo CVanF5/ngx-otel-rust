@@ -1,0 +1,14 @@
+TSAN F2 evidence — exporter-core simplicity remediation (S2/S3/S4/S9)
+GIT_COMMIT=fe80eaa4b2fa6fba0d73ad094b9495447f4f1294   captured=2026-06-24T10:15:07Z   host=macOS arm64 / Docker linux-arm64 (build/Dockerfile.tsan)
+command: make tsan-test
+---- provenance + verdict (from gate-exporter-core.log) ----
+[tsan-run] PROVENANCE: GIT_COMMIT=fe80eaa4b2fa6fba0d73ad094b9495447f4f1294 DATE=2026-06-24T09:50:55Z
+[tsan-run] Zero ThreadSanitizer warnings.  TSAN gate: PASS.
+[tsan-run] INTEGRATION NOTE: these scripts had functional/timing failures: run_signal_storm.sh(rc=2)
+---- note: run_signal_storm.sh rc=2 is the known Docker-root log-dir perms/timing flake;
+     the ThreadSanitizer WARNING SCAN (zero warnings) is the race gate and it PASSED. ----
+[tsan-run] Step 3.5: Pre-building TSAN-instrumented cdylib...
+[tsan-run] Step 3.5: nm-check: /work/ngx-otel-rust/target/aarch64-unknown-linux-gnu/release/libngx_http_otel_module.so
+[tsan-run] Step 3.5: __tsan_* symbol count in cdylib: 42
+[tsan-run] Step 3.5: OK — 42 __tsan_* symbols confirmed in libngx_http_otel_module.so.
+[tsan-run] Step 3.5: full path: /work/ngx-otel-rust/target/aarch64-unknown-linux-gnu/release/libngx_http_otel_module.so

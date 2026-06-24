@@ -1,0 +1,12 @@
+ASan F2 evidence — exporter-core simplicity remediation (S2/S3/S4/S9)
+GIT_COMMIT=fe80eaa4b2fa6fba0d73ad094b9495447f4f1294   captured=2026-06-24T10:15:07Z   host=macOS arm64 / Docker linux-arm64 (build/Dockerfile.tsan)
+command: make asan-test  (after clearing stale objs-sanitize volume to force SSL-linked reconfigure)
+---- provenance + verdict (from gate-rerun-exporter-core.log) ----
+[asan-run] PROVENANCE: GIT_COMMIT=fe80eaa4b2fa6fba0d73ad094b9495447f4f1294 DATE=2026-06-24T10:07:28Z
+[asan-run] Zero AddressSanitizer reports across: run_grpc_export.sh run_grpc_bidi_smoke.sh run_dns_dualstack.sh run_reload.sh run_traces.sh run_redirect_safe.sh run_access_log.sh run_c2_cert_walk.sh run_c3_cert_metrics.sh run_chaos_kill9.sh run_chaos_crashloop.sh run_chaos_dead_collector.sh run_b4_daemon_on_gen1.sh run_b1_spsc_reload_chaos.sh run_chaos_quit_responsiveness.sh
+[asan-run] ASan gate: PASS (no use-after-free / heap error on the exercised wake paths).
+[asan-run] Step 3.5: Pre-building ASan-instrumented cdylib...
+[asan-run] Step 3.5: nm-check: /work/ngx-otel-rust/target/aarch64-unknown-linux-gnu/release/libngx_http_otel_module.so
+[asan-run] Step 3.5: __asan_* symbol count in cdylib: 142
+[asan-run] Step 3.5: OK — 142 __asan_* symbols confirmed in libngx_http_otel_module.so.
+[asan-run] Step 3.5: full path: /work/ngx-otel-rust/target/aarch64-unknown-linux-gnu/release/libngx_http_otel_module.so
