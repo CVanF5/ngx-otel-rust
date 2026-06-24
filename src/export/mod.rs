@@ -1245,12 +1245,15 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                         })
                     };
                     // Pdata pipeline: wrap → process → encode → send (Step U2).
-                    let mut logs_pd = Pdata::Logs(collect_log_records(
-                        amcf,
-                        logs_base,
-                        n_workers,
-                        worker_start_ns,
-                    ));
+                    let (logs_batch, logs_drops) =
+                        collect_log_records(amcf, logs_base, n_workers, worker_start_ns);
+                    ACCESS_LOGS_DROPPED.store(logs_drops.access_dropped, Ordering::Relaxed);
+                    ERROR_LOGS_DROPPED.store(logs_drops.error_dropped, Ordering::Relaxed);
+                    if logs_drops.error_coalesced_orphaned > 0 {
+                        ERROR_LOGS_COALESCED_ORPHANED
+                            .fetch_add(logs_drops.error_coalesced_orphaned, Ordering::Relaxed);
+                    }
+                    let mut logs_pd = Pdata::Logs(logs_batch);
                     processor.process(&mut logs_pd);
                     send_fresh_batch(
                         &mut transport,
@@ -1328,8 +1331,10 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                         })
                     };
                     // Pdata pipeline: wrap → process → encode → send (Step U2).
-                    let mut spans_pd =
-                        Pdata::Spans(collect_span_records(amcf, spans_base, n_workers));
+                    let (spans_batch, spans_dropped) =
+                        collect_span_records(amcf, spans_base, n_workers);
+                    TRACES_DROPPED_RECORDS.store(spans_dropped, Ordering::Relaxed);
+                    let mut spans_pd = Pdata::Spans(spans_batch);
                     processor.process(&mut spans_pd);
                     send_fresh_batch(
                         &mut transport,
@@ -1802,8 +1807,15 @@ async fn graceful_drain(
                 })
             };
             // Pdata pipeline: wrap → process → encode → send (Step U2).
-            let mut logs_pd =
-                Pdata::Logs(collect_log_records(amcf, logs_base, n_workers, worker_start_ns));
+            let (logs_batch, logs_drops) =
+                collect_log_records(amcf, logs_base, n_workers, worker_start_ns);
+            ACCESS_LOGS_DROPPED.store(logs_drops.access_dropped, Ordering::Relaxed);
+            ERROR_LOGS_DROPPED.store(logs_drops.error_dropped, Ordering::Relaxed);
+            if logs_drops.error_coalesced_orphaned > 0 {
+                ERROR_LOGS_COALESCED_ORPHANED
+                    .fetch_add(logs_drops.error_coalesced_orphaned, Ordering::Relaxed);
+            }
+            let mut logs_pd = Pdata::Logs(logs_batch);
             processor.process(&mut logs_pd);
             let n_logs = count_pdata_records(&logs_pd);
             if n_logs > 0 {
@@ -1888,7 +1900,9 @@ async fn graceful_drain(
                     spans_n_workers_from_zone(avail, DEFAULT_SPAN_RING_CAP)
                 })
             };
-            let mut spans_pd = Pdata::Spans(collect_span_records(amcf, spans_base, n_workers));
+            let (spans_batch, spans_dropped) = collect_span_records(amcf, spans_base, n_workers);
+            TRACES_DROPPED_RECORDS.store(spans_dropped, Ordering::Relaxed);
+            let mut spans_pd = Pdata::Spans(spans_batch);
             processor.process(&mut spans_pd);
             let n_spans = count_pdata_records(&spans_pd);
             if n_spans > 0 {
@@ -2739,6 +2753,19 @@ fn collect_all_sources(amcf: &MainConfig, worker_start_ns: u64, collector_host: 
     }
 }
 
+/// Per-interval drop counts returned by [`collect_log_records`].
+///
+/// The caller is responsible for updating the corresponding self-metric
+/// atomics so that collection is decoupled from instrumentation.
+struct LogsDropCounts {
+    /// Sum of per-worker access-ring `drop_count()` snapshots.
+    access_dropped: u64,
+    /// Sum of per-worker error-ring `drop_count()` snapshots.
+    error_dropped: u64,
+    /// Total orphaned coalesced-count occurrences for this drain cycle.
+    error_coalesced_orphaned: u64,
+}
+
 /// Drain all worker access-log and error-log rings and assemble a [`LogsBatch`].
 ///
 /// Called once per export tick when `any_log_export_enabled()` is true.
@@ -2746,22 +2773,23 @@ fn collect_all_sources(amcf: &MainConfig, worker_start_ns: u64, collector_host: 
 /// (access) and error records written by the `ngx_otel_error_writer` hook
 /// (error logs).
 ///
-/// Updates `ACCESS_LOGS_DROPPED` from each ring's `drop_count()`.
-/// Updates `ERROR_LOGS_DROPPED` from the error ring's `drop_count()`.
+/// Returns a [`LogsDropCounts`] alongside the batch; the caller stores the
+/// counts into `ACCESS_LOGS_DROPPED`, `ERROR_LOGS_DROPPED`, and
+/// `ERROR_LOGS_COALESCED_ORPHANED`.
 ///
 /// **Orphaned coalesced counts:** after ring drain, any entry in the
 /// coalescer `counts_vec` whose `template_hash` was NOT matched by a ring
 /// record (meaning the verbatim ring push failed — ring full) gets a
 /// synthetic `LogRecord` with `body = "(ring-full: verbatim sample dropped
 /// — occurrence count preserved)"`, `nginx.error.template_hash`, and
-/// `nginx.error.coalesced_count` attributes.  `ERROR_LOGS_COALESCED_ORPHANED`
-/// is incremented by the total orphaned occurrence count.
+/// `nginx.error.coalesced_count` attributes.  The orphaned total is
+/// returned in `LogsDropCounts::error_coalesced_orphaned`.
 fn collect_log_records(
     amcf: &MainConfig,
     logs_base: *mut u8,
     n_workers: usize,
     _now_ns: u64,
-) -> LogsBatch {
+) -> (LogsBatch, LogsDropCounts) {
     let now = crate::util::now_unix_nano();
 
     let mut logs: std::vec::Vec<LogRecord> = std::vec::Vec::new();
@@ -2818,12 +2846,13 @@ fn collect_log_records(
         }
     }
 
-    // Update the ACCESS_LOGS_DROPPED self-metric.
-    ACCESS_LOGS_DROPPED.store(total_dropped, Ordering::Relaxed);
+    // Capture access drop count; the caller stores it into ACCESS_LOGS_DROPPED.
+    let access_dropped = total_dropped;
 
     // Drain error rings: only when error_log_enabled.
     if amcf.error_log_enabled {
         let mut error_dropped: u64 = 0;
+        let mut total_orphaned: u64 = 0;
         for w in 0..n_workers {
             // 1. Drain the coalescer table to get (key_hash, severity, count) tuples.
             //    Safety: zone sized for n_workers; w < n_workers; cap correct.
@@ -2878,7 +2907,6 @@ fn collect_log_records(
             // seen in any ring record consumed above.  The synthetic record carries
             // the coalesced_count so the backend receives the occurrence total even
             // without the original error message body.
-            let mut orphaned_total: u64 = 0;
             for &(hash, severity, count) in &counts_vec {
                 if count > 0 && !consumed_hashes.contains(&hash) {
                     let (severity_number, severity_text) = nginx_to_otel(severity as u32);
@@ -2904,21 +2932,37 @@ fn collect_log_records(
                         trace_id: std::vec::Vec::new(),
                         span_id: std::vec::Vec::new(),
                     });
-                    orphaned_total += count as u64;
+                    total_orphaned += count as u64;
                 }
             }
-            if orphaned_total > 0 {
-                // Accumulate additively — orphaned counts are per-interval.
-                ERROR_LOGS_COALESCED_ORPHANED.fetch_add(orphaned_total, Ordering::Relaxed);
-            }
         }
-        ERROR_LOGS_DROPPED.store(error_dropped, Ordering::Relaxed);
-    }
-
-    LogsBatch {
-        resource: Resource { attributes: build_resource_attrs(amcf) },
-        scope: Scope { name: "ngx-otel-rust".into(), version: env!("CARGO_PKG_VERSION").into() },
-        logs,
+        (
+            LogsBatch {
+                resource: Resource { attributes: build_resource_attrs(amcf) },
+                scope: Scope {
+                    name: "ngx-otel-rust".into(),
+                    version: env!("CARGO_PKG_VERSION").into(),
+                },
+                logs,
+            },
+            LogsDropCounts {
+                access_dropped,
+                error_dropped,
+                error_coalesced_orphaned: total_orphaned,
+            },
+        )
+    } else {
+        (
+            LogsBatch {
+                resource: Resource { attributes: build_resource_attrs(amcf) },
+                scope: Scope {
+                    name: "ngx-otel-rust".into(),
+                    version: env!("CARGO_PKG_VERSION").into(),
+                },
+                logs,
+            },
+            LogsDropCounts { access_dropped, error_dropped: 0, error_coalesced_orphaned: 0 },
+        )
     }
 }
 
@@ -2927,8 +2971,13 @@ fn collect_log_records(
 /// Called once per sub-interval tick (every [`SHUTDOWN_POLL_INTERVAL`])
 /// when the spans shm zone is mapped.  Mirrors [`collect_log_records`].
 ///
-/// Updates `TRACES_DROPPED_RECORDS` from each ring's `drop_count()`.
-fn collect_span_records(amcf: &MainConfig, spans_base: *mut u8, n_workers: usize) -> SpansBatch {
+/// Returns the sum of per-worker `drop_count()` snapshots alongside the batch;
+/// the caller stores it into `TRACES_DROPPED_RECORDS`.
+fn collect_span_records(
+    amcf: &MainConfig,
+    spans_base: *mut u8,
+    n_workers: usize,
+) -> (SpansBatch, u64) {
     let now = crate::util::now_unix_nano();
 
     let mut spans: std::vec::Vec<Span> = std::vec::Vec::new();
@@ -2960,13 +3009,17 @@ fn collect_span_records(amcf: &MainConfig, spans_base: *mut u8, n_workers: usize
         }
     }
 
-    TRACES_DROPPED_RECORDS.store(total_dropped, Ordering::Relaxed);
-
-    SpansBatch {
-        resource: Resource { attributes: build_resource_attrs(amcf) },
-        scope: Scope { name: "ngx-otel-rust".into(), version: env!("CARGO_PKG_VERSION").into() },
-        spans,
-    }
+    (
+        SpansBatch {
+            resource: Resource { attributes: build_resource_attrs(amcf) },
+            scope: Scope {
+                name: "ngx-otel-rust".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
+            },
+            spans,
+        },
+        total_dropped,
+    )
 }
 
 /// Parse one access log record from the wire-format bytes produced by
@@ -3551,7 +3604,7 @@ mod tests {
         // Synthesize a minimal config (log_ring_cap() = DEFAULT_LOG_RING_CAP).
         let amcf = crate::config::MainConfig::default();
 
-        let batch = collect_log_records(&amcf, slot_ptr, 1, 0);
+        let (batch, _drops) = collect_log_records(&amcf, slot_ptr, 1, 0);
         assert!(batch.logs.is_empty(), "empty rings must produce empty LogsBatch");
 
         // SAFETY: `slot_ptr`/`layout` are the exact pointer and layout returned
@@ -3640,7 +3693,7 @@ mod tests {
             let error_hdr = slot_ptr.add(ring_size_bytes(cap)).cast::<WorkerSignalRingHeader>();
             (*error_hdr).cap.store(cap as u64, Ordering::Relaxed);
         }
-        let logs_batch = collect_log_records(&amcf, slot_ptr, 1, 0);
+        let (logs_batch, _drops) = collect_log_records(&amcf, slot_ptr, 1, 0);
         // SAFETY: same pointer/layout returned by `alloc_zeroed` above; the
         // buffer is no longer referenced after `collect_log_records` returns.
         unsafe { std::alloc::dealloc(slot_ptr, layout) };
@@ -3882,7 +3935,7 @@ mod tests {
         }
 
         let amcf = crate::config::MainConfig::default();
-        let batch = collect_log_records(&amcf, slot_ptr, 1, 0);
+        let (batch, _drops) = collect_log_records(&amcf, slot_ptr, 1, 0);
 
         assert_eq!(batch.logs.len(), 1, "one access LogRecord expected");
         let rec = &batch.logs[0];
@@ -3956,7 +4009,7 @@ mod tests {
             ..crate::config::MainConfig::default()
         };
 
-        let batch = collect_log_records(&amcf, slot_ptr, 1, 0);
+        let (batch, _drops) = collect_log_records(&amcf, slot_ptr, 1, 0);
 
         // Must have exactly ONE record: the nginx.error entry.
         assert_eq!(batch.logs.len(), 1, "one error record must be drained");
@@ -4052,7 +4105,7 @@ mod tests {
             ..crate::config::MainConfig::default()
         };
 
-        let batch = collect_log_records(&amcf, slot_ptr, 1, 0);
+        let (batch, _drops) = collect_log_records(&amcf, slot_ptr, 1, 0);
 
         assert_eq!(batch.logs.len(), 1, "one error record");
         let rec = &batch.logs[0];
@@ -4142,10 +4195,7 @@ mod tests {
             ..crate::config::MainConfig::default()
         };
 
-        // Reset the orphaned counter before the test drain.
-        ERROR_LOGS_COALESCED_ORPHANED.store(0, Ordering::Relaxed);
-
-        let batch = collect_log_records(&amcf, slot_ptr, 1, 0);
+        let (batch, drops) = collect_log_records(&amcf, slot_ptr, 1, 0);
 
         // 3. Pre-fix: batch.logs would be empty (orphaned count silently discarded).
         //    Post-fix: one synthetic record is emitted carrying the orphaned count.
@@ -4191,11 +4241,11 @@ mod tests {
             "synthetic record body must contain 'ring-full'; got: {body_str:?}"
         );
 
-        // 4. Self-metric must reflect the orphaned count total.
-        let orphaned_metric = ERROR_LOGS_COALESCED_ORPHANED.load(Ordering::Acquire);
+        // 4. The returned drop count must reflect the orphaned count total.
+        //    (The caller is responsible for storing this into ERROR_LOGS_COALESCED_ORPHANED.)
         assert_eq!(
-            orphaned_metric, coalesced_n as u64,
-            "ERROR_LOGS_COALESCED_ORPHANED must be incremented by the orphaned count"
+            drops.error_coalesced_orphaned, coalesced_n as u64,
+            "error_coalesced_orphaned drop count must equal the orphaned slot count"
         );
     }
 
