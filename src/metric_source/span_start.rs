@@ -27,7 +27,9 @@
 //!   directive), the handler returns immediately.
 //! - **Bounded when unsampled:** pool-alloc + one header scan + sampling branch.
 //!   No span record, no ring push, no second header scan in LOG.
-//! - No heap allocation, no locks, no logging, no `std::thread::spawn`.
+//! - No heap allocation, no locks, no logging on the success path, no `std::thread::spawn`.
+//!   (A one-shot WARN is emitted per worker on the rare pool-OOM decline path; see
+//!   `warn_span_ctx_oom_once`.)
 
 use core::ffi::c_void;
 
@@ -41,6 +43,49 @@ use crate::traces::ctx::{
     alloc_span_ctx, alloc_span_ctx_plain, gen_span_id, gen_trace_id, pool_from_request, SpanCtx,
 };
 use crate::HttpOtelModule;
+
+// ── One-shot OOM warn ─────────────────────────────────────────────────────────
+
+use std::cell::Cell;
+
+thread_local! {
+    /// One-shot guard for the pool-alloc OOM WARN log.
+    ///
+    /// Set (once) when a `SpanCtx` pool allocation fails in this worker thread.
+    /// Ensures the "tracing context allocation failed" WARN is emitted at most
+    /// once per worker, matching the EMERG-once pattern in `traces::ctx`.
+    static SPAN_CTX_OOM_WARNED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Emit a single NGX_LOG_WARN for a SpanCtx pool-alloc failure.
+///
+/// Guarded by `SPAN_CTX_OOM_WARNED` so at most one WARN is emitted per worker
+/// thread — prevents log spam when the pool is persistently exhausted.
+/// In test/test-support builds the nginx log infrastructure is not initialised;
+/// the guard flag is still set so call-count assertions hold.
+///
+/// `#[cold]` keeps this off the compiler's inlining and optimisation horizon
+/// for the success path.
+#[cold]
+fn warn_span_ctx_oom_once(log: *mut nginx_sys::ngx_log_t) {
+    if SPAN_CTX_OOM_WARNED.with(Cell::get) {
+        return;
+    }
+    SPAN_CTX_OOM_WARNED.with(|f| f.set(true));
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        if log.is_null() {
+            return;
+        }
+        ngx::ngx_log_error!(
+            nginx_sys::NGX_LOG_WARN,
+            log,
+            "otel: request-pool alloc failed for SpanCtx; tracing context unavailable — \
+             spans may be lost for this and subsequent requests (pool exhausted)"
+        );
+    }
+    let _ = log;
+}
 
 /// Unit struct for the REWRITE-phase span-start handler.
 pub struct SpanStartHandler;
@@ -208,7 +253,13 @@ impl HttpRequestHandler for SpanStartHandler {
             let pool = unsafe { pool_from_request(r_ptr) };
             let pre_ctx = alloc_span_ctx_plain(&pool);
             if pre_ctx.is_null() {
-                return Status::NGX_DECLINED; // OOM (extremely rare)
+                // OOM (extremely rare): emit one WARN per worker so the operator
+                // knows spans may be lost, then degrade like any other gate-decline.
+                // SAFETY: `(*request.as_ref().connection).log` is the request log
+                // pointer, valid for the duration of this handler call.
+                let log = unsafe { (*request.as_ref().connection).log };
+                warn_span_ctx_oom_once(log);
+                return Status::NGX_DECLINED;
             }
             // SAFETY: `pre_ctx` is freshly pool-allocated (zeroed); we write only
             // `flags` here; all other fields (including `sampled`) remain zero
@@ -333,7 +384,11 @@ impl HttpRequestHandler for SpanStartHandler {
         let pool = unsafe { pool_from_request(r_ptr) };
         let ctx_ptr = alloc_span_ctx(&pool);
         if ctx_ptr.is_null() {
-            // OOM in the request pool — extremely rare.  Clear pre-gate ctx and exit.
+            // OOM in the request pool — extremely rare.  Emit one WARN per worker
+            // so the operator knows spans may be lost, then clear and degrade.
+            // SAFETY: `(*request.as_ref().connection).log` is the request log.
+            let log = unsafe { (*request.as_ref().connection).log };
+            warn_span_ctx_oom_once(log);
             request.set_module_ctx(core::ptr::null_mut(), module_ref);
             return Status::NGX_DECLINED;
         }

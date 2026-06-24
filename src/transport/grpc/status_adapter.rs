@@ -60,15 +60,33 @@ use crate::transport::DeliveryOutcome;
 // identical to the generated forms, and the `prost_types` crate (already a
 // transitive dep) provides `prost_types::Duration` for the `retry_delay` field.
 
+// Field-number source pins:
+//   google.rpc.Status:    https://github.com/googleapis/googleapis/blob/master/google/rpc/status.proto
+//     field 1  code    int32
+//     field 2  message string
+//     field 3  details repeated google.protobuf.Any   ← the only field we decode
+//   google.protobuf.Any:  https://github.com/protocolbuffers/protobuf/blob/main/src/google/protobuf/any.proto
+//     field 1  type_url string
+//     field 2  value    bytes
+//   google.rpc.RetryInfo: https://github.com/googleapis/googleapis/blob/master/google/rpc/error_details.proto
+//     field 1  retry_delay google.protobuf.Duration
+//   google.protobuf.Duration: https://github.com/protocolbuffers/protobuf/blob/main/src/google/protobuf/duration.proto
+//     field 1  seconds int64
+//     field 2  nanos   int32
+
 /// Minimal decode of `google.protobuf.Any` (field layout is canonical protobuf).
 ///
 /// Used to iterate the `details` array inside `google.rpc.Status`.
 #[derive(Clone, ::prost::Message)]
 struct ProtoAny {
-    /// The fully-qualified type URL, e.g. `type.googleapis.com/google.rpc.RetryInfo`.
+    /// `string type_url = 1;` — fully-qualified type URL, e.g.
+    /// `type.googleapis.com/google.rpc.RetryInfo`.
+    /// Field number pinned to `google.protobuf.Any.type_url = 1` per
+    /// <https://github.com/protocolbuffers/protobuf/blob/main/src/google/protobuf/any.proto>.
     #[prost(string, tag = "1")]
     type_url: ::prost::alloc::string::String,
-    /// The protobuf encoding of the wrapped message.
+    /// `bytes value = 2;` — protobuf encoding of the wrapped message.
+    /// Field number pinned to `google.protobuf.Any.value = 2` per the same source.
     #[prost(bytes = "vec", tag = "2")]
     value: ::prost::alloc::vec::Vec<u8>,
 }
@@ -81,6 +99,8 @@ struct ProtoAny {
 #[derive(Clone, ::prost::Message)]
 struct RpcStatus {
     /// `repeated google.protobuf.Any details = 3;`
+    /// Field number pinned to `google.rpc.Status.details = 3` per
+    /// <https://github.com/googleapis/googleapis/blob/master/google/rpc/status.proto>.
     #[prost(message, repeated, tag = "3")]
     details: ::prost::alloc::vec::Vec<ProtoAny>,
 }
@@ -95,6 +115,8 @@ struct RpcStatus {
 #[derive(Clone, ::prost::Message)]
 struct RetryInfo {
     /// `google.protobuf.Duration retry_delay = 1;`
+    /// Field number pinned to `google.rpc.RetryInfo.retry_delay = 1` per
+    /// <https://github.com/googleapis/googleapis/blob/master/google/rpc/error_details.proto>.
     #[prost(message, optional, tag = "1")]
     retry_delay: ::core::option::Option<::prost_types::Duration>,
 }
@@ -740,5 +762,79 @@ mod tests {
     fn s3_resource_exhausted_via_outcome_no_hint_permanent() {
         let status = tonic::Status::new(tonic::Code::ResourceExhausted, "rate limited");
         assert_eq!(grpc_status_to_outcome(&status), DeliveryOutcome::Permanent);
+    }
+
+    // ── Golden-byte fixture (S6) ──────────────────────────────────────────────
+    //
+    // This test decodes a **hand-computed, statically-known byte fixture** that
+    // represents a real `google.rpc.Status` proto carrying a `RetryInfo` detail.
+    // Unlike the symmetric round-trip tests above (which encode via our own
+    // structs and then decode — blind to field-number drift), this fixture is
+    // computed from first principles against the public proto definitions and
+    // does NOT use any of our encode helpers.  If a struct field number is
+    // changed, this test fails, catching the drift.
+    //
+    // Wire layout (all lengths are single-byte varints here):
+    //
+    //   google.rpc.Status { details[0] = Any { ... } }
+    //   ┌─────────────────────────────────────────────────────────┐
+    //   │ 0x1a 0x30  → field 3 (details), wire type 2 (LEN), len=48
+    //   │   ┌ google.protobuf.Any ─────────────────────────────── ┐
+    //   │   │ 0x0a 0x28  → field 1 (type_url), LEN, len=40        │
+    //   │   │   "type.googleapis.com/google.rpc.RetryInfo" (40 B)  │
+    //   │   │ 0x12 0x04  → field 2 (value), LEN, len=4            │
+    //   │   │   ┌ google.rpc.RetryInfo ──────────────────────── ┐  │
+    //   │   │   │ 0x0a 0x02  → field 1 (retry_delay), LEN, len=2 │ │
+    //   │   │   │   ┌ google.protobuf.Duration ──────────────┐   │  │
+    //   │   │   │   │ 0x08 0x05  → field 1 (seconds), VARINT=5 │  │  │
+    //   │   │   │   └────────────────────────────────────────┘   │  │
+    //   │   │   └───────────────────────────────────────────────┘  │
+    //   │   └──────────────────────────────────────────────────────┘
+    //   └─────────────────────────────────────────────────────────┘
+    //
+    // Field numbers sourced from:
+    //   google.rpc.Status.details    = 3  (google/rpc/status.proto)
+    //   google.protobuf.Any.type_url = 1  (google/protobuf/any.proto)
+    //   google.protobuf.Any.value    = 2  (google/protobuf/any.proto)
+    //   google.rpc.RetryInfo.retry_delay = 1  (google/rpc/error_details.proto)
+    //   google.protobuf.Duration.seconds = 1  (google/protobuf/duration.proto)
+    #[test]
+    fn s6_golden_byte_retry_info_fixture() {
+        // 50-byte static fixture: google.rpc.Status { details[0] = RetryInfo{5s} }
+        // Computed from proto wire format — NOT produced by our encode helpers.
+        #[rustfmt::skip]
+        const GOLDEN: &[u8] = &[
+            // google.rpc.Status: field 3 (details), LEN, length=48
+            0x1a, 0x30,
+            // google.protobuf.Any: field 1 (type_url), LEN, length=40
+            0x0a, 0x28,
+            // "type.googleapis.com/google.rpc.RetryInfo" (40 bytes)
+            0x74, 0x79, 0x70, 0x65, 0x2e, 0x67, 0x6f, 0x6f,
+            0x67, 0x6c, 0x65, 0x61, 0x70, 0x69, 0x73, 0x2e,
+            0x63, 0x6f, 0x6d, 0x2f, 0x67, 0x6f, 0x6f, 0x67,
+            0x6c, 0x65, 0x2e, 0x72, 0x70, 0x63, 0x2e, 0x52,
+            0x65, 0x74, 0x72, 0x79, 0x49, 0x6e, 0x66, 0x6f,
+            // google.protobuf.Any: field 2 (value), LEN, length=4
+            0x12, 0x04,
+            // google.rpc.RetryInfo: field 1 (retry_delay), LEN, length=2
+            0x0a, 0x02,
+            // google.protobuf.Duration: field 1 (seconds), VARINT, value=5
+            0x08, 0x05,
+        ];
+
+        // Sanity: the type_url string embedded in the fixture is correct.
+        assert_eq!(
+            core::str::from_utf8(&GOLDEN[4..44]).unwrap(),
+            "type.googleapis.com/google.rpc.RetryInfo",
+            "fixture type_url bytes must spell out the canonical RetryInfo type URL"
+        );
+
+        // Decode through our production path and assert the expected retry delay.
+        let result = extract_retry_info_from_details(GOLDEN);
+        assert_eq!(
+            result,
+            Some(Duration::from_secs(5)),
+            "golden-byte fixture must decode to a 5-second retry delay"
+        );
     }
 }
