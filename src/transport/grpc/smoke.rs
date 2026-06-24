@@ -257,10 +257,10 @@ pub async fn fire_one_grpc_export(
     let handshake_fut =
         hyper::client::conn::http2::handshake::<_, _, tonic::body::Body>(NgxExecutor, io);
 
-    ngx::ngx_log_debug!(log_ptr, "smoke: awaiting h2 handshake");
+    debug!(log_ptr, "smoke: awaiting h2 handshake");
     let (sender, conn) =
         handshake_fut.await.map_err(|e| SmokeError::Handshake(std::format!("{e}")))?;
-    ngx::ngx_log_debug!(log_ptr, "smoke: h2 handshake completed");
+    debug!(log_ptr, "smoke: h2 handshake completed");
 
     // 5. Drive `conn` (the request-stream dispatcher) on the NGINX event
     //    loop so requests can complete.  Detached: we don't await its
@@ -277,12 +277,12 @@ pub async fn fire_one_grpc_export(
     // 7. Issue the unary `Export(ExportMetricsServiceRequest)` call.
     let request = tonic::Request::new(build_export_request());
 
-    ngx::ngx_log_debug!(log_ptr, "smoke: awaiting client.export()");
+    debug!(log_ptr, "smoke: awaiting client.export()");
     let _resp = client
         .export(request)
         .await
         .map_err(|status| SmokeError::GrpcCall(std::format!("{status}")))?;
-    ngx::ngx_log_debug!(log_ptr, "smoke: client.export() returned OK");
+    debug!(log_ptr, "smoke: client.export() returned OK");
 
     Ok(())
 }
@@ -368,10 +368,10 @@ pub async fn fire_one_bidi_stream(
         io,
     );
 
-    ngx::ngx_log_debug!(log_ptr, "bidi smoke: awaiting h2 handshake");
+    debug!(log_ptr, "bidi smoke: awaiting h2 handshake");
     let (sender, conn) =
         handshake_fut.await.map_err(|e| SmokeError::Handshake(std::format!("{e}")))?;
-    ngx::ngx_log_debug!(log_ptr, "bidi smoke: h2 handshake completed");
+    debug!(log_ptr, "bidi smoke: h2 handshake completed");
 
     // 5. Drive the Connection on the NGINX event loop.
     ngx::async_::spawn(async move {
@@ -410,7 +410,7 @@ pub async fn fire_one_bidi_stream(
         mpsc_send_one(&mut tx, Ping { seq, payload: std::vec::Vec::new() }).await?;
         sent += 1;
     }
-    ngx::ngx_log_debug!(log_ptr, "bidi smoke: Phase A sent (sent=3)");
+    debug!(log_ptr, "bidi smoke: Phase A sent (sent=3)");
 
     while received < 3 {
         let _pong = inbound
@@ -422,14 +422,14 @@ pub async fn fire_one_bidi_stream(
             })?;
         received += 1;
     }
-    ngx::ngx_log_debug!(log_ptr, "bidi smoke: Phase A drained (received=3)");
+    debug!(log_ptr, "bidi smoke: Phase A drained (received=3)");
 
     // Phase B: send 7 more pings then drain until total received == 10.
     for seq in 3u64..10 {
         mpsc_send_one(&mut tx, Ping { seq, payload: std::vec::Vec::new() }).await?;
         sent += 1;
     }
-    ngx::ngx_log_debug!(log_ptr, "bidi smoke: Phase B sent (sent=10)");
+    debug!(log_ptr, "bidi smoke: Phase B sent (sent=10)");
 
     while received < 10 {
         let _pong = inbound
@@ -441,7 +441,7 @@ pub async fn fire_one_bidi_stream(
             })?;
         received += 1;
     }
-    ngx::ngx_log_debug!(log_ptr, "bidi smoke: Phase B drained (received=10)");
+    debug!(log_ptr, "bidi smoke: Phase B drained (received=10)");
 
     // Phase C: close the send-half.  The server should see stream end and
     // close its response stream too.
@@ -456,7 +456,7 @@ pub async fn fire_one_bidi_stream(
             "Phase C: expected stream end after tx drop, got another pong",
         )));
     }
-    ngx::ngx_log_debug!(log_ptr, "bidi smoke: Phase C stream end confirmed");
+    debug!(log_ptr, "bidi smoke: Phase C stream end confirmed");
 
     // Verify counts.
     if sent != 10 || received != 10 {
@@ -464,11 +464,7 @@ pub async fn fire_one_bidi_stream(
     }
 
     // This exact line is what run_grpc_bidi_smoke.sh asserts on.
-    ngx::ngx_log_error!(
-        nginx_sys::NGX_LOG_NOTICE,
-        log_ptr,
-        "bidi smoke: bidi complete (sent=10, received=10)"
-    );
+    notice!(log_ptr, "bidi smoke: bidi complete (sent=10, received=10)");
 
     Ok(())
 }
@@ -540,8 +536,7 @@ pub async fn fire_bidi_overload(
 
     let log_ptr = log.as_ptr();
 
-    ngx::ngx_log_error!(
-        nginx_sys::NGX_LOG_NOTICE,
+    notice!(
         log_ptr,
         "bidi overload: starting (duration={}s rate={}msg/s give_up={}ms)",
         duration_s,
@@ -733,8 +728,7 @@ pub async fn fire_bidi_overload(
     let elapsed_s = overload_start.elapsed().as_secs();
 
     // This exact line is what run_grpc_bidi_overload.sh asserts on.
-    ngx::ngx_log_error!(
-        nginx_sys::NGX_LOG_NOTICE,
+    notice!(
         log_ptr,
         "bidi overload: sent={} received={} dropped={} duration_s={}",
         sent,

@@ -708,7 +708,7 @@ impl NgxConnIo {
                     // SAFETY: same non-null, live connection; reading its `log`
                     // pointer field for the debug log below.
                     let log = unsafe { (*this.pc.connection).log };
-                    ngx::ngx_log_debug!(
+                    debug!(
                         log,
                         "NgxConnIo::poll_connect NGX_AGAIN: storing rev+wev wakers"
                     );
@@ -821,11 +821,7 @@ impl hyper::rt::Read for NgxConnIo {
             let this = self.get_mut();
             let prev_was_some = this.rev.is_some();
             this.rev = Some(cx.waker().clone());
-            ngx::ngx_log_debug!(
-                log,
-                "NgxConnIo::poll_read storing rev waker (prev_was_some={})",
-                prev_was_some
-            );
+            debug!(log, "NgxConnIo::poll_read storing rev waker (prev_was_some={})", prev_was_some);
             return Poll::Pending;
         }
 
@@ -867,10 +863,9 @@ impl hyper::rt::Write for NgxConnIo {
             let this = self.get_mut();
             let prev_was_some = this.wev.is_some();
             this.wev = Some(cx.waker().clone());
-            ngx::ngx_log_debug!(
+            debug!(
                 log,
-                "NgxConnIo::poll_write storing wev waker (prev_was_some={})",
-                prev_was_some
+                "NgxConnIo::poll_write storing wev waker (prev_was_some={})", prev_was_some
             );
             return Poll::Pending;
         }
@@ -920,7 +915,7 @@ unsafe extern "C" fn ngx_otel_conn_read_handler(ev: *mut ngx_event_t) {
     let rev_was_some = waker_opt.is_some();
     // SAFETY: `c` is the live connection; reading its `log` pointer field.
     let log = unsafe { (*c).log };
-    ngx::ngx_log_debug!(log, "ngx_otel_conn_read_handler: rev_was_some={}", rev_was_some);
+    debug!(log, "ngx_otel_conn_read_handler: rev_was_some={}", rev_was_some);
     if let Some(waker) = waker_opt {
         waker.wake();
     }
@@ -941,7 +936,7 @@ unsafe extern "C" fn ngx_otel_conn_write_handler(ev: *mut ngx_event_t) {
     let wev_was_some = waker_opt.is_some();
     // SAFETY: `c` is the live connection; reading its `log` pointer field.
     let log = unsafe { (*c).log };
-    ngx::ngx_log_debug!(log, "ngx_otel_conn_write_handler: wev_was_some={}", wev_was_some);
+    debug!(log, "ngx_otel_conn_write_handler: wev_was_some={}", wev_was_some);
     if let Some(waker) = waker_opt {
         waker.wake();
     } else {
