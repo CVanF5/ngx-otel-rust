@@ -126,9 +126,17 @@ pub enum CoalesceResult {
 /// 3. Skip optional `*<digits> ` (connection context).
 /// 4. Return the subslice up to the first ` while ` or `, client:`.
 ///
+/// # Format dependency
+/// This scan hard-codes nginx's error-log line shape (the `] `, `: `, ` while `
+/// and `, client:` markers above).  If a future nginx release changes that
+/// format, extraction silently degrades: lines fall back to the verbatim buffer
+/// (see below) and coalescing of those lines stops, but no records are lost or
+/// mis-attributed.
+///
 /// # Fallback
 /// If any marker is not found (malformed or truncated line), returns the largest
-/// reasonable subslice (avoids empty keys, which would all hash to the same slot).
+/// reasonable subslice.  If that subslice is empty, the whole `buf` is returned
+/// verbatim so distinct malformed lines do not all collide on the same empty key.
 pub fn stable_core(buf: &[u8]) -> &[u8] {
     let mut pos = 0;
     let len = buf.len();
@@ -188,7 +196,14 @@ pub fn stable_core(buf: &[u8]) -> &[u8] {
         i += 1;
     }
 
-    &buf[core_start..end]
+    let core = &buf[core_start..end];
+    if core.is_empty() {
+        // Extraction produced nothing (line did not match the expected shape):
+        // fall back to the whole buffer so distinct malformed lines do not all
+        // collide on the same empty key.
+        return buf;
+    }
+    core
 }
 
 /// Compute the coalescer key: FNV-1a over `[severity_byte] ++ stable_core_bytes`.
