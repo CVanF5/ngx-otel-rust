@@ -32,8 +32,7 @@ use crate::logs::{
 use crate::metric_source::location_conf::LogExportMode;
 use crate::shm::{
     combo_index, logs_access_ring, spans_ring, worker_slots, HttpMethod, ProtoVersion, StatusClass,
-    WorkerSlots, BYTES_BOUNDS, DEFAULT_SPAN_RING_CAP, DURATION_BOUNDS_MS, N_BYTES_BUCKETS,
-    N_DURATION_BUCKETS, UPSTREAM_IDX_OTHER,
+    WorkerSlots, BYTES_BOUNDS, DEFAULT_SPAN_RING_CAP, DURATION_BOUNDS_MS, UPSTREAM_IDX_OTHER,
 };
 use crate::traces::{emit_span_record, SpanRecord, MAX_SPAN_EXTRA_ATTRS, MAX_SPAN_NAME};
 use crate::HttpOtelModule;
@@ -76,6 +75,16 @@ fn record_base_combo(slot: &WorkerSlots, status: u16, base_idx: usize, duration_
 /// Unit struct for the log-phase handler; all state lives in the shm zone.
 pub struct LogPhaseHandler;
 
+/// Shared per-request metadata computed once and fed to the metrics,
+/// access-log, and span helpers.
+struct RequestMeta {
+    status: u16,
+    proto: ProtoVersion,
+    base_idx: usize,
+    route_idx: usize,
+    resp_bytes: u64,
+}
+
 impl HttpRequestHandler for LogPhaseHandler {
     const PHASE: HttpPhase = HttpPhase::Log;
     type Output = Status;
@@ -94,7 +103,79 @@ impl HttpRequestHandler for LogPhaseHandler {
             None => return Status::NGX_OK,
         };
 
-        // Determine current worker index (no syscall — nginx global).
+        // Resolve worker slot: get the current worker index and validate bounds.
+        let worker_id = match Self::resolve_worker_slot(request, amcf) {
+            Some(id) => id,
+            None => return Status::NGX_OK,
+        };
+
+        // Read SpanCtx once (parse-once + dual-clock): used for duration,
+        // exemplars, access-log trace correlation, and span emission.
+        // SAFETY: `request` is the valid live nginx request for this handler;
+        // `as_ref()` yields the underlying `ngx_http_request_t` pointer.
+        let r_ptr = request.as_ref() as *const nginx_sys::ngx_http_request_t;
+        // SAFETY: `r_ptr` is the valid live request for this handler (derived
+        // directly from the `request` argument); `read_span_ctx` reads only the
+        // ctx array slot at our module's index, which is sound for the request lifetime.
+        let span_ctx = unsafe { Self::read_span_ctx(r_ptr) };
+
+        // Dual-clock duration in microseconds.
+        let r = request.as_ref();
+        let duration_us = Self::compute_duration_us(r, span_ctx);
+
+        // Shared request metadata: computed once, consumed by all three signal paths.
+        let meta = Self::read_request_meta(r, amcf);
+
+        // Signal path 1: bump per-worker shm counters (metrics).
+        Self::record_request_metrics(r, amcf, worker_id, &meta, duration_us);
+
+        // Determine whether this request's access record is selected for export.
+        let export_selected = Self::check_export_selected(r, amcf);
+
+        // Read client address and User-Agent once; shared by access log and span.
+        let span_sampled = span_ctx.is_some_and(|ctx| ctx.sampled);
+        let need_detail = export_selected || span_sampled;
+        let (client_addr, user_agent_raw) = Self::read_request_detail(&*request, need_detail);
+
+        // Signal path 2: push access-log tail record into per-worker ring.
+        Self::maybe_emit_access_log(
+            r,
+            amcf,
+            worker_id,
+            &meta,
+            span_ctx,
+            duration_us,
+            export_selected,
+            client_addr,
+            user_agent_raw,
+        );
+
+        // Signal path 3: push span record into per-worker spans ring.
+        Self::maybe_emit_span(
+            r,
+            amcf,
+            worker_id,
+            &meta,
+            span_ctx,
+            duration_us,
+            client_addr,
+            user_agent_raw,
+        );
+
+        Status::NGX_OK
+    }
+}
+
+impl LogPhaseHandler {
+    /// Reads the current worker index from the nginx global and validates it
+    /// against the smallest registered shm zone capacity.
+    ///
+    /// Returns `Some(worker_id)` when the index is in range, `None` when a
+    /// zone is undersized (logs an ALERT and disables the module for this worker).
+    fn resolve_worker_slot(
+        request: &mut Request,
+        amcf: &crate::config::MainConfig,
+    ) -> Option<usize> {
         // SAFETY: `ngx_worker` is a `static mut` set once by nginx during worker
         // init and only ever read thereafter from this worker process, so reading
         // it on the (single-threaded) request path is sound.
@@ -132,61 +213,65 @@ impl HttpRequestHandler for LogPhaseHandler {
                 worker_id,
                 n_workers
             );
-            return Status::NGX_OK;
+            return None;
         }
 
         debug_assert!(worker_id < n_workers, "worker_id out of zone bounds");
+        Some(worker_id)
+    }
 
-        // Use AsRef to get a typed reference to the underlying ngx_http_request_t.
-        let r = request.as_ref();
-
-        // ── Read SpanCtx early (parse-once + dual-clock) ───────────────────
-        // Read BEFORE the duration computation so the monotonic anchor in
-        // SpanCtx.start_mono can drive the µs histogram when tracing is on.
-        // Set by SpanStartHandler in REWRITE.  None when tracing is not configured.
-        // Re-used for:
-        //   (1) µs duration histogram (metrics block).
-        //   (2) trace correlation on the access tail log / exemplar (below).
-        //   (3) span record emission when sampled (the span block below).
-        let span_ctx: Option<&crate::traces::ctx::SpanCtx> = {
-            use crate::traces::ctx::{recover_span_ctx, SpanCtx};
-            // SAFETY: `ngx_http_otel_module` is a valid static module descriptor;
-            // `get_module_ctx` reads the request ctx array at our module's index and
-            // returns a valid reference only when non-null (set by `SpanStartHandler`
-            // from a pool-allocated `SpanCtx` that lives for the full request lifetime).
-            let module = unsafe { &*core::ptr::addr_of!(crate::ngx_http_otel_module) };
-            let slot = request.get_module_ctx::<SpanCtx>(module);
-            // The LOG phase can run AFTER an internal redirect (error_page /
-            // try_files), where nginx has zeroed the module-ctx array.  Recover the
-            // SpanCtx from the pool-cleanup anchor so the LOG phase sees pass-1's
-            // span (one span per request).  The recovery walk runs ONLY when the
-            // slot is NULL && r->internal/filter_finalize — i.e. post-redirect.
-            match slot {
-                Some(c) => Some(c),
-                None => {
-                    let r = request.as_ref() as *const _ as *mut nginx_sys::ngx_http_request_t;
-                    // SAFETY: `r` is the live request pointer; `module` is the
-                    // process-lifetime descriptor; the NULL slot is passed in.
-                    let recovered = unsafe { recover_span_ctx(r, module, core::ptr::null_mut()) };
-                    // SAFETY: `recovered` is either NULL or a pointer into the
-                    // request pool (the cleanup-anchored SpanCtx), valid for the
-                    // request lifetime.
-                    unsafe { recovered.as_ref() }
-                }
+    /// Reads the `SpanCtx` for this request, recovering it from the
+    /// pool-cleanup anchor when nginx zeroes the module-ctx array after an
+    /// internal redirect.
+    ///
+    /// # Safety
+    /// `r_ptr` must be the valid live request pointer for the current handler.
+    unsafe fn read_span_ctx(
+        r_ptr: *const nginx_sys::ngx_http_request_t,
+    ) -> Option<&'static crate::traces::ctx::SpanCtx> {
+        use crate::traces::ctx::{recover_span_ctx, SpanCtx};
+        // SAFETY: `ngx_http_otel_module` is a valid static module descriptor;
+        // the ctx array is indexed by `ctx_index` set at module registration.
+        let module = unsafe { &*core::ptr::addr_of!(crate::ngx_http_otel_module) };
+        // SAFETY: `r_ptr` is the live request pointer per the contract; reading
+        // the ctx array slot is sound for the request lifetime.
+        let ctx_ptr = unsafe { *(*r_ptr).ctx.add(module.ctx_index) }.cast::<SpanCtx>();
+        // SAFETY: `ctx_ptr` is either null (module ctx not yet set) or a valid
+        // `*mut SpanCtx` into the request pool, set by `SpanStartHandler` and
+        // valid for the full request lifetime; `as_ref()` is safe for both cases.
+        let slot: Option<&SpanCtx> = unsafe { ctx_ptr.as_ref() };
+        // The LOG phase can run AFTER an internal redirect (error_page /
+        // try_files), where nginx has zeroed the module-ctx array.  Recover the
+        // SpanCtx from the pool-cleanup anchor so the LOG phase sees pass-1's
+        // span (one span per request).  The recovery walk runs ONLY when the
+        // slot is NULL && r->internal/filter_finalize — i.e. post-redirect.
+        match slot {
+            Some(c) => Some(c),
+            None => {
+                let r_mut = r_ptr as *mut nginx_sys::ngx_http_request_t;
+                // SAFETY: `r_mut` is the live request pointer; `module` is the
+                // process-lifetime descriptor; the NULL slot is passed in.
+                let recovered = unsafe { recover_span_ctx(r_mut, module, core::ptr::null_mut()) };
+                // SAFETY: `recovered` is either NULL or a pointer into the
+                // request pool (the cleanup-anchored SpanCtx), valid for the
+                // request lifetime.
+                unsafe { recovered.as_ref() }
             }
-        };
+        }
+    }
 
-        // ── request duration in MICROSECONDS ─────────────────────────────────
-        // OTel-SDK-idiomatic dual-clock:
-        //   When tracing is enabled (SpanCtx present): `start_mono.elapsed()` is
-        //   one vDSO CLOCK_MONOTONIC read per request; always ≥ 0, NTP-immune.
-        //   Makes the µs histogram, span (end−start), and the
-        //   http.server.request.duration attribute all coherent (same duration,
-        //   same basis).
-        //   When tracing is disabled (no SpanCtx): fall back to the wall-clock
-        //   approach (SystemTime::now() minus nginx's cached start — existing
-        //   behaviour; saturating_sub handles backward NTP steps).
-        let duration_us: u64 = if let Some(ctx) = span_ctx {
+    /// Computes the request duration in microseconds using the OTel-SDK-idiomatic
+    /// dual-clock strategy:
+    /// - When a `SpanCtx` is present: `start_mono.elapsed()` — one vDSO
+    ///   `CLOCK_MONOTONIC` read, NTP-immune, keeps the µs histogram, span, and
+    ///   `http.server.request.duration` attribute coherent.
+    /// - When absent: wall-clock fallback (`SystemTime::now()` minus nginx's
+    ///   cached start), with `saturating_sub` to handle backward NTP steps.
+    fn compute_duration_us(
+        r: &nginx_sys::ngx_http_request_t,
+        span_ctx: Option<&crate::traces::ctx::SpanCtx>,
+    ) -> u64 {
+        if let Some(ctx) = span_ctx {
             ctx.start_mono.elapsed().as_micros() as u64
         } else {
             use std::time::{SystemTime, UNIX_EPOCH};
@@ -194,11 +279,17 @@ impl HttpRequestHandler for LogPhaseHandler {
             let end_us = d.as_nanos() as u64 / 1_000;
             let start_us = (r.start_sec as u64) * 1_000_000 + (r.start_msec as u64) * 1_000;
             end_us.saturating_sub(start_us)
-        };
+        }
+    }
 
-        // ── Shared request metadata ───────────────────────────────────────────
-        // Computed once; used by the metrics block, access-log tail, and span block.
-        let method = HttpMethod::from_bytes(r.method_name.as_bytes());
+    /// Reads per-request metadata that is shared across all three signal paths
+    /// (metrics, access-log tail, and span record).
+    ///
+    /// All values are O(1) reads or lookups — no allocation, no locking.
+    fn read_request_meta(
+        r: &nginx_sys::ngx_http_request_t,
+        amcf: &crate::config::MainConfig,
+    ) -> RequestMeta {
         let status = r.headers_out.status as u16;
         let proto = ProtoVersion::from_ngx(r.http_version as core::ffi::c_uint);
 
@@ -220,6 +311,7 @@ impl HttpRequestHandler for LogPhaseHandler {
         // Fix: skip only the histogram bump when status == 0.  The route and upstream
         // histograms (below) still record the duration — the request consumed real
         // resources regardless of the abort.
+        let method = HttpMethod::from_bytes(r.method_name.as_bytes());
         let status_class = StatusClass::from_status(status);
         let base_idx = combo_index(method, status_class, proto);
 
@@ -234,7 +326,7 @@ impl HttpRequestHandler for LogPhaseHandler {
         // `resp_bytes` is needed by both the metrics response-bytes histogram and the
         // access-log tail record — compute it once outside the metrics block.
         let resp_bytes = {
-            let conn = request.connection();
+            let conn = r.connection;
             if conn.is_null() {
                 0u64
             } else {
@@ -246,148 +338,163 @@ impl HttpRequestHandler for LogPhaseHandler {
             }
         };
 
-        // ── METRICS block ─────────────────────────────────────────────────────
+        RequestMeta { status, proto, base_idx, route_idx, resp_bytes }
+    }
+
+    /// Bumps the per-worker shm counters for the base combo, per-route, per-upstream,
+    /// body-size, and upstream-timing histograms.
+    ///
+    /// Skipped entirely when the metrics shm zone is absent (`otel_metrics off`).
+    fn record_request_metrics(
+        r: &nginx_sys::ngx_http_request_t,
+        amcf: &crate::config::MainConfig,
+        worker_id: usize,
+        meta: &RequestMeta,
+        duration_us: u64,
+    ) {
         // Skipped when the metrics shm zone is absent (e.g. `otel_metrics off`).
         // Traces and access-log tails are unaffected — they have their own zones
         // and are handled in the independent blocks below.
-        if let Some(metrics_base) = amcf.shm_base() {
-            // Get our per-worker slot. No allocation; pointer arithmetic only.
-            // SAFETY: `worker_id < n_workers` (enforced by the bounds guard above);
-            // `n_workers` is derived from the registered zone sizes so the slot is
-            // within the zone.
-            let slot = unsafe { &*worker_slots(metrics_base, worker_id) };
+        let metrics_base = match amcf.shm_base() {
+            Some(b) => b,
+            None => return,
+        };
 
-            // 1. Base table: {method × status_class × protocol} (160 combos).
-            record_base_combo(slot, status, base_idx, duration_us);
+        // Get our per-worker slot. No allocation; pointer arithmetic only.
+        // SAFETY: `worker_id < n_workers` (enforced by the bounds guard above);
+        // `n_workers` is derived from the registered zone sizes so the slot is
+        // within the zone.
+        let slot = unsafe { &*worker_slots(metrics_base, worker_id) };
 
-            // 2. Per-route table: http.route = location name.
-            slot.route_duration_combos[route_idx].record(duration_us);
+        // 1. Base table: {method × status_class × protocol} (160 combos).
+        record_base_combo(slot, meta.status, meta.base_idx, duration_us);
 
-            // 3. Per-upstream table: nginx.upstream.zone.
-            //    Skip if no upstream (zone_ptr = 0 → UPSTREAM_IDX_OTHER).
-            let upstream_zone_ptr: usize = if let Some(upstream) = request.upstream() {
-                // SAFETY: `request.upstream()` returns `Some` only when nginx has set
-                // up the per-request upstream struct, so `upstream` is a valid
-                // `ngx_http_upstream_t` pointer for the duration of this handler.
-                let us = unsafe { (*upstream).upstream };
-                if !us.is_null() {
-                    // SAFETY: `us` is the non-null `ngx_http_upstream_srv_conf_t`
-                    // pointer just read from the live upstream struct; reading its
-                    // `shm_zone` field is sound.
-                    let zone = unsafe { (*us).shm_zone };
-                    if !zone.is_null() {
-                        zone as usize
-                    } else {
-                        0
-                    }
+        // 2. Per-route table: http.route = location name.
+        slot.route_duration_combos[meta.route_idx].record(duration_us);
+
+        // 3. Per-upstream table: nginx.upstream.zone.
+        //    Skip if no upstream (zone_ptr = 0 → UPSTREAM_IDX_OTHER).
+        let upstream_zone_ptr: usize = if !r.upstream.is_null() {
+            // SAFETY: `r.upstream` is non-null: it is the per-request
+            // `ngx_http_upstream_t` set by the upstream module, valid for the
+            // duration of this handler.
+            let us = unsafe { (*r.upstream).upstream };
+            if !us.is_null() {
+                // SAFETY: `us` is the non-null `ngx_http_upstream_srv_conf_t`
+                // pointer just read from the live upstream struct; reading its
+                // `shm_zone` field is sound.
+                let zone = unsafe { (*us).shm_zone };
+                if !zone.is_null() {
+                    zone as usize
                 } else {
                     0
                 }
             } else {
                 0
-            };
-            let upstream_idx = amcf.upstream_idx_for_zone(upstream_zone_ptr);
-            // Only bump upstream histogram when request actually went through an upstream.
-            if upstream_zone_ptr != 0 && upstream_idx < UPSTREAM_IDX_OTHER {
-                slot.upstream_duration_combos[upstream_idx].record(duration_us);
-            } else if upstream_zone_ptr != 0 {
-                // Over-cap upstream: bump "other" slot (UPSTREAM_IDX_OTHER = UPSTREAM_CAP).
-                slot.upstream_duration_combos[UPSTREAM_IDX_OTHER].record(duration_us);
-            }
-            // zone_ptr == 0 → no upstream → skip upstream histogram.
-
-            // ── request body bytes ────────────────────────────────────────────
-            slot.request_body_bytes.record(r.request_length as u64, &BYTES_BOUNDS);
-
-            // ── response bytes ────────────────────────────────────────────────
-            slot.response_body_bytes.record(resp_bytes, &BYTES_BOUNDS);
-
-            // ── upstream timings (if an upstream was used) ────────────────────
-            // Sum the timings/bytes across ALL upstream attempts, not just the
-            // current (last) `u->state`.  When `proxy_next_upstream` retries a peer,
-            // nginx pushes a fresh `ngx_http_upstream_state_t` per attempt onto
-            // `r->upstream_states` (an `ngx_array_t`); `u->state` points only at the
-            // last one.  The core `$upstream_response_time` / `$upstream_*_bytes`
-            // variables iterate the whole `r->upstream_states` array
-            // (`ngx_http_upstream_response_time_variable` /
-            // `..._response_length_variable`, ngx_http_upstream.c:6027,6105), so
-            // reading only `u->state` undercounts multi-attempt requests.  Walk the
-            // same array and aggregate so the metric matches the total upstream cost
-            // those variables report.
-            // `request.upstream()` being `Some` confirms this request actually went
-            // through an upstream, so `r->upstream_states` is meaningful.
-            if request.upstream().is_some() {
-                // SAFETY: `r` is the live request for this LOG-phase handler;
-                // `upstream_states` is either null (no upstream attempts) or a valid
-                // `ngx_array_t*` of `ngx_http_upstream_state_t` in the request pool,
-                // valid for this handler.  The walk only reads plain numeric fields.
-                if let Some(sum) = unsafe { sum_upstream_states(r.upstream_states) } {
-                    // nginx initialises the timing fields to (ngx_msec_t)-1
-                    // (= NGX_MSEC_SENTINEL) when the attempt did not complete that
-                    // phase (e.g. connect_time on a refused connection); the core
-                    // variables emit "-" for it (ngx_http_upstream.c:6074).  The
-                    // walk skips sentinel attempts per field, so a metric is recorded
-                    // only when at least one attempt had a real measurement.
-                    if let Some(resp_ms) = sum.response_ms {
-                        slot.upstream_response_ms.record(resp_ms, &DURATION_BOUNDS_MS);
-                    }
-                    if let Some(hdr_ms) = sum.header_ms {
-                        slot.upstream_header_ms.record(hdr_ms, &DURATION_BOUNDS_MS);
-                    }
-                    if let Some(conn_ms) = sum.connect_ms {
-                        slot.upstream_connect_ms.record(conn_ms, &DURATION_BOUNDS_MS);
-                    }
-                    slot.upstream_bytes_received.record(sum.bytes_received, &BYTES_BOUNDS);
-                    slot.upstream_bytes_sent.record(sum.bytes_sent, &BYTES_BOUNDS);
-                }
-            }
-        } // end metrics block
-
-        // ── exception-tail / exemplar export ──────────────────────────────
-        // Independent of the metrics block: the logs shm zone is gated separately.
-        // Gate 1 (cheap config check): no location selects export anywhere →
-        //   any_log_export_enabled() = false, this entire block is skipped, so
-        //   a deployment without `otel_log_export` pays only the single bool.
-        // Gate 2 (per-location selection): the matched location's
-        //   `otel_log_export` mode decides export.  `on`/bare ⇒ always export;
-        //   `if=<cond>` ⇒ export when the complex value is truthy; `off`/unset
-        //   ⇒ nothing.  Nothing is hardcoded — the operator's condition is the
-        //   only predicate (privacy-safe default of no export).
-        let export_selected = if amcf.any_log_export_enabled() {
-            match HttpOtelModule::location_conf(r) {
-                Some(lc) => match lc.log_export_mode() {
-                    LogExportMode::All => true,
-                    LogExportMode::If => {
-                        // SAFETY: `r` is the valid non-null request for this
-                        // handler; `lc.log_export_cv` is non-null for the `If`
-                        // mode (set at config time, lives on the conf pool for
-                        // the process lifetime).
-                        let r_ptr = r as *const nginx_sys::ngx_http_request_t
-                            as *mut nginx_sys::ngx_http_request_t;
-                        eval_export_truthy(r_ptr, lc.log_export_cv)
-                    }
-                    LogExportMode::Off | LogExportMode::Unset => false,
-                },
-                None => false,
             }
         } else {
-            false
+            0
         };
+        let upstream_idx = amcf.upstream_idx_for_zone(upstream_zone_ptr);
+        // Only bump upstream histogram when request actually went through an upstream.
+        if upstream_zone_ptr != 0 && upstream_idx < UPSTREAM_IDX_OTHER {
+            slot.upstream_duration_combos[upstream_idx].record(duration_us);
+        } else if upstream_zone_ptr != 0 {
+            // Over-cap upstream: bump "other" slot (UPSTREAM_IDX_OTHER = UPSTREAM_CAP).
+            slot.upstream_duration_combos[UPSTREAM_IDX_OTHER].record(duration_us);
+        }
+        // zone_ptr == 0 → no upstream → skip upstream histogram.
 
-        // ── Shared request detail (read ONCE, fed to BOTH the access tail and
-        //    the span record) ─────────────────────────────────────────────────
-        // The access tail (above) and the span record (below) both need the
-        // realip-aware client address and the User-Agent.  Per the single-phase
-        // (LOG) consumer rule, read each once here into a local and feed both
-        // sinks — no `SpanCtx` caching (that is reserved for cross-phase values
-        // like the parsed traceparent).  Gated on actually needing the detail:
-        // either the tail is selected OR the request is a sampled span.
-        let span_sampled = span_ctx.is_some_and(|ctx| ctx.sampled);
-        let need_detail = export_selected || span_sampled;
+        // ── request body bytes ────────────────────────────────────────────
+        slot.request_body_bytes.record(r.request_length as u64, &BYTES_BOUNDS);
 
+        // ── response bytes ────────────────────────────────────────────────
+        slot.response_body_bytes.record(meta.resp_bytes, &BYTES_BOUNDS);
+
+        // ── upstream timings (if an upstream was used) ────────────────────
+        // Sum the timings/bytes across ALL upstream attempts, not just the
+        // current (last) `u->state`.  When `proxy_next_upstream` retries a peer,
+        // nginx pushes a fresh `ngx_http_upstream_state_t` per attempt onto
+        // `r->upstream_states` (an `ngx_array_t`); `u->state` points only at the
+        // last one.  The core `$upstream_response_time` / `$upstream_*_bytes`
+        // variables iterate the whole `r->upstream_states` array
+        // (`ngx_http_upstream_response_time_variable` /
+        // `..._response_length_variable`, ngx_http_upstream.c:6027,6105), so
+        // reading only `u->state` undercounts multi-attempt requests.  Walk the
+        // same array and aggregate so the metric matches the total upstream cost
+        // those variables report.
+        // `r.upstream` being non-null confirms this request actually went
+        // through an upstream, so `r->upstream_states` is meaningful.
+        if !r.upstream.is_null() {
+            // SAFETY: `r` is the live request for this LOG-phase handler;
+            // `upstream_states` is either null (no upstream attempts) or a valid
+            // `ngx_array_t*` of `ngx_http_upstream_state_t` in the request pool,
+            // valid for this handler.  The walk only reads plain numeric fields.
+            if let Some(sum) = unsafe { sum_upstream_states(r.upstream_states) } {
+                // nginx initialises the timing fields to (ngx_msec_t)-1
+                // (= NGX_MSEC_SENTINEL) when the attempt did not complete that
+                // phase (e.g. connect_time on a refused connection); the core
+                // variables emit "-" for it (ngx_http_upstream.c:6074).  The
+                // walk skips sentinel attempts per field, so a metric is recorded
+                // only when at least one attempt had a real measurement.
+                if let Some(resp_ms) = sum.response_ms {
+                    slot.upstream_response_ms.record(resp_ms, &DURATION_BOUNDS_MS);
+                }
+                if let Some(hdr_ms) = sum.header_ms {
+                    slot.upstream_header_ms.record(hdr_ms, &DURATION_BOUNDS_MS);
+                }
+                if let Some(conn_ms) = sum.connect_ms {
+                    slot.upstream_connect_ms.record(conn_ms, &DURATION_BOUNDS_MS);
+                }
+                slot.upstream_bytes_received.record(sum.bytes_received, &BYTES_BOUNDS);
+                slot.upstream_bytes_sent.record(sum.bytes_sent, &BYTES_BOUNDS);
+            }
+        }
+    }
+
+    /// Evaluates the `otel_log_export` gates and returns `true` when this
+    /// request's access record should be pushed to the per-worker ring.
+    ///
+    /// Gate 1 (cheap config check): `any_log_export_enabled()` — false when no
+    /// location selects export, skipping all subsequent work for that deployment.
+    /// Gate 2 (per-location): the matched location's `LogExportMode` decides;
+    /// `If` evaluates the operator-supplied complex value.
+    fn check_export_selected(
+        r: &nginx_sys::ngx_http_request_t,
+        amcf: &crate::config::MainConfig,
+    ) -> bool {
+        if !amcf.any_log_export_enabled() {
+            return false;
+        }
+        match HttpOtelModule::location_conf(r) {
+            Some(lc) => match lc.log_export_mode() {
+                LogExportMode::All => true,
+                LogExportMode::If => {
+                    // SAFETY: `r` is the valid non-null request for this
+                    // handler; `lc.log_export_cv` is non-null for the `If`
+                    // mode (set at config time, lives on the conf pool for
+                    // the process lifetime).
+                    let r_ptr = r as *const nginx_sys::ngx_http_request_t
+                        as *mut nginx_sys::ngx_http_request_t;
+                    eval_export_truthy(r_ptr, lc.log_export_cv)
+                }
+                LogExportMode::Off | LogExportMode::Unset => false,
+            },
+            None => false,
+        }
+    }
+
+    /// Reads the realip-aware client address and the User-Agent header, which
+    /// are shared between the access-log tail and the span record.
+    ///
+    /// Both values are read exactly once per request regardless of how many
+    /// signal paths consume them.  When `need_detail` is false (neither the
+    /// access tail nor a sampled span is needed), both return empty slices at
+    /// zero cost.
+    fn read_request_detail(request: &Request, need_detail: bool) -> (&[u8], &[u8]) {
         // Client address (realip-aware `$remote_addr`): the connection's
         // `addr_text`, which nginx's realip module rewrites in place to the real
-        // client.  Same source the tail used previously.
+        // client.
         let client_addr: &[u8] = if need_detail && !request.connection().is_null() {
             // SAFETY: the connection pointer is non-null (checked) and points to
             // the request's `ngx_connection_t`, valid for this handler.
@@ -422,313 +529,347 @@ impl HttpRequestHandler for LogPhaseHandler {
             b""
         };
 
-        if export_selected {
-            if let Some(logs_base) = amcf.logs_shm_base() {
-                let cap = amcf.log_ring_cap();
-                // Safety: zone was sized for ≥ worker_id slots at registration.
-                let access_ring = unsafe { logs_access_ring(logs_base, worker_id, cap) };
-                let producer = WorkerRingProducer { ring: access_ring };
+        (client_addr, user_agent_raw)
+    }
 
-                // Gather HTTP semconv fields from the request.
-                let method: &[u8] = r.method_name.as_bytes();
-                let status = r.headers_out.status as u16;
-                let req_len = r.request_length as u64;
-                let resp_bytes_acc = resp_bytes; // already computed above
-
-                // Timestamp: request start time in nanoseconds.
-                // Derived from nginx's stored start fields (ms precision).
-                let ts_unix_nano: u64 = (r.start_sec as u64)
-                    .saturating_mul(1_000_000_000)
-                    .saturating_add(r.start_msec as u64 * 1_000_000);
-
-                // W3C trace correlation (parse-once):
-                // SpanCtx was read once above; extract trace_id/span_id when sampled.
-                // Unsampled requests (ctx.sampled=false) still have a SpanCtx for
-                // W3C propagation but do not stamp the access tail.
-                let trace_context: Option<([u8; 16], [u8; 8])> =
-                    span_ctx.filter(|ctx| ctx.sampled).map(|ctx| (ctx.trace_id, ctx.span_id));
-
-                // url.path: r.uri (decoded path, WITHOUT query string / args).
-                // Use r.uri, NOT r.unparsed_uri (= $request_uri, which includes
-                // '?args') — including args would be a semconv violation and a
-                // PII/credential-leak vector (e.g. ?token=SECRET ends up in
-                // exported tails + exemplars).
-                // r.uri is the normalised, args-stripped equivalent of $uri;
-                // the query string lives separately in r.args and is NOT recorded.
-                // High-cardinality — stays on the tail record ONLY, never a metric dim.
-                let url_path: &[u8] = r.uri.as_bytes();
-
-                // Build the canonical sampled-request record once; project into both sinks.
-                // No allocation — all fields borrow nginx request memory (stack frame).
-                let sampled = SampledRequest {
-                    ts_unix_nano,
-                    trace: trace_context,
-                    url_path,
-                    user_agent: user_agent_raw,
-                    duration_us,
-                    combo_idx: base_idx as u32,
-                    method,
-                    status,
-                    request_length: req_len,
-                    response_bytes: resp_bytes_acc,
-                    client_addr,
-                };
-
-                // Sink 1: per-worker SPSC log ring (exception-tail LogRecord).
-                // A `false` return is the ring-full drop path (already counted
-                // in the ring's `dropped`) — the TRIGGER for the
-                // exporter-liveness check (heartbeat = the VERDICT).  Zero
-                // added cost on the healthy path.
-                if !emit_access_record(&producer, &sampled) {
-                    // SAFETY: `request.connection()` is the request's live
-                    // connection pointer (may be null — handled inside);
-                    // `(*conn).log` is the connection log nginx error logging
-                    // uses for this request.
-                    let conn_log = unsafe {
-                        let conn = request.connection();
-                        if conn.is_null() {
-                            core::ptr::null_mut()
-                        } else {
-                            (*conn).log
-                        }
-                    };
-                    crate::liveness::check_exporter_liveness_on_drop(amcf, conn_log);
-                }
-            }
+    /// Pushes an access-log tail record into the per-worker SPSC ring when
+    /// the request is selected for export.  On ring-full, triggers the exporter
+    /// liveness check.
+    ///
+    /// Independent of the metrics block: the logs shm zone is gated separately.
+    #[allow(clippy::too_many_arguments)]
+    fn maybe_emit_access_log(
+        r: &nginx_sys::ngx_http_request_t,
+        amcf: &crate::config::MainConfig,
+        worker_id: usize,
+        meta: &RequestMeta,
+        span_ctx: Option<&crate::traces::ctx::SpanCtx>,
+        duration_us: u64,
+        export_selected: bool,
+        client_addr: &[u8],
+        user_agent_raw: &[u8],
+    ) {
+        if !export_selected {
+            return;
         }
+        let logs_base = match amcf.logs_shm_base() {
+            Some(b) => b,
+            None => return,
+        };
 
-        // ── Span record emission ──────────────────────────────────────────────
+        let cap = amcf.log_ring_cap();
+        // Safety: zone was sized for ≥ worker_id slots at registration.
+        let access_ring = unsafe { logs_access_ring(logs_base, worker_id, cap) };
+        let producer = WorkerRingProducer { ring: access_ring };
+
+        // Gather HTTP semconv fields from the request.
+        let method: &[u8] = r.method_name.as_bytes();
+        let req_len = r.request_length as u64;
+
+        // Timestamp: request start time in nanoseconds.
+        // Derived from nginx's stored start fields (ms precision).
+        let ts_unix_nano: u64 = (r.start_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(r.start_msec as u64 * 1_000_000);
+
+        // W3C trace correlation (parse-once):
+        // SpanCtx was read once above; extract trace_id/span_id when sampled.
+        // Unsampled requests (ctx.sampled=false) still have a SpanCtx for
+        // W3C propagation but do not stamp the access tail.
+        let trace_context: Option<([u8; 16], [u8; 8])> =
+            span_ctx.filter(|ctx| ctx.sampled).map(|ctx| (ctx.trace_id, ctx.span_id));
+
+        // url.path: r.uri (decoded path, WITHOUT query string / args).
+        // Use r.uri, NOT r.unparsed_uri (= $request_uri, which includes
+        // '?args') — including args would be a semconv violation and a
+        // PII/credential-leak vector (e.g. ?token=SECRET ends up in
+        // exported tails + exemplars).
+        // r.uri is the normalised, args-stripped equivalent of $uri;
+        // the query string lives separately in r.args and is NOT recorded.
+        // High-cardinality — stays on the tail record ONLY, never a metric dim.
+        let url_path: &[u8] = r.uri.as_bytes();
+
+        // Build the canonical sampled-request record once; project into both sinks.
+        // No allocation — all fields borrow nginx request memory (stack frame).
+        let sampled = SampledRequest {
+            ts_unix_nano,
+            trace: trace_context,
+            url_path,
+            user_agent: user_agent_raw,
+            duration_us,
+            combo_idx: meta.base_idx as u32,
+            method,
+            status: meta.status,
+            request_length: req_len,
+            response_bytes: meta.resp_bytes,
+            client_addr,
+        };
+
+        // Sink 1: per-worker SPSC log ring (exception-tail LogRecord).
+        // A `false` return is the ring-full drop path (already counted
+        // in the ring's `dropped`) — the TRIGGER for the
+        // exporter-liveness check (heartbeat = the VERDICT).  Zero
+        // added cost on the healthy path.
+        if !emit_access_record(&producer, &sampled) {
+            // SAFETY: `r.connection` is the request's live connection pointer
+            // (may be null); `(*conn).log` is the connection log nginx error
+            // logging uses for this request.
+            let conn_log = unsafe {
+                let conn = r.connection;
+                if conn.is_null() {
+                    core::ptr::null_mut()
+                } else {
+                    (*conn).log
+                }
+            };
+            crate::liveness::check_exporter_liveness_on_drop(amcf, conn_log);
+        }
+    }
+
+    /// Writes an exemplar into the metrics slot and pushes a span record into
+    /// the per-worker spans ring, when the request is sampled.  On ring-full,
+    /// triggers the exporter liveness check.
+    ///
+    /// Independent of the metrics block: the spans zone is gated separately.
+    #[allow(clippy::too_many_arguments)]
+    fn maybe_emit_span(
+        r: &nginx_sys::ngx_http_request_t,
+        amcf: &crate::config::MainConfig,
+        worker_id: usize,
+        meta: &RequestMeta,
+        span_ctx: Option<&crate::traces::ctx::SpanCtx>,
+        duration_us: u64,
+        client_addr: &[u8],
+        user_agent_raw: &[u8],
+    ) {
         // Gate 1: request must be sampled (ctx.sampled=true).
         // Gate 2: spans shm zone must be available (otel_spans_zone configured).
         // Both gates false → zero work, no ring push.
         // This block is INDEPENDENT of the metrics block above — spans are emitted
         // regardless of whether `otel_metrics` is on or off.
-        if let Some(ctx) = span_ctx.filter(|ctx| ctx.sampled) {
-            // ── Exemplar write (OTel TraceBased exemplar filter) ───────────────
-            // Record an exemplar into the metrics slot ONLY when the metrics zone
-            // is present (exemplar reservoirs live in the metrics shm slot).
-            // Skipped when `otel_metrics off` — the span record below still runs.
-            // <https://opentelemetry.io/docs/specs/otel/metrics/sdk/#exemplar-defaults>
-            // Hot path: one null-check + a branch + ≤ 6 Relaxed stores when enabled.
-            if let Some(metrics_base) = amcf.shm_base() {
-                // SAFETY: `worker_id < n_workers` (verified by the bounds guard above);
-                // the slot pointer is within the registered zone.
-                let metrics_slot = unsafe { &*worker_slots(metrics_base, worker_id) };
-                // Request start time in ns (ms precision from nginx's stored fields).
-                let exemplar_ts_ns: u64 = (r.start_sec as u64)
-                    .saturating_mul(1_000_000_000)
-                    .saturating_add(r.start_msec as u64 * 1_000_000);
-                metrics_slot.exemplar_reservoirs[base_idx].write(&SampledRequest {
-                    ts_unix_nano: exemplar_ts_ns,
-                    trace: Some((ctx.trace_id, ctx.span_id)),
-                    url_path: b"",
-                    user_agent: b"",
-                    duration_us,
-                    combo_idx: base_idx as u32,
-                    method: r.method_name.as_bytes(),
-                    status: r.headers_out.status as u16,
-                    request_length: 0,
-                    response_bytes: 0,
-                    client_addr: b"",
-                });
-            }
+        let ctx = match span_ctx.filter(|ctx| ctx.sampled) {
+            Some(c) => c,
+            None => return,
+        };
 
-            if let Some(spans_base) = amcf.spans_shm_base() {
-                // Collect per-location config (span_name_cv + span_attrs).
-                // `HttpOtelModule::location_conf` returns the merged LocationConf for
-                // the matched location; null/absent → default (built-in name, no attrs).
-                let loc_conf = HttpOtelModule::location_conf(r);
-
-                // Build span name: evaluate `otel_span_name` complex value if set,
-                // else fall back to built-in "METHOD route_name" format.
-                // No heap allocation; evaluated into a stack buffer capped at MAX_SPAN_NAME.
-                let mut span_name_buf = [0u8; MAX_SPAN_NAME];
-                let span_name_len = {
-                    let mut evaluated_name: &[u8] = &[];
-                    let mut cv_buf = nginx_sys::ngx_str_t::default();
-                    let use_cv = loc_conf
-                        .and_then(|lc| {
-                            if lc.span_name_cv.is_null() {
-                                None
-                            } else {
-                                Some(lc.span_name_cv)
-                            }
-                        })
-                        .is_some_and(|cv_ptr| {
-                            // SAFETY: `r` is the valid non-null request pointer (same
-                            // request the handler was called on); `cv_ptr` is a valid
-                            // `ngx_http_complex_value_t*` in conf-pool memory compiled
-                            // at config time; `cv_buf` is a local ngx_str_t for output.
-                            let rc = unsafe {
-                                nginx_sys::ngx_http_complex_value(
-                                    r as *const nginx_sys::ngx_http_request_t
-                                        as *mut nginx_sys::ngx_http_request_t,
-                                    cv_ptr,
-                                    &raw mut cv_buf,
-                                )
-                            };
-                            rc == nginx_sys::NGX_OK as nginx_sys::ngx_int_t && !cv_buf.is_empty()
-                        });
-                    if use_cv {
-                        // SAFETY: `cv_buf` was just populated by `ngx_http_complex_value`;
-                        // `data` points into the request pool (valid for the LOG-phase call).
-                        evaluated_name = unsafe {
-                            if cv_buf.len > 0 && !cv_buf.data.is_null() {
-                                core::slice::from_raw_parts(cv_buf.data, cv_buf.len)
-                            } else {
-                                b""
-                            }
-                        };
-                    }
-                    if evaluated_name.is_empty() {
-                        // Built-in "METHOD route_name" fallback.
-                        build_span_name(
-                            &mut span_name_buf,
-                            r.method_name.as_bytes(),
-                            amcf.route_name(route_idx).as_bytes(),
-                        )
-                    } else {
-                        let len = evaluated_name.len().min(MAX_SPAN_NAME);
-                        span_name_buf[..len].copy_from_slice(&evaluated_name[..len]);
-                        len
-                    }
-                };
-
-                // Build extra_attrs from otel_span_attr directives (up to
-                // MAX_SPAN_EXTRA_ATTRS pairs).  No heap allocation — stack buffer only.
-                let mut attrs_buf: [(&[u8], &[u8]); MAX_SPAN_EXTRA_ATTRS] =
-                    [(&[], &[]); MAX_SPAN_EXTRA_ATTRS];
-                let attrs_len = if let Some(lc) = loc_conf {
-                    let n = lc.span_attrs.len().min(MAX_SPAN_EXTRA_ATTRS);
-                    for (slot, (k, v)) in attrs_buf[..n].iter_mut().zip(lc.span_attrs[..n].iter()) {
-                        // SAFETY: `k` and `v` are `ngx_str_t` values from the nginx
-                        // conf pool (populated at config-parse time by
-                        // `cmd_add_otel_span_attr`); `as_bytes()` safely reinterprets
-                        // the pointer + length as a byte slice valid for process lifetime.
-                        *slot = (k.as_bytes(), v.as_bytes());
-                    }
-                    n
-                } else {
-                    0
-                };
-
-                // OTel HTTP server span StatusCode: Error(2) for 5xx, Unset(0) otherwise.
-                let otel_status_code: u8 = if status >= 500 { 2 } else { 0 };
-
-                // Span end time: derived from the monotonic duration for coherence.
-                // end = start + duration_us * 1_000 ns.
-                // Invariants: end >= start (monotonic); span (end−start) == duration_us.
-                let end_time_unix_nano =
-                    ctx.start_time_unix_nano.saturating_add(duration_us.saturating_mul(1_000));
-
-                // ── HTTP semconv coverage sources (already materialized) ───────
-                let conn_ptr = request.connection();
-
-                // url.scheme: TLS connection ⇒ "https".
-                let scheme_https = if conn_ptr.is_null() {
-                    false
-                } else {
-                    // SAFETY: `conn_ptr` is non-null (checked); `ssl` is a pointer
-                    // nginx sets non-null on TLS connections.
-                    unsafe { !(*conn_ptr).ssl.is_null() }
-                };
-
-                // server.address: the matched server name, falling back to the
-                // request Host header (mirrors nginx-otel getServerName,
-                // http_module.cpp:395-406).
-                let server_address: &[u8] = {
-                    let from_srv = NgxHttpCoreModule::server_conf(r)
-                        .map(|cscf| cscf.server_name.as_bytes())
-                        .unwrap_or(b"");
-                    if from_srv.is_empty() {
-                        r.headers_in.server.as_bytes()
-                    } else {
-                        from_srv
-                    }
-                };
-
-                // server.port / client.port (local + client sockaddr ports).
-                // SAFETY: `conn_ptr` is the request connection pointer (may be
-                // null — `server_port` handles null).
-                let server_port_val = unsafe { server_port(conn_ptr) };
-                // SAFETY: `conn_ptr` is the request connection pointer (may be
-                // null — `client_port` handles null).
-                let client_port_val = unsafe { client_port(conn_ptr) };
-
-                // network.peer.{address,port}: the TRUE TCP socket peer via the
-                // realip-aware `$realip_remote_addr` selection (saved original
-                // when realip rewrote the connection, else the live peer).
-                let r_mut =
-                    r as *const nginx_sys::ngx_http_request_t as *mut nginx_sys::ngx_http_request_t;
-                // SAFETY: `r_mut` is the live request pointer for this handler.
-                let (peer_address, peer_port_val) = unsafe { realip_peer(r_mut) };
-
-                // http.request.body.size: content_length_n (-1 = absent ⇒ 0).
-                let req_body_size = if r.headers_in.content_length_n > 0 {
-                    r.headers_in.content_length_n as u64
-                } else {
-                    0
-                };
-                // http.response.body.size: bytes sent minus response headers
-                // (mirrors nginx-otel http.response_content_length,
-                // http_module.cpp:436).
-                let resp_body_size = resp_bytes.saturating_sub(r.header_size as u64);
-
-                let rec = SpanRecord {
-                    trace_id: ctx.trace_id,
-                    span_id: ctx.span_id,
-                    parent_span_id: ctx.parent_span_id,
-                    flags: ctx.flags,
-                    start_time_unix_nano: ctx.start_time_unix_nano,
-                    end_time_unix_nano,
-                    status_code: otel_status_code,
-                    kind: 2, // SpanKind::Server
-                    name: &span_name_buf[..span_name_len],
-                    method: r.method_name.as_bytes(),
-                    http_status: status,
-                    url_path: r.uri.as_bytes(), // uri = path only; unparsed_uri = path+args
-                    duration_us,
-                    proto: proto as u8,
-                    scheme_https,
-                    server_port: server_port_val,
-                    client_port: client_port_val,
-                    peer_port: peer_port_val,
-                    req_body_size,
-                    resp_body_size,
-                    url_query: r.args.as_bytes(), // url.query: args without leading '?'
-                    route: amcf.route_name(route_idx).as_bytes(),
-                    user_agent: user_agent_raw,
-                    server_address,
-                    client_address: client_addr,
-                    peer_address,
-                    extra_attrs: &attrs_buf[..attrs_len],
-                };
-
-                // SAFETY: `spans_base` is the valid mapped shm start returned by
-                // `spans_shm_base()`, sized for ≥ worker_id spans-ring slots at zone
-                // registration in postconfiguration.  The ring lives for the worker's
-                // lifetime and outlives this handler invocation.
-                let spans = unsafe { spans_ring(spans_base, worker_id, DEFAULT_SPAN_RING_CAP) };
-                let producer = WorkerRingProducer { ring: spans };
-                // Ring-full drop path → liveness check (see the access-ring
-                // hook above for the trigger/verdict rationale).
-                if !emit_span_record(&producer, &rec) {
-                    // SAFETY: same contract as the access-ring hook — null
-                    // connection handled, `(*conn).log` is the request's log.
-                    let conn_log = unsafe {
-                        let conn = request.connection();
-                        if conn.is_null() {
-                            core::ptr::null_mut()
-                        } else {
-                            (*conn).log
-                        }
-                    };
-                    crate::liveness::check_exporter_liveness_on_drop(amcf, conn_log);
-                }
-            }
+        // ── Exemplar write (OTel TraceBased exemplar filter) ───────────────
+        // Record an exemplar into the metrics slot ONLY when the metrics zone
+        // is present (exemplar reservoirs live in the metrics shm slot).
+        // Skipped when `otel_metrics off` — the span record below still runs.
+        // <https://opentelemetry.io/docs/specs/otel/metrics/sdk/#exemplar-defaults>
+        // Hot path: one null-check + a branch + ≤ 6 Relaxed stores when enabled.
+        if let Some(metrics_base) = amcf.shm_base() {
+            // SAFETY: `worker_id < n_workers` (verified by the bounds guard above);
+            // the slot pointer is within the registered zone.
+            let metrics_slot = unsafe { &*worker_slots(metrics_base, worker_id) };
+            // Request start time in ns (ms precision from nginx's stored fields).
+            let exemplar_ts_ns: u64 = (r.start_sec as u64)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(r.start_msec as u64 * 1_000_000);
+            metrics_slot.exemplar_reservoirs[meta.base_idx].write(&SampledRequest {
+                ts_unix_nano: exemplar_ts_ns,
+                trace: Some((ctx.trace_id, ctx.span_id)),
+                url_path: b"",
+                user_agent: b"",
+                duration_us,
+                combo_idx: meta.base_idx as u32,
+                method: r.method_name.as_bytes(),
+                status: r.headers_out.status as u16,
+                request_length: 0,
+                response_bytes: 0,
+                client_addr: b"",
+            });
         }
 
-        Status::NGX_OK
+        let spans_base = match amcf.spans_shm_base() {
+            Some(b) => b,
+            None => return,
+        };
+
+        // Collect per-location config (span_name_cv + span_attrs).
+        // `HttpOtelModule::location_conf` returns the merged LocationConf for
+        // the matched location; null/absent → default (built-in name, no attrs).
+        let loc_conf = HttpOtelModule::location_conf(r);
+
+        // Build span name: evaluate `otel_span_name` complex value if set,
+        // else fall back to built-in "METHOD route_name" format.
+        // No heap allocation; evaluated into a stack buffer capped at MAX_SPAN_NAME.
+        let mut span_name_buf = [0u8; MAX_SPAN_NAME];
+        let span_name_len = {
+            let mut evaluated_name: &[u8] = &[];
+            let mut cv_buf = nginx_sys::ngx_str_t::default();
+            let use_cv = loc_conf
+                .and_then(|lc| if lc.span_name_cv.is_null() { None } else { Some(lc.span_name_cv) })
+                .is_some_and(|cv_ptr| {
+                    // SAFETY: `r` is the valid non-null request pointer (same
+                    // request the handler was called on); `cv_ptr` is a valid
+                    // `ngx_http_complex_value_t*` in conf-pool memory compiled
+                    // at config time; `cv_buf` is a local ngx_str_t for output.
+                    let rc = unsafe {
+                        nginx_sys::ngx_http_complex_value(
+                            r as *const nginx_sys::ngx_http_request_t
+                                as *mut nginx_sys::ngx_http_request_t,
+                            cv_ptr,
+                            &raw mut cv_buf,
+                        )
+                    };
+                    rc == nginx_sys::NGX_OK as nginx_sys::ngx_int_t && !cv_buf.is_empty()
+                });
+            if use_cv {
+                // SAFETY: `cv_buf` was just populated by `ngx_http_complex_value`;
+                // `data` points into the request pool (valid for the LOG-phase call).
+                evaluated_name = unsafe {
+                    if cv_buf.len > 0 && !cv_buf.data.is_null() {
+                        core::slice::from_raw_parts(cv_buf.data, cv_buf.len)
+                    } else {
+                        b""
+                    }
+                };
+            }
+            if evaluated_name.is_empty() {
+                // Built-in "METHOD route_name" fallback.
+                build_span_name(
+                    &mut span_name_buf,
+                    r.method_name.as_bytes(),
+                    amcf.route_name(meta.route_idx).as_bytes(),
+                )
+            } else {
+                let len = evaluated_name.len().min(MAX_SPAN_NAME);
+                span_name_buf[..len].copy_from_slice(&evaluated_name[..len]);
+                len
+            }
+        };
+
+        // Build extra_attrs from otel_span_attr directives (up to
+        // MAX_SPAN_EXTRA_ATTRS pairs).  No heap allocation — stack buffer only.
+        let mut attrs_buf: [(&[u8], &[u8]); MAX_SPAN_EXTRA_ATTRS] =
+            [(&[], &[]); MAX_SPAN_EXTRA_ATTRS];
+        let attrs_len = if let Some(lc) = loc_conf {
+            let n = lc.span_attrs.len().min(MAX_SPAN_EXTRA_ATTRS);
+            for (slot, (k, v)) in attrs_buf[..n].iter_mut().zip(lc.span_attrs[..n].iter()) {
+                // SAFETY: `k` and `v` are `ngx_str_t` values from the nginx
+                // conf pool (populated at config-parse time by
+                // `cmd_add_otel_span_attr`); `as_bytes()` safely reinterprets
+                // the pointer + length as a byte slice valid for process lifetime.
+                *slot = (k.as_bytes(), v.as_bytes());
+            }
+            n
+        } else {
+            0
+        };
+
+        // OTel HTTP server span StatusCode: Error(2) for 5xx, Unset(0) otherwise.
+        let otel_status_code: u8 = if meta.status >= 500 { 2 } else { 0 };
+
+        // Span end time: derived from the monotonic duration for coherence.
+        // end = start + duration_us * 1_000 ns.
+        // Invariants: end >= start (monotonic); span (end−start) == duration_us.
+        let end_time_unix_nano =
+            ctx.start_time_unix_nano.saturating_add(duration_us.saturating_mul(1_000));
+
+        // ── HTTP semconv coverage sources (already materialized) ───────
+        let conn_ptr = r.connection;
+
+        // url.scheme: TLS connection ⇒ "https".
+        let scheme_https = if conn_ptr.is_null() {
+            false
+        } else {
+            // SAFETY: `conn_ptr` is non-null (checked); `ssl` is a pointer
+            // nginx sets non-null on TLS connections.
+            unsafe { !(*conn_ptr).ssl.is_null() }
+        };
+
+        // server.address: the matched server name, falling back to the
+        // request Host header (mirrors nginx-otel getServerName,
+        // http_module.cpp:395-406).
+        let server_address: &[u8] = {
+            let from_srv = NgxHttpCoreModule::server_conf(r)
+                .map(|cscf| cscf.server_name.as_bytes())
+                .unwrap_or(b"");
+            if from_srv.is_empty() {
+                r.headers_in.server.as_bytes()
+            } else {
+                from_srv
+            }
+        };
+
+        // server.port / client.port (local + client sockaddr ports).
+        // SAFETY: `conn_ptr` is the request connection pointer (may be
+        // null — `server_port` handles null).
+        let server_port_val = unsafe { server_port(conn_ptr) };
+        // SAFETY: `conn_ptr` is the request connection pointer (may be
+        // null — `client_port` handles null).
+        let client_port_val = unsafe { client_port(conn_ptr) };
+
+        // network.peer.{address,port}: the TRUE TCP socket peer via the
+        // realip-aware `$realip_remote_addr` selection (saved original
+        // when realip rewrote the connection, else the live peer).
+        let r_mut = r as *const nginx_sys::ngx_http_request_t as *mut nginx_sys::ngx_http_request_t;
+        // SAFETY: `r_mut` is the live request pointer for this handler.
+        let (peer_address, peer_port_val) = unsafe { realip_peer(r_mut) };
+
+        // http.request.body.size: content_length_n (-1 = absent ⇒ 0).
+        let req_body_size = if r.headers_in.content_length_n > 0 {
+            r.headers_in.content_length_n as u64
+        } else {
+            0
+        };
+        // http.response.body.size: bytes sent minus response headers
+        // (mirrors nginx-otel http.response_content_length,
+        // http_module.cpp:436).
+        let resp_body_size = meta.resp_bytes.saturating_sub(r.header_size as u64);
+
+        let rec = SpanRecord {
+            trace_id: ctx.trace_id,
+            span_id: ctx.span_id,
+            parent_span_id: ctx.parent_span_id,
+            flags: ctx.flags,
+            start_time_unix_nano: ctx.start_time_unix_nano,
+            end_time_unix_nano,
+            status_code: otel_status_code,
+            kind: 2, // SpanKind::Server
+            name: &span_name_buf[..span_name_len],
+            method: r.method_name.as_bytes(),
+            http_status: meta.status,
+            url_path: r.uri.as_bytes(), // uri = path only; unparsed_uri = path+args
+            duration_us,
+            proto: meta.proto as u8,
+            scheme_https,
+            server_port: server_port_val,
+            client_port: client_port_val,
+            peer_port: peer_port_val,
+            req_body_size,
+            resp_body_size,
+            url_query: r.args.as_bytes(), // url.query: args without leading '?'
+            route: amcf.route_name(meta.route_idx).as_bytes(),
+            user_agent: user_agent_raw,
+            server_address,
+            client_address: client_addr,
+            peer_address,
+            extra_attrs: &attrs_buf[..attrs_len],
+        };
+
+        // SAFETY: `spans_base` is the valid mapped shm start returned by
+        // `spans_shm_base()`, sized for ≥ worker_id spans-ring slots at zone
+        // registration in postconfiguration.  The ring lives for the worker's
+        // lifetime and outlives this handler invocation.
+        let spans = unsafe { spans_ring(spans_base, worker_id, DEFAULT_SPAN_RING_CAP) };
+        let producer = WorkerRingProducer { ring: spans };
+        // Ring-full drop path → liveness check (see the access-ring
+        // hook above for the trigger/verdict rationale).
+        if !emit_span_record(&producer, &rec) {
+            // SAFETY: `r.connection` is the request's live connection pointer
+            // (may be null); `(*conn).log` is the request's log.
+            let conn_log = unsafe {
+                let conn = r.connection;
+                if conn.is_null() {
+                    core::ptr::null_mut()
+                } else {
+                    (*conn).log
+                }
+            };
+            crate::liveness::check_exporter_liveness_on_drop(amcf, conn_log);
+        }
     }
 }
 
@@ -1125,40 +1266,168 @@ unsafe impl Sync for InstrumentedSource {}
 impl crate::metric_source::MetricSource for InstrumentedSource {
     #[allow(clippy::needless_range_loop)] // idx parallels two independent slices (buckets + bounds)
     fn collect(&self) -> std::vec::Vec<crate::data_model::Metric> {
-        use crate::data_model::{AggregationTemporality, AnyValue, Exemplar, KeyValue};
-        use crate::shm::{
-            combo_index, HttpMethod, ProtoVersion, StatusClass, BYTES_BOUNDS, DURATION_BOUNDS_S,
-            EXP_HISTOGRAM_BUCKET_OFFSET, EXP_HISTOGRAM_SCALE, N_COMBOS, N_EXP_BUCKETS,
-            N_HTTP_METHODS, N_PROTO_VERSIONS, N_ROUTE_SLOTS, N_STATUS_CLASSES, N_UPSTREAM_SLOTS,
-        };
+        use crate::data_model::AggregationTemporality;
+        use crate::shm::{BYTES_BOUNDS, DURATION_BOUNDS_S};
 
         let start = self.start_time_unix_nano;
         let now = crate::util::now_unix_nano();
-
-        // Aggregate per-combination exp-histogram slots over all workers.
-        // combo_agg[idx] = ([bucket_counts; N_EXP_BUCKETS], zero_count, sum, count)
-        let mut combo_agg: std::vec::Vec<([u64; N_EXP_BUCKETS], u64, u64, u64)> =
-            std::vec![([0u64; N_EXP_BUCKETS], 0u64, 0u64, 0u64); N_COMBOS];
-        // Separate route / upstream aggregation tables.
-        let mut route_agg: std::vec::Vec<([u64; N_EXP_BUCKETS], u64, u64, u64)> =
-            std::vec![([0u64; N_EXP_BUCKETS], 0u64, 0u64, 0u64); N_ROUTE_SLOTS];
-        let mut upstream_agg: std::vec::Vec<([u64; N_EXP_BUCKETS], u64, u64, u64)> =
-            std::vec![([0u64; N_EXP_BUCKETS], 0u64, 0u64, 0u64); N_UPSTREAM_SLOTS];
-        let mut req_bytes = ([0u64; N_BYTES_BUCKETS], 0u64, 0u64);
-        let mut resp_bytes = ([0u64; N_BYTES_BUCKETS], 0u64, 0u64);
-        let mut up_resp = ([0u64; N_DURATION_BUCKETS], 0u64, 0u64);
-        let mut up_hdr = ([0u64; N_DURATION_BUCKETS], 0u64, 0u64);
-        let mut up_conn = ([0u64; N_DURATION_BUCKETS], 0u64, 0u64);
-        let mut up_bytes = ([0u64; N_BYTES_BUCKETS], 0u64, 0u64);
-        let mut up_bytes_sent = ([0u64; N_BYTES_BUCKETS], 0u64, 0u64);
 
         // SAFETY: `self.amcf` is the main-config pointer captured at exporter
         // setup; it is either null or points to the `MainConfig` that lives for
         // the whole process. `as_ref()` yields `None` for null and otherwise a
         // reference that does not outlive `self`, so it is sound.
-        let amcf_ref_early: Option<&crate::config::MainConfig> = unsafe { self.amcf.as_ref() };
+        let amcf_ref: Option<&crate::config::MainConfig> = unsafe { self.amcf.as_ref() };
 
-        // Collect exemplars from all workers: Vec<(combo_idx, Exemplar)>
+        // Step 1: aggregate shm counters across all workers + collect exemplars.
+        let (agg, all_exemplars) = self.aggregate_worker_slots();
+
+        // DURATION_BOUNDS_S is already f64 (seconds); upstream histograms record
+        // raw ms values against DURATION_BOUNDS_MS on the worker, and the exporter
+        // publishes in seconds by using DURATION_BOUNDS_S here and dividing the sum.
+        let dur_bounds_s: std::vec::Vec<f64> = DURATION_BOUNDS_S.to_vec();
+        let byte_bounds: std::vec::Vec<f64> = BYTES_BOUNDS.iter().map(|&b| b as f64).collect();
+
+        // Step 2: build one metric per signal family and return.
+        std::vec![
+            // Request duration: base (method × sc × proto), by_route, by_upstream.
+            self.build_duration_metric(&agg.combo_agg, &all_exemplars, start, now),
+            self.build_route_metric(&agg.route_agg, amcf_ref, start, now),
+            self.build_upstream_duration_metric(&agg.upstream_agg, amcf_ref, start, now),
+            // Request / response body sizes.
+            hist_metric(
+                "http.server.request.body.size",
+                "HTTP server request body size",
+                "By",
+                agg.req_bytes,
+                byte_bounds.clone(),
+                start,
+                now,
+                AggregationTemporality::Cumulative,
+            ),
+            hist_metric(
+                "http.server.response.body.size",
+                "HTTP server response body size",
+                "By",
+                agg.resp_bytes,
+                byte_bounds.clone(),
+                start,
+                now,
+                AggregationTemporality::Cumulative,
+            ),
+            // Upstream timings: published in seconds (`"s"`); the worker records raw
+            // ms values against DURATION_BOUNDS_MS, so the bucket placement is
+            // unchanged — only the bounds (DURATION_BOUNDS_S) and the scalar sum
+            // (÷1000) change at export.
+            hist_metric_with_sum(
+                "nginx.upstream.response.duration",
+                "Upstream response time",
+                "s",
+                agg.up_resp,
+                ms_to_s_hist_sum(agg.up_resp.1),
+                dur_bounds_s.clone(),
+                start,
+                now,
+                AggregationTemporality::Cumulative,
+            ),
+            hist_metric_with_sum(
+                "nginx.upstream.header.duration",
+                "Upstream time to first response byte",
+                "s",
+                agg.up_hdr,
+                ms_to_s_hist_sum(agg.up_hdr.1),
+                dur_bounds_s.clone(),
+                start,
+                now,
+                AggregationTemporality::Cumulative,
+            ),
+            hist_metric_with_sum(
+                "nginx.upstream.connect.duration",
+                "Upstream connection establishment time",
+                "s",
+                agg.up_conn,
+                ms_to_s_hist_sum(agg.up_conn.1),
+                dur_bounds_s.clone(),
+                start,
+                now,
+                AggregationTemporality::Cumulative,
+            ),
+            // Upstream byte counters.
+            hist_metric(
+                "nginx.upstream.bytes.received",
+                "Bytes received from upstream",
+                "By",
+                agg.up_bytes,
+                byte_bounds.clone(),
+                start,
+                now,
+                AggregationTemporality::Cumulative,
+            ),
+            hist_metric(
+                "nginx.upstream.bytes.sent",
+                "Bytes sent to upstream",
+                "By",
+                agg.up_bytes_sent,
+                byte_bounds.clone(),
+                start,
+                now,
+                AggregationTemporality::Cumulative,
+            ),
+        ]
+    }
+}
+
+/// Aggregated shm counters accumulated over all worker slots for one export cycle.
+struct WorkerAgg {
+    /// Base combination histograms (method × status_class × protocol).
+    combo_agg: std::vec::Vec<([u64; crate::shm::N_EXP_BUCKETS], u64, u64, u64)>,
+    /// Per-route duration histograms.
+    route_agg: std::vec::Vec<([u64; crate::shm::N_EXP_BUCKETS], u64, u64, u64)>,
+    /// Per-upstream duration histograms.
+    upstream_agg: std::vec::Vec<([u64; crate::shm::N_EXP_BUCKETS], u64, u64, u64)>,
+    /// Request body sizes.
+    req_bytes: ([u64; crate::shm::N_BYTES_BUCKETS], u64, u64),
+    /// Response body sizes.
+    resp_bytes: ([u64; crate::shm::N_BYTES_BUCKETS], u64, u64),
+    /// Upstream response time (ms, converted to seconds at export).
+    up_resp: ([u64; crate::shm::N_DURATION_BUCKETS], u64, u64),
+    /// Upstream header time (ms, converted to seconds at export).
+    up_hdr: ([u64; crate::shm::N_DURATION_BUCKETS], u64, u64),
+    /// Upstream connect time (ms, converted to seconds at export).
+    up_conn: ([u64; crate::shm::N_DURATION_BUCKETS], u64, u64),
+    /// Bytes received from upstreams.
+    up_bytes: ([u64; crate::shm::N_BYTES_BUCKETS], u64, u64),
+    /// Bytes sent to upstreams.
+    up_bytes_sent: ([u64; crate::shm::N_BYTES_BUCKETS], u64, u64),
+}
+
+impl InstrumentedSource {
+    /// Walks every per-worker shm slot, aggregating all histogram counters and
+    /// collecting exemplars in one pass.
+    ///
+    /// Returns the aggregated data and the raw exemplar list, which the caller
+    /// distributes to the appropriate data points.
+    #[allow(clippy::needless_range_loop)] // idx used to index two independent parallel slices
+    fn aggregate_worker_slots(
+        &self,
+    ) -> (WorkerAgg, std::vec::Vec<(u32, crate::data_model::Exemplar)>) {
+        use crate::data_model::Exemplar;
+        use crate::shm::{N_COMBOS, N_EXP_BUCKETS, N_ROUTE_SLOTS, N_UPSTREAM_SLOTS};
+
+        // combo_agg[idx] = ([bucket_counts; N_EXP_BUCKETS], zero_count, sum, count)
+        let mut combo_agg: std::vec::Vec<([u64; N_EXP_BUCKETS], u64, u64, u64)> =
+            std::vec![([0u64; N_EXP_BUCKETS], 0u64, 0u64, 0u64); N_COMBOS];
+        let mut route_agg: std::vec::Vec<([u64; N_EXP_BUCKETS], u64, u64, u64)> =
+            std::vec![([0u64; N_EXP_BUCKETS], 0u64, 0u64, 0u64); N_ROUTE_SLOTS];
+        let mut upstream_agg: std::vec::Vec<([u64; N_EXP_BUCKETS], u64, u64, u64)> =
+            std::vec![([0u64; N_EXP_BUCKETS], 0u64, 0u64, 0u64); N_UPSTREAM_SLOTS];
+        let mut req_bytes = ([0u64; crate::shm::N_BYTES_BUCKETS], 0u64, 0u64);
+        let mut resp_bytes = ([0u64; crate::shm::N_BYTES_BUCKETS], 0u64, 0u64);
+        let mut up_resp = ([0u64; crate::shm::N_DURATION_BUCKETS], 0u64, 0u64);
+        let mut up_hdr = ([0u64; crate::shm::N_DURATION_BUCKETS], 0u64, 0u64);
+        let mut up_conn = ([0u64; crate::shm::N_DURATION_BUCKETS], 0u64, 0u64);
+        let mut up_bytes = ([0u64; crate::shm::N_BYTES_BUCKETS], 0u64, 0u64);
+        let mut up_bytes_sent = ([0u64; crate::shm::N_BYTES_BUCKETS], 0u64, 0u64);
+
         let mut all_exemplars: std::vec::Vec<(u32, Exemplar)> = std::vec::Vec::new();
 
         for i in 0..self.n_workers {
@@ -1252,54 +1521,47 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
             }
         }
 
-        // DURATION_BOUNDS_S is already f64 (seconds); upstream histograms record
-        // raw ms values against DURATION_BOUNDS_MS on the worker, and the exporter
-        // publishes in seconds by using DURATION_BOUNDS_S here and dividing the sum.
-        let dur_bounds_s: std::vec::Vec<f64> = DURATION_BOUNDS_S.to_vec();
-        let byte_bounds: std::vec::Vec<f64> = BYTES_BOUNDS.iter().map(|&b| b as f64).collect();
+        (
+            WorkerAgg {
+                combo_agg,
+                route_agg,
+                upstream_agg,
+                req_bytes,
+                resp_bytes,
+                up_resp,
+                up_hdr,
+                up_conn,
+                up_bytes,
+                up_bytes_sent,
+            },
+            all_exemplars,
+        )
+    }
 
-        // ── Build http.server.request.duration ──────────────────────────
-        // All histograms are cumulative running totals.
-        // amcf provides route/upstream name strings for the attribute values.
-        let amcf_ref: Option<&crate::config::MainConfig> = amcf_ref_early;
-
-        // Decomposed: emit THREE separate metric series:
-        //  1. http.server.request.duration (base: method × sc × proto)
-        //  2. http.server.request.duration.by_route (per http.route location)
-        //  3. http.server.request.duration.by_upstream (per nginx.upstream.zone)
+    /// Builds the `http.server.request.duration` metric from the aggregated
+    /// base-combination histograms.
+    ///
+    /// When `status_code_class_enabled`, emits one data point per
+    /// `{method × status_class × protocol}` combination (160 combos) with the
+    /// corresponding exemplars.  Otherwise collapses all combinations into a
+    /// single unlabelled data point.
+    fn build_duration_metric(
+        &self,
+        combo_agg: &[([u64; crate::shm::N_EXP_BUCKETS], u64, u64, u64)],
+        all_exemplars: &[(u32, crate::data_model::Exemplar)],
+        start: u64,
+        now: u64,
+    ) -> crate::data_model::Metric {
         use crate::data_model::{
-            ExponentialHistogramData, ExponentialHistogramDataPoint, Metric, MetricData,
+            AggregationTemporality, AnyValue, Exemplar, ExponentialHistogramData,
+            ExponentialHistogramDataPoint, KeyValue, Metric, MetricData,
+        };
+        use crate::shm::{
+            combo_index, HttpMethod, ProtoVersion, StatusClass, EXP_HISTOGRAM_BUCKET_OFFSET,
+            EXP_HISTOGRAM_SCALE, N_EXP_BUCKETS, N_HTTP_METHODS, N_PROTO_VERSIONS, N_STATUS_CLASSES,
         };
 
-        // Helper to emit one exp-histogram data point from aggregated buckets.
-        let make_dp = |agg: &([u64; N_EXP_BUCKETS], u64, u64, u64),
-                       attrs: std::vec::Vec<KeyValue>,
-                       exemplars: std::vec::Vec<Exemplar>|
-         -> Option<ExponentialHistogramDataPoint> {
-            let (bc, zc, bs, bcount) = *agg;
-            if bcount == 0 {
-                return None;
-            }
-            Some(ExponentialHistogramDataPoint {
-                attributes: attrs,
-                start_time_unix_nano: start,
-                time_unix_nano: now,
-                count: bcount,
-                // The histogram is published in seconds.  The worker buckets
-                // seconds directly (shm::ExpHistogramSlot) but accumulates the
-                // sum in raw µs; convert the scalar sum to seconds here — one
-                // lossless divide per series at export (same convert-at-export
-                // precedent as the access-log/span duration attributes).
-                sum: us_to_seconds(bs),
-                scale: EXP_HISTOGRAM_SCALE,
-                zero_count: zc,
-                positive_offset: EXP_HISTOGRAM_BUCKET_OFFSET,
-                positive_bucket_counts: bc.to_vec(),
-                exemplars,
-            })
-        };
-
-        let duration_metric = if self.status_code_class_enabled {
+        if self.status_code_class_enabled {
             // Base series: method × status_class × protocol (160 combos).
             let mut data_points: std::vec::Vec<ExponentialHistogramDataPoint> =
                 std::vec::Vec::new();
@@ -1334,7 +1596,9 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                                 value: AnyValue::String(proto.as_str().into())
                             },
                         ];
-                        if let Some(dp) = make_dp(&combo_agg[combo], attrs, combo_exemplars) {
+                        if let Some(dp) =
+                            make_exp_dp(&combo_agg[combo], attrs, combo_exemplars, start, now)
+                        {
                             data_points.push(dp);
                         }
                     }
@@ -1353,7 +1617,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
             // Aggregate across all base combinations → single data point.
             let mut all_buckets = [0u64; N_EXP_BUCKETS];
             let (mut all_zero, mut all_sum, mut all_count) = (0u64, 0u64, 0u64);
-            for agg in &combo_agg {
+            for agg in combo_agg {
                 for (a, b) in all_buckets.iter_mut().zip(agg.0.iter()) {
                     *a += b;
                 }
@@ -1372,7 +1636,7 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                         start_time_unix_nano: start,
                         time_unix_nano: now,
                         count: all_count,
-                        // Convert the raw-µs sum to seconds at export (see make_dp).
+                        // Convert the raw-µs sum to seconds at export (see make_exp_dp).
                         sum: us_to_seconds(all_sum),
                         scale: EXP_HISTOGRAM_SCALE,
                         zero_count: all_zero,
@@ -1382,153 +1646,92 @@ impl crate::metric_source::MetricSource for InstrumentedSource {
                     }],
                 }),
             }
-        };
+        }
+    }
 
-        // Per-route series (http.server.request.duration.by_route).
-        let route_metric = {
-            let mut data_points: std::vec::Vec<ExponentialHistogramDataPoint> =
-                std::vec::Vec::new();
-            for r_idx in 0..N_ROUTE_SLOTS {
-                let route_name: std::string::String = amcf_ref
-                    .map(|c| std::string::String::from(c.route_name(r_idx)))
-                    .unwrap_or_else(|| std::format!("route_{}", r_idx));
-                let attrs = std::vec![KeyValue {
-                    key: "http.route".into(),
-                    value: AnyValue::String(route_name)
-                }];
-                if let Some(dp) = make_dp(&route_agg[r_idx], attrs, std::vec![]) {
-                    data_points.push(dp);
-                }
-            }
-            // Moved out of the `http.server.*` semconv namespace to
-            // `nginx.*` — this is a Tier-2 nginx-specific metric, not semconv.
-            Metric {
-                name: "nginx.http.request.duration.by_route".into(),
-                description: "HTTP server request duration by matched location (http.route)".into(),
-                unit: "s".into(),
-                data: MetricData::ExponentialHistogram(ExponentialHistogramData {
-                    aggregation_temporality: AggregationTemporality::Cumulative,
-                    data_points,
-                }),
-            }
+    /// Builds the `nginx.http.request.duration.by_route` metric, one data point
+    /// per registered location (`http.route` attribute).
+    #[allow(clippy::needless_range_loop)] // r_idx is both the slice index and the route-name key
+    fn build_route_metric(
+        &self,
+        route_agg: &[([u64; crate::shm::N_EXP_BUCKETS], u64, u64, u64)],
+        amcf_ref: Option<&crate::config::MainConfig>,
+        start: u64,
+        now: u64,
+    ) -> crate::data_model::Metric {
+        use crate::data_model::{
+            AggregationTemporality, AnyValue, ExponentialHistogramData,
+            ExponentialHistogramDataPoint, KeyValue, Metric, MetricData,
         };
+        use crate::shm::N_ROUTE_SLOTS;
 
-        // Per-upstream series (http.server.request.duration.by_upstream).
-        let upstream_metric = {
-            let mut data_points: std::vec::Vec<ExponentialHistogramDataPoint> =
-                std::vec::Vec::new();
-            for u_idx in 0..N_UPSTREAM_SLOTS {
-                let uname: std::string::String = amcf_ref
-                    .map(|c| std::string::String::from(c.upstream_zone_name(u_idx)))
-                    .unwrap_or_else(|| std::format!("upstream_{}", u_idx));
-                let attrs = std::vec![KeyValue {
-                    key: "nginx.upstream.zone".into(),
-                    value: AnyValue::String(uname)
-                }];
-                if let Some(dp) = make_dp(&upstream_agg[u_idx], attrs, std::vec![]) {
-                    data_points.push(dp);
-                }
+        let mut data_points: std::vec::Vec<ExponentialHistogramDataPoint> = std::vec::Vec::new();
+        for r_idx in 0..N_ROUTE_SLOTS {
+            let route_name: std::string::String = amcf_ref
+                .map(|c| std::string::String::from(c.route_name(r_idx)))
+                .unwrap_or_else(|| std::format!("route_{}", r_idx));
+            let attrs = std::vec![KeyValue {
+                key: "http.route".into(),
+                value: AnyValue::String(route_name)
+            }];
+            if let Some(dp) = make_exp_dp(&route_agg[r_idx], attrs, std::vec![], start, now) {
+                data_points.push(dp);
             }
-            // Moved out of the `http.server.*` semconv namespace to
-            // `nginx.*` — Tier-2 nginx-specific metric.
-            Metric {
-                name: "nginx.http.request.duration.by_upstream".into(),
-                description: "HTTP server request duration by upstream zone (nginx.upstream.zone)"
-                    .into(),
-                unit: "s".into(),
-                data: MetricData::ExponentialHistogram(ExponentialHistogramData {
-                    aggregation_temporality: AggregationTemporality::Cumulative,
-                    data_points,
-                }),
-            }
+        }
+        // Moved out of the `http.server.*` semconv namespace to
+        // `nginx.*` — this is a Tier-2 nginx-specific metric, not semconv.
+        Metric {
+            name: "nginx.http.request.duration.by_route".into(),
+            description: "HTTP server request duration by matched location (http.route)".into(),
+            unit: "s".into(),
+            data: MetricData::ExponentialHistogram(ExponentialHistogramData {
+                aggregation_temporality: AggregationTemporality::Cumulative,
+                data_points,
+            }),
+        }
+    }
+
+    /// Builds the `nginx.http.request.duration.by_upstream` metric, one data point
+    /// per registered upstream zone (`nginx.upstream.zone` attribute).
+    #[allow(clippy::needless_range_loop)] // u_idx is both the slice index and the upstream-zone key
+    fn build_upstream_duration_metric(
+        &self,
+        upstream_agg: &[([u64; crate::shm::N_EXP_BUCKETS], u64, u64, u64)],
+        amcf_ref: Option<&crate::config::MainConfig>,
+        start: u64,
+        now: u64,
+    ) -> crate::data_model::Metric {
+        use crate::data_model::{
+            AggregationTemporality, AnyValue, ExponentialHistogramData,
+            ExponentialHistogramDataPoint, KeyValue, Metric, MetricData,
         };
+        use crate::shm::N_UPSTREAM_SLOTS;
 
-        std::vec![
-            duration_metric,
-            route_metric,
-            upstream_metric,
-            hist_metric(
-                "http.server.request.body.size",
-                "HTTP server request body size",
-                "By",
-                req_bytes,
-                byte_bounds.clone(),
-                start,
-                now,
-                AggregationTemporality::Cumulative,
-            ),
-            hist_metric(
-                "http.server.response.body.size",
-                "HTTP server response body size",
-                "By",
-                resp_bytes,
-                byte_bounds.clone(),
-                start,
-                now,
-                AggregationTemporality::Cumulative,
-            ),
-            // ── upstream timings ─────────────────────────────────────────
-            // Renamed from `http.server.upstream.*` to `nginx.upstream.*`
-            // (Tier-2; not semconv).  Published in seconds (`"s"`); the worker
-            // records raw ms values against DURATION_BOUNDS_MS, so the bucket
-            // placement is unchanged — only the bounds (DURATION_BOUNDS_S) and
-            // the scalar sum (÷1000) change at export.
-            hist_metric_with_sum(
-                "nginx.upstream.response.duration",
-                "Upstream response time",
-                "s",
-                up_resp,
-                ms_to_s_hist_sum(up_resp.1),
-                dur_bounds_s.clone(),
-                start,
-                now,
-                AggregationTemporality::Cumulative,
-            ),
-            hist_metric_with_sum(
-                "nginx.upstream.header.duration",
-                "Upstream time to first response byte",
-                "s",
-                up_hdr,
-                ms_to_s_hist_sum(up_hdr.1),
-                dur_bounds_s.clone(),
-                start,
-                now,
-                AggregationTemporality::Cumulative,
-            ),
-            hist_metric_with_sum(
-                "nginx.upstream.connect.duration",
-                "Upstream connection establishment time",
-                "s",
-                up_conn,
-                ms_to_s_hist_sum(up_conn.1),
-                dur_bounds_s.clone(),
-                start,
-                now,
-                AggregationTemporality::Cumulative,
-            ),
-            // Renamed from `http.server.upstream.bytes.*` to `nginx.upstream.bytes.*`.
-            // Unit stays `By`.
-            hist_metric(
-                "nginx.upstream.bytes.received",
-                "Bytes received from upstream",
-                "By",
-                up_bytes,
-                byte_bounds.clone(),
-                start,
-                now,
-                AggregationTemporality::Cumulative,
-            ),
-            hist_metric(
-                "nginx.upstream.bytes.sent",
-                "Bytes sent to upstream",
-                "By",
-                up_bytes_sent,
-                byte_bounds.clone(),
-                start,
-                now,
-                AggregationTemporality::Cumulative,
-            ),
-        ]
+        let mut data_points: std::vec::Vec<ExponentialHistogramDataPoint> = std::vec::Vec::new();
+        for u_idx in 0..N_UPSTREAM_SLOTS {
+            let uname: std::string::String = amcf_ref
+                .map(|c| std::string::String::from(c.upstream_zone_name(u_idx)))
+                .unwrap_or_else(|| std::format!("upstream_{}", u_idx));
+            let attrs = std::vec![KeyValue {
+                key: "nginx.upstream.zone".into(),
+                value: AnyValue::String(uname)
+            }];
+            if let Some(dp) = make_exp_dp(&upstream_agg[u_idx], attrs, std::vec![], start, now) {
+                data_points.push(dp);
+            }
+        }
+        // Moved out of the `http.server.*` semconv namespace to
+        // `nginx.*` — Tier-2 nginx-specific metric.
+        Metric {
+            name: "nginx.http.request.duration.by_upstream".into(),
+            description: "HTTP server request duration by upstream zone (nginx.upstream.zone)"
+                .into(),
+            unit: "s".into(),
+            data: MetricData::ExponentialHistogram(ExponentialHistogramData {
+                aggregation_temporality: AggregationTemporality::Cumulative,
+                data_points,
+            }),
+        }
     }
 }
 
@@ -1643,6 +1846,39 @@ fn hist_metric<const N: usize>(
         time_ns,
         temporality,
     )
+}
+
+/// Build one exp-histogram data point from an aggregated `(buckets, zero_count,
+/// sum_us, count)` tuple.
+///
+/// Returns `None` when `count == 0` (skip zero-count series from the output).
+/// The scalar sum is converted from raw microseconds to seconds here — one
+/// lossless divide per series at export (same convert-at-export pattern as the
+/// access-log/span duration attributes and `us_to_seconds`).
+fn make_exp_dp(
+    agg: &([u64; crate::shm::N_EXP_BUCKETS], u64, u64, u64),
+    attrs: std::vec::Vec<crate::data_model::KeyValue>,
+    exemplars: std::vec::Vec<crate::data_model::Exemplar>,
+    start: u64,
+    now: u64,
+) -> Option<crate::data_model::ExponentialHistogramDataPoint> {
+    use crate::shm::{EXP_HISTOGRAM_BUCKET_OFFSET, EXP_HISTOGRAM_SCALE};
+    let (bc, zc, bs, bcount) = *agg;
+    if bcount == 0 {
+        return None;
+    }
+    Some(crate::data_model::ExponentialHistogramDataPoint {
+        attributes: attrs,
+        start_time_unix_nano: start,
+        time_unix_nano: now,
+        count: bcount,
+        sum: us_to_seconds(bs),
+        scale: EXP_HISTOGRAM_SCALE,
+        zero_count: zc,
+        positive_offset: EXP_HISTOGRAM_BUCKET_OFFSET,
+        positive_bucket_counts: bc.to_vec(),
+        exemplars,
+    })
 }
 
 // ── Unit tests ───────────────────────────────────────────────────────────────
