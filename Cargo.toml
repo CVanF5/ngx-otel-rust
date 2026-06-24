@@ -89,6 +89,9 @@ export-modules = []
 # Expose test-only types (SpinConnector, SpinTcpIo, etc.) so external crates can
 # exercise transport logic without a live NGINX process.  Never enable in production.
 test-support = []
+# Enable trace!() log macro (maps to debug! / NGX_LOG_DEBUG).  Off by default;
+# enable only when diagnosing detailed call flow in development builds.
+trace = []
 
 # Integration tests that exercise HyperHttpTransport via SpinConnector require
 # the test-support feature to expose the Spin* types and HyperHttpTransport::new.

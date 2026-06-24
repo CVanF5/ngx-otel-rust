@@ -73,6 +73,8 @@ use ngx::http::{add_phase_handler, HttpModule, HttpModuleLocationConf, HttpModul
 #[cfg(any(test, feature = "test-support"))]
 use ngx::core::Pool;
 
+#[macro_use]
+mod log;
 pub mod cert_table;
 mod config;
 pub mod data_model;
@@ -189,21 +191,11 @@ fn spawn_exporter_for_cycle(
     };
 
     if pid == nginx_sys::NGX_INVALID_PID as nginx_sys::ngx_pid_t {
-        ngx::ngx_log_error!(
-            nginx_sys::NGX_LOG_ERR,
-            cycle_ref.log,
-            "otel: failed to spawn exporter process"
-        );
+        error!(cycle_ref.log, "otel: failed to spawn exporter process");
         return Status::NGX_ERROR.into();
     }
 
-    ngx::ngx_log_error!(
-        nginx_sys::NGX_LOG_NOTICE,
-        cycle_ref.log,
-        "otel: spawned exporter process, pid={}, reload={}",
-        pid,
-        is_reload
-    );
+    notice!(cycle_ref.log, "otel: spawned exporter process, pid={}, reload={}", pid, is_reload);
     Status::NGX_OK.into()
 }
 
@@ -372,8 +364,7 @@ unsafe fn check_zone_sizing(
     //
     // SAFETY: `cycle` is valid; `.log` is non-null.
     let log = unsafe { (*cycle).log };
-    ngx::ngx_log_error!(
-        nginx_sys::NGX_LOG_EMERG,
+    emerg!(
         log,
         "otel: shm zones were reserved for {} worker slots (ngx_ncpu at parse time) \
          but worker_processes={}; move the worker_processes directive BEFORE the \
@@ -512,8 +503,7 @@ extern "C" fn ngx_otel_init_module(cycle: *mut nginx_sys::ngx_cycle_t) -> nginx_
     //
     // SAFETY: `cycle` is valid (verified above).
     if !is_reload && unsafe { is_pre_daemon_initial_start(cycle) } {
-        ngx::ngx_log_error!(
-            nginx_sys::NGX_LOG_ALERT,
+        alert!(
             cycle_ref.log,
             "otel: daemon on — gen-1 exporter will be unsupervised after daemonize \
              (PPID 1; crash-respawn unavailable for this generation). \
@@ -1014,8 +1004,7 @@ extern "C" fn ngx_otel_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
             // out (not retained).  The EMERG line is emitted at most once per
             // worker because `eager_seed_drbg` is called exactly once here.
             let log = unsafe { (*cycle).log };
-            ngx::ngx_log_error!(
-                nginx_sys::NGX_LOG_EMERG,
+            emerg!(
                 log,
                 "otel: trace-ID DRBG seeding failed ({e}); OS RNG unavailable — \
                  tracing DISABLED for this worker (traffic unaffected, no spans emitted)"
@@ -1058,11 +1047,7 @@ extern "C" fn ngx_otel_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
                 let pool = unsafe { Pool::from_ngx_pool((*cycle).pool) };
                 // `log` is shared by all three harnesses; guard it once.
                 let Some(log_nn) = core::ptr::NonNull::new(log) else {
-                    ngx::ngx_log_error!(
-                        nginx_sys::NGX_LOG_ERR,
-                        log,
-                        "otel grpc smoke harness: null log pointer; skipping"
-                    );
+                    error!(log, "otel grpc smoke harness: null log pointer; skipping");
                     return Status::NGX_OK.into();
                 };
 
@@ -1087,19 +1072,10 @@ extern "C" fn ngx_otel_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
                         match result {
                             Ok(()) => {
                                 // This exact line is what `run_grpc_smoke.sh` asserts on.
-                                ngx::ngx_log_error!(
-                                    nginx_sys::NGX_LOG_NOTICE,
-                                    log_ptr,
-                                    "grpc smoke: export complete"
-                                );
+                                notice!(log_ptr, "grpc smoke: export complete");
                             }
                             Err(e) => {
-                                ngx::ngx_log_error!(
-                                    nginx_sys::NGX_LOG_ERR,
-                                    log_ptr,
-                                    "grpc smoke: export failed: {}",
-                                    e
-                                );
+                                error!(log_ptr, "grpc smoke: export failed: {}", e);
                             }
                         }
                     },
@@ -1132,12 +1108,7 @@ extern "C" fn ngx_otel_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
                             Err(e) => {
                                 // This exact pattern is what run_grpc_bidi_smoke.sh
                                 // asserts must appear zero times.
-                                ngx::ngx_log_error!(
-                                    nginx_sys::NGX_LOG_ERR,
-                                    log_ptr,
-                                    "bidi smoke: bidi failed: {}",
-                                    e
-                                );
+                                error!(log_ptr, "bidi smoke: bidi failed: {}", e);
                             }
                         }
                     },
@@ -1167,8 +1138,7 @@ extern "C" fn ngx_otel_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
                                 // internally.  No additional log needed here.
                             }
                             Err(e) => {
-                                ngx::ngx_log_error!(
-                                    nginx_sys::NGX_LOG_ERR,
+                                error!(
                                     log_ptr,
                                     "bidi overload: failed: {}",
                                     e
@@ -1219,15 +1189,15 @@ fn run_grpc_smoke_harness<Fut>(
     }
     let log = log_nn.as_ptr();
     let Ok(endpoint_str) = core::str::from_utf8(spec.endpoint_bytes) else {
-        ngx::ngx_log_error!(nginx_sys::NGX_LOG_ERR, log, "{}", spec.not_utf8_msg);
+        error!(log, "{}", spec.not_utf8_msg);
         return;
     };
     let endpoint_owned = std::string::String::from(endpoint_str);
     let firing = std::format!("{} (endpoint={})", spec.firing_prefix, endpoint_owned);
-    ngx::ngx_log_error!(nginx_sys::NGX_LOG_NOTICE, log, "{}", firing);
+    notice!(log, "{}", firing);
     let task = ngx::async_::spawn(make_future(endpoint_owned, log_nn));
     if pool.allocate(task).is_null() {
-        ngx::ngx_log_error!(nginx_sys::NGX_LOG_ERR, log, "{}", spec.alloc_fail_msg);
+        error!(log, "{}", spec.alloc_fail_msg);
     }
 }
 
