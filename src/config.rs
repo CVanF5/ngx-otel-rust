@@ -1843,7 +1843,7 @@ extern "C" fn cmd_exporter_set_endpoint(
     let ecf = unsafe { conf.cast::<ExporterConfig>().as_mut().expect("exporter config") };
 
     if !ecf.endpoint.is_empty() {
-        return c"is duplicate".as_ptr().cast_mut();
+        return already_set_error();
     }
 
     // SAFETY: `cf` is the valid non-null parse context nginx passes to a directive
@@ -1864,7 +1864,7 @@ extern "C" fn cmd_exporter_set_trusted_cert(
     let ecf = unsafe { conf.cast::<ExporterConfig>().as_mut().expect("exporter config") };
 
     if !ecf.trusted_cert.is_empty() {
-        return c"is duplicate".as_ptr().cast_mut();
+        return already_set_error();
     }
 
     // SAFETY: `cf` is the valid non-null directive parse context; its `args` array
@@ -1886,7 +1886,7 @@ extern "C" fn cmd_exporter_set_ssl_cert(
     // SAFETY: `conf` is the `otel_exporter` block conf pointer (`ExporterConfig`).
     let ecf = unsafe { conf.cast::<ExporterConfig>().as_mut().expect("exporter config") };
     if !ecf.ssl_cert.is_empty() {
-        return c"is duplicate".as_ptr().cast_mut();
+        return already_set_error();
     }
     // SAFETY: `cf` is the valid non-null directive parse context.
     let args = unsafe { cf_args(cf) };
@@ -1906,7 +1906,7 @@ extern "C" fn cmd_exporter_set_ssl_cert_key(
     // SAFETY: `conf` is the `otel_exporter` block conf pointer (`ExporterConfig`).
     let ecf = unsafe { conf.cast::<ExporterConfig>().as_mut().expect("exporter config") };
     if !ecf.ssl_cert_key.is_empty() {
-        return c"is duplicate".as_ptr().cast_mut();
+        return already_set_error();
     }
     // SAFETY: `cf` is the valid non-null directive parse context.
     let args = unsafe { cf_args(cf) };
@@ -1926,7 +1926,7 @@ extern "C" fn cmd_exporter_set_ssl_verify(
     // SAFETY: `conf` is the `otel_exporter` block conf pointer (`ExporterConfig`).
     let ecf = unsafe { conf.cast::<ExporterConfig>().as_mut().expect("exporter config") };
     if ecf.ssl_verify != UNSET_FLAG {
-        return c"is duplicate".as_ptr().cast_mut();
+        return already_set_error();
     }
     // SAFETY: `cf` is the valid non-null directive parse context.
     let args = unsafe { cf_args(cf) };
@@ -1982,7 +1982,7 @@ extern "C" fn cmd_exporter_set_metrics_endpoint(
     // SAFETY: `conf` is the `otel_exporter` block conf pointer (an `ExporterConfig`).
     let ecf = unsafe { conf.cast::<ExporterConfig>().as_mut().expect("exporter config") };
     if !ecf.metrics_endpoint.is_empty() {
-        return c"is duplicate".as_ptr().cast_mut();
+        return already_set_error();
     }
     // SAFETY: `cf` is the valid non-null directive parse context.
     let args = unsafe { cf_args(cf) };
@@ -1999,7 +1999,7 @@ extern "C" fn cmd_exporter_set_logs_endpoint(
     // SAFETY: `conf` is the `otel_exporter` block conf pointer (an `ExporterConfig`).
     let ecf = unsafe { conf.cast::<ExporterConfig>().as_mut().expect("exporter config") };
     if !ecf.logs_endpoint.is_empty() {
-        return c"is duplicate".as_ptr().cast_mut();
+        return already_set_error();
     }
     // SAFETY: `cf` is the valid non-null directive parse context.
     let args = unsafe { cf_args(cf) };
@@ -2016,7 +2016,7 @@ extern "C" fn cmd_exporter_set_traces_endpoint(
     // SAFETY: `conf` is the `otel_exporter` block conf pointer (an `ExporterConfig`).
     let ecf = unsafe { conf.cast::<ExporterConfig>().as_mut().expect("exporter config") };
     if !ecf.traces_endpoint.is_empty() {
-        return c"is duplicate".as_ptr().cast_mut();
+        return already_set_error();
     }
     // SAFETY: `cf` is the valid non-null directive parse context.
     let args = unsafe { cf_args(cf) };
@@ -2080,7 +2080,7 @@ extern "C" fn cmd_exporter_block_set_interval(
     };
 
     if amcf.metric_interval_ms != UNSET_U64 {
-        return c"is duplicate".as_ptr().cast_mut();
+        return already_set_error();
     }
 
     // SAFETY: `cf` is the valid non-null directive parse context (TAKE1 arg).
@@ -2594,7 +2594,7 @@ extern "C" fn cmd_set_metric_interval(
     let amcf = unsafe { conf.cast::<MainConfig>().as_mut().expect("main config") };
 
     if amcf.metric_interval_ms != UNSET_U64 {
-        return c"is duplicate".as_ptr().cast_mut();
+        return already_set_error();
     }
 
     // SAFETY: `cf` is the valid non-null directive parse context; `args` holds the
@@ -2627,7 +2627,7 @@ extern "C" fn cmd_set_metric_zone(
     let amcf = unsafe { conf.cast::<MainConfig>().as_mut().expect("main config") };
 
     if amcf.zone_size > 0 {
-        return c"is duplicate".as_ptr().cast_mut();
+        return already_set_error();
     }
 
     // SAFETY: `cf` is the valid non-null directive parse context; `args` holds the
@@ -2667,7 +2667,7 @@ extern "C" fn cmd_set_export_protocol(
     let amcf = unsafe { conf.cast::<MainConfig>().as_mut().expect("main config") };
 
     if amcf.export_protocol.is_some() {
-        return c"is duplicate".as_ptr().cast_mut();
+        return already_set_error();
     }
 
     // SAFETY: `cf` is the valid non-null directive parse context; `args` holds the
@@ -2713,7 +2713,7 @@ extern "C" fn cmd_set_log_ring_size(
     let amcf = unsafe { conf.cast::<MainConfig>().as_mut().expect("main config") };
 
     if amcf.log_ring_size > 0 {
-        return c"is duplicate".as_ptr().cast_mut();
+        return already_set_error();
     }
 
     // SAFETY: `cf` is the valid non-null directive parse context; `args` holds the
@@ -2723,7 +2723,7 @@ extern "C" fn cmd_set_log_ring_size(
 
     match parse_size_bytes(raw) {
         Some(n) if n > 0 => {
-            // `LogsWorkerRingHeader` holds four `AtomicU64` fields (align = 8).
+            // `WorkerSignalRingHeader` holds four `AtomicU64` fields (align = 8).
             // `CoalesceSlot` holds an `AtomicU64` at offset 0 (align = 8).
             // The error-ring header starts at slot_base + ring_size_bytes(cap) and
             // the coalescer table starts at slot_base + 2 * ring_size_bytes(cap).
@@ -2761,6 +2761,53 @@ extern "C" fn cmd_set_log_ring_size(
     }
 }
 
+/// Directive-handler error string for a directive that appears more than once.
+///
+/// nginx renders the returned pointer as `"<directive>" is duplicate`.  Centralises
+/// the `c"is duplicate"` cast repeated across the duplicate-guard arms of the
+/// directive handlers.
+#[inline]
+fn already_set_error() -> *mut c_char {
+    c"is duplicate".as_ptr().cast_mut()
+}
+
+/// Parse the `otel_error_log` severity floor from the directive arguments.
+///
+/// `TAKE1` parses the explicit level; `NOARGS` defaults to `NGX_LOG_ERR`.
+/// Returns `None` (after logging an `NGX_LOG_EMERG` line) on an unknown level.
+///
+/// # Safety
+/// `cf` must be the valid, non-null parse context nginx passes to the handler.
+unsafe fn parse_error_log_level_floor(cf: *mut ngx_conf_t) -> Option<ngx_uint_t> {
+    // SAFETY: `cf` is the valid non-null parse context. `cf_args(cf)` reads the
+    // parsed tokens, and the inner `ngx_conf_log_error!` uses the same valid `cf`.
+    unsafe {
+        let args = cf_args(cf);
+        if args.len() > 1 {
+            // TAKE1: parse the explicit level argument.
+            let level_str = args[1].as_bytes();
+            match parse_error_log_level(level_str) {
+                Some(l) => Some(l),
+                None => {
+                    ngx_conf_log_error!(
+                        NGX_LOG_EMERG,
+                        &raw mut *cf,
+                        "otel_error_log: unknown level; use emerg|alert|crit|error|warn|notice|info|debug"
+                    );
+                    None
+                }
+            }
+        } else {
+            // NOARGS: fixed default floor = NGX_LOG_ERR (error severity).
+            // This is intentionally DECOUPLED from the core `error_log` level:
+            // mirroring couples the OTel floor to on-box debug verbosity
+            // (against orthogonality) and a parse-time read of cycle->new_log
+            // is directive-order dependent.
+            Some(nginx_sys::NGX_LOG_ERR as ngx_uint_t)
+        }
+    }
+}
+
 /// Directive callback for `otel_error_log [<level>];`.
 ///
 /// Inserts a writer-only `ngx_log_t` node into `cycle->new_log` via
@@ -2790,32 +2837,10 @@ extern "C" fn cmd_set_error_log(
         return NGX_CONF_ERROR;
     }
 
-    // SAFETY: `cf` is the valid non-null parse context. `cf_args(cf)` reads the
-    // parsed tokens, and the inner `ngx_conf_log_error!` uses the same valid `cf`.
-    let level_floor: ngx_uint_t = unsafe {
-        let args = cf_args(cf);
-        if args.len() > 1 {
-            // TAKE1: parse the explicit level argument.
-            let level_str = args[1].as_bytes();
-            match parse_error_log_level(level_str) {
-                Some(l) => l,
-                None => {
-                    ngx_conf_log_error!(
-                        NGX_LOG_EMERG,
-                        &raw mut *cf,
-                        "otel_error_log: unknown level; use emerg|alert|crit|error|warn|notice|info|debug"
-                    );
-                    return NGX_CONF_ERROR;
-                }
-            }
-        } else {
-            // NOARGS: fixed default floor = NGX_LOG_ERR (error severity).
-            // This is intentionally DECOUPLED from the core `error_log` level:
-            // mirroring couples the OTel floor to on-box debug verbosity
-            // (against orthogonality) and a parse-time read of cycle->new_log
-            // is directive-order dependent.
-            nginx_sys::NGX_LOG_ERR as ngx_uint_t
-        }
+    // SAFETY: `cf` is the valid non-null parse context nginx passes to the handler.
+    let level_floor: ngx_uint_t = match unsafe { parse_error_log_level_floor(cf) } {
+        Some(l) => l,
+        None => return NGX_CONF_ERROR,
     };
 
     // Allocate the ngx_log_t node and OtelErrorWriterState from the config pool.
@@ -3017,7 +3042,7 @@ extern "C" fn cmd_set_otel_trace(
     // exclusive reference.
     let lcf = unsafe { conf.cast::<LocationConf>().as_mut().expect("location config") };
     if !lcf.otel_trace.is_null() {
-        return c"is duplicate".as_ptr().cast_mut();
+        return already_set_error();
     }
     // SAFETY: `cf` is the valid non-null directive parse context.
     let args = unsafe { cf_args(cf) };
@@ -3059,7 +3084,7 @@ extern "C" fn cmd_set_otel_log_export(
     // exclusive reference.
     let lcf = unsafe { conf.cast::<LocationConf>().as_mut().expect("location config") };
     if lcf.log_export_is_set() {
-        return c"is duplicate".as_ptr().cast_mut();
+        return already_set_error();
     }
 
     // SAFETY: `cf` is the valid non-null directive parse context.
@@ -3131,7 +3156,7 @@ extern "C" fn cmd_set_otel_trace_context(
     // SAFETY: nginx passes our `LocationConf*` as `conf`; the cast is valid.
     let lcf = unsafe { conf.cast::<LocationConf>().as_mut().expect("location config") };
     if lcf.trace_context_is_set() {
-        return c"is duplicate".as_ptr().cast_mut();
+        return already_set_error();
     }
     // SAFETY: `cf` is the valid non-null directive parse context.
     let args = unsafe { cf_args(cf) };
@@ -3168,7 +3193,7 @@ extern "C" fn cmd_set_otel_span_name(
     // SAFETY: nginx passes our `LocationConf*` as `conf`; the cast is valid.
     let lcf = unsafe { conf.cast::<LocationConf>().as_mut().expect("location config") };
     if !lcf.span_name_cv.is_null() {
-        return c"is duplicate".as_ptr().cast_mut();
+        return already_set_error();
     }
     // SAFETY: `cf` is the valid non-null directive parse context.
     let args = unsafe { cf_args(cf) };

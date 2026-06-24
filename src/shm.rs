@@ -1195,7 +1195,7 @@ pub unsafe extern "C" fn otel_shm_zone_init(
 
 // ── Logs shm zone ─────────────────────────────────────────────
 
-use crate::logs::ring::{ring_size_bytes, LogsWorkerRing, LogsWorkerRingHeader};
+use crate::logs::ring::{ring_size_bytes, WorkerSignalRing, WorkerSignalRingHeader};
 
 // ── Compile-time alignment guards ───────────────────────────────────────
 //
@@ -1204,7 +1204,7 @@ use crate::logs::ring::{ring_size_bytes, LogsWorkerRing, LogsWorkerRingHeader};
 //   [ring_size_bytes(cap), 2*rbs)             — error ring header + payload
 //   [2*ring_size_bytes(cap), 2*rbs+tbl)       — CoalesceSlot table
 //
-// `LogsWorkerRingHeader` contains four `AtomicU64` fields → alignment = 8 bytes.
+// `WorkerSignalRingHeader` contains four `AtomicU64` fields → alignment = 8 bytes.
 // `CoalesceSlot` contains an `AtomicU64` at offset 0 → alignment = 8 bytes.
 //
 // For both sub-structures to land at aligned addresses:
@@ -1215,7 +1215,7 @@ use crate::logs::ring::{ring_size_bytes, LogsWorkerRing, LogsWorkerRingHeader};
 // cap % 8 == 0 is enforced at config-parse time by `cmd_set_log_ring_size`.
 const _: () = assert!(
     crate::logs::ring::RING_HEADER_SIZE % 8 == 0,
-    "LogsWorkerRingHeader size must be a multiple of 8: error-ring header alignment depends on this",
+    "WorkerSignalRingHeader size must be a multiple of 8: error-ring header alignment depends on this",
 );
 const _: () = assert!(
     crate::logs::coalesce::coalesce_table_bytes() % 8 == 0,
@@ -1281,12 +1281,12 @@ pub fn logs_n_workers_from_zone(zone_data_bytes: usize, cap: usize) -> usize {
 pub unsafe fn logs_zone_cap(base_addr: *mut u8) -> usize {
     // Worker-0's access ring header lives at `base_addr + 0`.
     // SAFETY: caller guarantees `base_addr` is valid for at least one slot
-    // header; `LogsWorkerRingHeader` is `#[repr(C)]` with `AtomicU64` fields,
+    // header; `WorkerSignalRingHeader` is `#[repr(C)]` with `AtomicU64` fields,
     // so the cast is well-aligned (shm zones are at least page-aligned).
-    unsafe { (*base_addr.cast::<LogsWorkerRingHeader>()).cap.load(Ordering::Relaxed) as usize }
+    unsafe { (*base_addr.cast::<WorkerSignalRingHeader>()).cap.load(Ordering::Relaxed) as usize }
 }
 
-/// Obtain a [`LogsWorkerRing`] view of the **access** ring for `worker_id`.
+/// Obtain a [`WorkerSignalRing`] view of the **access** ring for `worker_id`.
 ///
 /// Layout per slot (base = `shm.addr + data_offset()`):
 /// ```text
@@ -1300,7 +1300,7 @@ pub unsafe fn logs_zone_cap(base_addr: *mut u8) -> usize {
 ///
 /// The slot stride (`logs_slot_size(cap)`) is derived from the cap **stamped in
 /// the first worker's ring header** by [`logs_shm_zone_init`] — the same value
-/// used by [`LogsWorkerRing::push`] and [`LogsWorkerRing::pop_into`].  The
+/// used by [`WorkerSignalRing::push`] and [`WorkerSignalRing::pop_into`].  The
 /// `cap` parameter serves as a fallback only when the header is not yet
 /// initialised (cap == 0), ensuring stride and push/pop never diverge.
 ///
@@ -1309,7 +1309,11 @@ pub unsafe fn logs_zone_cap(base_addr: *mut u8) -> usize {
 /// - `worker_id < n_workers` and `cap` must match the zone registration.
 /// - The returned ring must not outlive the zone mapping.
 #[inline]
-pub unsafe fn logs_access_ring(base_addr: *mut u8, worker_id: usize, cap: usize) -> LogsWorkerRing {
+pub unsafe fn logs_access_ring(
+    base_addr: *mut u8,
+    worker_id: usize,
+    cap: usize,
+) -> WorkerSignalRing {
     // Use the header-stamped cap as the single source of truth for stride; fall
     // back to the config cap only before zone-init has run (header cap == 0).
     // This keeps stride consistent with the cap push/pop read from the same header,
@@ -1325,15 +1329,19 @@ pub unsafe fn logs_access_ring(base_addr: *mut u8, worker_id: usize, cap: usize)
     // `worker_id < n_workers`, and `stride_cap` matches the live zone layout,
     // so `slot_off` is within the zone. The access ring header begins at slot
     // offset 0, satisfying `from_shm_ptr`'s contract.
-    unsafe { LogsWorkerRing::from_shm_ptr(base_addr.add(slot_off)) }
+    unsafe { WorkerSignalRing::from_shm_ptr(base_addr.add(slot_off)) }
 }
 
-/// Obtain a [`LogsWorkerRing`] view of the **error** ring for `worker_id`.
+/// Obtain a [`WorkerSignalRing`] view of the **error** ring for `worker_id`.
 ///
 /// Error ring follows immediately after the access ring within the same slot.
 /// See [`logs_access_ring`] for the stride/cap source-of-truth policy.
 #[inline]
-pub unsafe fn logs_error_ring(base_addr: *mut u8, worker_id: usize, cap: usize) -> LogsWorkerRing {
+pub unsafe fn logs_error_ring(
+    base_addr: *mut u8,
+    worker_id: usize,
+    cap: usize,
+) -> WorkerSignalRing {
     // SAFETY: same as `logs_access_ring` — `base_addr` is valid for at least
     // one slot header, satisfying `logs_zone_cap`'s precondition.
     let hdr_cap = unsafe { logs_zone_cap(base_addr) };
@@ -1344,14 +1352,14 @@ pub unsafe fn logs_error_ring(base_addr: *mut u8, worker_id: usize, cap: usize) 
     // SAFETY: same contract as `logs_access_ring`; the error ring header begins
     // one `ring_size_bytes(stride_cap)` past the access ring within the same
     // in-zone slot, satisfying `from_shm_ptr`'s contract.
-    unsafe { LogsWorkerRing::from_shm_ptr(base_addr.add(error_off)) }
+    unsafe { WorkerSignalRing::from_shm_ptr(base_addr.add(error_off)) }
 }
 
 /// Return the raw `*mut u8` of the **error** ring for `worker_id`.
 ///
 /// Unlike [`logs_error_ring`] this returns the raw pointer suitable for stashing in
 /// `OtelErrorWriterState::error_ring_ptr`.  The writer reconstructs a
-/// [`LogsWorkerRing`] view via `LogsWorkerRing::from_shm_ptr` on each hot-path call.
+/// [`WorkerSignalRing`] view via `WorkerSignalRing::from_shm_ptr` on each hot-path call.
 ///
 /// Called by `init_process` once per worker after the logs zone is mapped.
 /// See [`logs_access_ring`] for the stride/cap source-of-truth policy.
@@ -1455,10 +1463,10 @@ pub unsafe extern "C" fn logs_shm_zone_init(
             let base: *mut u8 = zone.shm.addr.cast::<u8>().add(offset);
             for w in 0..n_active {
                 let slot_off = w * slot_sz;
-                (*base.add(slot_off).cast::<LogsWorkerRingHeader>())
+                (*base.add(slot_off).cast::<WorkerSignalRingHeader>())
                     .cap
                     .store(cap as u64, Ordering::Relaxed);
-                (*base.add(slot_off + ring_size_bytes(cap)).cast::<LogsWorkerRingHeader>())
+                (*base.add(slot_off + ring_size_bytes(cap)).cast::<WorkerSignalRingHeader>())
                     .cap
                     .store(cap as u64, Ordering::Relaxed);
             }
@@ -1514,14 +1522,14 @@ pub unsafe extern "C" fn logs_shm_zone_init(
         // Access ring header.
         // SAFETY: `slot_off = w * slot_sz` with `w < n_active ≤ n_reserved`,
         // so `base + slot_off` is within the just-zeroed active slot area.
-        let access_hdr = unsafe { base.add(slot_off).cast::<LogsWorkerRingHeader>() };
+        let access_hdr = unsafe { base.add(slot_off).cast::<WorkerSignalRingHeader>() };
         // SAFETY: valid just-zeroed header; exclusive init-time write.
         unsafe { (*access_hdr).cap.store(cap as u64, Ordering::Relaxed) };
         // Error ring header (immediately follows the access ring payload).
         // SAFETY: the error header sits one `ring_size_bytes(cap)` past the
         // access header, still within the same in-bounds slot.
         let error_hdr =
-            unsafe { base.add(slot_off + ring_size_bytes(cap)).cast::<LogsWorkerRingHeader>() };
+            unsafe { base.add(slot_off + ring_size_bytes(cap)).cast::<WorkerSignalRingHeader>() };
         // SAFETY: as above — valid just-zeroed header, exclusive init-time write.
         unsafe { (*error_hdr).cap.store(cap as u64, Ordering::Relaxed) };
     }
@@ -1531,9 +1539,9 @@ pub unsafe extern "C" fn logs_shm_zone_init(
 
 // ── Spans shm zone ───────────────────────────────────────────────
 //
-// The spans shm zone holds one `LogsWorkerRing` per worker (one ring per slot,
+// The spans shm zone holds one `WorkerSignalRing` per worker (one ring per slot,
 // unlike the logs zone which holds two rings + a coalescer table per slot).
-// The ring is the same `LogsWorkerRingHeader` + payload layout reused from logs.
+// The ring is the same `WorkerSignalRingHeader` + payload layout reused from logs.
 //
 // Layout per worker slot:
 //   slot_i = base + i × spans_slot_size(cap)
@@ -1571,9 +1579,9 @@ pub fn spans_n_workers_from_zone(zone_data_bytes: usize, cap: usize) -> usize {
     (zone_data_bytes.checked_div(slot).unwrap_or(0)).max(1)
 }
 
-/// Obtain a [`LogsWorkerRing`] view of the spans ring for `worker_id`.
+/// Obtain a [`WorkerSignalRing`] view of the spans ring for `worker_id`.
 ///
-/// Reuses the same ring type as the logs zone (same `LogsWorkerRingHeader`
+/// Reuses the same ring type as the logs zone (same `WorkerSignalRingHeader`
 /// layout and atomic SPSC semantics).
 ///
 /// # Safety
@@ -1581,12 +1589,12 @@ pub fn spans_n_workers_from_zone(zone_data_bytes: usize, cap: usize) -> usize {
 /// - `worker_id < n_workers` and `cap` must match the zone registration.
 /// - The returned ring must not outlive the zone mapping.
 #[inline]
-pub unsafe fn spans_ring(base_addr: *mut u8, worker_id: usize, cap: usize) -> LogsWorkerRing {
+pub unsafe fn spans_ring(base_addr: *mut u8, worker_id: usize, cap: usize) -> WorkerSignalRing {
     let slot_off = worker_id * spans_slot_size(cap);
     // SAFETY: per the fn contract `base_addr` is `shm.addr + data_offset()`,
     // `worker_id < n_workers`, and `cap` matches registration, so `slot_off` is
     // within the zone.  The spans ring header begins at slot offset 0.
-    unsafe { LogsWorkerRing::from_shm_ptr(base_addr.add(slot_off)) }
+    unsafe { WorkerSignalRing::from_shm_ptr(base_addr.add(slot_off)) }
 }
 
 /// NGINX zone-init callback for the spans shm zone.
@@ -1633,7 +1641,7 @@ pub unsafe extern "C" fn spans_shm_zone_init(
             let base: *mut u8 = zone.shm.addr.cast::<u8>().add(offset);
             for w in 0..n_active {
                 let slot_off = w * slot_sz;
-                (*base.add(slot_off).cast::<LogsWorkerRingHeader>())
+                (*base.add(slot_off).cast::<WorkerSignalRingHeader>())
                     .cap
                     .store(cap as u64, Ordering::Relaxed);
             }
@@ -1683,7 +1691,7 @@ pub unsafe extern "C" fn spans_shm_zone_init(
         let slot_off = w * slot_sz;
         // SAFETY: `slot_off = w * slot_sz` with `w < n_active ≤ n_reserved`,
         // so `base + slot_off` is within the just-zeroed active slot area.
-        let hdr = unsafe { base.add(slot_off).cast::<LogsWorkerRingHeader>() };
+        let hdr = unsafe { base.add(slot_off).cast::<WorkerSignalRingHeader>() };
         // SAFETY: valid just-zeroed header; exclusive init-time write.
         unsafe { (*hdr).cap.store(cap as u64, Ordering::Relaxed) };
     }
@@ -2667,7 +2675,7 @@ mod tests {
     /// and this test's assertion on step (4) will fail.
     #[test]
     fn b1_cap_survives_reload() {
-        use crate::logs::ring::{ring_size_bytes, LogsWorkerRingHeader};
+        use crate::logs::ring::{ring_size_bytes, WorkerSignalRingHeader};
         use nginx_sys::ngx_shm_zone_t;
 
         const CAP: usize = 512;
@@ -2700,11 +2708,11 @@ mod tests {
             let off = w * slot_sz;
             // SAFETY: off = w * slot_sz < n_slots * slot_sz ≤ zone_sz - data_off.
             let access_cap = unsafe {
-                (*base.add(off).cast::<LogsWorkerRingHeader>()).cap.load(Ordering::Relaxed)
+                (*base.add(off).cast::<WorkerSignalRingHeader>()).cap.load(Ordering::Relaxed)
             };
             // SAFETY: same bounds; error header follows access ring payload.
             let error_cap = unsafe {
-                (*base.add(off + ring_size_bytes(CAP)).cast::<LogsWorkerRingHeader>())
+                (*base.add(off + ring_size_bytes(CAP)).cast::<WorkerSignalRingHeader>())
                     .cap
                     .load(Ordering::Relaxed)
             };
@@ -2716,14 +2724,15 @@ mod tests {
         let off1 = slot_sz;
         // SAFETY: off1 < n_slots * slot_sz ≤ zone_sz - data_off.
         unsafe {
-            (*base.add(off1).cast::<LogsWorkerRingHeader>()).cap.store(0, Ordering::Relaxed);
-            (*base.add(off1 + ring_size_bytes(CAP)).cast::<LogsWorkerRingHeader>())
+            (*base.add(off1).cast::<WorkerSignalRingHeader>()).cap.store(0, Ordering::Relaxed);
+            (*base.add(off1 + ring_size_bytes(CAP)).cast::<WorkerSignalRingHeader>())
                 .cap
                 .store(0, Ordering::Relaxed);
         }
         // SAFETY: same bounds as above.
-        let cap_check =
-            unsafe { (*base.add(off1).cast::<LogsWorkerRingHeader>()).cap.load(Ordering::Relaxed) };
+        let cap_check = unsafe {
+            (*base.add(off1).cast::<WorkerSignalRingHeader>()).cap.load(Ordering::Relaxed)
+        };
         assert_eq!(cap_check, 0, "sanity: slot 1 access cap must be 0 before reload");
 
         // ── (3) Reload ───────────────────────────────────────────────────────────
@@ -2735,11 +2744,12 @@ mod tests {
 
         // ── (4) Assert slot 1 has cap stamped (the H2F3 fix) ────────────────────
         // SAFETY: same bounds as step (2).
-        let access_cap1 =
-            unsafe { (*base.add(off1).cast::<LogsWorkerRingHeader>()).cap.load(Ordering::Relaxed) };
+        let access_cap1 = unsafe {
+            (*base.add(off1).cast::<WorkerSignalRingHeader>()).cap.load(Ordering::Relaxed)
+        };
         // SAFETY: same bounds.
         let error_cap1 = unsafe {
-            (*base.add(off1 + ring_size_bytes(CAP)).cast::<LogsWorkerRingHeader>())
+            (*base.add(off1 + ring_size_bytes(CAP)).cast::<WorkerSignalRingHeader>())
                 .cap
                 .load(Ordering::Relaxed)
         };
@@ -2754,14 +2764,14 @@ mod tests {
 
         // SAFETY: base points into zone_mem; slot 0 is at offset 0.
         let access_cap0 =
-            unsafe { (*base.cast::<LogsWorkerRingHeader>()).cap.load(Ordering::Relaxed) };
+            unsafe { (*base.cast::<WorkerSignalRingHeader>()).cap.load(Ordering::Relaxed) };
         assert_eq!(access_cap0, CAP as u64, "H2F3: reload must not corrupt slot 0 cap");
     }
 
     /// H2F3 regression: spans_shm_zone_init must stamp `cap` into new-worker
     /// slots on SIGHUP reload (scale-up path).
     ///
-    /// Each spans slot contains ONE `LogsWorkerRingHeader` at slot base
+    /// Each spans slot contains ONE `WorkerSignalRingHeader` at slot base
     /// (spans_slot_size = ring_size_bytes; no separate error ring).
     /// Also asserts read_offset / write_offset are untouched by the reload
     /// path (reload stamps cap only; offsets survive from the old generation).
@@ -2770,7 +2780,7 @@ mod tests {
     /// and this test's assertion on step (4) will fail.
     #[test]
     fn b1_spans_cap_survives_reload() {
-        use crate::logs::ring::LogsWorkerRingHeader;
+        use crate::logs::ring::WorkerSignalRingHeader;
         use nginx_sys::ngx_shm_zone_t;
 
         const CAP: usize = 512;
@@ -2803,7 +2813,7 @@ mod tests {
             let off = w * slot_sz;
             // SAFETY: off = w * slot_sz < n_slots * slot_sz ≤ zone_sz - data_off.
             let cap = unsafe {
-                (*base.add(off).cast::<LogsWorkerRingHeader>()).cap.load(Ordering::Relaxed)
+                (*base.add(off).cast::<WorkerSignalRingHeader>()).cap.load(Ordering::Relaxed)
             };
             assert_eq!(cap, CAP as u64, "fresh init: slot {w} cap must be stamped");
         }
@@ -2812,7 +2822,7 @@ mod tests {
         let off1 = slot_sz; // byte offset of slot 1 from base
                             // SAFETY: off1 = slot_sz < n_slots * slot_sz ≤ zone_sz - data_off.
         unsafe {
-            let hdr1 = base.add(off1).cast::<LogsWorkerRingHeader>();
+            let hdr1 = base.add(off1).cast::<WorkerSignalRingHeader>();
             (*hdr1).cap.store(0, Ordering::Relaxed);
             // Set NON-ZERO sentinel offsets so step (5) can detect a re-zeroing
             // regression: the reload path must stamp cap only and leave the
@@ -2823,8 +2833,9 @@ mod tests {
             (*hdr1).write_offset.store(13, Ordering::Relaxed);
         }
         // SAFETY: off1 = slot_sz < n_slots * slot_sz ≤ zone_sz - data_off.
-        let cap_check =
-            unsafe { (*base.add(off1).cast::<LogsWorkerRingHeader>()).cap.load(Ordering::Relaxed) };
+        let cap_check = unsafe {
+            (*base.add(off1).cast::<WorkerSignalRingHeader>()).cap.load(Ordering::Relaxed)
+        };
         assert_eq!(cap_check, 0, "sanity: slot 1 cap must be 0 before reload");
 
         // ── (3) Reload ───────────────────────────────────────────────────────────
@@ -2836,8 +2847,9 @@ mod tests {
 
         // ── (4) Assert slot 1 has cap stamped (the H2F3 fix) ────────────────────
         // SAFETY: same bounds as step (2).
-        let cap1 =
-            unsafe { (*base.add(off1).cast::<LogsWorkerRingHeader>()).cap.load(Ordering::Relaxed) };
+        let cap1 = unsafe {
+            (*base.add(off1).cast::<WorkerSignalRingHeader>()).cap.load(Ordering::Relaxed)
+        };
         assert_eq!(cap1, CAP as u64, "H2F3: spans reload must stamp cap on new worker slot");
 
         // ── (5) Assert read_offset / write_offset PRESERVED ─────────────────────
@@ -2846,17 +2858,17 @@ mod tests {
         // store in the reload path would clobber them — assert they are preserved.
         // SAFETY: same bounds as step (2).
         let ro = unsafe {
-            (*base.add(off1).cast::<LogsWorkerRingHeader>()).read_offset.load(Ordering::Relaxed)
+            (*base.add(off1).cast::<WorkerSignalRingHeader>()).read_offset.load(Ordering::Relaxed)
         };
         // SAFETY: same bounds as step (2).
         let wo = unsafe {
-            (*base.add(off1).cast::<LogsWorkerRingHeader>()).write_offset.load(Ordering::Relaxed)
+            (*base.add(off1).cast::<WorkerSignalRingHeader>()).write_offset.load(Ordering::Relaxed)
         };
         assert_eq!(ro, 7, "H2F3: spans reload must not touch read_offset (sentinel preserved)");
         assert_eq!(wo, 13, "H2F3: spans reload must not touch write_offset (sentinel preserved)");
 
         // SAFETY: base points into zone_mem; slot 0 header is at offset 0.
-        let cap0 = unsafe { (*base.cast::<LogsWorkerRingHeader>()).cap.load(Ordering::Relaxed) };
+        let cap0 = unsafe { (*base.cast::<WorkerSignalRingHeader>()).cap.load(Ordering::Relaxed) };
         assert_eq!(cap0, CAP as u64, "H2F3: reload must not corrupt slot 0 cap");
     }
 
@@ -2880,7 +2892,7 @@ mod tests {
     ///     → the fallback branch is the only path, so mutation has no effect there).
     #[test]
     fn ring_ptr_stride_matches_header_cap() {
-        use crate::logs::ring::{ring_size_bytes, LogsWorkerRingHeader};
+        use crate::logs::ring::{ring_size_bytes, WorkerSignalRingHeader};
 
         // Two caps that produce different slot sizes — the test distinguishes them.
         const HDR_CAP: usize = 512; // stamped in ring headers (live shm truth)
@@ -2898,10 +2910,10 @@ mod tests {
         let base = unsafe { zone_mem.as_mut_ptr().add(data_off) };
 
         // Stamp HDR_CAP into worker-0's access ring header (the single source of truth).
-        // SAFETY: base[0] is within zone_mem; cast to LogsWorkerRingHeader is valid
+        // SAFETY: base[0] is within zone_mem; cast to WorkerSignalRingHeader is valid
         // because the buffer is large enough and the struct is repr(C).
         unsafe {
-            (*base.cast::<LogsWorkerRingHeader>()).cap.store(HDR_CAP as u64, Ordering::Relaxed);
+            (*base.cast::<WorkerSignalRingHeader>()).cap.store(HDR_CAP as u64, Ordering::Relaxed);
         }
 
         // ── Verify logs_zone_cap reads the header ────────────────────────────────
@@ -2932,9 +2944,9 @@ mod tests {
         // Stamp HDR_CAP at the expected worker-1 position so ring1.cap() returns HDR_CAP
         // when the fix is active (ring1 points to expected_w1_ptr).
         // SAFETY: expected_w1_ptr is within zone_mem (HDR_CAP < CONFIG_CAP → offset smaller
-        // than zone_sz); the cast to LogsWorkerRingHeader is valid for the same reason.
+        // than zone_sz); the cast to WorkerSignalRingHeader is valid for the same reason.
         unsafe {
-            (*expected_w1_ptr.cast::<LogsWorkerRingHeader>())
+            (*expected_w1_ptr.cast::<WorkerSignalRingHeader>())
                 .cap
                 .store(HDR_CAP as u64, Ordering::Relaxed);
         }
@@ -2949,7 +2961,7 @@ mod tests {
         // SAFETY: wrong_w1_ptr = base + logs_slot_size(CONFIG_CAP) ≤ base + zone_sz (within
         // zone_mem); cast is valid.
         unsafe {
-            (*wrong_w1_ptr.cast::<LogsWorkerRingHeader>())
+            (*wrong_w1_ptr.cast::<WorkerSignalRingHeader>())
                 .cap
                 .store(CONFIG_CAP as u64, Ordering::Relaxed);
         }

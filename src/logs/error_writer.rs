@@ -38,7 +38,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use nginx_sys::{ngx_shm_zone_t, ngx_uint_t};
 
 use crate::logs::coalesce::{self, CoalesceResult, CoalesceSlot};
-use crate::logs::ring::LogsWorkerRing;
+use crate::logs::ring::WorkerSignalRing;
 
 // ── RAII busy-flag guard ──────────────────────────────────────────────────────
 
@@ -357,7 +357,7 @@ fn cached_unix_nanos(tp: *const nginx_sys::ngx_time_t) -> u64 {
 /// so 532 bytes is safe.
 ///
 /// # Safety
-/// `ring_ptr` must be a valid pointer to an initialised `LogsWorkerRingHeader`
+/// `ring_ptr` must be a valid pointer to an initialised `WorkerSignalRingHeader`
 /// in the logs shm zone, valid for the duration of this call.
 pub unsafe fn push_error_record(
     ring_ptr: *mut u8,
@@ -366,8 +366,8 @@ pub unsafe fn push_error_record(
     template_hash: u64,
     body: &[u8],
 ) {
-    // SAFETY: ring_ptr points to an initialised LogsWorkerRingHeader in shm.
-    let ring = unsafe { LogsWorkerRing::from_shm_ptr(ring_ptr) };
+    // SAFETY: ring_ptr points to an initialised WorkerSignalRingHeader in shm.
+    let ring = unsafe { WorkerSignalRing::from_shm_ptr(ring_ptr) };
     let body_len = body.len().min(MAX_ERROR_BODY_LEN);
 
     // Build the full wire record on the stack (no heap allocation).

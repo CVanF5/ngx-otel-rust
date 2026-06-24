@@ -383,7 +383,7 @@ mod tests {
     #[test]
     fn access_record_pushes_bytes_to_ring() {
         let (_buf, ring) = make_ring_with_cap(4096);
-        // LogsWorkerRing is Copy, so we can use it for both the producer and drain.
+        // WorkerSignalRing is Copy, so we can use it for both the producer and drain.
         let producer = WorkerRingProducer { ring };
 
         let req = SampledRequest {

@@ -52,7 +52,7 @@ pub mod severity;
 /// # Wire format per record
 /// `[u8 ngx_level][u64 ts_unix_nano_be][u8 kind][payload...]`
 /// where `kind = 0` is access, `kind = 1` is error.  The outer
-/// [`ring::LogsWorkerRing`] prepends its own 4-byte length prefix.
+/// [`ring::WorkerSignalRing`] prepends its own 4-byte length prefix.
 pub trait LogProducer {
     /// Push a pre-formatted record into the ring for the current worker.
     ///
@@ -63,14 +63,14 @@ pub trait LogProducer {
 
 // ── WorkerRingProducer ───────────────────────────────────────────────────────
 
-/// A thin [`LogProducer`] wrapper around a [`ring::LogsWorkerRing`].
+/// A thin [`LogProducer`] wrapper around a [`ring::WorkerSignalRing`].
 ///
 /// Constructed by `LogPhaseHandler` on each request and by the
 /// error-log writer on each error event.  Zero cost: just an
 /// opaque view (raw pointer) into the ring in shm.
 pub struct WorkerRingProducer {
     /// View of the calling worker's ring (a raw pointer into shm).
-    pub ring: ring::LogsWorkerRing,
+    pub ring: ring::WorkerSignalRing,
 }
 
 impl LogProducer for WorkerRingProducer {

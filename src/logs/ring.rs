@@ -12,15 +12,18 @@
 //! payload region that immediately follows in memory:
 //!
 //! ```text
-//! [ LogsWorkerRingHeader (32 bytes) ][ payload (cap bytes) ]
+//! [ WorkerSignalRingHeader (32 bytes) ][ payload (cap bytes) ]
 //! ```
 //!
-//! `LogsWorkerRingHeader` carries the three atomic counters plus the runtime
+//! `WorkerSignalRingHeader` carries the three atomic counters plus the runtime
 //! `cap` field.  The `cap` is set once at zone-init time (from the configured
 //! `otel_log_ring_size`), then read by both push and pop on every call.
 //!
-//! [`LogsWorkerRing`] is a lightweight view (a pointer to the header) obtained
-//! from a raw shm pointer; it is NOT a container and does not own memory.
+//! [`WorkerSignalRing`] is a lightweight view (a pointer to the header) obtained
+//! from a raw shm pointer; it is NOT a container and does not own memory.  The
+//! type is signal-agnostic: the same ring backs the access-log and error-log
+//! signals here and the trace-span signal (the spans ring lives in its own shm
+//! zone), so the name is deliberately not signal-specific.
 //!
 //! # Default capacity
 //!
@@ -52,7 +55,7 @@ pub const DEFAULT_LOG_RING_CAP: usize = 512 * 1024;
 /// `#[repr(C)]` ensures deterministic layout across worker processes and the
 /// exporter process.
 #[repr(C)]
-pub struct LogsWorkerRingHeader {
+pub struct WorkerSignalRingHeader {
     /// Monotonically increasing byte count written by the producer.
     pub write_offset: AtomicU64,
     /// Monotonically increasing byte count consumed by the exporter.
@@ -70,7 +73,7 @@ pub struct LogsWorkerRingHeader {
 }
 
 /// Size of the header alone (without payload).
-pub const RING_HEADER_SIZE: usize = core::mem::size_of::<LogsWorkerRingHeader>();
+pub const RING_HEADER_SIZE: usize = core::mem::size_of::<WorkerSignalRingHeader>();
 
 /// Total bytes required for one ring with the given capacity.
 #[inline]
@@ -80,7 +83,7 @@ pub fn ring_size_bytes(cap: usize) -> usize {
 
 /// A lightweight view over a per-worker log ring in shm.
 ///
-/// Does NOT own the memory — it is a pointer to a [`LogsWorkerRingHeader`]
+/// Does NOT own the memory — it is a pointer to a [`WorkerSignalRingHeader`]
 /// that lives in the logs shm zone.  The payload immediately follows the
 /// header.
 ///
@@ -91,25 +94,25 @@ pub fn ring_size_bytes(cap: usize) -> usize {
 /// # Safety invariant
 /// Only one writer and one reader may operate concurrently (SPSC).
 #[derive(Clone, Copy)]
-pub struct LogsWorkerRing {
-    header: *mut LogsWorkerRingHeader,
+pub struct WorkerSignalRing {
+    header: *mut WorkerSignalRingHeader,
 }
 
-// SAFETY: `LogsWorkerRing` is just a pointer into shared memory accessible from
+// SAFETY: `WorkerSignalRing` is just a pointer into shared memory accessible from
 // multiple processes (workers + exporter). All header fields it touches are
 // atomics, and the caller upholds the SPSC single-writer/single-reader
 // invariant, so it is sound to move across threads/processes.
-unsafe impl Send for LogsWorkerRing {}
+unsafe impl Send for WorkerSignalRing {}
 // SAFETY: as for the `Send` impl above — shared access goes through atomic
-// header fields under the SPSC invariant, so concurrent `&LogsWorkerRing` use
+// header fields under the SPSC invariant, so concurrent `&WorkerSignalRing` use
 // is sound.
-unsafe impl Sync for LogsWorkerRing {}
+unsafe impl Sync for WorkerSignalRing {}
 
-impl LogsWorkerRing {
+impl WorkerSignalRing {
     /// Obtain a view over the ring at `ptr`.
     ///
     /// # Safety
-    /// `ptr` must point to a valid `LogsWorkerRingHeader` followed by
+    /// `ptr` must point to a valid `WorkerSignalRingHeader` followed by
     /// at least `header.cap` bytes of payload (all in shm).
     #[inline]
     pub unsafe fn from_shm_ptr(ptr: *mut u8) -> Self {
@@ -118,7 +121,7 @@ impl LogsWorkerRing {
 
     #[inline]
     fn cap(&self) -> usize {
-        // SAFETY: `self.header` points to a valid `LogsWorkerRingHeader` in the
+        // SAFETY: `self.header` points to a valid `WorkerSignalRingHeader` in the
         // logs shm zone for this view's lifetime (the `from_shm_ptr` contract);
         // `cap` is an `AtomicU64`, so the load is well-defined under concurrent
         // cross-process access.
@@ -287,27 +290,27 @@ pub(crate) mod tests {
     ///
     /// Simulates what the shm zone-init path does: allocates space for the
     /// header + payload, zero-inits, and sets `header.cap`.
-    pub fn make_ring_with_cap(cap: usize) -> (Box<[u8]>, LogsWorkerRing) {
+    pub fn make_ring_with_cap(cap: usize) -> (Box<[u8]>, WorkerSignalRing) {
         let total = ring_size_bytes(cap);
         let mut buf = vec![0u8; total].into_boxed_slice();
         let ptr = buf.as_mut_ptr();
         // SAFETY: `ptr` is the start of a freshly-allocated, zero-initialised
         // `ring_size_bytes(cap)` buffer. The global allocator returns memory
-        // aligned well above `LogsWorkerRingHeader`'s 8-byte requirement, so the
+        // aligned well above `WorkerSignalRingHeader`'s 8-byte requirement, so the
         // cast and atomic store are well-defined in this test helper (the
         // production path lives in 8-byte-aligned slab memory).
         unsafe {
-            let hdr = ptr.cast::<LogsWorkerRingHeader>();
+            let hdr = ptr.cast::<WorkerSignalRingHeader>();
             (*hdr).cap.store(cap as u64, Ordering::Relaxed);
         }
         // SAFETY: `ptr` points to that header followed by `cap` payload bytes,
         // satisfying `from_shm_ptr`'s contract; `buf` outlives the returned ring.
-        let ring = unsafe { LogsWorkerRing::from_shm_ptr(ptr) };
+        let ring = unsafe { WorkerSignalRing::from_shm_ptr(ptr) };
         (buf, ring)
     }
 
     /// Create a standard small test ring (1024-byte cap).
-    pub fn make_ring_small() -> (Box<[u8]>, LogsWorkerRing) {
+    pub fn make_ring_small() -> (Box<[u8]>, WorkerSignalRing) {
         make_ring_with_cap(TEST_CAP)
     }
 
@@ -490,7 +493,7 @@ pub(crate) mod tests {
         let h1 = thread::spawn(move || {
             b1.wait(); // start simultaneously with thread 2
                        // SAFETY: ring_ptr points to the ring buffer (kept alive by buf_arc).
-            let ring = unsafe { LogsWorkerRing::from_shm_ptr(ring_ptr as *mut u8) };
+            let ring = unsafe { WorkerSignalRing::from_shm_ptr(ring_ptr as *mut u8) };
             let mut out = std::vec::Vec::new();
             let mut count = 0usize;
             while ring.pop_into(&mut out) {
@@ -503,7 +506,7 @@ pub(crate) mod tests {
         let h2 = thread::spawn(move || {
             b2.wait();
             // SAFETY: same rationale as h1.
-            let ring = unsafe { LogsWorkerRing::from_shm_ptr(ring_ptr as *mut u8) };
+            let ring = unsafe { WorkerSignalRing::from_shm_ptr(ring_ptr as *mut u8) };
             let mut out = std::vec::Vec::new();
             let mut count = 0usize;
             while ring.pop_into(&mut out) {

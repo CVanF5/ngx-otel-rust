@@ -3663,7 +3663,7 @@ mod tests {
     #[test]
     fn logs_drain_handles_empty_rings() {
         use crate::logs::ring::{
-            ring_size_bytes, LogsWorkerRingHeader, DEFAULT_LOG_RING_CAP, RING_HEADER_SIZE,
+            ring_size_bytes, WorkerSignalRingHeader, DEFAULT_LOG_RING_CAP, RING_HEADER_SIZE,
         };
         use crate::shm::logs_slot_size;
 
@@ -3680,11 +3680,11 @@ mod tests {
         // SAFETY: `slot_ptr` is the start of the just-zeroed `slot_sz` buffer; the
         // access header lives at offset 0 and the error header one
         // `ring_size_bytes(cap)` in, both within the slot, and `cap` is an
-        // `AtomicU64`. The buffer is 8-byte aligned for `LogsWorkerRingHeader`.
+        // `AtomicU64`. The buffer is 8-byte aligned for `WorkerSignalRingHeader`.
         unsafe {
-            let access_hdr = slot_ptr.cast::<LogsWorkerRingHeader>();
+            let access_hdr = slot_ptr.cast::<WorkerSignalRingHeader>();
             (*access_hdr).cap.store(cap as u64, Ordering::Relaxed);
-            let error_hdr = slot_ptr.add(ring_size_bytes(cap)).cast::<LogsWorkerRingHeader>();
+            let error_hdr = slot_ptr.add(ring_size_bytes(cap)).cast::<WorkerSignalRingHeader>();
             (*error_hdr).cap.store(cap as u64, Ordering::Relaxed);
         }
 
@@ -3737,7 +3737,7 @@ mod tests {
     #[test]
     fn service_instance_id_present_on_metrics_and_logs_resource() {
         use crate::logs::ring::{
-            ring_size_bytes, LogsWorkerRingHeader, DEFAULT_LOG_RING_CAP, RING_HEADER_SIZE,
+            ring_size_bytes, WorkerSignalRingHeader, DEFAULT_LOG_RING_CAP, RING_HEADER_SIZE,
         };
         use crate::shm::logs_slot_size;
 
@@ -3773,11 +3773,11 @@ mod tests {
         // SAFETY: `slot_ptr` is the start of the just-zeroed `slot_sz` buffer;
         // access header at offset 0, error header one `ring_size_bytes(cap)` in,
         // both within the slot; `cap` is an `AtomicU64` and the buffer is aligned
-        // for `LogsWorkerRingHeader`.
+        // for `WorkerSignalRingHeader`.
         unsafe {
-            let access_hdr = slot_ptr.cast::<LogsWorkerRingHeader>();
+            let access_hdr = slot_ptr.cast::<WorkerSignalRingHeader>();
             (*access_hdr).cap.store(cap as u64, Ordering::Relaxed);
-            let error_hdr = slot_ptr.add(ring_size_bytes(cap)).cast::<LogsWorkerRingHeader>();
+            let error_hdr = slot_ptr.add(ring_size_bytes(cap)).cast::<WorkerSignalRingHeader>();
             (*error_hdr).cap.store(cap as u64, Ordering::Relaxed);
         }
         let logs_batch = collect_log_records(&amcf, slot_ptr, 1, 0);
@@ -3958,22 +3958,22 @@ mod tests {
 
     /// Helper: build a one-worker logs shm slot with initialised ring headers.
     fn make_logs_slot(cap: usize) -> (std::vec::Vec<u8>, *mut u8) {
-        use crate::logs::ring::{ring_size_bytes, LogsWorkerRingHeader};
+        use crate::logs::ring::{ring_size_bytes, WorkerSignalRingHeader};
         use crate::shm::logs_slot_size;
 
         let slot_sz = logs_slot_size(cap);
         let mut buf = std::vec![0u8; slot_sz];
         let ptr = buf.as_mut_ptr();
         // SAFETY: `ptr` is the start of the just-zeroed `slot_sz`-byte `Vec`
-        // buffer (Vec's allocation is suitably aligned for `LogsWorkerRingHeader`
+        // buffer (Vec's allocation is suitably aligned for `WorkerSignalRingHeader`
         // here, with `RING_HEADER_SIZE` headroom); the access header sits at
         // offset 0 and the error header one `ring_size_bytes(cap)` in, both
         // within the slot, and `cap` is an `AtomicU64`. `buf` is returned so it
         // outlives every use of `ptr`.
         unsafe {
-            let access_hdr = ptr.cast::<LogsWorkerRingHeader>();
+            let access_hdr = ptr.cast::<WorkerSignalRingHeader>();
             (*access_hdr).cap.store(cap as u64, Ordering::Relaxed);
-            let error_hdr = ptr.add(ring_size_bytes(cap)).cast::<LogsWorkerRingHeader>();
+            let error_hdr = ptr.add(ring_size_bytes(cap)).cast::<WorkerSignalRingHeader>();
             (*error_hdr).cap.store(cap as u64, Ordering::Relaxed);
         }
         (buf, ptr)
