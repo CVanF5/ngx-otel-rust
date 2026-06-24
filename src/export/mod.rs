@@ -565,6 +565,194 @@ fn grpc_ignored_endpoint_names(
     names
 }
 
+// ── QUIT-DEFER test-support hook ───────────────────────────────────────────────
+//
+// `NGX_OTEL_QUIT_DEFER_TICKS` delays `ngx_quit` processing for N × 250 ms
+// periodic ticks, keeping the old exporter's ring drains alive during the
+// overlap window with a newly-started successor exporter.  Used by
+// mutation-evidence runs to create a deterministic SPSC race window:
+//   fixed code  + defer → abdicates within one tick (`successor_announced`
+//               returns true) → chaos PASSES
+//   mutated code + defer → both exporters drain the same rings for N ticks
+//               → duplicates / conservation FAIL
+//
+// The whole mechanism is compiled in ONLY under the "test-support" feature.
+// In production builds `QuitDefer` is a zero-sized type whose predicates are
+// `const false`, so the dual-`cfg` branching is funnelled into a single set of
+// uniform call sites in `export_loop` with zero production code change.
+#[cfg(feature = "test-support")]
+struct QuitDefer {
+    ticks: u32,
+}
+
+#[cfg(feature = "test-support")]
+impl QuitDefer {
+    fn from_env() -> Self {
+        let ticks = std::env::var("NGX_OTEL_QUIT_DEFER_TICKS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        QuitDefer { ticks }
+    }
+
+    /// True while a defer window is in effect (ticks remain). When active, the
+    /// inter-send shutdown short-circuits must NOT fire — they would skip
+    /// exactly the drains the defer window exists to run.
+    #[inline]
+    fn active(&self) -> bool {
+        self.ticks > 0
+    }
+
+    /// Consume one tick on a `ngx_quit` observation. Returns `true` if the quit
+    /// was deferred (a tick was consumed; caller should keep running periodic
+    /// drains), `false` if no ticks remain (caller should proceed to shutdown).
+    #[inline]
+    fn consume_tick(&mut self) -> bool {
+        if self.ticks > 0 {
+            self.ticks -= 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[cfg(not(feature = "test-support"))]
+struct QuitDefer;
+
+#[cfg(not(feature = "test-support"))]
+impl QuitDefer {
+    #[inline]
+    fn from_env() -> Self {
+        QuitDefer
+    }
+
+    /// No defer mechanism compiled in: always `false`.
+    #[inline]
+    const fn active(&self) -> bool {
+        false
+    }
+
+    /// No defer mechanism compiled in: never defers a quit.
+    #[inline]
+    fn consume_tick(&mut self) -> bool {
+        false
+    }
+}
+
+/// Resolve the number of active worker slots to scan for a per-signal shm zone.
+///
+/// Prefers the registration-time `n_active_workers` count (set by
+/// `check_zone_sizing`); for callers that did not go through that path it falls
+/// back to deriving the count from the zone's usable size via `from_avail`
+/// (`avail` = `shm.size` minus the slab-pool header).  Inactive slots are
+/// OS-zeroed pages, so scanning only the active ones avoids faulting cold RAM.
+///
+/// # Safety
+/// `zone` must be a non-null pointer to a live `ngx_shm_zone_t` valid for the
+/// exporter's lifetime (the caller has just confirmed the zone is mapped via
+/// the matching `*_shm_base()` accessor).  The `&*` borrow does not escape this
+/// function; `shm.size` is a plain field read.
+unsafe fn get_n_workers(
+    n_active: &core::sync::atomic::AtomicUsize,
+    zone: *mut nginx_sys::ngx_shm_zone_t,
+    from_avail: impl FnOnce(usize) -> usize,
+) -> usize {
+    let n = n_active.load(core::sync::atomic::Ordering::Relaxed);
+    if n > 0 {
+        n
+    } else {
+        let zone = &*zone;
+        let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
+        from_avail(avail)
+    }
+}
+
+/// Encode, send (deadline-capped), and apply the outcome policy for a freshly
+/// collected batch of one signal lane (metrics / logs / spans).
+///
+/// This is the shared body of the three periodic fresh-send sites: the encode →
+/// `with_deadline(send)` → outcome-match shape is identical across signals,
+/// differing only by the lane's retry queue, backoff state, failure counter, and
+/// the diagnostic wording.  `signal_prefix` is `""` for metrics (so the metrics
+/// lines read "otel export: send …", with no lane word) and `"logs "` / `"spans "`
+/// for the other lanes; `success_noun` is the plural noun in the success line
+/// ("data points" / "log records" / "span records").  These exact strings are
+/// matched by the chaos integration harness, so they are preserved verbatim.
+///
+/// A zero-record batch sends nothing.  Send budget is [`PERIODIC_SEND_BUDGET`];
+/// a deadline expiry is a transient failure taking the identical
+/// enqueue/counter/ERR path as a transport error.
+#[allow(clippy::too_many_arguments)]
+async fn send_fresh_batch(
+    transport: &mut ExportTransport,
+    pd: &Pdata,
+    backoff: &mut SignalBackoff,
+    queue: &mut VecDeque<(std::vec::Vec<u8>, u64)>,
+    retry_buffer_depth: usize,
+    failure_counter: &AtomicU64,
+    log: *mut nginx_sys::ngx_log_t,
+    signal: &'static str,
+    signal_prefix: &str,
+    success_noun: &str,
+) {
+    let n_records = count_pdata_records(pd);
+    if n_records == 0 {
+        return;
+    }
+    let bytes = encode_pdata(pd);
+    match with_deadline(transport.send_pdata(pd, bytes.clone()), PERIODIC_SEND_BUDGET).await {
+        // Outcome-driven policy (release / requeue+defer / drop).
+        Ok(Ok(ref outcome)) => {
+            // `apply_fresh_send_outcome` re-reads the monotonic clock internally
+            // (post-send) so the backoff deadline is computed from a fresh "now",
+            // not the pre-send `is_deferred` capture that gated entry to the lane.
+            if apply_fresh_send_outcome(
+                outcome,
+                backoff,
+                queue,
+                bytes,
+                n_records,
+                retry_buffer_depth,
+                failure_counter,
+                log,
+                signal,
+            ) == OutcomeAction::Release
+            {
+                ngx::ngx_log_error!(
+                    NGX_LOG_INFO,
+                    log,
+                    "otel export: sent {} {} to collector",
+                    n_records,
+                    success_noun
+                );
+            }
+        }
+        Ok(Err(ref e)) => {
+            ngx::ngx_log_error!(
+                NGX_LOG_ERR,
+                log,
+                "otel export: {}send failed ({}); queuing for retry",
+                signal_prefix,
+                e
+            );
+            enqueue_with_eviction(queue, bytes, n_records, retry_buffer_depth, log);
+            failure_counter.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(DeadlineExceeded) => {
+            ngx::ngx_log_error!(
+                NGX_LOG_ERR,
+                log,
+                "otel export: {}send timed out after {:?}; queuing for retry",
+                signal_prefix,
+                PERIODIC_SEND_BUDGET
+            );
+            enqueue_with_eviction(queue, bytes, n_records, retry_buffer_depth, log);
+            failure_counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// When `ngx_quit` is detected, runs [`graceful_drain`], sets
 /// [`EXPORT_LOOP_DONE`], and returns. The exporter cycle polls
 /// `EXPORT_LOOP_DONE` before calling `process::exit`.
@@ -783,20 +971,9 @@ pub async fn export_loop(amcf: &'static MainConfig) {
     // safe across the overlap window (cumulative counters dedup by timestamp).
     let mut periodic_abdicated = false;
 
-    // test-support: QUIT-DEFER hook ──────────────────────────────────────────
-    // NGX_OTEL_QUIT_DEFER_TICKS delays ngx_quit processing for N × 250 ms
-    // periodic ticks, keeping the old exporter's ring drains alive during the
-    // overlap window with a newly-started successor exporter.  Used by
-    // mutation-evidence runs to create a deterministic SPSC race window:
-    //   fixed code  + defer → abdicates within one tick (successor_announced
-    //               returns true) → chaos PASSES
-    //   mutated code + defer → both exporters drain the same rings for N ticks
-    //               → duplicates / conservation FAIL
-    // This variable is only compiled when the "test-support" feature is
-    // enabled — zero production code change.
-    #[cfg(feature = "test-support")]
-    let mut quit_defer_ticks: u32 =
-        std::env::var("NGX_OTEL_QUIT_DEFER_TICKS").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    // test-support QUIT-DEFER hook (see `QuitDefer`). Zero-sized + `const false`
+    // predicates in production builds, so the call sites below are uniform.
+    let mut quit_defer = QuitDefer::from_env();
 
     // Capture the master (parent) PID once at export loop startup.
     // nginx_sys::ngx_parent is set by ngx_spawn_process to the master's PID
@@ -901,20 +1078,11 @@ pub async fn export_loop(amcf: &'static MainConfig) {
         // the master's NGX_CMD_QUIT channel handler and read here in the
         // single-threaded exporter process; a plain read of it is well-defined.
         if unsafe { nginx_sys::ngx_quit } != 0 {
-            // test-support: QUIT-DEFER — if ticks remain, fall through to the
-            // inner sleep loop so periodic ring drains keep running during the
-            // overlap window.  Compiled away in production builds.
-            let should_drain_now: bool = {
-                #[cfg(feature = "test-support")]
-                {
-                    quit_defer_ticks == 0
-                }
-                #[cfg(not(feature = "test-support"))]
-                {
-                    true
-                }
-            };
-            if should_drain_now {
+            // test-support: QUIT-DEFER — if a defer window is active, fall
+            // through to the inner sleep loop so periodic ring drains keep
+            // running during the overlap window. Always drains in production
+            // builds (`active()` is `const false`).
+            if !quit_defer.active() {
                 ngx::ngx_log_error!(
                     NGX_LOG_NOTICE,
                     log.as_ptr(),
@@ -980,19 +1148,12 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                 // test-support: QUIT-DEFER — consume one tick; the periodic
                 // drain code below the check still runs this sub-interval.
                 // When ticks reach zero we fall through to the normal exit.
-                #[cfg(feature = "test-support")]
-                if quit_defer_ticks > 0 {
-                    quit_defer_ticks -= 1;
-                    // Do NOT break — let periodic drain fire this tick.
-                } else {
+                // In production `consume_tick()` always returns false → break.
+                if !quit_defer.consume_tick() {
                     shutdown_during_sleep = ShutdownKind::Exiting;
                     break;
                 }
-                #[cfg(not(feature = "test-support"))]
-                {
-                    shutdown_during_sleep = ShutdownKind::Exiting;
-                    break;
-                }
+                // Do NOT break — let periodic drain fire this tick.
             }
 
             // Whether a QUIT-DEFER overlap window is currently active.
@@ -1001,16 +1162,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             // the inter-send shutdown short-circuits below must NOT fire — they
             // would skip exactly the drains the defer window exists to run.
             // Always false in production builds (no defer mechanism compiled in).
-            let defer_active: bool = {
-                #[cfg(feature = "test-support")]
-                {
-                    quit_defer_ticks > 0
-                }
-                #[cfg(not(feature = "test-support"))]
-                {
-                    false
-                }
-            };
+            let defer_active: bool = quit_defer.active();
 
             // Check for successor before periodic ring pops.
             // One Acquire load of successor_gen; sets the latch permanently on first
@@ -1084,21 +1236,13 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                     // Use n_active_workers to drain only active slots; the
                     // zone may be reserved for more (ncpu-headroom) but inactive
                     // slots are OS-zeroed pages — scanning them faults RAM in.
-                    let n_workers = {
-                        use core::sync::atomic::Ordering;
-                        let n = amcf.n_active_workers.load(Ordering::Relaxed);
-                        if n > 0 {
-                            n
-                        } else {
-                            // Fallback for callers that did not go through check_zone_sizing.
-                            // SAFETY: amcf.logs_shm_zone is non-null when logs_shm_base()
-                            // returned Some above; `&*` and `shm.size` read do not escape.
-                            unsafe {
-                                let zone = &*amcf.logs_shm_zone;
-                                let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
-                                logs_n_workers_from_zone(avail, amcf.log_ring_cap())
-                            }
-                        }
+                    // SAFETY: `logs_shm_base()` returned `Some`, so `logs_shm_zone`
+                    // is non-null and points to a live, mapped zone for the
+                    // exporter's lifetime (see the block comment above).
+                    let n_workers = unsafe {
+                        get_n_workers(&amcf.n_active_workers, amcf.logs_shm_zone, |avail| {
+                            logs_n_workers_from_zone(avail, amcf.log_ring_cap())
+                        })
                     };
                     // Pdata pipeline: wrap → process → encode → send (Step U2).
                     let mut logs_pd = Pdata::Logs(collect_log_records(
@@ -1108,87 +1252,19 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                         worker_start_ns,
                     ));
                     processor.process(&mut logs_pd);
-                    let n_logs = count_pdata_records(&logs_pd);
-                    if n_logs > 0 {
-                        let logs_bytes = encode_pdata(&logs_pd);
-                        // Cap at PERIODIC_SEND_BUDGET; deadline expiry is a
-                        // transient failure taking the identical enqueue/counter/ERR path.
-                        match with_deadline(
-                            transport.send_pdata(&logs_pd, logs_bytes.clone()),
-                            PERIODIC_SEND_BUDGET,
-                        )
-                        .await
-                        {
-                            // Outcome-driven policy (release / requeue+defer / drop).
-                            Ok(Ok(ref outcome)) => {
-                                // Re-read the monotonic clock here, AFTER the
-                                // logs retry-drain and fresh-send awaits (each
-                                // capped at PERIODIC_SEND_BUDGET). A `Retryable`
-                                // verdict sets `not_before_msec = basis +
-                                // defer_ms`; with a stale (pre-send) basis the
-                                // deadline can already be in the past once
-                                // `defer_ms` is capped at `BACKOFF_CAP_MS`, so
-                                // `is_deferred` would return false and the
-                                // exporter would hammer a failing collector at
-                                // full cadence. `is_deferred` at the top of the
-                                // loop intentionally keeps the pre-send capture
-                                // (it gates entry for THIS iteration).
-                                // `apply_logs_fresh_send_outcome` re-reads the
-                                // clock internally (post-send); the call site
-                                // cannot accidentally supply a stale basis.
-                                if apply_logs_fresh_send_outcome(
-                                    outcome,
-                                    &mut logs_backoff,
-                                    &mut logs_retry_queue,
-                                    logs_bytes,
-                                    n_logs,
-                                    retry_buffer_depth,
-                                    &LOGS_SEND_FAILURES,
-                                    log.as_ptr(),
-                                ) == OutcomeAction::Release
-                                {
-                                    ngx::ngx_log_error!(
-                                        NGX_LOG_INFO,
-                                        log.as_ptr(),
-                                        "otel export: sent {} log records to collector",
-                                        n_logs
-                                    );
-                                }
-                            }
-                            Ok(Err(ref e)) => {
-                                ngx::ngx_log_error!(
-                                    NGX_LOG_ERR,
-                                    log.as_ptr(),
-                                    "otel export: logs send failed ({}); queuing for retry",
-                                    e
-                                );
-                                enqueue_with_eviction(
-                                    &mut logs_retry_queue,
-                                    logs_bytes,
-                                    n_logs,
-                                    retry_buffer_depth,
-                                    log.as_ptr(),
-                                );
-                                LOGS_SEND_FAILURES.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Err(DeadlineExceeded) => {
-                                ngx::ngx_log_error!(
-                                    NGX_LOG_ERR,
-                                    log.as_ptr(),
-                                    "otel export: logs send timed out after {:?}; queuing for retry",
-                                    PERIODIC_SEND_BUDGET
-                                );
-                                enqueue_with_eviction(
-                                    &mut logs_retry_queue,
-                                    logs_bytes,
-                                    n_logs,
-                                    retry_buffer_depth,
-                                    log.as_ptr(),
-                                );
-                                LOGS_SEND_FAILURES.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                    }
+                    send_fresh_batch(
+                        &mut transport,
+                        &logs_pd,
+                        &mut logs_backoff,
+                        &mut logs_retry_queue,
+                        retry_buffer_depth,
+                        &LOGS_SEND_FAILURES,
+                        log.as_ptr(),
+                        "logs",
+                        "logs ",
+                        "log records",
+                    )
+                    .await;
                 }
             }
 
@@ -1243,106 +1319,31 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                     // lifetime. The `&*` borrow does not escape this block, and
                     // `shm.size` is a plain field read.
                     // Use n_active_workers (same rationale as logs above).
-                    let n_workers = {
-                        use core::sync::atomic::Ordering;
-                        let n = amcf.n_active_workers.load(Ordering::Relaxed);
-                        if n > 0 {
-                            n
-                        } else {
-                            // SAFETY: amcf.spans_shm_zone is non-null when spans_shm_base()
-                            // returned Some above; `&*` and `shm.size` read do not escape.
-                            unsafe {
-                                let zone = &*amcf.spans_shm_zone;
-                                let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
-                                spans_n_workers_from_zone(avail, DEFAULT_SPAN_RING_CAP)
-                            }
-                        }
+                    // SAFETY: `spans_shm_base()` returned `Some`, so `spans_shm_zone`
+                    // is non-null and points to a live, mapped zone for the
+                    // exporter's lifetime (see the block comment above).
+                    let n_workers = unsafe {
+                        get_n_workers(&amcf.n_active_workers, amcf.spans_shm_zone, |avail| {
+                            spans_n_workers_from_zone(avail, DEFAULT_SPAN_RING_CAP)
+                        })
                     };
                     // Pdata pipeline: wrap → process → encode → send (Step U2).
                     let mut spans_pd =
                         Pdata::Spans(collect_span_records(amcf, spans_base, n_workers));
                     processor.process(&mut spans_pd);
-                    let n_spans = count_pdata_records(&spans_pd);
-                    if n_spans > 0 {
-                        let spans_bytes = encode_pdata(&spans_pd);
-                        // Cap at PERIODIC_SEND_BUDGET; deadline expiry is a
-                        // transient failure taking the identical enqueue/counter/ERR path.
-                        match with_deadline(
-                            transport.send_pdata(&spans_pd, spans_bytes.clone()),
-                            PERIODIC_SEND_BUDGET,
-                        )
-                        .await
-                        {
-                            // Outcome-driven policy (release / requeue+defer / drop).
-                            Ok(Ok(ref outcome)) => {
-                                // Re-read the monotonic clock here, AFTER the
-                                // spans retry-drain and fresh-send awaits (each
-                                // capped at PERIODIC_SEND_BUDGET). A `Retryable`
-                                // verdict sets `not_before_msec = basis +
-                                // defer_ms`; with a stale (pre-send) basis the
-                                // deadline can already be in the past once
-                                // `defer_ms` is capped at `BACKOFF_CAP_MS`, so
-                                // `is_deferred` would return false and the
-                                // exporter would hammer a failing collector at
-                                // full cadence. `is_deferred` at the top of the
-                                // loop intentionally keeps the pre-send capture
-                                // (it gates entry for THIS iteration).
-                                // `apply_spans_fresh_send_outcome` re-reads the
-                                // clock internally (post-send); the call site
-                                // cannot accidentally supply a stale basis.
-                                if apply_spans_fresh_send_outcome(
-                                    outcome,
-                                    &mut spans_backoff,
-                                    &mut spans_retry_queue,
-                                    spans_bytes,
-                                    n_spans,
-                                    retry_buffer_depth,
-                                    &TRACES_SEND_FAILURES,
-                                    log.as_ptr(),
-                                ) == OutcomeAction::Release
-                                {
-                                    ngx::ngx_log_error!(
-                                        NGX_LOG_INFO,
-                                        log.as_ptr(),
-                                        "otel export: sent {} span records to collector",
-                                        n_spans
-                                    );
-                                }
-                            }
-                            Ok(Err(ref e)) => {
-                                ngx::ngx_log_error!(
-                                    NGX_LOG_ERR,
-                                    log.as_ptr(),
-                                    "otel export: spans send failed ({}); queuing for retry",
-                                    e
-                                );
-                                enqueue_with_eviction(
-                                    &mut spans_retry_queue,
-                                    spans_bytes,
-                                    n_spans,
-                                    retry_buffer_depth,
-                                    log.as_ptr(),
-                                );
-                                TRACES_SEND_FAILURES.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Err(DeadlineExceeded) => {
-                                ngx::ngx_log_error!(
-                                    NGX_LOG_ERR,
-                                    log.as_ptr(),
-                                    "otel export: spans send timed out after {:?}; queuing for retry",
-                                    PERIODIC_SEND_BUDGET
-                                );
-                                enqueue_with_eviction(
-                                    &mut spans_retry_queue,
-                                    spans_bytes,
-                                    n_spans,
-                                    retry_buffer_depth,
-                                    log.as_ptr(),
-                                );
-                                TRACES_SEND_FAILURES.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                    }
+                    send_fresh_batch(
+                        &mut transport,
+                        &spans_pd,
+                        &mut spans_backoff,
+                        &mut spans_retry_queue,
+                        retry_buffer_depth,
+                        &TRACES_SEND_FAILURES,
+                        log.as_ptr(),
+                        "spans",
+                        "spans ",
+                        "span records",
+                    )
+                    .await;
                 }
             }
         }
@@ -1364,8 +1365,9 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             // full sleep interval (slept >= interval, no break) while quit
             // was set and ticks were still being consumed, we need to
             // continue the outer loop for another round of periodic drains.
-            #[cfg(feature = "test-support")]
-            if quit_defer_ticks > 0 {
+            // `active()` is `const false` in production builds, so this never
+            // fires there.
+            if quit_defer.active() {
                 // shutdown_during_sleep is re-declared at the top of each
                 // outer loop iteration, so no reset needed — just continue.
                 continue; // outer loop: back to top
@@ -1469,17 +1471,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
         // immediately runs graceful_drain (quit) or returns (terminate) rather than
         // chaining the fresh-metrics send first. Skipped during a QUIT-DEFER window
         // so the overlap-window drains complete (test-support only; never in prod).
-        let metrics_defer_active: bool = {
-            #[cfg(feature = "test-support")]
-            {
-                quit_defer_ticks > 0
-            }
-            #[cfg(not(feature = "test-support"))]
-            {
-                false
-            }
-        };
-        if shutdown_requested() && !metrics_defer_active {
+        if shutdown_requested() && !quit_defer.active() {
             continue;
         }
 
@@ -1492,87 +1484,26 @@ pub async fn export_loop(amcf: &'static MainConfig) {
         let mut metrics_pd =
             Pdata::Metrics(collect_all_sources(amcf, worker_start_ns, &collector_host));
         processor.process(&mut metrics_pd);
-        let n_pts = count_pdata_records(&metrics_pd);
-        if n_pts > 0 && !metrics_deferred {
-            let bytes = encode_pdata(&metrics_pd);
-
-            // ── Send the fresh batch ──────────────────────────────────────
-            // Cap at PERIODIC_SEND_BUDGET; deadline expiry is a transient
-            // failure taking the identical enqueue/counter/ERR path.
-            match with_deadline(
-                transport.send_pdata(&metrics_pd, bytes.clone()),
-                PERIODIC_SEND_BUDGET,
+        // Skip the fresh send while a `Retryable` backoff defers the lane
+        // (deferring the send, not growing the buffer). `send_fresh_batch`
+        // sends nothing for a zero-record batch. The metrics success line has
+        // no lane word ("otel export: sent N data points to collector"); the
+        // metrics failure/timeout lines likewise carry no lane prefix, matched
+        // verbatim by the chaos harness.
+        if !metrics_deferred {
+            send_fresh_batch(
+                &mut transport,
+                &metrics_pd,
+                &mut metrics_backoff,
+                &mut retry_queue,
+                retry_buffer_depth,
+                &SEND_FAILURES,
+                log.as_ptr(),
+                "metrics",
+                "",
+                "data points",
             )
-            .await
-            {
-                // Outcome-driven policy (release / requeue+defer / drop).
-                Ok(Ok(ref outcome)) => {
-                    // Re-read the monotonic clock here, AFTER the retry-drain and
-                    // fresh-send awaits (each capped at PERIODIC_SEND_BUDGET, so up
-                    // to two ~15s waits may have elapsed since `metrics_now_msec`
-                    // was captured at the top of this iteration). A `Retryable`
-                    // verdict computes `not_before_msec = basis + defer_ms`; with a
-                    // stale (pre-send) basis the deadline can already be in the past
-                    // once `defer_ms` is capped at `BACKOFF_CAP_MS`, so `is_deferred`
-                    // would return false and the next iteration would hammer a
-                    // failing collector at full cadence. The backoff basis must be a
-                    // fresh "now". `is_deferred` above intentionally keeps the
-                    // pre-send capture (it gates entry for THIS iteration).
-                    // `apply_metrics_fresh_send_outcome` re-reads the clock
-                    // internally (post-send); the call site cannot accidentally
-                    // supply a stale basis.
-                    if apply_metrics_fresh_send_outcome(
-                        outcome,
-                        &mut metrics_backoff,
-                        &mut retry_queue,
-                        bytes,
-                        n_pts,
-                        retry_buffer_depth,
-                        &SEND_FAILURES,
-                        log.as_ptr(),
-                    ) == OutcomeAction::Release
-                    {
-                        ngx::ngx_log_error!(
-                            NGX_LOG_INFO,
-                            log.as_ptr(),
-                            "otel export: sent {} data points to collector",
-                            n_pts
-                        );
-                    }
-                }
-                Ok(Err(ref e)) => {
-                    ngx::ngx_log_error!(
-                        NGX_LOG_ERR,
-                        log.as_ptr(),
-                        "otel export: send failed ({}); queuing for retry",
-                        e
-                    );
-                    enqueue_with_eviction(
-                        &mut retry_queue,
-                        bytes,
-                        n_pts,
-                        retry_buffer_depth,
-                        log.as_ptr(),
-                    );
-                    SEND_FAILURES.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(DeadlineExceeded) => {
-                    ngx::ngx_log_error!(
-                        NGX_LOG_ERR,
-                        log.as_ptr(),
-                        "otel export: send timed out after {:?}; queuing for retry",
-                        PERIODIC_SEND_BUDGET
-                    );
-                    enqueue_with_eviction(
-                        &mut retry_queue,
-                        bytes,
-                        n_pts,
-                        retry_buffer_depth,
-                        log.as_ptr(),
-                    );
-                    SEND_FAILURES.fetch_add(1, Ordering::Relaxed);
-                }
-            }
+            .await;
         }
 
         // (Log drain happens every SHUTDOWN_POLL_INTERVAL inside the chunked
@@ -1862,22 +1793,13 @@ async fn graceful_drain(
     if !has_successor && (amcf.any_log_export_enabled() || amcf.error_log_enabled) {
         if let Some(logs_base) = amcf.logs_shm_base() {
             // Use n_active_workers (same rationale as export path).
-            let n_workers = {
-                use core::sync::atomic::Ordering;
-                let n = amcf.n_active_workers.load(Ordering::Relaxed);
-                if n > 0 {
-                    n
-                } else {
-                    // SAFETY: `logs_shm_base()` returned `Some`, so the logs zone is
-                    // registered and mapped; `amcf.logs_shm_zone` points to a live
-                    // `ngx_shm_zone_t` valid for the exporter's lifetime. The `&*`
-                    // borrow does not escape this block; `shm.size` is a plain read.
-                    unsafe {
-                        let zone = &*amcf.logs_shm_zone;
-                        let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
-                        logs_n_workers_from_zone(avail, amcf.log_ring_cap())
-                    }
-                }
+            // SAFETY: `logs_shm_base()` returned `Some`, so `logs_shm_zone` is
+            // non-null and points to a live, mapped zone for the exporter's
+            // lifetime.
+            let n_workers = unsafe {
+                get_n_workers(&amcf.n_active_workers, amcf.logs_shm_zone, |avail| {
+                    logs_n_workers_from_zone(avail, amcf.log_ring_cap())
+                })
             };
             // Pdata pipeline: wrap → process → encode → send (Step U2).
             let mut logs_pd =
@@ -1958,22 +1880,13 @@ async fn graceful_drain(
     if !has_successor {
         if let Some(spans_base) = amcf.spans_shm_base() {
             // Use n_active_workers (same rationale as export path).
-            let n_workers = {
-                use core::sync::atomic::Ordering;
-                let n = amcf.n_active_workers.load(Ordering::Relaxed);
-                if n > 0 {
-                    n
-                } else {
-                    // SAFETY: `spans_shm_base()` returned `Some`, so the spans zone is
-                    // registered and mapped; `amcf.spans_shm_zone` points to a live
-                    // `ngx_shm_zone_t` valid for the exporter's lifetime. The `&*`
-                    // borrow does not escape this block; `shm.size` is a plain read.
-                    unsafe {
-                        let zone = &*amcf.spans_shm_zone;
-                        let avail = zone.shm.size.saturating_sub(crate::shm::data_offset());
-                        spans_n_workers_from_zone(avail, DEFAULT_SPAN_RING_CAP)
-                    }
-                }
+            // SAFETY: `spans_shm_base()` returned `Some`, so `spans_shm_zone` is
+            // non-null and points to a live, mapped zone for the exporter's
+            // lifetime.
+            let n_workers = unsafe {
+                get_n_workers(&amcf.n_active_workers, amcf.spans_shm_zone, |avail| {
+                    spans_n_workers_from_zone(avail, DEFAULT_SPAN_RING_CAP)
+                })
             };
             let mut spans_pd = Pdata::Spans(collect_span_records(amcf, spans_base, n_workers));
             processor.process(&mut spans_pd);
@@ -2302,15 +2215,17 @@ fn handle_fresh_send_outcome(
     action
 }
 
-/// Apply the send outcome for a **fresh metrics batch**, re-reading the
-/// monotonic clock internally (after the send await) so the backoff deadline
-/// is computed from a fresh "now", not a pre-send stale capture.
+/// Apply the send outcome for a **fresh batch** of any signal, re-reading the
+/// monotonic clock internally (after the send await) so the backoff deadline is
+/// computed from a fresh "now", not a pre-send stale capture.
 ///
-/// Each signal has its own wrapper so the call sites cannot accidentally pass
-/// a stale pre-send clock value — the basis is always read here, immediately
-/// before delegating to [`handle_fresh_send_outcome`].
+/// The basis is always read here — immediately before delegating to
+/// [`handle_fresh_send_outcome`] — so a call site cannot accidentally pass a
+/// stale pre-send clock value regardless of which signal lane invokes it.
+/// `signal` is the lane name ("metrics" / "logs" / "spans") used only for the
+/// diagnostic log wording.
 #[allow(clippy::too_many_arguments)]
-fn apply_metrics_fresh_send_outcome(
+fn apply_fresh_send_outcome(
     outcome: &crate::transport::DeliveryOutcome,
     backoff: &mut SignalBackoff,
     queue: &mut VecDeque<(std::vec::Vec<u8>, u64)>,
@@ -2319,6 +2234,7 @@ fn apply_metrics_fresh_send_outcome(
     retry_buffer_depth: usize,
     failure_counter: &AtomicU64,
     log: *mut nginx_sys::ngx_log_t,
+    signal: &'static str,
 ) -> OutcomeAction {
     // Re-read the clock AFTER the send await returns. See `post_send_backoff_basis`.
     let basis = post_send_backoff_basis();
@@ -2332,63 +2248,7 @@ fn apply_metrics_fresh_send_outcome(
         retry_buffer_depth,
         failure_counter,
         log,
-        "metrics",
-    )
-}
-
-/// Apply the send outcome for a **fresh logs batch**; see
-/// [`apply_metrics_fresh_send_outcome`] for the stale-basis rationale.
-#[allow(clippy::too_many_arguments)]
-fn apply_logs_fresh_send_outcome(
-    outcome: &crate::transport::DeliveryOutcome,
-    backoff: &mut SignalBackoff,
-    queue: &mut VecDeque<(std::vec::Vec<u8>, u64)>,
-    bytes: std::vec::Vec<u8>,
-    n_records: u64,
-    retry_buffer_depth: usize,
-    failure_counter: &AtomicU64,
-    log: *mut nginx_sys::ngx_log_t,
-) -> OutcomeAction {
-    let basis = post_send_backoff_basis();
-    handle_fresh_send_outcome(
-        outcome,
-        backoff,
-        basis,
-        queue,
-        bytes,
-        n_records,
-        retry_buffer_depth,
-        failure_counter,
-        log,
-        "logs",
-    )
-}
-
-/// Apply the send outcome for a **fresh spans batch**; see
-/// [`apply_metrics_fresh_send_outcome`] for the stale-basis rationale.
-#[allow(clippy::too_many_arguments)]
-fn apply_spans_fresh_send_outcome(
-    outcome: &crate::transport::DeliveryOutcome,
-    backoff: &mut SignalBackoff,
-    queue: &mut VecDeque<(std::vec::Vec<u8>, u64)>,
-    bytes: std::vec::Vec<u8>,
-    n_records: u64,
-    retry_buffer_depth: usize,
-    failure_counter: &AtomicU64,
-    log: *mut nginx_sys::ngx_log_t,
-) -> OutcomeAction {
-    let basis = post_send_backoff_basis();
-    handle_fresh_send_outcome(
-        outcome,
-        backoff,
-        basis,
-        queue,
-        bytes,
-        n_records,
-        retry_buffer_depth,
-        failure_counter,
-        log,
-        "spans",
+        signal,
     )
 }
 
@@ -5214,24 +5074,25 @@ mod tests {
     }
 
     /// Call-site wiring guard for all three fresh-send lanes (metrics / logs /
-    /// spans). Each lane has a dedicated `apply_{signal}_fresh_send_outcome`
-    /// wrapper that reads the monotonic clock internally via
+    /// spans). All three lanes call the shared `apply_fresh_send_outcome`
+    /// helper, which reads the monotonic clock internally via
     /// `post_send_backoff_basis()` — the call site cannot accidentally supply a
-    /// stale pre-send capture.
+    /// stale pre-send capture. Each lane below exercises that helper with its
+    /// own signal name so the per-lane backoff state is checked independently.
     ///
     /// This test uses the `TEST_CLOCK_MSEC` injectable clock to simulate the
     /// clock advancing between the top of the iteration ("pre-send") and the
-    /// return of the send await ("post-send"), then calls each wrapper function
-    /// directly. Because the wrappers call `post_send_backoff_basis()` (which
-    /// reads `TEST_CLOCK_MSEC`) internally, the test observes the EXACT same
-    /// clock path the production call site uses.
+    /// return of the send await ("post-send"), then calls the helper directly.
+    /// Because the helper calls `post_send_backoff_basis()` (which reads
+    /// `TEST_CLOCK_MSEC`) internally, the test observes the EXACT same clock
+    /// path the production call site uses.
     ///
     /// Mutation guide (execute manually to verify):
     ///   • Replace `post_send_backoff_basis()` with `0` (or any stale constant)
-    ///     inside any of the three `apply_{signal}_fresh_send_outcome` wrappers.
-    ///   • Re-run this test: it FAILS on the `is_deferred` assertion for that
-    ///     signal because the deadline is placed at `0 + BACKOFF_CAP_MS`, which
-    ///     is still less than `real_now`.
+    ///     inside `apply_fresh_send_outcome`.
+    ///   • Re-run this test: it FAILS on the `is_deferred` assertion because the
+    ///     deadline is placed at `0 + BACKOFF_CAP_MS`, which is still less than
+    ///     `real_now`.
     ///   • Restore `post_send_backoff_basis()`: test PASSES again.
     #[test]
     fn fresh_send_backoff_basis_wiring_all_lanes() {
@@ -5249,7 +5110,7 @@ mod tests {
             let mut backoff = SignalBackoff { not_before_msec: 0, consecutive_retryable: 60 };
             let mut q = VecDeque::new();
             let fc = AtomicU64::new(0);
-            let action = apply_metrics_fresh_send_outcome(
+            let action = apply_fresh_send_outcome(
                 &Outcome::Retryable { retry_after: None },
                 &mut backoff,
                 &mut q,
@@ -5258,14 +5119,15 @@ mod tests {
                 8,
                 &fc,
                 core::ptr::null_mut(),
+                "metrics",
             );
             assert_eq!(action, OutcomeAction::Requeue, "metrics: must Requeue");
             assert!(
                 backoff.is_deferred(real_now),
-                "metrics: apply_metrics_fresh_send_outcome must place the defer \
+                "metrics: apply_fresh_send_outcome must place the defer \
                  deadline in the future (post-send clock = {real_now}, \
                  not_before = {}). Mutation: replace post_send_backoff_basis() \
-                 with a stale value inside apply_metrics_fresh_send_outcome \
+                 with a stale value inside apply_fresh_send_outcome \
                  and confirm this assertion fails.",
                 backoff.not_before_msec
             );
@@ -5276,7 +5138,7 @@ mod tests {
             let mut backoff = SignalBackoff { not_before_msec: 0, consecutive_retryable: 60 };
             let mut q = VecDeque::new();
             let fc = AtomicU64::new(0);
-            let action = apply_logs_fresh_send_outcome(
+            let action = apply_fresh_send_outcome(
                 &Outcome::Retryable { retry_after: None },
                 &mut backoff,
                 &mut q,
@@ -5285,14 +5147,15 @@ mod tests {
                 8,
                 &fc,
                 core::ptr::null_mut(),
+                "logs",
             );
             assert_eq!(action, OutcomeAction::Requeue, "logs: must Requeue");
             assert!(
                 backoff.is_deferred(real_now),
-                "logs: apply_logs_fresh_send_outcome must place the defer deadline \
+                "logs: apply_fresh_send_outcome must place the defer deadline \
                  in the future (post-send clock = {real_now}, \
                  not_before = {}). Mutation: replace post_send_backoff_basis() \
-                 with a stale value inside apply_logs_fresh_send_outcome \
+                 with a stale value inside apply_fresh_send_outcome \
                  and confirm this assertion fails.",
                 backoff.not_before_msec
             );
@@ -5303,7 +5166,7 @@ mod tests {
             let mut backoff = SignalBackoff { not_before_msec: 0, consecutive_retryable: 60 };
             let mut q = VecDeque::new();
             let fc = AtomicU64::new(0);
-            let action = apply_spans_fresh_send_outcome(
+            let action = apply_fresh_send_outcome(
                 &Outcome::Retryable { retry_after: None },
                 &mut backoff,
                 &mut q,
@@ -5312,14 +5175,15 @@ mod tests {
                 8,
                 &fc,
                 core::ptr::null_mut(),
+                "spans",
             );
             assert_eq!(action, OutcomeAction::Requeue, "spans: must Requeue");
             assert!(
                 backoff.is_deferred(real_now),
-                "spans: apply_spans_fresh_send_outcome must place the defer deadline \
+                "spans: apply_fresh_send_outcome must place the defer deadline \
                  in the future (post-send clock = {real_now}, \
                  not_before = {}). Mutation: replace post_send_backoff_basis() \
-                 with a stale value inside apply_spans_fresh_send_outcome \
+                 with a stale value inside apply_fresh_send_outcome \
                  and confirm this assertion fails.",
                 backoff.not_before_msec
             );
