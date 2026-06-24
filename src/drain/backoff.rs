@@ -16,8 +16,6 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use nginx_sys::NGX_LOG_ERR;
-
 use super::graceful::enqueue_with_eviction;
 use super::self_metrics::{PARTIAL_REJECTED, PERMANENT_REJECTED, UNAUTHORIZED_REJECTED};
 use super::{BACKOFF_BASE_MS, BACKOFF_CAP_MS};
@@ -160,8 +158,7 @@ pub(super) fn maybe_log_unauthorized(log: *mut nginx_sys::ngx_log_t, signal: &st
         return;
     }
     UNAUTHORIZED_LOG_LAST_MSEC.store(now.max(1), Ordering::Relaxed);
-    ngx::ngx_log_error!(
-        NGX_LOG_ERR,
+    error!(
         log,
         "otel export: {} batch rejected — authentication/authorization failed; \
          check exporter credentials (dropping, not retrying)",
@@ -278,8 +275,7 @@ pub(super) fn handle_fresh_send_outcome(
         OutcomeAction::Release => {}
         OutcomeAction::Requeue => {
             if !log.is_null() {
-                ngx::ngx_log_error!(
-                    NGX_LOG_ERR,
+                error!(
                     log,
                     "otel export: {} send retryable; queuing for retry and deferring next drain",
                     signal
@@ -290,12 +286,7 @@ pub(super) fn handle_fresh_send_outcome(
         }
         OutcomeAction::Drop => {
             if !log.is_null() {
-                ngx::ngx_log_error!(
-                    NGX_LOG_ERR,
-                    log,
-                    "otel export: dropping fresh {} batch — non-retryable verdict",
-                    signal
-                );
+                error!(log, "otel export: dropping fresh {} batch — non-retryable verdict", signal);
             }
         }
     }

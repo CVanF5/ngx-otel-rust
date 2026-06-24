@@ -19,7 +19,6 @@ use core::sync::atomic::Ordering;
 use core::task::{Context, Poll};
 use std::collections::VecDeque;
 
-use nginx_sys::{NGX_LOG_ERR, NGX_LOG_NOTICE};
 use pin_project_lite::pin_project;
 
 use super::self_metrics::DROPPED_RECORDS;
@@ -101,12 +100,7 @@ pub(super) fn enqueue_with_eviction(
         if let Some((_, dropped_pts)) = retry_queue.pop_front() {
             DROPPED_RECORDS.fetch_add(dropped_pts, Ordering::Relaxed);
             if !log.is_null() {
-                ngx::ngx_log_error!(
-                    NGX_LOG_ERR,
-                    log,
-                    "otel export: retry buffer full, dropped {} records",
-                    dropped_pts
-                );
+                error!(log, "otel export: retry buffer full, dropped {} records", dropped_pts);
             }
             retry_queue.push_back((bytes, n_pts));
             return dropped_pts;
@@ -256,8 +250,7 @@ pub(super) async fn graceful_drain(
     // the periodic drain path and graceful_drain.
     let has_successor = successor_announced(amcf, my_gen);
 
-    ngx::ngx_log_error!(
-        NGX_LOG_NOTICE,
+    notice!(
         log.as_ptr(),
         "otel export: graceful drain starting ({} queued batch(es), successor={})",
         queued,
@@ -266,8 +259,7 @@ pub(super) async fn graceful_drain(
     if has_successor {
         // Abdication path — log/span ring pops are skipped (new exporter owns).
         // Still flush in-process retry buffers and final cumulative-metrics batch.
-        ngx::ngx_log_error!(
-            NGX_LOG_NOTICE,
+        notice!(
             log.as_ptr(),
             "otel export: successor announced — abdicating log/span ring drains \
              (new exporter is sole consumer)"
@@ -285,12 +277,9 @@ pub(super) async fn graceful_drain(
                 // (release/requeue+defer/drop) applies.
                 Ok(Ok(_outcome)) => {}
                 Ok(Err(e)) => {
-                    ngx::ngx_log_error!(
-                        NGX_LOG_ERR,
+                    error!(
                         log.as_ptr(),
-                        "otel export: drain: queued batch ({} pts) send failed: {}",
-                        n_pts,
-                        e
+                        "otel export: drain: queued batch ({} pts) send failed: {}", n_pts, e
                     );
                     // Other queued batches likely fail too; stop and let the
                     // remainder be dropped when the loop returns.
@@ -302,8 +291,7 @@ pub(super) async fn graceful_drain(
                     break;
                 }
                 Err(DeadlineExceeded) => {
-                    ngx::ngx_log_error!(
-                        NGX_LOG_NOTICE,
+                    notice!(
                         log.as_ptr(),
                         "otel export: drain: queued batch ({} pts) timed out after {:?}",
                         n_pts,
@@ -334,24 +322,17 @@ pub(super) async fn graceful_drain(
             {
                 // Any Ok(outcome) treated as release (the outcome-driven policy applies).
                 Ok(Ok(_outcome)) => {
-                    ngx::ngx_log_error!(
-                        NGX_LOG_NOTICE,
+                    notice!(
                         log.as_ptr(),
                         "otel export: drain: final batch sent ({} data points)",
                         n_pts
                     );
                 }
                 Ok(Err(e)) => {
-                    ngx::ngx_log_error!(
-                        NGX_LOG_ERR,
-                        log.as_ptr(),
-                        "otel export: drain: final batch failed: {}",
-                        e
-                    );
+                    error!(log.as_ptr(), "otel export: drain: final batch failed: {}", e);
                 }
                 Err(DeadlineExceeded) => {
-                    ngx::ngx_log_error!(
-                        NGX_LOG_NOTICE,
+                    notice!(
                         log.as_ptr(),
                         "otel export: drain: final batch timed out after {:?}",
                         GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET
@@ -368,12 +349,9 @@ pub(super) async fn graceful_drain(
             // (release/requeue+defer/drop) applies.
             Ok(Ok(_outcome)) => {}
             Ok(Err(e)) => {
-                ngx::ngx_log_error!(
-                    NGX_LOG_ERR,
+                error!(
                     log.as_ptr(),
-                    "otel export: drain: logs queued batch ({} records) send failed: {}",
-                    n_logs,
-                    e
+                    "otel export: drain: logs queued batch ({} records) send failed: {}", n_logs, e
                 );
                 // F6: credit remaining queued logs records to DROPPED_RECORDS before
                 // clearing so the self-metric reflects the full drop, not just the
@@ -382,8 +360,7 @@ pub(super) async fn graceful_drain(
                 break;
             }
             Err(DeadlineExceeded) => {
-                ngx::ngx_log_error!(
-                    NGX_LOG_NOTICE,
+                notice!(
                     log.as_ptr(),
                     "otel export: drain: logs queued batch ({} records) timed out",
                     n_logs
@@ -433,27 +410,17 @@ pub(super) async fn graceful_drain(
                 {
                     // Any Ok(outcome) treated as release (the outcome-driven policy applies).
                     Ok(Ok(_outcome)) => {
-                        ngx::ngx_log_error!(
-                            NGX_LOG_NOTICE,
+                        notice!(
                             log.as_ptr(),
                             "otel export: drain: final logs batch sent ({} records)",
                             n_logs
                         );
                     }
                     Ok(Err(e)) => {
-                        ngx::ngx_log_error!(
-                            NGX_LOG_ERR,
-                            log.as_ptr(),
-                            "otel export: drain: final logs batch failed: {}",
-                            e
-                        );
+                        error!(log.as_ptr(), "otel export: drain: final logs batch failed: {}", e);
                     }
                     Err(DeadlineExceeded) => {
-                        ngx::ngx_log_error!(
-                            NGX_LOG_NOTICE,
-                            log.as_ptr(),
-                            "otel export: drain: final logs batch timed out"
-                        );
+                        notice!(log.as_ptr(), "otel export: drain: final logs batch timed out");
                     }
                 }
             }
@@ -467,8 +434,7 @@ pub(super) async fn graceful_drain(
             // (release/requeue+defer/drop) applies.
             Ok(Ok(_outcome)) => {}
             Ok(Err(e)) => {
-                ngx::ngx_log_error!(
-                    NGX_LOG_ERR,
+                error!(
                     log.as_ptr(),
                     "otel export: drain: spans queued batch ({} records) send failed: {}",
                     n_spans,
@@ -479,8 +445,7 @@ pub(super) async fn graceful_drain(
                 break;
             }
             Err(DeadlineExceeded) => {
-                ngx::ngx_log_error!(
-                    NGX_LOG_NOTICE,
+                notice!(
                     log.as_ptr(),
                     "otel export: drain: spans queued batch ({} records) timed out",
                     n_spans
@@ -521,32 +486,22 @@ pub(super) async fn graceful_drain(
                 {
                     // Any Ok(outcome) treated as release (the outcome-driven policy applies).
                     Ok(Ok(_outcome)) => {
-                        ngx::ngx_log_error!(
-                            NGX_LOG_NOTICE,
+                        notice!(
                             log.as_ptr(),
                             "otel export: drain: final spans batch sent ({} records)",
                             n_spans
                         );
                     }
                     Ok(Err(e)) => {
-                        ngx::ngx_log_error!(
-                            NGX_LOG_ERR,
-                            log.as_ptr(),
-                            "otel export: drain: final spans batch failed: {}",
-                            e
-                        );
+                        error!(log.as_ptr(), "otel export: drain: final spans batch failed: {}", e);
                     }
                     Err(DeadlineExceeded) => {
-                        ngx::ngx_log_error!(
-                            NGX_LOG_NOTICE,
-                            log.as_ptr(),
-                            "otel export: drain: final spans batch timed out"
-                        );
+                        notice!(log.as_ptr(), "otel export: drain: final spans batch timed out");
                     }
                 }
             }
         }
     } // end `if !has_successor` for spans ring drain
 
-    ngx::ngx_log_error!(NGX_LOG_NOTICE, log.as_ptr(), "otel export: graceful drain complete");
+    notice!(log.as_ptr(), "otel export: graceful drain complete");
 }

@@ -45,8 +45,6 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
 use std::collections::VecDeque;
 
-use nginx_sys::{NGX_LOG_ERR, NGX_LOG_INFO, NGX_LOG_NOTICE, NGX_LOG_WARN};
-
 use crate::config::{ExportProtocol, MainConfig};
 use crate::data_model::{
     AggregationTemporality, AnyValue, Batch, GaugeData, KeyValue, LogRecord, LogsBatch, Metric,
@@ -496,29 +494,16 @@ async fn send_fresh_batch(
                 signal,
             ) == OutcomeAction::Release
             {
-                ngx::ngx_log_error!(
-                    NGX_LOG_INFO,
-                    log,
-                    "otel export: sent {} {} to collector",
-                    n_records,
-                    success_noun
-                );
+                info!(log, "otel export: sent {} {} to collector", n_records, success_noun);
             }
         }
         Ok(Err(ref e)) => {
-            ngx::ngx_log_error!(
-                NGX_LOG_ERR,
-                log,
-                "otel export: {}send failed ({}); queuing for retry",
-                signal_prefix,
-                e
-            );
+            error!(log, "otel export: {}send failed ({}); queuing for retry", signal_prefix, e);
             enqueue_with_eviction(queue, bytes, n_records, retry_buffer_depth, log);
             failure_counter.fetch_add(1, Ordering::Relaxed);
         }
         Err(DeadlineExceeded) => {
-            ngx::ngx_log_error!(
-                NGX_LOG_ERR,
+            error!(
                 log,
                 "otel export: {}send timed out after {:?}; queuing for retry",
                 signal_prefix,
@@ -546,11 +531,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
     let endpoint_str = match core::str::from_utf8(amcf.exporter.endpoint.as_bytes()) {
         Ok(s) => s,
         Err(_) => {
-            ngx::ngx_log_error!(
-                NGX_LOG_ERR,
-                log.as_ptr(),
-                "otel export: endpoint is not valid UTF-8; export loop aborting"
-            );
+            error!(log.as_ptr(), "otel export: endpoint is not valid UTF-8; export loop aborting");
             return;
         }
     };
@@ -598,16 +579,11 @@ pub async fn export_loop(amcf: &'static MainConfig) {
         let tls_cfg = TlsConfig { ca_file: trusted_cert, client_cert, client_key, insecure };
         let log_ptr = log.as_ptr();
         match tls_cfg.build_ctx(|msg| {
-            ngx::ngx_log_error!(NGX_LOG_WARN, log_ptr, "otel export: {}", msg);
+            warn!(log_ptr, "otel export: {}", msg);
         }) {
             Ok(ctx) => Some((ctx, insecure)),
             Err(e) => {
-                ngx::ngx_log_error!(
-                    NGX_LOG_ERR,
-                    log.as_ptr(),
-                    "otel export: failed to build TLS context: {}",
-                    e
-                );
+                error!(log.as_ptr(), "otel export: failed to build TLS context: {}", e);
                 return;
             }
         }
@@ -636,12 +612,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                     ExportTransport::Http(t)
                 }
                 Err(e) => {
-                    ngx::ngx_log_error!(
-                        NGX_LOG_ERR,
-                        log.as_ptr(),
-                        "otel export: failed to create HTTP transport: {}",
-                        e
-                    );
+                    error!(log.as_ptr(), "otel export: failed to create HTTP transport: {}", e);
                     return;
                 }
             }
@@ -664,12 +635,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
                     ExportTransport::Grpc(t)
                 }
                 Err(e) => {
-                    ngx::ngx_log_error!(
-                        NGX_LOG_ERR,
-                        log.as_ptr(),
-                        "otel export: failed to create gRPC transport: {}",
-                        e
-                    );
+                    error!(log.as_ptr(), "otel export: failed to create gRPC transport: {}", e);
                     return;
                 }
             }
@@ -693,8 +659,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             &amcf.exporter.logs_endpoint,
             &amcf.exporter.traces_endpoint,
         ) {
-            ngx::ngx_log_error!(
-                NGX_LOG_WARN,
+            warn!(
                 log.as_ptr(),
                 "otel export: {}_endpoint ignored under grpc transport \
                  (path routing is not applicable)",
@@ -806,8 +771,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
         ExportProtocol::OtlpHttp => "otlp_http",
         ExportProtocol::OtlpGrpc => "otlp_grpc",
     };
-    ngx::ngx_log_error!(
-        NGX_LOG_NOTICE,
+    notice!(
         log.as_ptr(),
         "otel export: export loop started, endpoint={}, protocol={}, interval={}ms, retry_depth={}",
         endpoint_str,
@@ -824,8 +788,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
     // absent. WARN (not ERR): the module otherwise works; this is a degraded feature,
     // not a failure. One-shot at startup, matching the lifecycle-line convention.
     #[cfg(not(ngx_feature = "stat_stub"))]
-    ngx::ngx_log_error!(
-        NGX_LOG_WARN,
+    warn!(
         log.as_ptr(),
         "otel export: stub_status metrics disabled: nginx built without \
          --with-http_stub_status_module; nginx.connections.* and \
@@ -838,11 +801,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
         // written only by the master/signal-delivery path and read here in the
         // single-threaded exporter process; a plain read of it is well-defined.
         if unsafe { nginx_sys::ngx_terminate } != 0 {
-            ngx::ngx_log_error!(
-                NGX_LOG_NOTICE,
-                log.as_ptr(),
-                "otel export: ngx_terminate set, exiting without drain"
-            );
+            notice!(log.as_ptr(), "otel export: ngx_terminate set, exiting without drain");
             return;
         }
 
@@ -860,11 +819,7 @@ pub async fn export_loop(amcf: &'static MainConfig) {
             // running during the overlap window. Always drains in production
             // builds (`active()` is `const false`).
             if !quit_defer.active() {
-                ngx::ngx_log_error!(
-                    NGX_LOG_NOTICE,
-                    log.as_ptr(),
-                    "otel export: ngx_quit set, starting graceful drain"
-                );
+                notice!(log.as_ptr(), "otel export: ngx_quit set, starting graceful drain");
                 graceful_drain(
                     &mut transport,
                     &mut DrainQueues {
@@ -1007,8 +962,7 @@ async fn periodic_tick(
         // the latch short-circuits immediately after the first true result).
         if !*periodic_abdicated && successor_announced(amcf, my_gen) {
             *periodic_abdicated = true;
-            ngx::ngx_log_error!(
-                NGX_LOG_NOTICE,
+            notice!(
                 log.as_ptr(),
                 "otel export: successor announced — abdicating periodic ring pops \
                  (my_gen={})",
@@ -1213,11 +1167,7 @@ async fn periodic_tick(
             // Caller (export_loop) will `continue` to the next outer iteration.
             return ShutdownKind::None;
         }
-        ngx::ngx_log_error!(
-            NGX_LOG_NOTICE,
-            log.as_ptr(),
-            "otel export: ngx_quit set during sleep, starting graceful drain"
-        );
+        notice!(log.as_ptr(), "otel export: ngx_quit set during sleep, starting graceful drain");
         graceful_drain(
             transport,
             &mut DrainQueues {
@@ -1271,8 +1221,7 @@ async fn periodic_tick(
                 ctrl.window_start_unix.store(0, Ordering::Relaxed);
             }
             *crash_counter_reset = true;
-            ngx::ngx_log_error!(
-                NGX_LOG_INFO,
+            info!(
                 log.as_ptr(),
                 "otel export: exporter healthy for {}s — crash counter reset",
                 crate::exporter::CRASH_WINDOW_SECS,
@@ -1490,8 +1439,7 @@ async fn drain_retry_queue_once_with_timer<S, Mk, T>(
                     OutcomeAction::Requeue => {
                         failure_counter.fetch_add(1, Ordering::Relaxed);
                         if !log.is_null() {
-                            ngx::ngx_log_error!(
-                                NGX_LOG_ERR,
+                            error!(
                                 log,
                                 "otel export: {} retry send retryable; re-queuing and \
                                  deferring next drain",
@@ -1506,8 +1454,7 @@ async fn drain_retry_queue_once_with_timer<S, Mk, T>(
                     // Keep draining: each batch carries its own verdict.
                     OutcomeAction::Drop => {
                         if !log.is_null() {
-                            ngx::ngx_log_error!(
-                                NGX_LOG_ERR,
+                            error!(
                                 log,
                                 "otel export: dropping {} retry batch — non-retryable verdict",
                                 signal
@@ -1520,25 +1467,16 @@ async fn drain_retry_queue_once_with_timer<S, Mk, T>(
                 failure_counter.fetch_add(1, Ordering::Relaxed);
                 if is_permanent_rejection(e) {
                     if !log.is_null() {
-                        ngx::ngx_log_error!(
-                            NGX_LOG_ERR,
+                        error!(
                             log,
-                            "otel export: dropping {} batch — permanent rejection ({})",
-                            signal,
-                            e
+                            "otel export: dropping {} batch — permanent rejection ({})", signal, e
                         );
                     }
                     drain_failed = true;
                     continue;
                 }
                 if !log.is_null() {
-                    ngx::ngx_log_error!(
-                        NGX_LOG_ERR,
-                        log,
-                        "otel export: {} retry send failed ({}); re-queuing",
-                        signal,
-                        e
-                    );
+                    error!(log, "otel export: {} retry send failed ({}); re-queuing", signal, e);
                 }
                 enqueue_with_eviction(queue, bytes, n, retry_buffer_depth, log);
                 drain_failed = true;
@@ -1546,8 +1484,7 @@ async fn drain_retry_queue_once_with_timer<S, Mk, T>(
             Err(DeadlineExceeded) => {
                 failure_counter.fetch_add(1, Ordering::Relaxed);
                 if !log.is_null() {
-                    ngx::ngx_log_error!(
-                        NGX_LOG_ERR,
+                    error!(
                         log,
                         "otel export: {} retry send timed out after {:?}; re-queuing",
                         signal,
