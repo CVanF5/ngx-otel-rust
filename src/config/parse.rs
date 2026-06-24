@@ -68,6 +68,10 @@ pub(crate) fn parse_size_bytes(s: &[u8]) -> Option<usize> {
 /// `AtomicU64` alignment at each boundary `cap` must be a multiple of 8.
 /// Values near `usize::MAX` where rounding up would overflow are rejected
 /// here so the caller can surface an error rather than panic.
+///
+/// Used only by the test-support `otel_log_ring_size` directive handler (and
+/// its unit test); production builds always use the auto-default ring size.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn align_ring_size(n: usize) -> Option<usize> {
     n.checked_next_multiple_of(8)
 }

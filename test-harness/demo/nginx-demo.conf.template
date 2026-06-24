@@ -68,9 +68,8 @@ http {
     # exporter emits one aggregated point per series each interval. 2s here for a
     # lively demo dashboard; production is typically 10s or more.
     otel_metric_interval 2s;
-    # Shared-memory zone backing the metric slots (a default zone is used when
-    # unset; unused in the demo):
-    #   otel_metric_zone otel_metrics 1m;
+    # The metrics shared-memory zone is auto-sized from worker_processes; there is
+    # no operator-facing tuning directive.
     # Split the request-duration histogram by method × status-class × protocol
     # (bounded, low-cardinality attributes) so the dashboard can break p99 and
     # rate down by those dimensions. Status is the CLASS (2xx/4xx/5xx), not the
@@ -93,9 +92,8 @@ http {
         ~^[45]   1;       # 4xx and 5xx → truthy → exported
     }
     otel_log_export if=$otel_export_tail;
-    # Per-worker logs ring capacity backing the exception tail (default 512k;
-    # unused in the demo):
-    #   otel_log_ring_size 512k;
+    # The per-worker logs ring capacity backing the exception tail is fixed at
+    # 512k; there is no operator-facing tuning directive.
     # Error log over OTLP: coalesced nginx.error LogRecords plus a companion error-
     # rate metric. Optional argument sets the minimum severity (defaults to error).
     otel_error_log warn;

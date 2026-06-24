@@ -222,6 +222,11 @@ The shared-memory architecture is invisible to the nginx config. All
 `otel_exporter {}` sub-directives, `otel_service_name`, and `otel_resource_attr`
 work identically.
 
+The metrics shared-memory zone and the per-worker log rings are auto-sized
+(from `worker_processes` and a fixed 512k default, respectively) with no
+operator-facing tuning directive. Neither auto-sizing knob corresponds to any
+C++ `nginx-otel` directive, so drop-in config compatibility is unaffected.
+
 ---
 
 ## Quick-reference: config diff for a traces-only C++ user

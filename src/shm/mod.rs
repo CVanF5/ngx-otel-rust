@@ -994,8 +994,8 @@ pub fn logs_n_workers_from_zone(zone_data_bytes: usize, cap: usize) -> usize {
 /// This is the single source of truth for the slot stride (used by
 /// [`logs_access_ring`], [`logs_error_ring`], [`logs_error_ring_ptr`], and
 /// [`logs_coalesce_table`]).  Reading from the header instead of the config
-/// parameter prevents a stride/push-pop desync on a SIGHUP that changes
-/// `otel_log_ring_size`: the zone was sized and laid out with the cap stamped
+/// parameter prevents a stride/push-pop desync on a SIGHUP that changes the
+/// log ring cap: the zone was sized and laid out with the cap stamped
 /// into the header by [`logs_shm_zone_init`]; using any other cap for stride
 /// would compute wrong slot addresses.
 ///
@@ -1046,7 +1046,7 @@ pub unsafe fn logs_access_ring(
     // Use the header-stamped cap as the single source of truth for stride; fall
     // back to the config cap only before zone-init has run (header cap == 0).
     // This keeps stride consistent with the cap push/pop read from the same header,
-    // preventing a desync if `otel_log_ring_size` is changed between reloads.
+    // preventing a desync if the log ring cap is changed between reloads.
     // SAFETY: `base_addr` is `shm.addr + data_offset()` per the fn contract,
     // which means it is valid for at least one full slot (≥ RING_HEADER_SIZE bytes),
     // satisfying `logs_zone_cap`'s precondition.
@@ -2604,7 +2604,7 @@ mod tests {
     /// Regression: `logs_access_ring` / `logs_error_ring` / `logs_error_ring_ptr` /
     /// `logs_coalesce_table` must derive their slot stride from the ring header's
     /// cap, NOT from the config `cap` parameter.  A mismatch (e.g. from a SIGHUP
-    /// that changes `otel_log_ring_size`) would compute wrong slot addresses.
+    /// that changes the log ring cap) would compute wrong slot addresses.
     ///
     /// This test sets the header cap to `HDR_CAP` while passing `CONFIG_CAP`
     /// (different) to the stride functions.  The fix reads `HDR_CAP` from the

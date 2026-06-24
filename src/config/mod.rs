@@ -289,10 +289,6 @@ pub struct MainConfig {
     pub exporter_headers: std::vec::Vec<KvPair>,
     /// `otel_metric_interval` — stored in milliseconds; UNSET_U64 until configured.
     pub metric_interval_ms: u64,
-    /// `otel_metric_zone <name> <size>` — name part.
-    pub zone_name: ngx_str_t,
-    /// `otel_metric_zone <name> <size>` — size in bytes; 0 = not configured.
-    pub zone_size: usize,
     /// `otel_metrics on | off` — enable or disable metric collection and export.
     ///
     /// When `off`, the metrics shared memory zone is not registered, worker
@@ -389,6 +385,11 @@ pub struct MainConfig {
     pub any_log_export: bool,
     /// `otel_log_ring_size <size>` — per-worker ring capacity in bytes.
     /// `0` = not configured (uses `DEFAULT_LOG_RING_CAP`).
+    ///
+    /// Test-support only: the directive that sets this is registered only in
+    /// `test`/`test-support` builds.  Production builds always use the
+    /// auto-default ([`crate::logs::ring::DEFAULT_LOG_RING_CAP`]).
+    #[cfg(any(test, feature = "test-support"))]
     pub log_ring_size: usize,
 
     // ── Error-log export ─────────────────────────────────────────────────────
@@ -479,8 +480,6 @@ impl Default for MainConfig {
             resource_attrs: std::vec::Vec::new(),
             exporter_headers: std::vec::Vec::new(),
             metric_interval_ms: UNSET_U64,
-            zone_name: ngx_str_t::default(),
-            zone_size: 0,
             metrics_enabled: UNSET_FLAG,
             status_code_class: UNSET_FLAG,
             #[cfg(any(test, feature = "test-support"))]
@@ -502,6 +501,7 @@ impl Default for MainConfig {
             n_active_workers: core::sync::atomic::AtomicUsize::new(0),
             // No location selects log export until a directive sets one.
             any_log_export: false,
+            #[cfg(any(test, feature = "test-support"))]
             log_ring_size: 0,
             // Error-log defaults.
             error_log_enabled: false,
@@ -973,17 +973,11 @@ impl MainConfig {
         // SAFETY: `cf` is the valid non-null parse context at postconfiguration.
         let n_workers: usize = unsafe { n_workers_to_reserve(cf) };
 
-        // Compute required zone size.
-        let required_size = shm::zone_size_for(n_workers);
-
-        // Choose a zone name: use the configured name or default.
-        let default_name = ngx::ngx_string!("ngx_http_otel_zone");
-        let mut zone_name: ngx_str_t =
-            if self.zone_name.is_empty() { default_name } else { self.zone_name };
-
-        // Apply the larger of required size and explicitly configured size.
-        let zone_size =
-            if self.zone_size > 0 { self.zone_size.max(required_size) } else { required_size };
+        // Zone size is computed from the reserved worker count; the zone name is
+        // fixed.  The zone is an internal per-worker metrics buffer with no
+        // operator-facing name, so neither is configurable.
+        let zone_size = shm::zone_size_for(n_workers);
+        let mut zone_name = ngx::ngx_string!("ngx_http_otel_zone");
 
         // Register the zone.
         // SAFETY: `cf` and `module` are the valid non-null pointers nginx passed
@@ -1528,15 +1522,17 @@ impl MainConfig {
 
     /// Effective per-worker log ring capacity in bytes.
     ///
-    /// Uses the value from `otel_log_ring_size` if set; otherwise
-    /// [`crate::logs::ring::DEFAULT_LOG_RING_CAP`].
+    /// Production builds always use the auto-default
+    /// [`crate::logs::ring::DEFAULT_LOG_RING_CAP`].  In `test`/`test-support`
+    /// builds the value from `otel_log_ring_size` overrides it when set, so
+    /// integration tests can shrink the ring to provoke overflow.
     #[inline]
     pub fn log_ring_cap(&self) -> usize {
+        #[cfg(any(test, feature = "test-support"))]
         if self.log_ring_size > 0 {
-            self.log_ring_size
-        } else {
-            crate::logs::ring::DEFAULT_LOG_RING_CAP
+            return self.log_ring_size;
         }
+        crate::logs::ring::DEFAULT_LOG_RING_CAP
     }
 
     /// Returns the base address of our WorkerSlots data within the shared memory zone.
@@ -1633,13 +1629,13 @@ impl MainConfig {
     /// for example, when `otel_metrics off` leaves the metrics zone unregistered.
     /// Only registered zones (capacity > 0) constrain the bound.
     ///
-    /// The metrics zone can be inflated past the reserved worker count via
-    /// `otel_zone_size` (`register_shm_zone` takes `zone_size.max(required)`),
-    /// but the logs and spans zones are sized strictly for the reserved worker
-    /// count (`n_workers_to_reserve`).  A `worker_id` that fits the inflated
-    /// metrics zone could therefore overflow the smaller logs/spans rings.
-    /// The hot-path guard validates against this MIN so a `worker_id` that would
-    /// overrun the *smallest* indexed ring is rejected before any ring write.
+    /// The three zones are registered independently and may differ in the worker
+    /// count they were sized for (e.g. when `otel_metrics off` leaves the metrics
+    /// zone unregistered, or a reload re-derives a different reserved count for a
+    /// zone that survives from the old cycle).  A `worker_id` that fits one ring
+    /// could therefore overflow a smaller sibling ring.  The hot-path guard
+    /// validates against this MIN so a `worker_id` that would overrun the
+    /// *smallest* indexed ring is rejected before any ring write.
     ///
     /// Returns 0 when no zone is registered, causing the bounds guard to skip
     /// all LOG-phase work.
@@ -1893,15 +1889,6 @@ macro_rules! production_commands {
                 offset: 0,
                 post: ptr::null_mut(),
             },
-            // otel_metric_zone <name> <size>;
-            ngx_command_t {
-                name: ngx_string!("otel_metric_zone"),
-                type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE2) as ngx_uint_t,
-                set: Some(cmd_set_metric_zone),
-                conf: NGX_HTTP_MAIN_CONF_OFFSET,
-                offset: 0,
-                post: ptr::null_mut(),
-            },
             // otel_metric_status_code_class on | off;
             ngx_command_t {
                 name: ngx_string!("otel_metric_status_code_class"),
@@ -1919,17 +1906,6 @@ macro_rules! production_commands {
                 name: ngx_string!("otel_export_protocol"),
                 type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
                 set: Some(cmd_set_export_protocol),
-                conf: NGX_HTTP_MAIN_CONF_OFFSET,
-                offset: 0,
-                post: ptr::null_mut(),
-            },
-            // otel_log_ring_size <size>;
-            // Per-worker ring capacity in bytes.  Memory = size × 2 × N workers.
-            // Default: 512k (DEFAULT_LOG_RING_CAP).  Raise for high-RPS deployments.
-            ngx_command_t {
-                name: ngx_string!("otel_log_ring_size"),
-                type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-                set: Some(cmd_set_log_ring_size),
                 conf: NGX_HTTP_MAIN_CONF_OFFSET,
                 offset: 0,
                 post: ptr::null_mut(),
@@ -2059,25 +2035,29 @@ macro_rules! production_commands {
     };
 }
 
-/// Production build: 17 production commands + terminator.
+/// Production build: 15 production commands + terminator.
 #[cfg(not(any(test, feature = "test-support")))]
-pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 18] = {
-    let mut cmds = [ngx_command_t::empty(); 18];
+pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 16] = {
+    let mut cmds = [ngx_command_t::empty(); 16];
     let prod = production_commands!();
     let mut i = 0;
-    while i < 17 {
+    while i < 15 {
         cmds[i] = prod[i];
         i += 1;
     }
-    // cmds[17] stays empty() — terminator
+    // cmds[15] stays empty() — terminator
     cmds
 };
 
-/// test-support build: 17 production commands + 4 test-only directives + terminator.
+/// test-support build: 15 production commands + 5 test-only directives + terminator.
 ///
 /// The test-only directives exist ONLY in test-support builds and are absent from
 /// the production command table (and therefore from the production `.so`, verified
 /// by grep on `objs-release/ngx_http_otel_module.so`):
+///   - `otel_log_ring_size <size>;` — sets the per-worker log-ring capacity in bytes.
+///     Production builds always use the auto-default (`DEFAULT_LOG_RING_CAP`, 512k);
+///     this override exists only so integration tests can shrink the ring to provoke
+///     ring-full overflow deterministically (see the heartbeat-stale polarity tests).
 ///   - `otel_status_endpoint;` — location-level (no args) content handler returning
 ///     `control_shm.version` as plain text; lets the heartbeat integration test read
 ///     the exporter's liveness counter without process-level introspection.
@@ -2085,16 +2065,25 @@ pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 18] = {
 ///   - `otel_grpc_bidi_smoke_endpoint <url>;` — bidi gRPC harness trigger.
 ///   - `otel_grpc_bidi_overload_endpoint <url>;` — bidi backpressure / give-up test trigger.
 #[cfg(any(test, feature = "test-support"))]
-pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 22] = {
-    let mut cmds = [ngx_command_t::empty(); 22];
+pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 21] = {
+    let mut cmds = [ngx_command_t::empty(); 21];
     let prod = production_commands!();
     let mut i = 0;
-    while i < 17 {
+    while i < 15 {
         cmds[i] = prod[i];
         i += 1;
     }
-    // Index 17: otel_status_endpoint (test-support only).
-    cmds[17] = ngx_command_t {
+    // Index 15: otel_log_ring_size (test-support only).
+    cmds[15] = ngx_command_t {
+        name: ngx_string!("otel_log_ring_size"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(cmd_set_log_ring_size),
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+        offset: 0,
+        post: ptr::null_mut(),
+    };
+    // Index 16: otel_status_endpoint (test-support only).
+    cmds[16] = ngx_command_t {
         name: ngx_string!("otel_status_endpoint"),
         type_: (nginx_sys::NGX_HTTP_LOC_CONF | NGX_CONF_NOARGS) as ngx_uint_t,
         set: Some(cmd_set_otel_status_endpoint),
@@ -2102,8 +2091,8 @@ pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 22] = {
         offset: 0,
         post: ptr::null_mut(),
     };
-    // Index 18: otel_grpc_smoke_endpoint (test-support only).
-    cmds[18] = ngx_command_t {
+    // Index 17: otel_grpc_smoke_endpoint (test-support only).
+    cmds[17] = ngx_command_t {
         name: ngx_string!("otel_grpc_smoke_endpoint"),
         type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
         set: Some(nginx_sys::ngx_conf_set_str_slot),
@@ -2111,8 +2100,8 @@ pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 22] = {
         offset: mem::offset_of!(MainConfig, grpc_smoke_endpoint),
         post: ptr::null_mut(),
     };
-    // Index 19: otel_grpc_bidi_smoke_endpoint (test-support only).
-    cmds[19] = ngx_command_t {
+    // Index 18: otel_grpc_bidi_smoke_endpoint (test-support only).
+    cmds[18] = ngx_command_t {
         name: ngx_string!("otel_grpc_bidi_smoke_endpoint"),
         type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
         set: Some(nginx_sys::ngx_conf_set_str_slot),
@@ -2120,8 +2109,8 @@ pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 22] = {
         offset: mem::offset_of!(MainConfig, bidi_smoke_endpoint),
         post: ptr::null_mut(),
     };
-    // Index 20: otel_grpc_bidi_overload_endpoint (test-support only).
-    cmds[20] = ngx_command_t {
+    // Index 19: otel_grpc_bidi_overload_endpoint (test-support only).
+    cmds[19] = ngx_command_t {
         name: ngx_string!("otel_grpc_bidi_overload_endpoint"),
         type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
         set: Some(nginx_sys::ngx_conf_set_str_slot),
@@ -2129,7 +2118,7 @@ pub static mut NGX_HTTP_OTEL_COMMANDS: [ngx_command_t; 22] = {
         offset: mem::offset_of!(MainConfig, bidi_overload_endpoint),
         post: ptr::null_mut(),
     };
-    // cmds[21] stays empty() — terminator.
+    // cmds[20] stays empty() — terminator.
     cmds
 };
 #[cfg(test)]
@@ -2139,10 +2128,9 @@ mod tests {
 
     /// The LOG-phase `worker_id` guard must validate against the MIN of every
     /// shm ring it indexes (metrics zone + logs + spans), not just the metrics
-    /// zone.  `otel_zone_size` can inflate the metrics zone beyond the reserved
-    /// worker count, while the logs/spans zones are sized strictly for it, so a
-    /// `worker_id` that fits the inflated metrics zone could still overrun the
-    /// smaller logs/spans rings.
+    /// zone.  The three zones are registered independently and may differ in the
+    /// worker count they were sized for, so a `worker_id` that fits one ring
+    /// could still overrun a smaller sibling ring.
     ///
     /// Mutation: revert `min_indexed_worker_capacity` to return the metrics
     /// capacity (e.g. `metrics`) and this test fails — the smaller logs/spans

@@ -16,8 +16,9 @@
 //! ```
 //!
 //! `WorkerSignalRingHeader` carries the three atomic counters plus the runtime
-//! `cap` field.  The `cap` is set once at zone-init time (from the configured
-//! `otel_log_ring_size`), then read by both push and pop on every call.
+//! `cap` field.  The `cap` is set once at zone-init time (from
+//! [`crate::config::MainConfig::log_ring_cap`]), then read by both push and pop
+//! on every call.
 //!
 //! [`WorkerSignalRing`] is a lightweight view (a pointer to the header) obtained
 //! from a raw shm pointer; it is NOT a container and does not own memory.  The
@@ -28,8 +29,8 @@
 //! # Default capacity
 //!
 //! `DEFAULT_LOG_RING_CAP` is 512 KiB per ring.  Memory = `cap × 2 × N` where
-//! `N` = worker count (one access ring + one error ring per worker).  Operators
-//! who need more capacity can raise it via `otel_log_ring_size`.
+//! `N` = worker count (one access ring + one error ring per worker).  This is a
+//! fixed default with no operator-facing tuning directive.
 //!
 //! # Wire format per record
 //! `[u32 record_len big-endian][payload bytes...]`
@@ -45,8 +46,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Default ring capacity in bytes per worker per signal type.
 ///
-/// 512 KiB.  Memory = `cap × 2 × N` workers.
-/// Raise with `otel_log_ring_size` if rings fill under your load.
+/// 512 KiB.  Memory = `cap × 2 × N` workers.  This is the fixed per-worker ring
+/// size; there is no operator-facing tuning directive.
 pub const DEFAULT_LOG_RING_CAP: usize = 512 * 1024;
 
 /// Fixed-size header for a per-worker log ring.
@@ -63,7 +64,7 @@ pub struct WorkerSignalRingHeader {
     /// Number of records dropped because the ring was full.
     pub dropped: AtomicU64,
     /// Ring payload capacity in bytes (set once at zone-init from
-    /// `otel_log_ring_size`, before any worker forks).
+    /// [`crate::config::MainConfig::log_ring_cap`], before any worker forks).
     ///
     /// `AtomicU64` rather than a plain `u64`: the header lives in cross-process
     /// shm and `cap` is read on every push/pop.  The write happens-before the

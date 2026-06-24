@@ -217,26 +217,8 @@ broken down by `http.request.method`, `http.response.status_class`, and
 `network.protocol.version`. When `off`, a single unattributed data point is
 emitted instead, reducing metric series count at the cost of less granularity.
 
-### `otel_metric_zone`
-
-| | |
-|---|---|
-| **Context** | `http` |
-| **Syntax** | `otel_metric_zone <name> <size>;` |
-| **Default** | (absent — auto-sized) |
-
-**Optional tuning override.** Most deployments never need this directive.
-
-When absent, the metrics shared-memory zone is auto-sized from `worker_processes`
-and named `ngx_http_otel_zone`. The configured size is clamped to at least the
-auto-computed minimum (`max(configured, required)`), so it can only enlarge the
-zone, never shrink it. The name is the nginx shm-zone label and is not
-referenced by any other directive.
-
-Use this only if the auto-sized zone is too small for an unusually large
-`worker_processes` count or a non-standard shm layout.
-
-Example: `otel_metric_zone my_otel_zone 10m;`
+The metrics shared-memory zone is auto-sized from `worker_processes` and named
+`ngx_http_otel_zone`; there is no operator-facing directive to tune it.
 
 ---
 
@@ -273,18 +255,8 @@ Note: metric exemplars (trace-linked `trace_id`/`span_id` pointers on the
 duration histogram) are not controlled by `otel_log_export`; they ride on
 `otel_trace` sampling.
 
-### `otel_log_ring_size`
-
-| | |
-|---|---|
-| **Context** | `http` |
-| **Syntax** | `otel_log_ring_size <size>;` |
-| **Default** | `512k` |
-
-Per-worker ring capacity in bytes backing the exception-tail log record buffer.
-Actual shared-memory cost is `size × 2 × N workers` (two rings per worker slot:
-access + error). Raise for high-RPS deployments where per-worker loss is observed
-(`ngx_otel.logs.access.dropped_records`). Must be a positive multiple of 8.
+The per-worker log ring capacity is fixed at `512k` (two rings per worker slot:
+access + error); there is no operator-facing directive to tune it.
 
 ### `otel_error_log`
 

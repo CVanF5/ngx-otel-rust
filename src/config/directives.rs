@@ -25,9 +25,11 @@ use crate::logs::error_writer::{
 };
 use crate::HttpOtelModule;
 
+#[cfg(any(test, feature = "test-support"))]
+use super::align_ring_size;
 use super::{
-    align_ring_size, cf_args, parse_duration_ms, parse_size_bytes, ExporterConfig, KvPair,
-    MainConfig, UNSET_FLAG, UNSET_U64,
+    cf_args, parse_duration_ms, parse_size_bytes, ExporterConfig, KvPair, MainConfig, UNSET_FLAG,
+    UNSET_U64,
 };
 
 // ── Inner exporter block ───────────────────────────────────────────────────────
@@ -492,41 +494,6 @@ pub(super) extern "C" fn cmd_set_metric_interval(
     }
 }
 
-pub(super) extern "C" fn cmd_set_metric_zone(
-    cf: *mut ngx_conf_t,
-    _cmd: *mut ngx_command_t,
-    conf: *mut c_void,
-) -> *mut c_char {
-    // SAFETY: nginx passes the module's `MainConfig` pointer as `conf` for this
-    // MAIN_CONF directive; the cast + `as_mut` yield a valid exclusive reference.
-    let amcf = unsafe { conf.cast::<MainConfig>().as_mut().expect("main config") };
-
-    if amcf.zone_size > 0 {
-        return already_set_error();
-    }
-
-    // SAFETY: `cf` is the valid non-null directive parse context; `args` holds the
-    // parsed tokens (TAKE2: name + size).
-    let args = unsafe { cf_args(cf) };
-    // args[1] = name, args[2] = size (e.g. "10m", "1g")
-    let size = match parse_size_bytes(args[2].as_bytes()) {
-        Some(s) if s > 0 => s,
-        _ => {
-            ngx_conf_log_error!(
-                NGX_LOG_EMERG,
-                &raw mut *cf,
-                "invalid size in \"otel_metric_zone\": \"{}\"",
-                args[2]
-            );
-            return NGX_CONF_ERROR;
-        }
-    };
-
-    amcf.zone_name = args[1];
-    amcf.zone_size = size;
-    NGX_CONF_OK
-}
-
 /// Directive callback for `otel_export_protocol otlp_http | otlp_grpc;`.
 ///
 /// Accepts `otlp_http` and `otlp_grpc`.  Rejects `arrow` with a
@@ -579,6 +546,12 @@ pub(super) extern "C" fn cmd_set_export_protocol(
 ///
 /// Parses a size value (e.g. `"512k"`, `"1m"`) using `parse_size_bytes` and
 /// stores the result in `MainConfig::log_ring_size`.
+///
+/// Test-support only: production builds always use the auto-default ring
+/// capacity ([`crate::logs::ring::DEFAULT_LOG_RING_CAP`]).  This override is
+/// registered only in `test`/`test-support` builds so integration tests can
+/// shrink the ring to provoke ring-full overflow deterministically.
+#[cfg(any(test, feature = "test-support"))]
 pub(super) extern "C" fn cmd_set_log_ring_size(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
