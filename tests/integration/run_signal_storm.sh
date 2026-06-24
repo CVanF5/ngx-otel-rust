@@ -264,7 +264,11 @@ if [[ -n "${NEW_LOGS:-}" ]]; then
 fi
 
 # Informational: how many nginx.error records arrived?
-ERROR_LOG_COUNT=$(echo "${NEW_LOGS:-}" | grep -o '"nginx\.error"' | wc -l | tr -d ' ' || echo 0)
+# `grep -o` exits 1 on zero matches; under `set -o pipefail` that fired the old
+# `|| echo 0` fallback *in addition to* wc's own "0", producing "0\n0" and a
+# `(( ))` syntax error below. Swallow the no-match failure inside the pipeline so
+# wc is the single source of the count.
+ERROR_LOG_COUNT=$(echo "${NEW_LOGS:-}" | { grep -o '"nginx\.error"' || true; } | wc -l | tr -d ' ')
 info "nginx.error records in LOGS_LOG during storm: ${ERROR_LOG_COUNT}"
 if (( ERROR_LOG_COUNT > 0 )); then
     pass "nginx.error records arrived during storm (coalescer active under signals)"
