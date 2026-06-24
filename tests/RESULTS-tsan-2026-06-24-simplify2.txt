@@ -1,0 +1,24 @@
+ThreadSanitizer gate — simplification pass 2 (export→drain rename + module split +
+export_loop lane extraction + hot-path/collect decompose + config/shm split + directive cut)
+
+PROVENANCE: GIT_COMMIT=69669abbf0082457959e56977c190e43d59d3936  DATE=2026-06-24T14:25:06Z
+Host: debian-vm (Linux aarch64, 6 cores), dockerized TSAN harness (build/tsan-run.sh).
+
+Instrumentation confirmed on the loaded cdylib:
+  __tsan_* symbol count in libngx_http_otel_module.so: 42  (matches established baseline)
+
+VERDICT: Zero ThreadSanitizer warnings.  TSAN gate: PASS.
+
+The TSAN race gate is the warning scan. `grep -ni "WARNING: ThreadSanitizer|data race"` over all
+per-script error logs returned ZERO hits. This is the gate that the export_loop control-flow
+reshape (commit 3f88379) needed, since that batch relocated the per-interval drain into
+periodic_tick() while keeping every atomic Ordering and the bounded drop-oldest backstop unchanged.
+
+NON-BLOCKING (NOT a race, NOT a production-code regression):
+  `make tsan-test` returned a non-zero exit (RC=2) because one integration script,
+  run_signal_storm.sh, had a FUNCTIONAL failure — a harness shell bug at
+  tests/integration/run_signal_storm.sh:269 (`((: 0\n0: syntax error in expression`), i.e. an
+  assertion arithmetic that received a multi-line count. This is the documented signal_storm
+  functional/timing flake, independent of these refactors: nginx started cleanly (no directive
+  rejected), ran through shmtx operations + exporter spawn/exit (code 0) + teardown. The TSAN
+  warning scan over its log was clean. Harness fragility, not a module finding.

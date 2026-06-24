@@ -1,0 +1,17 @@
+AddressSanitizer gate — simplification pass 2 (export→drain rename + module split +
+export_loop lane extraction + hot-path/collect decompose + config/shm split + directive cut)
+
+PROVENANCE: GIT_COMMIT=69669abbf0082457959e56977c190e43d59d3936  DATE=2026-06-24T14:32:39Z
+Host: debian-vm (Linux aarch64, 6 cores), dockerized ASan harness (build/asan-run.sh).
+
+Instrumentation confirmed on the loaded cdylib:
+  __asan_* symbol count in libngx_http_otel_module.so: 142  (matches established baseline)
+
+VERDICT: Zero AddressSanitizer reports.  ASan gate: PASS (no use-after-free / heap error on the
+exercised wake/teardown paths).  Make exit RC=0.
+
+Zero AddressSanitizer reports across 15 scripts:
+  run_grpc_export.sh run_grpc_bidi_smoke.sh run_dns_dualstack.sh run_reload.sh run_traces.sh
+  run_redirect_safe.sh run_access_log.sh run_c2_cert_walk.sh run_c3_cert_metrics.sh
+  run_chaos_kill9.sh run_chaos_crashloop.sh run_chaos_dead_collector.sh run_b4_daemon_on_gen1.sh
+  run_b1_spsc_reload_chaos.sh run_chaos_quit_responsiveness.sh
