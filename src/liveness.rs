@@ -163,8 +163,7 @@ pub(crate) fn check_exporter_liveness_on_drop(
     // via the error-log capture chain), the latch is already set.
     ALERT_LATCHED_GEN.store(current_gen, Ordering::Relaxed);
 
-    ngx::ngx_log_error!(
-        nginx_sys::NGX_LOG_ALERT,
+    alert!(
         log,
         "otel exporter heartbeat stale (no beat for >{}ms); telemetry suspended; \
          nginx -s reload restores",

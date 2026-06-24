@@ -205,8 +205,7 @@ impl LogPhaseHandler {
             // SAFETY: `r.connection` is a valid non-null pointer for the
             // lifetime of the request; `(*connection).log` is the request log.
             let log = unsafe { (*r.connection).log };
-            ngx::ngx_log_error!(
-                nginx_sys::NGX_LOG_ALERT,
+            alert!(
                 log,
                 "otel: worker_id {} >= smallest shm ring capacity {} — module \
                  disabled for this worker; move worker_processes before http{{}}",

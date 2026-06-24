@@ -77,8 +77,7 @@ fn warn_span_ctx_oom_once(log: *mut nginx_sys::ngx_log_t) {
         if log.is_null() {
             return;
         }
-        ngx::ngx_log_error!(
-            nginx_sys::NGX_LOG_WARN,
+        warn!(
             log,
             "otel: request-pool alloc failed for SpanCtx; tracing context unavailable — \
              spans may be lost for this and subsequent requests (pool exhausted)"

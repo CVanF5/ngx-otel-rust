@@ -399,8 +399,7 @@ fn log_lazy_seed_failure_once(e: getrandom::Error) {
         if log.is_null() {
             return;
         }
-        ngx::ngx_log_error!(
-            nginx_sys::NGX_LOG_EMERG,
+        emerg!(
             log,
             "otel: trace-ID DRBG lazy seeding failed ({e}); OS RNG unavailable — \
              tracing DISABLED for this worker (traffic unaffected, no spans emitted)"
