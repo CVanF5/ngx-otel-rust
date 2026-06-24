@@ -18,8 +18,6 @@
 //!   branch + the histogram bump).  Nothing is hardcoded — absent configuration
 //!   exports zero log records.
 
-use core::sync::atomic::Ordering;
-
 use nginx_sys;
 use ngx::core::Status;
 use ngx::http::{
@@ -95,22 +93,6 @@ impl HttpRequestHandler for LogPhaseHandler {
             Some(c) => c,
             None => return Status::NGX_OK,
         };
-
-        // Scaffold: prove the hot-path read is zero-cost.
-        // One Relaxed atomic load on control_shm.flags per request.
-        // The loaded value is intentionally discarded; a future dynamic-reconfig
-        // fast-path will use it (sampling rate, dropped attributes, etc.). This
-        // load is inside the is_configured() gate (we returned above if
-        // amcf.main_conf returned None, i.e., the module is disabled) so
-        // module-loaded-but-disabled stays zero-cost.
-        // TODO: act on the loaded flags value.
-        if let Some(ctrl) = amcf.control_shm_ptr() {
-            // SAFETY: `control_shm_ptr()` returns `Some` only when the control shm
-            // zone is mapped, so `ctrl` points to a valid control struct in shm for
-            // the worker's lifetime; `flags` is an atomic, so the concurrent load is
-            // well-defined.
-            let _ = unsafe { (*ctrl).flags.load(Ordering::Relaxed) };
-        }
 
         // Determine current worker index (no syscall — nginx global).
         // SAFETY: `ngx_worker` is a `static mut` set once by nginx during worker
