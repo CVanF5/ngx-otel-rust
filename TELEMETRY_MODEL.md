@@ -580,20 +580,25 @@ such as `http.method` and `http.status_code` are not emitted.
 | `server.port` | local listening port (integer) | omitted when absent |
 | `client.address` | logical client IP, realip-aware (`$remote_addr` equivalent) | |
 | `client.port` | logical client port (integer) | |
-| `network.peer.address` | true TCP socket peer address | absent when realip not compiled in — see note |
-| `network.peer.port` | true TCP socket peer port (integer) | absent when realip not compiled in |
+| `network.peer.address` | true TCP socket peer address | the immediate peer; see note |
+| `network.peer.port` | true TCP socket peer port (integer) | the immediate peer; see note |
 | `error.type` | HTTP status code as string (e.g. `"503"`) | present only when status ≥ 500; derived at export, no worker cost |
 | `http.server.request.duration` | request duration **in seconds** | enables coherent metric→exemplar→span drill-down |
 | Custom attrs | from `otel_span_attr` directives | per-location, up to `MAX_SPAN_EXTRA_ATTRS` entries |
 
-> **`network.peer.*` and realip.** These attributes represent the immediate TCP
-> socket peer, distinct from the logical client. They are sourced via nginx's
-> `$realip_remote_addr` / `$realip_remote_port` variables, which require the
-> `realip` module to be compiled in (the default nginx build includes it). When
-> built `--without-http_realip_module` the variable is unregistered and the two
-> attributes are **absent** from the span — not degraded to the client address.
-> `client.address` is always present and equals the socket peer when realip is
-> not in use.
+> **`network.peer.*` and realip.** These attributes always carry the **immediate
+> TCP socket peer** — the machine the connection physically arrived from —
+> distinct from the logical `client.address`. When nginx's `realip` module is
+> active (compiled in *and* a `set_real_ip_from` rule matches), it rewrites the
+> connection address in place to the real client, so `network.peer.*` is sourced
+> from the saved original via `$realip_remote_addr` / `$realip_remote_port` (the
+> proxy) while `client.address` carries the rewritten real client — the two
+> differ. When realip is inactive or built `--without-http_realip_module`,
+> `network.peer.*` is read directly from the connection socket peer
+> (`addr_text` / `sockaddr`): it is **still present**, and — with no intermediary
+> to distinguish — equals `client.address`. The attributes are omitted only in
+> the degenerate case where the connection peer address is unavailable (e.g. a
+> non-IP peer).
 
 [http-spans-semconv]: https://opentelemetry.io/docs/specs/semconv/http/http-spans/
 

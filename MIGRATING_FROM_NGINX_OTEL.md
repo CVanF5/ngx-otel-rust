@@ -64,15 +64,16 @@ lost or altered.
 attributes represent the **true TCP socket peer** (the immediate machine the
 connection arrived from), distinct from the logical client address.
 
-- When nginx's `realip` module **is compiled in** and `set_real_ip_from` is
-  configured, `network.peer.address` is the proxy's address and
-  `client.address` (see next section) is the real client IP rewritten by
-  realip — they differ.
-- When `realip` **is not compiled in** (`--without-http_realip_module`), the
-  `$realip_remote_addr` variable is not registered and `network.peer.address`
-  / `network.peer.port` are **absent from the span** (not degraded to the
-  client address). `client.address` is always present and equals the socket
-  peer in that case. This is expected; `network.peer.*` requires realip.
+- When nginx's `realip` module **is active** (compiled in *and* a
+  `set_real_ip_from` rule matches), it rewrites the connection address in place
+  to the real client, so `network.peer.address` is the proxy's address (read
+  from the saved original via `$realip_remote_addr`) while `client.address`
+  (see next section) is the real client IP — they differ.
+- When `realip` is **inactive or not compiled in**
+  (`--without-http_realip_module`), `network.peer.address` / `network.peer.port`
+  are read directly from the connection socket peer and are **still present** —
+  and, with no intermediary to distinguish, equal `client.address`. They are
+  omitted only when the connection peer address is genuinely unavailable.
 
 **OTel semconv reference:**
 [HTTP spans — attributes](https://opentelemetry.io/docs/specs/semconv/http/http-spans/)
