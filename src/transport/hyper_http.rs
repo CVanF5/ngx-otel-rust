@@ -146,13 +146,177 @@ pub(crate) fn parse_retry_after(value: &str) -> Option<Duration> {
         return Some(Duration::from_secs(secs));
     }
 
-    // Try HTTP-date via httpdate.
-    if let Ok(t) = httpdate::parse_http_date(v) {
+    // Try HTTP-date (IMF-fixdate form only; hyper normalises obs-date before this point).
+    if let Some(t) = parse_imf_fixdate(v) {
         let now = std::time::SystemTime::now();
         return t.duration_since(now).ok();
     }
 
     None
+}
+
+/// Parse an IMF-fixdate string into a `SystemTime`.
+///
+/// Accepts only the canonical form mandated by RFC 9110 §5.6.7:
+/// `Day, DD Mon YYYY HH:MM:SS GMT`
+/// (e.g. `"Thu, 01 Jan 1970 00:00:00 GMT"`).
+///
+/// Obs-date variants (RFC 850 / asctime) are normalised by hyper before this
+/// function is ever called; this parser intentionally rejects them and any
+/// other format.  The caller (parse_retry_after) uses this to compute a
+/// `now`-relative `Duration` from a server-supplied `Retry-After` header —
+/// an attacker-influenceable input — so the function MUST NOT panic or
+/// index out-of-bounds on any input, however short or malformed.
+///
+/// Returns `None` for any input that does not match the exact format.
+fn parse_imf_fixdate(s: &str) -> Option<std::time::SystemTime> {
+    // Expected length: "Thu, 01 Jan 1970 00:00:00 GMT" == 29 chars.
+    // Reject anything shorter (prevents index OOB on slice access below).
+    if s.len() < 29 {
+        return None;
+    }
+
+    // Structural skeleton (0-indexed byte positions):
+    //   0..3   day-of-week name (ignored; not validated beyond syntax)
+    //   3      ','
+    //   4      ' '
+    //   5..7   DD (2-digit day)
+    //   7      ' '
+    //   8..11  Mon (3-letter month abbreviation)
+    //   11     ' '
+    //   12..16 YYYY (4-digit year)
+    //   16     ' '
+    //   17..19 HH
+    //   19     ':'
+    //   20..22 MM
+    //   22     ':'
+    //   23..25 SS
+    //   25     ' '
+    //   26..29 "GMT"
+    //
+    // RFC 9110 §5.6.7.
+    let b = s.as_bytes();
+
+    // Require ", " separator after day-name.
+    if b[3] != b',' || b[4] != b' ' {
+        return None;
+    }
+    // Require space separators at fixed positions.
+    if b[7] != b' ' || b[11] != b' ' || b[16] != b' ' {
+        return None;
+    }
+    // Require "HH:MM:SS" separators.
+    if b[19] != b':' || b[22] != b':' {
+        return None;
+    }
+    // Require exactly " GMT" at position 25..29.
+    if &s[25..29] != " GMT" {
+        return None;
+    }
+
+    let day = parse_u32_exact(&s[5..7])?;
+    let month = parse_month_name(&s[8..11])?;
+    let year = parse_u32_exact(&s[12..16])?;
+    let hour = parse_u32_exact(&s[17..19])?;
+    let min = parse_u32_exact(&s[20..22])?;
+    let sec = parse_u32_exact(&s[23..25])?;
+
+    // Range-check fields before arithmetic (reject e.g. "Day 00" or "Hour 25").
+    if day == 0 || day > 31 || month == 0 || month > 12 {
+        return None;
+    }
+    if hour > 23 || min > 59 || sec > 60 {
+        // sec > 60 rejected (61 is never valid; 60 accommodates leap-second representations).
+        return None;
+    }
+
+    // Days since the Unix epoch (1970-01-01) via the civil-date algorithm.
+    // Algorithm: Neri–Schneier / Hinnant days_from_civil (public domain; well-known).
+    // z = year, adjusted so March is month 1 (simplifies leap-year accounting).
+    let unix_days = days_from_civil(year, month, day)?;
+
+    let total_secs = unix_days
+        .checked_mul(86_400)?
+        .checked_add(u64::from(hour) * 3_600)?
+        .checked_add(u64::from(min) * 60)?
+        .checked_add(u64::from(sec))?;
+
+    Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(total_secs))
+}
+
+/// Parse exactly `n` ASCII decimal digits from `s` into a `u32`.
+/// Returns `None` if `s` contains any non-digit byte.
+fn parse_u32_exact(s: &str) -> Option<u32> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut v: u32 = 0;
+    for b in s.bytes() {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        v = v.checked_mul(10)?.checked_add(u32::from(b - b'0'))?;
+    }
+    Some(v)
+}
+
+/// Map a 3-letter RFC 9110 month abbreviation to a 1-based month number (1=Jan).
+/// Returns `None` for unknown abbreviations.
+fn parse_month_name(s: &str) -> Option<u32> {
+    // RFC 9110 §5.6.7 month names are ASCII; case-sensitive per the grammar.
+    match s {
+        "Jan" => Some(1),
+        "Feb" => Some(2),
+        "Mar" => Some(3),
+        "Apr" => Some(4),
+        "May" => Some(5),
+        "Jun" => Some(6),
+        "Jul" => Some(7),
+        "Aug" => Some(8),
+        "Sep" => Some(9),
+        "Oct" => Some(10),
+        "Nov" => Some(11),
+        "Dec" => Some(12),
+        _ => None,
+    }
+}
+
+/// Compute the number of days elapsed since 1970-01-01 (Unix epoch) for a
+/// proleptic Gregorian calendar date given as `(year, month, day)` where
+/// `month` is 1-based (1 = January) and `day` is 1-based.
+///
+/// Returns `None` if the date precedes the Unix epoch (year < 1970, or
+/// year == 1970 and the date is before Jan 1) to avoid signed arithmetic in
+/// the caller, or on overflow.
+///
+/// Algorithm: standard civil-to-days formula (e.g. Hinnant, "date"
+/// <https://howardhinnant.github.io/date_algorithms.html>).
+fn days_from_civil(year: u32, month: u32, day: u32) -> Option<u64> {
+    // Shift year so that March is the first month; this makes leap-day the
+    // last day of the adjusted year, simplifying leap-year arithmetic.
+    // January/February of year Y become months 10/11 of the adjusted year Y-1.
+    let (y, m) = if month <= 2 { (year.checked_sub(1)?, month + 9) } else { (year, month - 3) };
+
+    // After the shift, Jan/Feb 1970 map to adjusted year 1969.
+    // Reject any date whose adjusted year is before 1969 (pre-epoch).
+    if y < 1969 {
+        return None;
+    }
+    // u64 arithmetic from here — no overflow risk for any plausible HTTP date.
+    let y = u64::from(y);
+    let m = u64::from(m);
+    let d = u64::from(day);
+
+    let era = y / 400;
+    let yoe = y - era * 400; // year-of-era [0, 399]
+    let doy = (153 * m + 2) / 5 + d - 1; // day-of-year [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // day-of-era [0, 146096]
+    let days = era * 146_097 + doe;
+
+    // Subtract the proleptic-Gregorian day number of the Unix epoch (1970-01-01).
+    // Applying the same formula to 1970-01-01 (adjusted: y=1969, m=10, d=1):
+    //   era=4, yoe=369, doy=306, doe=135080, days=719468.
+    days.checked_sub(719_468)
 }
 
 /// Map an HTTP status code (and an optional parsed `Retry-After` duration) to
@@ -3321,7 +3485,7 @@ mod tests {
     /// We can't assert an exact value (wall-clock dependent), so we check
     /// that it's `Some` and greater than zero.
     ///
-    /// Mutation evidence: remove the `httpdate::parse_http_date` branch →
+    /// Mutation evidence: remove the `parse_imf_fixdate` branch →
     /// `parse_retry_after("Mon, ...")` returns `None` → `is_some()` fails
     /// → test FAILS; restore → PASS.
     #[test]
@@ -3331,6 +3495,60 @@ mod tests {
         let result = parse_retry_after(future_date);
         assert!(result.is_some(), "HTTP-date in the future must parse to Some(duration); got None");
         assert!(result.unwrap() > Duration::ZERO, "duration for a future HTTP-date must be > 0");
+    }
+
+    /// `parse_imf_fixdate` maps the Unix epoch to `UNIX_EPOCH` exactly.
+    ///
+    /// "Thu, 01 Jan 1970 00:00:00 GMT" must yield `UNIX_EPOCH` (0 secs since epoch).
+    ///
+    /// Mutation evidence (GMT-suffix check): replace `" GMT"` acceptance with
+    /// `" UTC"` → this test FAILS; restore → PASS.
+    #[test]
+    fn s2_parse_imf_fixdate_unix_epoch() {
+        let t = parse_imf_fixdate("Thu, 01 Jan 1970 00:00:00 GMT");
+        assert_eq!(t, Some(std::time::UNIX_EPOCH), "Unix epoch date must parse to UNIX_EPOCH");
+    }
+
+    /// `parse_imf_fixdate` maps a known future date to the expected UNIX timestamp.
+    ///
+    /// "Fri, 01 Jan 2027 00:00:00 GMT":
+    ///   Days 1970-01-01 → 2027-01-01 = 57 years.
+    ///   Leap years in [1970, 2026]: 1972,76,80,84,88,92,96,2000,04,08,12,16,20,24 = 14 days.
+    ///   Non-leap years: 57 - 14 = 43.  Total days = 43*365 + 14*366 = 15695 + 5124 = 20819.
+    ///   UNIX timestamp = 20819 * 86400 = 1_798_761_600.
+    #[test]
+    fn s2_parse_imf_fixdate_known_future_date() {
+        let t = parse_imf_fixdate("Fri, 01 Jan 2027 00:00:00 GMT");
+        let expected = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_798_761_600);
+        assert_eq!(t, Some(expected), "2027-01-01 must map to UNIX timestamp 1_798_761_600");
+    }
+
+    /// `parse_imf_fixdate` rejects a non-GMT timezone suffix → None (no panic).
+    ///
+    /// Mutation evidence (GMT-suffix gate): removing the `!= " GMT"` check →
+    /// this test FAILS (returns Some instead of None); restore → PASS.
+    #[test]
+    fn s2_parse_imf_fixdate_non_gmt_zone_returns_none() {
+        assert_eq!(parse_imf_fixdate("Thu, 01 Jan 1970 00:00:00 UTC"), None);
+        assert_eq!(parse_imf_fixdate("Thu, 01 Jan 1970 00:00:00 EST"), None);
+        assert_eq!(parse_imf_fixdate("Thu, 01 Jan 1970 00:00:00 +00"), None);
+    }
+
+    /// `parse_imf_fixdate` does not panic on truncated or garbage input.
+    #[test]
+    fn s2_parse_imf_fixdate_truncated_and_garbage() {
+        // Shorter than minimum length — must return None, not panic.
+        assert_eq!(parse_imf_fixdate(""), None);
+        assert_eq!(parse_imf_fixdate("Thu"), None);
+        assert_eq!(parse_imf_fixdate("Thu, 01 Jan 197"), None);
+        // Garbage at the right length.
+        assert_eq!(parse_imf_fixdate("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"), None);
+        // Invalid month name.
+        assert_eq!(parse_imf_fixdate("Thu, 01 Xxx 1970 00:00:00 GMT"), None);
+        // Day 00 is invalid.
+        assert_eq!(parse_imf_fixdate("Thu, 00 Jan 1970 00:00:00 GMT"), None);
+        // Hour 25 is invalid.
+        assert_eq!(parse_imf_fixdate("Thu, 01 Jan 1970 25:00:00 GMT"), None);
     }
 
     /// `decode_partial_success_rejected` returns 0 for an empty body.
