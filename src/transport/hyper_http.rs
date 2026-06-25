@@ -161,21 +161,18 @@ pub(crate) fn parse_retry_after(value: &str) -> Option<Duration> {
 /// `Day, DD Mon YYYY HH:MM:SS GMT`
 /// (e.g. `"Thu, 01 Jan 1970 00:00:00 GMT"`).
 ///
-/// Obs-date variants (RFC 850 / asctime) are normalised by hyper before this
-/// function is ever called; this parser intentionally rejects them and any
-/// other format.  The caller (parse_retry_after) uses this to compute a
-/// `now`-relative `Duration` from a server-supplied `Retry-After` header —
-/// an attacker-influenceable input — so the function MUST NOT panic or
-/// index out-of-bounds on any input, however short or malformed.
+/// We parse IMF-fixdate ONLY (RFC 9110 §5.6.7).  Legacy obs-date forms
+/// (RFC 850 and asctime) are treated as unparseable: they return `None` and
+/// the caller falls through to the exporter's default backoff.  The caller
+/// (parse_retry_after) uses this to compute a `now`-relative `Duration` from a
+/// server-supplied `Retry-After` header — an attacker-influenceable input — so
+/// the function MUST NOT panic on any input, however short or malformed.
+///
+/// To guarantee that, the parser operates entirely on the raw byte slice and
+/// never uses `&str` indexing (which panics on a multibyte UTF-8 boundary).
 ///
 /// Returns `None` for any input that does not match the exact format.
 fn parse_imf_fixdate(s: &str) -> Option<std::time::SystemTime> {
-    // Expected length: "Thu, 01 Jan 1970 00:00:00 GMT" == 29 chars.
-    // Reject anything shorter (prevents index OOB on slice access below).
-    if s.len() < 29 {
-        return None;
-    }
-
     // Structural skeleton (0-indexed byte positions):
     //   0..3   day-of-week name (ignored; not validated beyond syntax)
     //   3      ','
@@ -194,8 +191,14 @@ fn parse_imf_fixdate(s: &str) -> Option<std::time::SystemTime> {
     //   25     ' '
     //   26..29 "GMT"
     //
-    // RFC 9110 §5.6.7.
+    // RFC 9110 §5.6.7.  Expected length is exactly 29 bytes.
     let b = s.as_bytes();
+    // Reject anything not exactly the IMF-fixdate length.  This bound makes the
+    // fixed-index `b[..]` accesses below in-range; byte indexing never panics on
+    // a UTF-8 boundary the way `&str[..]` slicing does.
+    if b.len() != 29 {
+        return None;
+    }
 
     // Require ", " separator after day-name.
     if b[3] != b',' || b[4] != b' ' {
@@ -209,20 +212,24 @@ fn parse_imf_fixdate(s: &str) -> Option<std::time::SystemTime> {
     if b[19] != b':' || b[22] != b':' {
         return None;
     }
-    // Require exactly " GMT" at position 25..29.
-    if &s[25..29] != " GMT" {
+    // Require exactly " GMT" at positions 25..29 (byte comparison, no &str slice).
+    if b[25] != b' ' || b[26] != b'G' || b[27] != b'M' || b[28] != b'T' {
         return None;
     }
 
-    let day = parse_u32_exact(&s[5..7])?;
-    let month = parse_month_name(&s[8..11])?;
-    let year = parse_u32_exact(&s[12..16])?;
-    let hour = parse_u32_exact(&s[17..19])?;
-    let min = parse_u32_exact(&s[20..22])?;
-    let sec = parse_u32_exact(&s[23..25])?;
+    let day = parse_u32_bytes(&b[5..7])?;
+    let month = parse_month_name(&b[8..11])?;
+    let year = parse_u32_bytes(&b[12..16])?;
+    let hour = parse_u32_bytes(&b[17..19])?;
+    let min = parse_u32_bytes(&b[20..22])?;
+    let sec = parse_u32_bytes(&b[23..25])?;
 
-    // Range-check fields before arithmetic (reject e.g. "Day 00" or "Hour 25").
-    if day == 0 || day > 31 || month == 0 || month > 12 {
+    // Range-check fields before arithmetic (reject e.g. "Hour 25").
+    if month == 0 || month > 12 {
+        return None;
+    }
+    // Validate day-of-month against the actual month length (incl. leap-year Feb).
+    if day == 0 || day > days_in_month(year, month) {
         return None;
     }
     if hour > 23 || min > 59 || sec > 60 {
@@ -244,40 +251,59 @@ fn parse_imf_fixdate(s: &str) -> Option<std::time::SystemTime> {
     Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(total_secs))
 }
 
-/// Parse exactly `n` ASCII decimal digits from `s` into a `u32`.
-/// Returns `None` if `s` contains any non-digit byte.
-fn parse_u32_exact(s: &str) -> Option<u32> {
-    if s.is_empty() {
+/// Parse a slice of ASCII decimal digit bytes into a `u32`.
+/// Returns `None` if the slice is empty or contains any non-digit byte.
+fn parse_u32_bytes(b: &[u8]) -> Option<u32> {
+    if b.is_empty() {
         return None;
     }
     let mut v: u32 = 0;
-    for b in s.bytes() {
-        if !b.is_ascii_digit() {
+    for &c in b {
+        if !c.is_ascii_digit() {
             return None;
         }
-        v = v.checked_mul(10)?.checked_add(u32::from(b - b'0'))?;
+        v = v.checked_mul(10)?.checked_add(u32::from(c - b'0'))?;
     }
     Some(v)
 }
 
-/// Map a 3-letter RFC 9110 month abbreviation to a 1-based month number (1=Jan).
+/// Map a 3-byte RFC 9110 month abbreviation to a 1-based month number (1=Jan).
 /// Returns `None` for unknown abbreviations.
-fn parse_month_name(s: &str) -> Option<u32> {
+fn parse_month_name(b: &[u8]) -> Option<u32> {
     // RFC 9110 §5.6.7 month names are ASCII; case-sensitive per the grammar.
-    match s {
-        "Jan" => Some(1),
-        "Feb" => Some(2),
-        "Mar" => Some(3),
-        "Apr" => Some(4),
-        "May" => Some(5),
-        "Jun" => Some(6),
-        "Jul" => Some(7),
-        "Aug" => Some(8),
-        "Sep" => Some(9),
-        "Oct" => Some(10),
-        "Nov" => Some(11),
-        "Dec" => Some(12),
+    match b {
+        b"Jan" => Some(1),
+        b"Feb" => Some(2),
+        b"Mar" => Some(3),
+        b"Apr" => Some(4),
+        b"May" => Some(5),
+        b"Jun" => Some(6),
+        b"Jul" => Some(7),
+        b"Aug" => Some(8),
+        b"Sep" => Some(9),
+        b"Oct" => Some(10),
+        b"Nov" => Some(11),
+        b"Dec" => Some(12),
         _ => None,
+    }
+}
+
+/// Number of days in `month` (1-based) of `year`, accounting for leap-year
+/// February.  A year is a leap year iff it is divisible by 4 and either not
+/// divisible by 100 or divisible by 400 (proleptic Gregorian).
+fn days_in_month(year: u32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
     }
 }
 
@@ -3525,8 +3551,8 @@ mod tests {
 
     /// `parse_imf_fixdate` rejects a non-GMT timezone suffix → None (no panic).
     ///
-    /// Mutation evidence (GMT-suffix gate): removing the `!= " GMT"` check →
-    /// this test FAILS (returns Some instead of None); restore → PASS.
+    /// Mutation evidence (GMT-suffix gate): removing the `b[26]/[27]/[28]` "GMT"
+    /// byte check → this test FAILS (returns Some instead of None); restore → PASS.
     #[test]
     fn s2_parse_imf_fixdate_non_gmt_zone_returns_none() {
         assert_eq!(parse_imf_fixdate("Thu, 01 Jan 1970 00:00:00 UTC"), None);
@@ -3537,7 +3563,7 @@ mod tests {
     /// `parse_imf_fixdate` does not panic on truncated or garbage input.
     #[test]
     fn s2_parse_imf_fixdate_truncated_and_garbage() {
-        // Shorter than minimum length — must return None, not panic.
+        // Shorter than required length — must return None, not panic.
         assert_eq!(parse_imf_fixdate(""), None);
         assert_eq!(parse_imf_fixdate("Thu"), None);
         assert_eq!(parse_imf_fixdate("Thu, 01 Jan 197"), None);
@@ -3549,6 +3575,50 @@ mod tests {
         assert_eq!(parse_imf_fixdate("Thu, 00 Jan 1970 00:00:00 GMT"), None);
         // Hour 25 is invalid.
         assert_eq!(parse_imf_fixdate("Thu, 01 Jan 1970 25:00:00 GMT"), None);
+    }
+
+    /// PERMANENT regression guard for the multibyte-UTF-8 panic class.
+    ///
+    /// `parse_imf_fixdate` / `parse_retry_after` parse an attacker-controlled
+    /// `Retry-After` header.  `&str[a..b]` slicing PANICS when an index lands
+    /// inside a multibyte UTF-8 char, which would crash the worker.  The parser
+    /// must operate on bytes and never panic.  This test pins that invariant:
+    /// each input below would have panicked under the old `&str`-slice parser.
+    #[test]
+    fn s2_parse_imf_fixdate_no_panic_on_multibyte_and_short() {
+        // 29-byte PoC: 'é' (0xC3 0xA9) straddles byte positions 24-25, where the
+        // old code did `&s[25..29]` / `&s[23..25]` and panicked.
+        let poc = "Thu, 01 Jan 1970 00:00:0\u{e9}GMT";
+        assert_eq!(poc.len(), 29, "PoC must be exactly 29 bytes to hit the fixed-index path");
+        assert_eq!(parse_imf_fixdate(poc), None);
+        assert_eq!(parse_retry_after(poc), None);
+
+        // Empty, 1-char, and 28-byte (one short) inputs must also be None, no panic.
+        assert_eq!(parse_imf_fixdate(""), None);
+        assert_eq!(parse_imf_fixdate("x"), None);
+        let twenty_eight = "Thu, 01 Jan 1970 00:00:00 GM"; // 28 bytes
+        assert_eq!(twenty_eight.len(), 28);
+        assert_eq!(parse_imf_fixdate(twenty_eight), None);
+
+        // A multibyte char inside the day-name region must also not panic.
+        let mb_dayname = "Th\u{e9}, 01 Jan 1970 00:00:0 GMT";
+        assert_eq!(parse_imf_fixdate(mb_dayname), None);
+    }
+
+    /// `parse_imf_fixdate` validates day-of-month against actual month length,
+    /// including leap-year February.
+    #[test]
+    fn s2_parse_imf_fixdate_day_of_month_validation() {
+        // Feb 30 never exists → None (previously rolled over to Mar 02).
+        assert_eq!(parse_imf_fixdate("Thu, 30 Feb 2023 00:00:00 GMT"), None);
+        // Feb 29 in a non-leap year (2023) → None.
+        assert_eq!(parse_imf_fixdate("Wed, 29 Feb 2023 00:00:00 GMT"), None);
+        // Feb 29 in a leap year (2024) → Some.
+        assert!(parse_imf_fixdate("Thu, 29 Feb 2024 00:00:00 GMT").is_some());
+        // Apr 31 (30-day month) → None.
+        assert_eq!(parse_imf_fixdate("Sun, 31 Apr 2024 00:00:00 GMT"), None);
+        // Jan 31 (valid) → Some.
+        assert!(parse_imf_fixdate("Wed, 31 Jan 2024 00:00:00 GMT").is_some());
     }
 
     /// `decode_partial_success_rejected` returns 0 for an empty body.
