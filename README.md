@@ -59,6 +59,13 @@ sudo apt install -y \
     pkg-config build-essential protobuf-compiler
 ```
 
+On macOS (Homebrew):
+
+```sh
+xcode-select --install                          # clang, make, libclang
+brew install openssl@3 pcre2 pkg-config protobuf
+```
+
 Install Rust via [rustup](https://rustup.rs/).
 
 > [!TIP]
@@ -178,8 +185,9 @@ body sizes; upstream timing and byte histograms; nginx `stub_status` series;
 TLS certificate expiry gauges; access-log exception tail with exemplars;
 coalesced error log records; distributed traces; 13 exporter self-metrics.
 
-A ready-made Grafana dashboard is at
-[`test-harness/demo/grafana/dashboards/ngx-otel-rust-overview.json`](test-harness/demo/grafana/dashboards/ngx-otel-rust-overview.json).
+A runnable end-to-end demo (NGINX + OTel collector + Grafana, TLS optional) lives
+in **[`test-harness/demo/`](test-harness/demo/README.md)**, including a ready-made
+[Grafana dashboard](test-harness/demo/grafana/dashboards/ngx-otel-rust-overview.json).
 
 ## Architecture
 
