@@ -157,5 +157,3 @@ sizing choice: raising the ceiling means enlarging the drain budget and the ring
 together, and chunking the send to stay below the gRPC maximum message size.
 Practical guidance: metrics and summary-logs are cheap enough to leave on by
 default; for high-volume tracing, sample down or raise the trace buffers.
-Measurements:
-[`tests/bench/RESULTS-span-saturation-2026-06-09.md`](../tests/bench/RESULTS-span-saturation-2026-06-09.md).

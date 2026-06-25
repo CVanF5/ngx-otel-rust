@@ -113,8 +113,7 @@ ngx-otel-rust/
 │       ├── nginx_c2.conf         # module loaded, no exporter (zero-cost case)
 │       ├── nginx_c3.conf         # module loaded + exporter configured
 │       ├── zero_cost.sh          # zero-cost wrk benchmark harness, randomised iteration order
-│       ├── analyse.sh            # tolerance assertion against committed JSON results
-│       └── RESULTS.md            # zero-cost + soak results (isolated AWS EPYC + macOS arm64)
+│       └── analyse.sh            # tolerance assertion against committed JSON results
 └── ...
 ```
 

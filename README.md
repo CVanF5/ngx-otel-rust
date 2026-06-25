@@ -28,8 +28,7 @@ process; pre-upstream-PR.**
 
 **Performance:** zero-cost-when-disabled verified at ≤ 0.01% throughput delta
 (isolated AWS EPYC and macOS arm64); 24-hour soak at ~523k req/s, bounded
-memory, clean collector-downtime recovery. See
-[`tests/bench/RESULTS.md`](tests/bench/RESULTS.md).
+memory, clean collector-downtime recovery.
 
 **NGINX Plus (Phase 4)** and **OTAP (Phase 5)** remain roadmap.
 

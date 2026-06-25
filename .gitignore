@@ -8,3 +8,6 @@
 /.claude/
 # ASan run-log directories (timestamped, generated at runtime)
 /tests/asan-logs-*/
+
+# Benchmark results live in Confluence, not the public repo (regenerated locally by the bench harness)
+/tests/bench/RESULTS*.md
