@@ -223,10 +223,10 @@ gates, and the full project-layout tree.
 
 ## Related
 
-- **[`MIGRATING_FROM_NGINX_OTEL.md`](MIGRATING_FROM_NGINX_OTEL.md)** — migration
-  guide from the C++ `nginx/nginx-otel` module.
-- C++ precedent: [`nginx/nginx-otel`](https://github.com/nginx/nginx-otel)
-  (traces only; same directive vocabulary, different concurrency model).
+- **[`MIGRATING_FROM_NGINX_OTEL.md`](MIGRATING_FROM_NGINX_OTEL.md)** — this module is a
+  config drop-in replacement for the C++
+  [`nginx/nginx-otel`](https://github.com/nginx/nginx-otel); the guide covers config
+  compatibility and the behavioral differences to expect.
 - ACME module precedent: [`nginx/nginx-acme`](https://github.com/nginx/nginx-acme).
   Build-system shape (Makefile + `config` + `auto/rust` + `build/*.mk`) mirrors
   nginx-acme's; see commits `6f3133b`, `fdd521c`, `4555185`.

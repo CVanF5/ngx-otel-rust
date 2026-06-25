@@ -23,7 +23,7 @@ directives load without modification.
 ## Contents
 
 1. [Span attribute renames](#1-span-attribute-renames)
-2. [New span attributes with no C++ equivalent](#2-new-span-attributes-with-no-c-equivalent)
+2. [Additional span attributes](#2-additional-span-attributes)
 3. [Span name default](#3-span-name-default)
 4. [`otel_trace_context` default](#4-otel_trace_context-default)
 5. [`otel_trace` truthiness](#5-otel_trace-truthiness)
@@ -80,10 +80,10 @@ connection arrived from), distinct from the logical client address.
 
 ---
 
-## 2. New span attributes with no C++ equivalent
+## 2. Additional span attributes
 
-This module emits additional attributes on every span that the C++ module did
-not:
+This module sets the following current-semconv attributes on every span
+automatically (no configuration needed):
 
 | Attribute | Value | Notes |
 |---|---|---|
@@ -188,10 +188,10 @@ there is no knob to replace them with.
 
 ## 8. Metrics — enabling or disabling
 
-The C++ module emits **traces only**. This module emits **metrics, logs, and
-traces**, with metrics on by default whenever `otel_exporter` is configured.
+This module emits metrics and logs in addition to traces, with metrics on by
+default whenever `otel_exporter` is configured.
 
-If you want traces-only behaviour (matching C++), add:
+To emit traces only, add:
 
 ```nginx
 http {
