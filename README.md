@@ -214,8 +214,6 @@ Full design detail, the pipeline diagram, invariants, and scaling measurements:
   module logs an `[alert]` at startup. See [`LIFECYCLE.md`](LIFECYCLE.md).
 - **Hot path is single-process-per-worker;** per-histogram attribute populations
   require multi-dimensional shm (deferred).
-- **Tokio appears in `Cargo.lock`** transitively via hyper 1.x — present at the
-  type level only, never instantiated at runtime.
 
 ## Contributing / Developing
 

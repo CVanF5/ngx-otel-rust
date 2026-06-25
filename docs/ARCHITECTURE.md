@@ -75,6 +75,11 @@ HTTP/2. Both transports run on a `NgxConnIo` adapter, which wraps
 `ngx_peer_connection_t` and uses NGINX's own event handlers for I/O-readiness
 wakeup — no spinning, no blocking. Workers never open a collector connection.
 
+Tokio appears in `Cargo.lock` as a type-level transitive dependency of the
+hyper / h2 / tonic HTTP-2 and gRPC stack, but **no Tokio runtime is ever
+instantiated** — the export loop runs entirely on `ngx-rust`'s single-threaded
+executor over NGINX's event loop, and workers spawn no threads or runtime.
+
 A small control shared-memory zone carries a liveness heartbeat plus a flags
 word. Workers load that flags word once per request — one `Relaxed` atomic read,
 the sole hot-path branch, reserved for future dynamic reconfiguration.
