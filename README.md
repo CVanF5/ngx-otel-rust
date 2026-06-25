@@ -26,9 +26,12 @@ process; pre-upstream-PR.**
   propagation; parent/ratio sampling; per-location span name and attributes;
   `$otel_trace_id`, `$otel_span_id`, `$otel_parent_id`, `$otel_parent_sampled`.
 
-**Performance:** zero-cost-when-disabled verified at ≤ 0.01% throughput delta
-(isolated AWS EPYC and macOS arm64); 24-hour soak at ~523k req/s, bounded
-memory, clean collector-downtime recovery.
+**Performance.** Metrics and logs are recorded on the request path as lock-free,
+syscall-free shared-memory writes; aggregation and export run in a separate
+process, off the hot path. The per-request cost is low enough to run these
+signals continuously in production. Tracing is per-request, so sample it under
+high load. A 24-hour soak at ~523k req/s ran with bounded memory and recovered
+cleanly from collector downtime.
 
 **NGINX Plus (Phase 4)** and **OTAP (Phase 5)** remain roadmap.
 
