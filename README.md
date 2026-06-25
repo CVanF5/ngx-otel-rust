@@ -182,11 +182,6 @@ names, units, attributes, and temporality — lives in
 **[`TELEMETRY_MODEL.md`](TELEMETRY_MODEL.md)**. Build dashboards, alerts, or
 pipelines against that file; you do not need the design proposal to integrate.
 
-In brief: HTTP request duration as an OTel exponential histogram (seconds);
-body sizes; upstream timing and byte histograms; nginx `stub_status` series;
-TLS certificate expiry gauges; access-log exception tail with exemplars;
-coalesced error log records; distributed traces; 13 exporter self-metrics.
-
 A runnable end-to-end demo (NGINX + OTel collector + Grafana, TLS optional) lives
 in **[`test-harness/demo/`](test-harness/demo/README.md)**, including a ready-made
 [Grafana dashboard](test-harness/demo/grafana/dashboards/ngx-otel-rust-overview.json).
