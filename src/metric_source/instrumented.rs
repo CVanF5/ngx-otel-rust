@@ -2739,4 +2739,132 @@ mod tests {
         assert_eq!(sum2.header_ms, None, "all-sentinel header_time → None");
         assert_eq!(sum2.response_ms, Some(3));
     }
+
+    /// `realip_peer()` falls back to `connection->addr_text` + `sockaddr` port
+    /// when `$realip_remote_addr` is absent (stubbed `ngx_http_get_variable`
+    /// returns null → `get_var()` returns `b""` → fallback path taken).
+    ///
+    /// This test stands in for the --without-http_realip_module environment:
+    /// when $realip_remote_addr is unregistered, get_var() returns b"" (stubbed
+    /// to null in cfg(test)), so realip_peer() falls back to reading the
+    /// immediate socket peer (connection->addr_text + sockaddr_port). Per OTel
+    /// semconv, network.peer.address/port = the immediate socket peer, not any
+    /// forwarded IP.
+    ///
+    /// Mutation check: temporarily return `(b"", 0)` from the fallback branch in
+    /// `realip_peer()` → this test fails with `assert_eq!(addr, b"203.0.113.7")`.
+    #[test]
+    fn realip_peer_falls_back_to_socket_peer_ipv4() {
+        use nginx_sys::{ngx_connection_t, ngx_http_request_s, ngx_str_t};
+
+        let addr_text: &[u8] = b"203.0.113.7";
+
+        // Build a sockaddr_in on the stack.  sin_port is in network byte order.
+        // SAFETY: `sockaddr_in` is a plain numeric C struct; zeroed then
+        // field-overwritten is valid; no nginx functions touch this memory.
+        let mut sin: libc::sockaddr_in = unsafe { core::mem::zeroed() };
+        sin.sin_family = libc::AF_INET as libc::sa_family_t;
+        sin.sin_port = 54321u16.to_be();
+
+        // Build the connection with addr_text pointing at our slice and sockaddr
+        // pointing at the sockaddr_in above.
+        // SAFETY: `ngx_connection_t` is a `#[repr(C)]` POD struct; zeroed is a
+        // valid initial state (null pointers, zero fds); we only access the two
+        // fields we set (`addr_text`, `sockaddr`) via the fallback branch.
+        let mut conn: ngx_connection_t = unsafe { core::mem::zeroed() };
+        conn.addr_text = ngx_str_t { len: addr_text.len(), data: addr_text.as_ptr() as *mut _ };
+        conn.sockaddr = &raw mut sin as *mut nginx_sys::sockaddr;
+
+        // Build a minimal request pointing at our connection.
+        // SAFETY: `ngx_http_request_s` is a `#[repr(C)]` POD struct; zeroed is a
+        // valid initial state; we only access `connection`, which we set here.
+        let mut req: ngx_http_request_s = unsafe { core::mem::zeroed() };
+        req.connection = &raw mut conn;
+
+        // SAFETY: `req` is a valid stack-allocated ngx_http_request_s for the
+        // duration of this call; `realip_peer` only dereferences `connection`,
+        // `addr_text`, and `sockaddr`, all of which we have initialised.
+        let (peer_addr, peer_port) = unsafe { super::realip_peer(&raw mut req) };
+        assert_eq!(peer_addr, b"203.0.113.7", "fallback addr must be connection->addr_text");
+        assert_eq!(peer_port, 54321, "fallback port must be decoded from sockaddr_in.sin_port");
+    }
+
+    /// Same fallback path as `realip_peer_falls_back_to_socket_peer_ipv4` but
+    /// with an IPv6 `sockaddr_in6` to exercise the `AF_INET6` arm of
+    /// `sockaddr_port()`.
+    ///
+    /// Mutation check: reverting the `AF_INET6` arm to return 0 instead of
+    /// `u16::from_be((*sin6).sin6_port)` makes this fail with `assert_eq!(port, 8080)`.
+    #[test]
+    fn realip_peer_falls_back_to_socket_peer_ipv6() {
+        use nginx_sys::{ngx_connection_t, ngx_http_request_s, ngx_str_t};
+
+        let addr_text: &[u8] = b"2001:db8::1";
+
+        // Build a sockaddr_in6 on the stack.
+        // SAFETY: `sockaddr_in6` is a plain numeric C struct; zeroed then
+        // field-overwritten is valid; no nginx functions touch this memory.
+        let mut sin6: libc::sockaddr_in6 = unsafe { core::mem::zeroed() };
+        sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+        sin6.sin6_port = 8080u16.to_be();
+
+        // SAFETY: see `realip_peer_falls_back_to_socket_peer_ipv4`.
+        let mut conn: ngx_connection_t = unsafe { core::mem::zeroed() };
+        conn.addr_text = ngx_str_t { len: addr_text.len(), data: addr_text.as_ptr() as *mut _ };
+        conn.sockaddr = &raw mut sin6 as *mut nginx_sys::sockaddr;
+
+        // SAFETY: `ngx_http_request_s` is a `#[repr(C)]` POD struct; zeroed is a
+        // valid initial state; we only access `connection`, which we set here.
+        let mut req: ngx_http_request_s = unsafe { core::mem::zeroed() };
+        req.connection = &raw mut conn;
+
+        // SAFETY: as above; `realip_peer` only reads `connection`, `addr_text`,
+        // and `sockaddr`, all of which are initialised.
+        let (peer_addr, peer_port) = unsafe { super::realip_peer(&raw mut req) };
+        assert_eq!(peer_addr, b"2001:db8::1", "fallback addr must be connection->addr_text (IPv6)");
+        assert_eq!(peer_port, 8080, "fallback port must be decoded from sockaddr_in6.sin6_port");
+    }
+
+    /// When `connection->addr_text` has len=0 (empty), `realip_peer()` must
+    /// return `b""` for the address — the degenerate / unconnected case.
+    ///
+    /// Mutation check: removing the `len > 0` guard in the fallback branch and
+    /// instead calling `from_raw_parts(null, 0)` would be undefined behaviour at
+    /// runtime. The test pins the observable return value for this degenerate
+    /// input so that any change to the guard logic is caught.
+    #[test]
+    fn realip_peer_degenerate_empty_addr_text() {
+        use nginx_sys::{ngx_connection_t, ngx_http_request_s, ngx_str_t};
+
+        // sockaddr_in with a non-zero port — confirms port is also read from
+        // sockaddr even when addr_text is empty (the guards are independent).
+        // SAFETY: `sockaddr_in` is a plain numeric C struct; zeroed then
+        // field-overwritten is valid; no nginx functions touch this memory.
+        let mut sin: libc::sockaddr_in = unsafe { core::mem::zeroed() };
+        sin.sin_family = libc::AF_INET as libc::sa_family_t;
+        sin.sin_port = 9999u16.to_be();
+
+        // SAFETY: `ngx_connection_t` zeroed; addr_text is explicitly empty
+        // (len=0, data=null — the zeroed default); sockaddr points at a valid sin.
+        let mut conn: ngx_connection_t = unsafe { core::mem::zeroed() };
+        // Leave addr_text as zeroed: len=0, data=null → triggers the `len > 0` guard.
+        conn.addr_text = ngx_str_t { len: 0, data: core::ptr::null_mut() };
+        conn.sockaddr = &raw mut sin as *mut nginx_sys::sockaddr;
+
+        // SAFETY: `ngx_http_request_s` is a `#[repr(C)]` POD struct; zeroed is a
+        // valid initial state; we only access `connection`, which we set here.
+        let mut req: ngx_http_request_s = unsafe { core::mem::zeroed() };
+        req.connection = &raw mut conn;
+
+        // SAFETY: as above; `realip_peer` only reads `connection`, `addr_text`,
+        // and `sockaddr`; all are valid for the call duration.
+        let (peer_addr, peer_port) = unsafe { super::realip_peer(&raw mut req) };
+        assert_eq!(peer_addr, b"", "empty addr_text must yield empty peer address");
+        // Port is still read from sockaddr (addr_text guard is independent of the
+        // sockaddr-null guard): the connection has a valid sockaddr so port is 9999.
+        assert_eq!(
+            peer_port, 9999,
+            "port is still read from sockaddr even when addr_text is empty"
+        );
+    }
 }
