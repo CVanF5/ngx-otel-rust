@@ -256,6 +256,9 @@ pub(super) fn apply_delivery_outcome(
 /// `now_msec` is the monotonic basis for the defer timestamp recorded in
 /// `backoff`. `bytes`/`n_records` are the fresh batch (consumed only when
 /// re-queued).
+// `queue`, `backoff`, and `failure_counter` are three disjoint `&mut` state slots
+// for one signal lane; bundling them into a struct would require split borrows or
+// `RefCell` at every call site, adding more complexity than the arg count saves.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handle_fresh_send_outcome(
     outcome: &crate::transport::DeliveryOutcome,
@@ -302,6 +305,8 @@ pub(super) fn handle_fresh_send_outcome(
 /// stale pre-send clock value regardless of which signal lane invokes it.
 /// `signal` is the lane name ("metrics" / "logs" / "spans") used only for the
 /// diagnostic log wording.
+// Thin clock-capture wrapper around `handle_fresh_send_outcome`; carries the same
+// disjoint `&mut` state slots that prevent struct bundling (see that fn's note).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn apply_fresh_send_outcome(
     outcome: &crate::transport::DeliveryOutcome,

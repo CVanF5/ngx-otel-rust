@@ -458,6 +458,10 @@ unsafe fn get_n_workers(
 /// A zero-record batch sends nothing.  Send budget is [`PERIODIC_SEND_BUDGET`];
 /// a deadline expiry is a transient failure taking the identical
 /// enqueue/counter/ERR path as a transport error.
+// Async export helper extracted from the export loop; each `&mut` arg is a distinct
+// per-signal lane slot (`transport`, `backoff`, `queue`, `failure_counter`).
+// Bundling them into a struct held across the `.await` would require split borrows
+// or interior mutability, adding contortions that outweigh the arg-count saving.
 #[allow(clippy::too_many_arguments)]
 async fn send_fresh_batch(
     transport: &mut ExportTransport,
@@ -879,6 +883,10 @@ pub async fn export_loop(amcf: &'static MainConfig) {
 /// - [`ShutdownKind::Terminate`] — `ngx_terminate` set; outer loop must return.
 /// - [`ShutdownKind::Exiting`] — `ngx_quit` detected; graceful drain was
 ///   performed inside this function; outer loop must return.
+// Three independent `&mut VecDeque` retry queues plus three `&mut SignalBackoff`
+// lanes, `&mut bool` latch, and `&mut QuitDefer` must remain distinct across
+// multiple `.await` points; a params struct would need split borrows or
+// `RefCell` — more complexity than the large arg list it would replace.
 #[allow(clippy::too_many_arguments)]
 async fn periodic_tick(
     amcf: &'static MainConfig,
@@ -1399,6 +1407,9 @@ async fn drain_retry_queue_once<S: RetrySend>(
 /// # Safety
 /// `log` must point to a valid `ngx_log_t` or be `null_mut()` (all log calls
 /// are null-guarded).
+// Generic async fn parameterised on `S: RetrySend` and `Mk: FnMut() -> T`; the
+// type-parameter constraints and the `sender: &mut S` hold across `.await`, so a
+// params struct would need to be generic over S and Mk — no simplification.
 #[allow(clippy::too_many_arguments)]
 async fn drain_retry_queue_once_with_timer<S, Mk, T>(
     queue: &mut VecDeque<(std::vec::Vec<u8>, u64)>,
