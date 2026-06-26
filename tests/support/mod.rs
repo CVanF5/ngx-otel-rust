@@ -244,6 +244,254 @@ pub unsafe extern "C" fn ngx_conf_parse(
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Additional stubs required by the gRPC test binaries on macOS flat namespace.
+//
+// Tests that import from `ngx_http_otel_module` (an rlib) transitively pull in
+// references to the full NGINX internal API.  On macOS, all symbols referenced
+// in a binary must be resolvable at load time even if they are never called.
+// These no-op stubs satisfy the linker without a running NGINX process.
+// ──────────────────────────────────────────────────────────────────────────────
+
+// nginx time (used by error-log timestamp code).
+// Stubbed as a null pointer — tests never call code that dereferences it.
+#[no_mangle]
+pub static mut ngx_cached_time: *mut nginx_sys::ngx_time_t = core::ptr::null_mut();
+
+// nginx process management globals.
+#[no_mangle]
+pub static mut ngx_pid: nginx_sys::ngx_pid_t = 0;
+#[no_mangle]
+pub static mut ngx_parent: nginx_sys::ngx_pid_t = 0;
+#[no_mangle]
+pub static mut ngx_channel: nginx_sys::ngx_socket_t = -1;
+#[no_mangle]
+pub static mut ngx_process_slot: nginx_sys::ngx_int_t = 0;
+#[no_mangle]
+pub static mut ngx_last_process: nginx_sys::ngx_int_t = 0;
+#[no_mangle]
+pub static mut ngx_processes: [nginx_sys::ngx_process_t; 1024] =
+    // SAFETY: ngx_process_t is a C struct with no mandatory invariants;
+    // zero-initialising produces a valid (though empty) process table entry.
+    unsafe { core::mem::zeroed() };
+
+// nginx process-control flags.
+#[no_mangle]
+pub static mut ngx_daemonized: nginx_sys::ngx_uint_t = 0;
+#[no_mangle]
+pub static mut ngx_inherited: nginx_sys::ngx_uint_t = 0;
+#[no_mangle]
+pub static mut ngx_test_config: nginx_sys::ngx_uint_t = 0;
+#[no_mangle]
+pub static mut ngx_quit: core::ffi::c_int = 0;
+#[no_mangle]
+pub static mut ngx_reopen: core::ffi::c_int = 0;
+#[no_mangle]
+pub static mut ngx_ncpu: nginx_sys::ngx_int_t = 1;
+#[no_mangle]
+pub static mut ngx_use_accept_mutex: nginx_sys::ngx_uint_t = 0;
+
+// nginx module descriptors pulled in by HTTP variable / upstream code.
+#[no_mangle]
+pub static mut ngx_http_upstream_module: nginx_sys::ngx_module_t =
+    nginx_sys::ngx_module_t::default();
+
+// nginx process management functions (never called in tests; stubs satisfy linker).
+#[no_mangle]
+pub unsafe extern "C" fn ngx_setproctitle(_title: *mut core::ffi::c_char) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn ngx_init_signals(_log: *mut nginx_sys::ngx_log_t) -> nginx_sys::ngx_int_t {
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ngx_spawn_process(
+    _cycle: *mut nginx_sys::ngx_cycle_t,
+    _proc: nginx_sys::ngx_spawn_proc_pt,
+    _data: *mut core::ffi::c_void,
+    _name: *mut core::ffi::c_char,
+    _respawn: nginx_sys::ngx_int_t,
+) -> nginx_sys::ngx_pid_t {
+    -1
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ngx_close_listening_sockets(_cycle: *mut nginx_sys::ngx_cycle_t) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn ngx_process_events_and_timers(_cycle: *mut nginx_sys::ngx_cycle_t) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn ngx_reopen_files(
+    _cycle: *mut nginx_sys::ngx_cycle_t,
+    _user: nginx_sys::ngx_uid_t,
+) {
+}
+
+// nginx pool allocation (pnalloc / pcalloc / pmemalign / pfree).
+#[no_mangle]
+pub unsafe extern "C" fn ngx_pnalloc(
+    _pool: *mut nginx_sys::ngx_pool_t,
+    _size: usize,
+) -> *mut core::ffi::c_void {
+    core::ptr::null_mut()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ngx_pcalloc(
+    _pool: *mut nginx_sys::ngx_pool_t,
+    _size: usize,
+) -> *mut core::ffi::c_void {
+    core::ptr::null_mut()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ngx_pmemalign(
+    _pool: *mut nginx_sys::ngx_pool_t,
+    _size: usize,
+    _alignment: usize,
+) -> *mut core::ffi::c_void {
+    core::ptr::null_mut()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ngx_pfree(
+    _pool: *mut nginx_sys::ngx_pool_t,
+    _p: *mut core::ffi::c_void,
+) -> nginx_sys::ngx_int_t {
+    0
+}
+
+// nginx buffer / list helpers.
+#[no_mangle]
+pub unsafe extern "C" fn ngx_create_temp_buf(
+    _pool: *mut nginx_sys::ngx_pool_t,
+    _size: usize,
+) -> *mut nginx_sys::ngx_buf_t {
+    core::ptr::null_mut()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ngx_list_push(
+    _list: *mut nginx_sys::ngx_list_t,
+) -> *mut core::ffi::c_void {
+    core::ptr::null_mut()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ngx_hash_strlow(
+    _dst: *mut nginx_sys::u_char,
+    _src: *mut nginx_sys::u_char,
+    _n: usize,
+) -> nginx_sys::ngx_uint_t {
+    0
+}
+
+// nginx network helpers.
+#[no_mangle]
+pub unsafe extern "C" fn ngx_inet_set_port(_sa: *mut libc::sockaddr, _port: libc::in_port_t) {}
+
+#[no_mangle]
+pub unsafe extern "C" fn ngx_connection_local_sockaddr(
+    _c: *mut nginx_sys::ngx_connection_t,
+    _s: *mut nginx_sys::ngx_str_t,
+    _port: nginx_sys::ngx_uint_t,
+) -> nginx_sys::ngx_int_t {
+    nginx_sys::NGX_ERROR as nginx_sys::ngx_int_t
+}
+
+// nginx channel I/O (IPC between master and workers).
+#[no_mangle]
+pub unsafe extern "C" fn ngx_read_channel(
+    _s: nginx_sys::ngx_socket_t,
+    _ch: *mut nginx_sys::ngx_channel_t,
+    _size: usize,
+    _log: *mut nginx_sys::ngx_log_t,
+) -> nginx_sys::ngx_int_t {
+    nginx_sys::NGX_ERROR as nginx_sys::ngx_int_t
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ngx_add_channel_event(
+    _cycle: *mut nginx_sys::ngx_cycle_t,
+    _fd: nginx_sys::ngx_fd_t,
+    _event: nginx_sys::ngx_int_t,
+    _handler: nginx_sys::ngx_event_handler_pt,
+) -> nginx_sys::ngx_int_t {
+    nginx_sys::NGX_ERROR as nginx_sys::ngx_int_t
+}
+
+// nginx resolver stubs.
+#[no_mangle]
+pub unsafe extern "C" fn ngx_resolve_start(
+    _r: *mut nginx_sys::ngx_resolver_t,
+    _temp: *mut nginx_sys::ngx_resolver_ctx_t,
+) -> *mut nginx_sys::ngx_resolver_ctx_t {
+    core::ptr::null_mut()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ngx_resolve_name(
+    _ctx: *mut nginx_sys::ngx_resolver_ctx_t,
+) -> nginx_sys::ngx_int_t {
+    nginx_sys::NGX_ERROR as nginx_sys::ngx_int_t
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ngx_resolve_name_done(_ctx: *mut nginx_sys::ngx_resolver_ctx_t) {}
+
+// nginx HTTP variable / complex-value API (referenced from HTTP module init code).
+#[no_mangle]
+pub unsafe extern "C" fn ngx_http_add_variable(
+    _cf: *mut nginx_sys::ngx_conf_t,
+    _name: *mut nginx_sys::ngx_str_t,
+    _flags: nginx_sys::ngx_uint_t,
+) -> *mut nginx_sys::ngx_http_variable_t {
+    core::ptr::null_mut()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ngx_http_get_variable(
+    _r: *mut nginx_sys::ngx_http_request_t,
+    _name: *mut nginx_sys::ngx_str_t,
+    _key: nginx_sys::ngx_uint_t,
+) -> *mut nginx_sys::ngx_http_variable_value_t {
+    core::ptr::null_mut()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ngx_http_compile_complex_value(
+    _ccv: *mut nginx_sys::ngx_http_compile_complex_value_t,
+) -> nginx_sys::ngx_int_t {
+    nginx_sys::NGX_ERROR as nginx_sys::ngx_int_t
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ngx_http_complex_value(
+    _r: *mut nginx_sys::ngx_http_request_t,
+    _val: *mut nginx_sys::ngx_http_complex_value_t,
+    _value: *mut nginx_sys::ngx_str_t,
+) -> nginx_sys::ngx_int_t {
+    nginx_sys::NGX_ERROR as nginx_sys::ngx_int_t
+}
+
+// nginx HTTP output filters (referenced transitively by the HTTP module).
+#[no_mangle]
+pub unsafe extern "C" fn ngx_http_output_filter(
+    _r: *mut nginx_sys::ngx_http_request_t,
+    _in: *mut nginx_sys::ngx_chain_t,
+) -> nginx_sys::ngx_int_t {
+    nginx_sys::NGX_ERROR as nginx_sys::ngx_int_t
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ngx_http_send_header(
+    _r: *mut nginx_sys::ngx_http_request_t,
+) -> nginx_sys::ngx_int_t {
+    nginx_sys::NGX_ERROR as nginx_sys::ngx_int_t
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Minimal spin-loop executor for async transport tests.
 // ──────────────────────────────────────────────────────────────────────────────
 

@@ -107,6 +107,16 @@ name = "grpc_smoke"
 path = "tests/grpc_smoke.rs"
 required-features = ["test-support"]
 
+# In-process bidi gRPC round-trip test.  Hosts the tonic echo server on a
+# background thread (small Tokio rt) and drives the spin-executor client
+# against it via an ephemeral TCP port.  No Docker / collector / nginx binary
+# required.  Replaces the two-process approach (bidi_echo_server binary +
+# run_grpc_bidi_smoke.sh bidi assertions).
+[[test]]
+name = "grpc_bidi"
+path = "tests/grpc_bidi.rs"
+required-features = ["test-support"]
+
 # Self-contained tests for the test-harness helpers (block_on timeout, stat
 # pointer aliasing).  No production library code is imported; these link
 # without a full NGINX object tree and run in standard CI.
@@ -116,14 +126,16 @@ path = "tests/harness_self_check.rs"
 required-features = ["test-support"]
 
 [dev-dependencies]
-# Test-only echo server for the bidi gRPC smoke test (see examples/bidi_echo_server.rs).  Dev-deps do NOT
-# propagate into release builds of the module dylib; `cargo tree --edges normal`
-# must show no tokio at the crate root.
+# Test-only echo server for the bidi gRPC smoke test (tests/grpc_bidi.rs).
+# The server is hosted on a background thread using a small Tokio runtime so
+# the module itself remains Tokio-runtime-free.  Dev-deps do NOT propagate
+# into release builds of the module dylib; `cargo tree --edges normal` must
+# show no tokio at the crate root.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync"] }
-# tokio-stream: needed for ReceiverStream in examples/bidi_echo_server.rs.
-# Already a transitive dep via tonic; made explicit here for the example.
+# tokio-stream: needed for ReceiverStream + TcpListenerStream in tests/grpc_bidi.rs.
+# Already a transitive dep via tonic; made explicit here for the test.
 tokio-stream = { version = "0.1", features = ["net"] }
-# tonic server feature (for EchoServer trait impl in examples/bidi_echo_server.rs)
+# tonic server feature (for EchoServer trait impl in tests/grpc_bidi.rs).
 # The existing tonic under [dependencies] already covers the client side.
 tonic = { version = "0.14", default-features = false, features = ["server", "transport", "router"] }
 

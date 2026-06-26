@@ -297,14 +297,14 @@ fn compile_protos() {
     // Two separate compilations are required because the main library is
     // no_std, and the tonic-generated server stub uses bare `Box::pin` which
     // is not in scope in a no_std context (tonic::codegen::* doesn't re-export
-    // Box).  The example binary (bidi_echo_server.rs) is a full-std Rust
-    // binary, so it can safely include the server+client version.
+    // Box).  The integration test (tests/grpc_bidi.rs) is a full-std binary
+    // so it can safely include the server+client version.
     //
     // - Client-only version → OUT_DIR/ngx.otel.echo.v1.rs
     //   Used from src/transport/grpc/echo_proto.rs (no_std-safe).
     //
     // - Server+client version → OUT_DIR/echo_server_gen/ngx.otel.echo.v1.rs
-    //   Used from examples/bidi_echo_server.rs (full-std, dev-only binary).
+    //   Used from tests/grpc_bidi.rs (full-std integration test).
     let echo_proto = proto_root.join("echo/v1/echo.proto");
     if echo_proto.exists() {
         let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -316,7 +316,7 @@ fn compile_protos() {
             .compile_protos(std::slice::from_ref(&echo_proto), std::slice::from_ref(&proto_root))
             .expect("tonic-prost-build failed for echo client");
 
-        // Server+client: used by examples/bidi_echo_server.rs only.
+        // Server+client: used by tests/grpc_bidi.rs (full-std integration test).
         let echo_server_out = out_dir.join("echo_server_gen");
         std::fs::create_dir_all(&echo_server_out).expect("create echo_server_gen dir");
         tonic_prost_build::configure()
