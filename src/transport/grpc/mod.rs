@@ -29,11 +29,11 @@ pub mod shim;
 pub mod status_adapter;
 pub mod transport;
 
-// Generated protobuf types for the local Echo bidi-streaming service.
-// A mechanical exercise of the bidi bridge; not gated on test-support because the
-// generated client types are used from smoke.rs (which IS gated), but the
-// proto types themselves (Ping, Pong) need to be reachable from examples/ too.
-// The server stub is used only from examples/bidi_echo_server.rs (dev-dep).
+// Generated protobuf types for the local Echo bidi-streaming service — a
+// mechanical exercise of the bidi bridge. Test-only: the client types are used
+// from `smoke.rs` and the in-process bidi test (`tests/grpc_bidi.rs`). Gated so
+// they never compile into production builds (mirrors `smoke.rs`).
+#[cfg(any(test, feature = "test-support"))]
 pub mod echo_proto;
 
 // In-worker gRPC viability harness: gated behind `test-support` so it never
