@@ -97,6 +97,16 @@ trace = []
 # (3) config-time guard requires worker_processes >= 2.  Goal: master-supervised
 # export (fixes the daemon-on gen-1 orphan / B2 problem).  NOT production-merge.
 dedicated-worker = []
+# EXPERIMENTAL SPIKE (spike/dual-role-otel-worker): simpler variant of
+# dedicated-worker.  One designated worker (last slot) drives the export task
+# AND still serves requests normally — NO accept suppression, NO reuseport
+# socket surgery.  The only difference vs dedicated-worker: skip the
+# spike_suppress_accept step; everything else (no child exporter, in-worker
+# export_loop, master supervision via NGX_PROCESS_RESPAWN) is identical.
+# Advantage: reuseport-clean (no blackhole) and sacrifices no request capacity.
+# Cost (to bench on host-1): CPU contention on the designated worker.
+# NOT production-merge.  Requires worker_processes >= 2.
+dual-role-worker = []
 
 # Integration tests that exercise HyperHttpTransport via SpinConnector require
 # the test-support feature to expose the Spin* types and HyperHttpTransport::new.

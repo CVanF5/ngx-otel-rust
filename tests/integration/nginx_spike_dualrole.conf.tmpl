@@ -1,0 +1,31 @@
+# Spike config: dual-role otel worker. @REUSEPORT@ = "reuseport" or "".
+daemon on;
+master_process on;
+worker_processes 3;
+error_log @PREFIX@/error.log info;
+pid @PREFIX@/nginx.pid;
+
+load_module @MODULE_PATH@;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    otel_exporter {
+        endpoint http://127.0.0.1:4318;
+    }
+
+    otel_service_name spike-dualrole;
+    otel_metric_interval 1s;
+
+    server {
+        listen 127.0.0.1:9301 @REUSEPORT@;
+        otel_log_export on;
+        otel_trace on;
+
+        location / {
+            return 200 "ok\n";
+        }
+    }
+}

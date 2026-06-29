@@ -70,8 +70,8 @@ use nginx_sys::{
 use ngx::core::Status;
 use ngx::http::{add_phase_handler, HttpModule, HttpModuleLocationConf, HttpModuleMainConf};
 // Pool is needed for the test-support gRPC smoke harnesses in init_process and
-// for the dedicated-worker spike's in-worker export-task pinning.
-#[cfg(any(test, feature = "test-support", feature = "dedicated-worker"))]
+// for the dedicated-worker / dual-role-worker spike's in-worker export-task pinning.
+#[cfg(any(test, feature = "test-support", feature = "dedicated-worker", feature = "dual-role-worker"))]
 use ngx::core::Pool;
 
 #[macro_use]
@@ -439,23 +439,31 @@ extern "C" fn ngx_otel_init_module(cycle: *mut nginx_sys::ngx_cycle_t) -> nginx_
         return Status::NGX_ERROR.into();
     }
 
-    // SPIKE (dedicated-worker): one worker is dedicated to OTel export and does
-    // NOT serve requests.  With worker_processes < 2 that would leave zero
-    // request-serving workers, so refuse to start.  (init_module runs only in
-    // the real master/single start, not under `nginx -t` — see the early return
-    // above — so this is a hard config-time failure that aborts startup/reload.)
-    #[cfg(feature = "dedicated-worker")]
+    // SPIKE (dedicated-worker / dual-role-worker): one worker slot is used for
+    // OTel export.  For dedicated-worker that slot serves no requests; for
+    // dual-role-worker it still serves requests, but worker_processes >= 2 is
+    // still a reasonable baseline (one exporter + at least one other worker).
+    // Refuse to start with worker_processes < 2 in either mode.
+    #[cfg(any(feature = "dedicated-worker", feature = "dual-role-worker"))]
     {
         // SAFETY: `cycle` is valid (verified above).
         let nworkers = unsafe { worker_processes_from_cycle(cycle) }.unwrap_or(1);
         if nworkers < 2 {
             // SAFETY: `cycle` is valid; `.log` is non-null at init_module time.
             let log = unsafe { (*cycle).log };
+            #[cfg(feature = "dedicated-worker")]
             emerg!(
                 log,
                 "otel: [spike dedicated-worker] requires worker_processes >= 2 \
                  (one worker is dedicated to export and serves no requests); \
                  worker_processes={} would leave zero request-serving workers",
+                nworkers
+            );
+            #[cfg(feature = "dual-role-worker")]
+            emerg!(
+                log,
+                "otel: [spike dual-role-worker] requires worker_processes >= 2; \
+                 worker_processes={}",
                 nworkers
             );
             return Status::NGX_ERROR.into();
@@ -496,12 +504,12 @@ extern "C" fn ngx_otel_init_module(cycle: *mut nginx_sys::ngx_cycle_t) -> nginx_
     // after a failed reload).  We roll the increment back on the spawn-error
     // path below to keep `successor_gen` consistent with the set of live
     // exporters: incremented iff a successor was actually forked.
-    // Under the dedicated-worker spike this is never consumed (we return before
-    // the child-spawn block); keep it computed so the reload path is identical
-    // to the production code path being measured against.
-    #[cfg_attr(feature = "dedicated-worker", allow(unused_assignments, unused_variables))]
+    // Under the dedicated-worker / dual-role-worker spike this is never consumed
+    // (we return before the child-spawn block); keep it computed so the reload
+    // path is identical to the production code path being measured against.
+    #[cfg_attr(any(feature = "dedicated-worker", feature = "dual-role-worker"), allow(unused_assignments, unused_variables))]
     let mut announced_successor_ctrl: *const exporter::control_shm::ControlShm = core::ptr::null();
-    #[cfg_attr(feature = "dedicated-worker", allow(unused_assignments))]
+    #[cfg_attr(any(feature = "dedicated-worker", feature = "dual-role-worker"), allow(unused_assignments))]
     if is_reload {
         if let Some(ctrl_ptr) = amcf.control_shm_ptr_mut() {
             // SAFETY: `control_shm_ptr_mut()` returns Some only when the zone is
@@ -542,13 +550,13 @@ extern "C" fn ngx_otel_init_module(cycle: *mut nginx_sys::ngx_cycle_t) -> nginx_
         );
     }
 
-    // SPIKE (dedicated-worker): do NOT spawn the separate child exporter
-    // process.  The export task runs inside the designated otel WORKER instead
-    // (see ngx_otel_init_process), so the master supervises it as a normal
-    // NGX_PROCESS_RESPAWN worker.  The successor-announce machinery above is a
-    // no-op in this mode because control_shm_ptr_mut() drives only the
-    // child-exporter generation handoff; leaving it as-is is harmless (the
-    // worker export task does not snapshot successor_gen).
+    // SPIKE (dedicated-worker / dual-role-worker): do NOT spawn the separate
+    // child exporter process.  The export task runs inside the designated otel
+    // WORKER instead (see ngx_otel_init_process), so the master supervises it
+    // as a normal NGX_PROCESS_RESPAWN worker.  The successor-announce machinery
+    // above is a no-op in either spike mode because control_shm_ptr_mut() drives
+    // only the child-exporter generation handoff; leaving it as-is is harmless
+    // (the worker export task does not snapshot successor_gen).
     #[cfg(feature = "dedicated-worker")]
     {
         notice!(
@@ -559,8 +567,21 @@ extern "C" fn ngx_otel_init_module(cycle: *mut nginx_sys::ngx_cycle_t) -> nginx_
         return Status::NGX_OK.into();
     }
 
+    // SPIKE (dual-role-worker): same as dedicated-worker: no child exporter.
+    // The designated worker runs the export task AND serves requests normally.
+    #[cfg(feature = "dual-role-worker")]
+    {
+        notice!(
+            cycle_ref.log,
+            "otel: [spike dual-role-worker] skipping child exporter spawn; \
+             export runs in the dual-role otel worker (last worker slot, \
+             still serves requests)"
+        );
+        return Status::NGX_OK.into();
+    }
+
     // Spawn the exporter for both initial start and SIGHUP reload.
-    #[cfg(not(feature = "dedicated-worker"))]
+    #[cfg(not(any(feature = "dedicated-worker", feature = "dual-role-worker")))]
     {
         let spawn_status = spawn_exporter_for_cycle(cycle, is_reload);
 
@@ -1218,6 +1239,18 @@ extern "C" fn ngx_otel_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
         }
     }
 
+    // ── SPIKE: dual-role otel worker ─────────────────────────────────────────
+    //
+    // When the `dual-role-worker` feature is on, the LAST worker slot runs the
+    // export task AND still serves requests normally (NO accept suppression).
+    // Identical to dedicated-worker except step (a) is omitted.
+    #[cfg(feature = "dual-role-worker")]
+    {
+        if let Some(()) = spike_dual_role_worker_init(cycle) {
+            // designated dual-role otel worker initialised; fall through to OK.
+        }
+    }
+
     Status::NGX_OK.into()
 }
 
@@ -1399,6 +1432,67 @@ unsafe fn spike_suppress_accept(cycle: *mut ngx_cycle_t) -> usize {
     }
 
     closed_reuseport
+}
+
+/// SPIKE (dual-role-worker): if this worker is the designated otel worker,
+/// spawn the export task — WITHOUT suppressing accept.  The worker continues
+/// to serve requests normally; it additionally drives the export loop.
+///
+/// Returns `Some(())` when this worker WAS the designated otel worker; `None`
+/// for ordinary workers.
+///
+/// This is identical to `spike_dedicated_worker_init` except the
+/// `spike_suppress_accept` step is omitted.  The two modes therefore share
+/// all accept-handling and reuseport plumbing: dual-role simply skips it,
+/// which is the headline advantage — no reuseport surgery, no blackhole.
+#[cfg(feature = "dual-role-worker")]
+fn spike_dual_role_worker_init(cycle: *mut ngx_cycle_t) -> Option<()> {
+    // Only real workers participate (not master/single/exporter/helper).
+    let worker_id = match crate::exporter::ngx_process() {
+        crate::exporter::NgxProcess::Worker(w) => w as usize,
+        _ => return None,
+    };
+
+    // SAFETY: `cycle` is the non-null valid cycle nginx passes into init_process.
+    let nworkers = unsafe { worker_processes_from_cycle(cycle) }.unwrap_or(1);
+    if nworkers < 2 {
+        return None; // guarded at init_module; defensive here.
+    }
+    let designated = nworkers - 1;
+    if worker_id != designated {
+        return None; // ordinary request-serving worker.
+    }
+
+    // SAFETY: `cycle` valid; `.log` non-null in a live worker.
+    let log = unsafe { (*cycle).log };
+    notice!(
+        log,
+        "otel: [spike dual-role-worker] worker {} of {} is the dual-role otel \
+         worker; starting export task (accept NOT suppressed — worker serves \
+         requests normally)",
+        worker_id,
+        nworkers
+    );
+
+    // Spawn the export task on this worker's event loop.
+    // No accept suppression: the worker keeps its listen socket and accept events.
+    // SAFETY: `cycle` is valid; this worker is single-threaded here.
+    let cycle_ref = unsafe { &mut *cycle };
+    let amcf = HttpOtelModule::main_conf(cycle_ref)?;
+    let task = ngx::async_::spawn(crate::drain::export_loop(amcf));
+    // SAFETY: `(*cycle).pool` is this worker's process-lifetime pool — the
+    // contract `Pool::from_ngx_pool` requires.
+    let pool = unsafe { Pool::from_ngx_pool((*cycle).pool) };
+    if pool.allocate(task).is_null() {
+        emerg!(
+            log,
+            "otel: [spike dual-role-worker] failed to pin export task on the \
+             worker pool (out of memory)"
+        );
+        return Some(());
+    }
+    notice!(log, "otel: [spike dual-role-worker] export task spawned on worker event loop");
+    Some(())
 }
 
 /// Descriptor for one `#[cfg(test-support)]` gRPC smoke harness (see
