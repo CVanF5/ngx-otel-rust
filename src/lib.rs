@@ -1347,7 +1347,7 @@ unsafe fn spike_suppress_accept(cycle: *mut ngx_cycle_t) -> usize {
                             unsafe {
                                 del(
                                     rev,
-                                    nginx_sys::NGX_READ_EVENT as nginx_sys::ngx_int_t,
+                                    nginx_sys::NGX_RS_READ_EVENT,
                                     nginx_sys::NGX_CLOSE_EVENT as nginx_sys::ngx_uint_t,
                                 );
                             }
@@ -1392,7 +1392,7 @@ unsafe fn spike_suppress_accept(cycle: *mut ngx_cycle_t) -> usize {
             // SAFETY: rev is the armed accept read event; del is the active
             // event module's del fn.
             unsafe {
-                del(rev, nginx_sys::NGX_READ_EVENT as nginx_sys::ngx_int_t, 0);
+                del(rev, nginx_sys::NGX_RS_READ_EVENT, 0);
             }
         }
         notice!(log, "otel: [spike dedicated-worker] removed accept event (slot {})", i);
