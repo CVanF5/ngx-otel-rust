@@ -35,12 +35,33 @@ use crate::HttpOtelModule;
 /// `ngx_process()`). The flag is set once and never cleared.
 pub(crate) static IS_OTEL_EXPORTER: AtomicBool = AtomicBool::new(false);
 
-/// Upper bound on the graceful-drain wait after `ngx_quit` before the exporter
-/// force-exits. The export loop normally signals `EXPORT_LOOP_DONE` within
-/// ~`SHUTDOWN_POLL_INTERVAL` (250 ms) of `ngx_quit`; this backstop only caps the
-/// pathological case (a wedged send). It is deliberately not tied to a configured
-/// interval; honoring `worker_shutdown_timeout` is a possible future refinement.
+/// Default upper bound on the graceful-drain wait after `ngx_quit` before the
+/// exporter force-exits. The export loop normally signals `EXPORT_LOOP_DONE`
+/// within ~`SHUTDOWN_POLL_INTERVAL` (250 ms) of `ngx_quit`; this backstop only
+/// caps the pathological case (a wedged send).
+///
+/// When `worker_shutdown_timeout` is set in the nginx config its value is used
+/// instead if it is smaller (see `effective_drain_backstop`).
 const GRACEFUL_DRAIN_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Compute the effective drain backstop duration, honouring `worker_shutdown_timeout`.
+///
+/// If `shutdown_timeout_ms` is 0 (nginx default, meaning "no timeout") the
+/// operator has not set `worker_shutdown_timeout`, so the module's own default
+/// cap (`GRACEFUL_DRAIN_BACKSTOP`) is used unchanged.  If the operator did set a
+/// timeout, the exporter respects it: `min(GRACEFUL_DRAIN_BACKSTOP, timeout)`.
+///
+/// This is a pure function and unit-testable without any nginx FFI context.
+pub(crate) fn effective_drain_backstop(
+    default_backstop: std::time::Duration,
+    shutdown_timeout_ms: u64,
+) -> std::time::Duration {
+    if shutdown_timeout_ms == 0 {
+        default_backstop
+    } else {
+        default_backstop.min(std::time::Duration::from_millis(shutdown_timeout_ms))
+    }
+}
 
 // ── Crash-loop backoff constants ─────────────────────────────────────────────
 
@@ -551,14 +572,33 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
                 backstop_ev.log = (*cycle).log;
                 // The backstop_ev is NOT moved while armed — this block stays on
                 // the call stack until the del_timer below completes.
-                let backstop_ms = GRACEFUL_DRAIN_BACKSTOP.as_millis() as nginx_sys::ngx_msec_t;
+                // Read worker_shutdown_timeout from the nginx core config so the
+                // exporter honours the operator's shutdown budget.
+                // Pattern mirrors drop_privileges_and_chdir (~line 725 in this file).
+                // SAFETY: cycle is the valid non-null cycle pointer established by
+                // the outer SAFETY contract; conf_ctx indexing uses the same pattern
+                // as lib.rs:232-234 and drop_privileges_and_chdir.
+                let shutdown_timeout_ms: u64 = {
+                    let core_idx = nginx_sys::ngx_core_module.index;
+                    let raw_conf: *mut *mut *mut core::ffi::c_void =
+                        *(*cycle).conf_ctx.add(core_idx);
+                    let ccf: *const nginx_sys::ngx_core_conf_t = raw_conf.cast();
+                    if ccf.is_null() {
+                        0
+                    } else {
+                        (*ccf).shutdown_timeout as u64
+                    }
+                };
+                let drain_cap =
+                    effective_drain_backstop(GRACEFUL_DRAIN_BACKSTOP, shutdown_timeout_ms);
+                let backstop_ms = drain_cap.as_millis() as nginx_sys::ngx_msec_t;
                 // SAFETY (ngx_add_timer): backstop_ev is a valid non-null
                 // ngx_event_t on the stack; ngx_current_msec and
                 // ngx_event_timer_rbtree are initialised by nginx before any
                 // process cycle runs.
                 nginx_sys::ngx_add_timer(&raw mut backstop_ev, backstop_ms);
 
-                let drain_deadline = std::time::Instant::now() + GRACEFUL_DRAIN_BACKSTOP;
+                let drain_deadline = std::time::Instant::now() + drain_cap;
                 while !crate::drain::EXPORT_LOOP_DONE.load(Ordering::Acquire)
                     && std::time::Instant::now() < drain_deadline
                 {
@@ -936,6 +976,43 @@ mod tests {
         assert_eq!(
             result, CRASH_BACKOFF_CAP_MS,
             "u64::MAX count must return cap (5000ms), not overflow"
+        );
+    }
+
+    // ── N3: effective_drain_backstop ──────────────────────────────────────────
+
+    /// N3: timeout = 0 (nginx default) → use the module default, unchanged.
+    ///
+    /// Mutation evidence (executed, both halves recorded in commit):
+    /// change `min` to `max` in `effective_drain_backstop` →
+    /// the `timeout=5000` test returns `15s` instead of `5s` → FAILS.
+    #[test]
+    fn n3_drain_backstop_zero_timeout_returns_default() {
+        let default = std::time::Duration::from_secs(15);
+        assert_eq!(
+            effective_drain_backstop(default, 0),
+            default,
+            "timeout=0 (unset) must return the default backstop"
+        );
+    }
+
+    #[test]
+    fn n3_drain_backstop_shorter_timeout_is_honoured() {
+        let default = std::time::Duration::from_secs(15);
+        assert_eq!(
+            effective_drain_backstop(default, 5_000),
+            std::time::Duration::from_secs(5),
+            "timeout=5000ms is shorter than 15s and must be used"
+        );
+    }
+
+    #[test]
+    fn n3_drain_backstop_longer_timeout_is_capped_at_default() {
+        let default = std::time::Duration::from_secs(15);
+        assert_eq!(
+            effective_drain_backstop(default, 60_000),
+            default,
+            "timeout=60s is longer than 15s and must be capped at the default"
         );
     }
 }
