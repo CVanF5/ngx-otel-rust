@@ -498,7 +498,11 @@ async fn send_fresh_batch(
                 signal,
             ) == OutcomeAction::Release
             {
-                info!(log, "otel export: sent {} {} to collector", n_records, success_noun);
+                // Per-interval success heartbeat — debug-level: on a quiet server this
+                // fires every export interval (default 5s) and carries little operational
+                // value (export health is better seen via the collector / self-metrics).
+                // Failures below stay at error/warn so problems remain visible at INFO+.
+                debug!(log, "otel export: sent {} {} to collector", n_records, success_noun);
             }
         }
         Ok(Err(ref e)) => {
