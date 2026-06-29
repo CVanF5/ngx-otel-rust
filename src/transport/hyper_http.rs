@@ -2252,6 +2252,10 @@ async fn http_post_raw(
         hdrs.insert(hyper::header::CONTENT_LENGTH, hyper::header::HeaderValue::from(body_len));
         hdrs.insert(hyper::header::CONNECTION, hyper::header::HeaderValue::from_static("close"));
         for (k, v) in extra_headers {
+            // Config-time validation (validate_header_kv in config/directives.rs) is
+            // the primary gate; this guard is a belt-and-suspenders defence for any
+            // path that bypasses the directive handlers (e.g. programmatic injection
+            // in tests or future internal callers).
             if let (Ok(name), Ok(val)) =
                 (k.parse::<hyper::header::HeaderName>(), v.parse::<hyper::header::HeaderValue>())
             {

@@ -163,6 +163,10 @@ impl ExporterConfig {
 pub(crate) enum TlsConfigError {
     /// Endpoint scheme is none of `unix:` / `http://` / `https://`.
     BadScheme,
+    /// The host part of the endpoint authority is empty.
+    BadHost,
+    /// The port part of the endpoint authority is not a valid `u16 > 0`.
+    BadPort,
     /// `ssl_certificate` set without `ssl_certificate_key`.
     CertWithoutKey,
     /// `ssl_certificate_key` set without `ssl_certificate`.
@@ -193,10 +197,54 @@ pub(crate) fn validate_endpoint_tls(
     file_exists: impl Fn(&str) -> bool,
 ) -> Result<bool, TlsConfigError> {
     let is_https = input.endpoint.starts_with("https://");
-    let valid_scheme =
-        input.endpoint.starts_with("unix:") || input.endpoint.starts_with("http://") || is_https;
+    let is_http = input.endpoint.starts_with("http://");
+    let valid_scheme = input.endpoint.starts_with("unix:") || is_http || is_https;
     if !valid_scheme {
         return Err(TlsConfigError::BadScheme);
+    }
+
+    // Validate the authority (host + optional port) for http:// and https://
+    // endpoints only.  unix: uses a socket path — no authority to validate.
+    //
+    // Mirrors the IPv6-bracket awareness in `parse_authority` (transport layer):
+    // for a bracketed IPv6 host `[...]`, only look for the port-separator `:`
+    // AFTER the closing `]`.
+    if is_http || is_https {
+        let scheme_len = if is_https { "https://".len() } else { "http://".len() };
+        // Authority = everything from after the scheme prefix up to the first `/`
+        // (or end-of-string for schemeless authority-only URLs).
+        let rest = &input.endpoint[scheme_len..];
+        let authority = rest.split('/').next().unwrap_or("");
+
+        // Determine where to search for the port-separator colon (IPv6-aware).
+        let search_start =
+            if authority.starts_with('[') { authority.find(']').map_or(0, |i| i + 1) } else { 0 };
+
+        let (host_raw, port_str) = match authority[search_start..].rfind(':') {
+            Some(rel_idx) => {
+                let idx = search_start + rel_idx;
+                (&authority[..idx], Some(&authority[idx + 1..]))
+            }
+            None => (authority, None),
+        };
+
+        // For bracketed IPv6 check emptiness after stripping brackets; for plain
+        // hosts use the raw slice directly.
+        let host_inner = if host_raw.starts_with('[') && host_raw.ends_with(']') {
+            &host_raw[1..host_raw.len() - 1]
+        } else {
+            host_raw
+        };
+        if host_inner.is_empty() {
+            return Err(TlsConfigError::BadHost);
+        }
+
+        if let Some(p) = port_str {
+            match p.parse::<u16>() {
+                Ok(n) if n > 0 => {}
+                _ => return Err(TlsConfigError::BadPort),
+            }
+        }
     }
 
     let has_cert = !input.ssl_cert.is_empty();
@@ -822,6 +870,22 @@ impl MainConfig {
                     NGX_LOG_EMERG,
                     &raw mut *cf,
                     "otel_exporter: \"endpoint\" must start with http://, https://, or unix:"
+                );
+                return Err(Status::NGX_ERROR);
+            }
+            Err(TlsConfigError::BadHost) => {
+                ngx_conf_log_error!(
+                    NGX_LOG_EMERG,
+                    &raw mut *cf,
+                    "otel_exporter: \"endpoint\" has an invalid host"
+                );
+                return Err(Status::NGX_ERROR);
+            }
+            Err(TlsConfigError::BadPort) => {
+                ngx_conf_log_error!(
+                    NGX_LOG_EMERG,
+                    &raw mut *cf,
+                    "otel_exporter: \"endpoint\" has an invalid port"
                 );
                 return Err(Status::NGX_ERROR);
             }
@@ -2689,6 +2753,55 @@ mod tests {
             Ok(true),
             "ssl_verify off must signal the insecure WARN"
         );
+    }
+
+    /// N1: authority (host + port) validation for http:// and https:// endpoints.
+    ///
+    /// Valid cases: no-port default-port elision, explicit valid port, bracketed
+    /// IPv6, path after authority, and unix: socket (no authority, always passes).
+    /// Invalid cases: empty host, port out-of-u16-range, port = 0, port not numeric.
+    ///
+    /// Mutation evidence (executed, both halves recorded in commit):
+    /// remove the `BadPort` port-range check → `http://h:99999` returns `Ok`
+    /// instead of `Err(BadPort)` → the `99999` test FAILS.
+    #[test]
+    fn a2_authority_validated() {
+        let exists = |_: &str| true;
+
+        // ── valid endpoints (must return Ok) ──────────────────────────────────
+        for ep in [
+            "http://h",
+            "http://h:4317",
+            "http://h:4317/v1",
+            "http://[::1]:4318",
+            "http://[::1]",
+            "https://h:443/p",
+            "unix:/run/x.sock",
+        ] {
+            assert_eq!(
+                validate_endpoint_tls(&val_input(ep, "", "", "", false), exists),
+                Ok(false),
+                "{ep:?} should be valid"
+            );
+        }
+
+        // ── invalid: empty host ────────────────────────────────────────────────
+        for ep in ["http://:4317", "http:///v1", "https://"] {
+            assert_eq!(
+                validate_endpoint_tls(&val_input(ep, "", "", "", false), exists),
+                Err(TlsConfigError::BadHost),
+                "{ep:?} should fail with BadHost"
+            );
+        }
+
+        // ── invalid: bad port ──────────────────────────────────────────────────
+        for ep in ["http://h:99999", "http://h:abc", "http://h:0", "https://h:65536"] {
+            assert_eq!(
+                validate_endpoint_tls(&val_input(ep, "", "", "", false), exists),
+                Err(TlsConfigError::BadPort),
+                "{ep:?} should fail with BadPort"
+            );
+        }
     }
 
     /// `parse_size_bytes` must return `None` for values that exceed `usize::MAX`
