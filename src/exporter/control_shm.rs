@@ -154,6 +154,9 @@ impl ControlShm {
     /// exact round-trip).
     ///
     /// [`announce_successor`]: Self::announce_successor
+    // Unused under the dedicated-worker spike (no child-exporter spawn, so the
+    // reload roll-back path is never reached).
+    #[cfg_attr(feature = "dedicated-worker", allow(dead_code))]
     pub fn rollback_successor(&self) {
         self.successor_gen.fetch_sub(1, Ordering::Release);
     }

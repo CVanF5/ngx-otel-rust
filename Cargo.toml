@@ -88,6 +88,15 @@ test-support = []
 # Enable trace!() log macro (maps to debug! / NGX_LOG_DEBUG).  Off by default;
 # enable only when diagnosing detailed call flow in development builds.
 trace = []
+# EXPERIMENTAL SPIKE (spike/dedicated-otel-worker): run the OTel export task
+# inside a dedicated, non-accepting nginx WORKER instead of the separate
+# `nginx: otel exporter` child process.  When enabled: (1) init_module does NOT
+# spawn the child exporter; (2) the LAST worker slot is designated the otel
+# worker — its init_process suppresses accept (removes read events / closes its
+# reuseport socket) and spawns the export task on the worker event loop;
+# (3) config-time guard requires worker_processes >= 2.  Goal: master-supervised
+# export (fixes the daemon-on gen-1 orphan / B2 problem).  NOT production-merge.
+dedicated-worker = []
 
 # Integration tests that exercise HyperHttpTransport via SpinConnector require
 # the test-support feature to expose the Spin* types and HyperHttpTransport::new.

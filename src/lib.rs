@@ -69,8 +69,9 @@ use nginx_sys::{
 };
 use ngx::core::Status;
 use ngx::http::{add_phase_handler, HttpModule, HttpModuleLocationConf, HttpModuleMainConf};
-// Pool is only needed for the test-support gRPC smoke harnesses in init_process.
-#[cfg(any(test, feature = "test-support"))]
+// Pool is needed for the test-support gRPC smoke harnesses in init_process and
+// for the dedicated-worker spike's in-worker export-task pinning.
+#[cfg(any(test, feature = "test-support", feature = "dedicated-worker"))]
 use ngx::core::Pool;
 
 #[macro_use]
@@ -157,6 +158,7 @@ unsafe impl HttpModuleLocationConf for HttpOtelModule {
 ///
 /// `is_reload` = true for SIGHUP reload (uses `NGX_PROCESS_JUST_RESPAWN`),
 /// false for initial start (uses `NGX_PROCESS_RESPAWN`).
+#[cfg_attr(feature = "dedicated-worker", allow(dead_code))]
 fn spawn_exporter_for_cycle(
     cycle: *mut nginx_sys::ngx_cycle_t,
     is_reload: bool,
@@ -437,6 +439,29 @@ extern "C" fn ngx_otel_init_module(cycle: *mut nginx_sys::ngx_cycle_t) -> nginx_
         return Status::NGX_ERROR.into();
     }
 
+    // SPIKE (dedicated-worker): one worker is dedicated to OTel export and does
+    // NOT serve requests.  With worker_processes < 2 that would leave zero
+    // request-serving workers, so refuse to start.  (init_module runs only in
+    // the real master/single start, not under `nginx -t` — see the early return
+    // above — so this is a hard config-time failure that aborts startup/reload.)
+    #[cfg(feature = "dedicated-worker")]
+    {
+        // SAFETY: `cycle` is valid (verified above).
+        let nworkers = unsafe { worker_processes_from_cycle(cycle) }.unwrap_or(1);
+        if nworkers < 2 {
+            // SAFETY: `cycle` is valid; `.log` is non-null at init_module time.
+            let log = unsafe { (*cycle).log };
+            emerg!(
+                log,
+                "otel: [spike dedicated-worker] requires worker_processes >= 2 \
+                 (one worker is dedicated to export and serves no requests); \
+                 worker_processes={} would leave zero request-serving workers",
+                nworkers
+            );
+            return Status::NGX_ERROR.into();
+        }
+    }
+
     // Detect SIGHUP reload vs initial start via old_cycle->conf_ctx.
     // See existing comment above for the IMPORTANT note about ngx_is_init_cycle.
     // SAFETY: `cycle` is valid (above). `old_cycle` is a pointer nginx initialises
@@ -471,7 +496,12 @@ extern "C" fn ngx_otel_init_module(cycle: *mut nginx_sys::ngx_cycle_t) -> nginx_
     // after a failed reload).  We roll the increment back on the spawn-error
     // path below to keep `successor_gen` consistent with the set of live
     // exporters: incremented iff a successor was actually forked.
+    // Under the dedicated-worker spike this is never consumed (we return before
+    // the child-spawn block); keep it computed so the reload path is identical
+    // to the production code path being measured against.
+    #[cfg_attr(feature = "dedicated-worker", allow(unused_assignments, unused_variables))]
     let mut announced_successor_ctrl: *const exporter::control_shm::ControlShm = core::ptr::null();
+    #[cfg_attr(feature = "dedicated-worker", allow(unused_assignments))]
     if is_reload {
         if let Some(ctrl_ptr) = amcf.control_shm_ptr_mut() {
             // SAFETY: `control_shm_ptr_mut()` returns Some only when the zone is
@@ -512,26 +542,46 @@ extern "C" fn ngx_otel_init_module(cycle: *mut nginx_sys::ngx_cycle_t) -> nginx_
         );
     }
 
-    // Spawn the exporter for both initial start and SIGHUP reload.
-    let spawn_status = spawn_exporter_for_cycle(cycle, is_reload);
-
-    // Roll back the successor announcement if the fork failed (NGX_INVALID_PID
-    // from RLIMIT_NPROC / ENOMEM).  No successor exists, so the old exporter
-    // must remain the sole consumer and keep draining the rings; leaving
-    // `successor_gen` bumped would latch its `periodic_abdicated` permanently
-    // (see the increment comment above).  This is a single Release decrement,
-    // mirroring the increment; the master is the sole writer of this field, so
-    // the round-trip leaves the counter at its pre-reload value.
-    let ok: nginx_sys::ngx_int_t = Status::NGX_OK.into();
-    if spawn_status != ok && !announced_successor_ctrl.is_null() {
-        // SAFETY: `announced_successor_ctrl` is non-null only when set from a
-        // valid `control_shm_ptr_mut()` above; same single-master-writer
-        // invariant as the increment.
-        let ctrl = unsafe { &*announced_successor_ctrl };
-        ctrl.rollback_successor();
+    // SPIKE (dedicated-worker): do NOT spawn the separate child exporter
+    // process.  The export task runs inside the designated otel WORKER instead
+    // (see ngx_otel_init_process), so the master supervises it as a normal
+    // NGX_PROCESS_RESPAWN worker.  The successor-announce machinery above is a
+    // no-op in this mode because control_shm_ptr_mut() drives only the
+    // child-exporter generation handoff; leaving it as-is is harmless (the
+    // worker export task does not snapshot successor_gen).
+    #[cfg(feature = "dedicated-worker")]
+    {
+        notice!(
+            cycle_ref.log,
+            "otel: [spike dedicated-worker] skipping child exporter spawn; \
+             export runs in the dedicated otel worker (last worker slot)"
+        );
+        return Status::NGX_OK.into();
     }
 
-    spawn_status
+    // Spawn the exporter for both initial start and SIGHUP reload.
+    #[cfg(not(feature = "dedicated-worker"))]
+    {
+        let spawn_status = spawn_exporter_for_cycle(cycle, is_reload);
+
+        // Roll back the successor announcement if the fork failed (NGX_INVALID_PID
+        // from RLIMIT_NPROC / ENOMEM).  No successor exists, so the old exporter
+        // must remain the sole consumer and keep draining the rings; leaving
+        // `successor_gen` bumped would latch its `periodic_abdicated` permanently
+        // (see the increment comment above).  This is a single Release decrement,
+        // mirroring the increment; the master is the sole writer of this field, so
+        // the round-trip leaves the counter at its pre-reload value.
+        let ok: nginx_sys::ngx_int_t = Status::NGX_OK.into();
+        if spawn_status != ok && !announced_successor_ctrl.is_null() {
+            // SAFETY: `announced_successor_ctrl` is non-null only when set from a
+            // valid `control_shm_ptr_mut()` above; same single-master-writer
+            // invariant as the increment.
+            let ctrl = unsafe { &*announced_successor_ctrl };
+            ctrl.rollback_successor();
+        }
+
+        spawn_status
+    }
 }
 
 impl HttpModule for HttpOtelModule {
@@ -1151,7 +1201,204 @@ extern "C" fn ngx_otel_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
         }
     }
 
+    // ── SPIKE: dedicated otel worker ────────────────────────────────────────
+    //
+    // When the `dedicated-worker` feature is on, the LAST worker slot
+    // (worker_processes - 1) is dedicated to OTel export:
+    //   (a) suppress accept on all listening sockets so it serves no requests;
+    //   (b) spawn the export task on this worker's own event loop — the same
+    //       `ngx::async_::spawn(export_loop(amcf))` flow the child exporter uses,
+    //       driven by `ngx_worker_process_cycle`'s `ngx_process_events_and_timers`.
+    // The master spawned this worker with NGX_PROCESS_RESPAWN, so a crash is
+    // reaped and respawned — fixing the daemon-on gen-1 orphan (B2).
+    #[cfg(feature = "dedicated-worker")]
+    {
+        if let Some(()) = spike_dedicated_worker_init(cycle) {
+            // designated otel worker initialised; fall through to OK.
+        }
+    }
+
     Status::NGX_OK.into()
+}
+
+/// SPIKE (dedicated-worker): if this worker is the designated otel worker,
+/// suppress accept on all listening sockets and spawn the export task.
+///
+/// Returns `Some(())` when this worker WAS the designated otel worker (so the
+/// caller knows it ran the spike path); `None` for ordinary request workers.
+///
+/// Designated slot = `worker_processes - 1` (the LAST slot).  Chosen because it
+/// is deterministic and unambiguous regardless of CPU affinity; worker 0 is
+/// historically special-cased (the grpc-smoke harness runs there) so the last
+/// slot avoids collision with that.
+#[cfg(feature = "dedicated-worker")]
+fn spike_dedicated_worker_init(cycle: *mut ngx_cycle_t) -> Option<()> {
+    // Only real workers participate (not master/single/exporter/helper).
+    let worker_id = match crate::exporter::ngx_process() {
+        crate::exporter::NgxProcess::Worker(w) => w as usize,
+        _ => return None,
+    };
+
+    // SAFETY: `cycle` is the non-null valid cycle nginx passes into init_process.
+    let nworkers = unsafe { worker_processes_from_cycle(cycle) }.unwrap_or(1);
+    if nworkers < 2 {
+        return None; // guarded at init_module; defensive here.
+    }
+    let designated = nworkers - 1;
+    if worker_id != designated {
+        return None; // ordinary request-serving worker.
+    }
+
+    // SAFETY: `cycle` valid; `.log` non-null in a live worker.
+    let log = unsafe { (*cycle).log };
+    notice!(
+        log,
+        "otel: [spike dedicated-worker] worker {} of {} is the dedicated otel \
+         worker; suppressing accept and starting export task",
+        worker_id,
+        nworkers
+    );
+
+    // (a) Suppress accept on every listening socket this worker armed.
+    // SAFETY: `cycle` is the valid cycle; called once, single-threaded, in this
+    // worker's init_process AFTER event_core's init_process armed the accept
+    // events (HTTP modules' init_process run after event modules).
+    let closed_reuseport = unsafe { spike_suppress_accept(cycle) };
+    notice!(
+        log,
+        "otel: [spike dedicated-worker] accept suppressed (reuseport sockets \
+         closed: {})",
+        closed_reuseport
+    );
+
+    // (b) Spawn the export task on this worker's event loop.
+    // SAFETY: `cycle` is valid; this worker is single-threaded here.
+    let cycle_ref = unsafe { &mut *cycle };
+    let amcf = HttpOtelModule::main_conf(cycle_ref)?;
+    let task = ngx::async_::spawn(crate::drain::export_loop(amcf));
+    // SAFETY: `(*cycle).pool` is this worker's process-lifetime pool — the
+    // contract `Pool::from_ngx_pool` requires.
+    let pool = unsafe { Pool::from_ngx_pool((*cycle).pool) };
+    if pool.allocate(task).is_null() {
+        emerg!(
+            log,
+            "otel: [spike dedicated-worker] failed to pin export task on the \
+             worker pool (out of memory)"
+        );
+        return Some(());
+    }
+    notice!(log, "otel: [spike dedicated-worker] export task spawned on worker event loop");
+    Some(())
+}
+
+/// SPIKE (dedicated-worker): remove the accept read event from every listening
+/// socket this worker has armed, and close any reuseport socket that belongs to
+/// this worker so the kernel redistributes its share of connections.
+///
+/// Returns the number of reuseport sockets closed.
+///
+/// # Safety
+/// `cycle` must be the valid non-null cycle nginx passed into `init_process`,
+/// called once per worker, single-threaded, AFTER event_core's `init_process`
+/// (`ngx_event_process_init`) has set up the accept events.
+#[cfg(feature = "dedicated-worker")]
+unsafe fn spike_suppress_accept(cycle: *mut ngx_cycle_t) -> usize {
+    // SAFETY: caller contract — cycle valid; single-threaded.
+    let cycle_ref = unsafe { &*cycle };
+    let log = cycle_ref.log;
+    let ls = cycle_ref.listening.elts as *mut nginx_sys::ngx_listening_t;
+    let n = cycle_ref.listening.nelts;
+    let mut closed_reuseport = 0usize;
+
+    // SAFETY: `ngx_worker` is set by the master before fork, read-only after.
+    let this_worker = unsafe { nginx_sys::ngx_worker };
+
+    // `ngx_del_event` is a C macro over `ngx_event_actions.del`; bindgen does
+    // not expose macros, so call the function pointer directly.  It is set by
+    // the active event module's init (epoll/kqueue) before init_process runs.
+    // SAFETY: `ngx_event_actions` is initialised by the event core before any
+    // worker init_process; single-threaded read here.
+    let del_event = unsafe { nginx_sys::ngx_event_actions.del };
+
+    for i in 0..n {
+        // SAFETY: i < nelts, ls points to nelts ngx_listening_t.
+        let lsi = unsafe { &mut *ls.add(i) };
+
+        // reuseport socket: each worker owns its OWN socket and only armed accept
+        // for its own slot (ngx_event.c:808).  A non-accepting reuseport worker
+        // that merely stops accepting would BLACKHOLE its share, so we CLOSE its
+        // fd to make the kernel redistribute.
+        #[cfg(target_os = "linux")]
+        let is_reuseport = lsi.reuseport() != 0;
+        #[cfg(not(target_os = "linux"))]
+        let is_reuseport = false;
+
+        if is_reuseport {
+            // Only this worker's own reuseport socket is armed in this process.
+            if lsi.worker == this_worker {
+                let c = lsi.connection;
+                if !c.is_null() {
+                    // SAFETY: c is the listening connection set in ngx_event_process_init.
+                    let rev = unsafe { (*c).read };
+                    if !rev.is_null() {
+                        if let Some(del) = del_event {
+                            // SAFETY: rev is a valid armed read event for this
+                            // listen fd; del is the active event module's del fn.
+                            unsafe {
+                                del(
+                                    rev,
+                                    nginx_sys::NGX_READ_EVENT as nginx_sys::ngx_int_t,
+                                    nginx_sys::NGX_CLOSE_EVENT as nginx_sys::ngx_uint_t,
+                                );
+                            }
+                        }
+                    }
+                }
+                // Close the listen fd so the kernel removes it from the
+                // SO_REUSEPORT group and redistributes connections.
+                if lsi.fd != -1 {
+                    // SAFETY: lsi.fd is this worker's reuseport listen fd.
+                    unsafe { libc::close(lsi.fd) };
+                    lsi.fd = -1;
+                    closed_reuseport += 1;
+                    notice!(
+                        log,
+                        "otel: [spike dedicated-worker] closed reuseport listen fd \
+                         (slot {})",
+                        i
+                    );
+                }
+            }
+            continue;
+        }
+
+        // Non-reuseport (shared listen socket): just remove the accept read
+        // event so this worker never wakes on accept.  The other workers still
+        // hold the shared fd and absorb all connections.  Do NOT close the fd —
+        // it is shared.
+        let c = lsi.connection;
+        if c.is_null() {
+            continue;
+        }
+        // SAFETY: c is the listening connection.
+        let rev = unsafe { (*c).read };
+        if rev.is_null() {
+            continue;
+        }
+        // ngx_del_event is the inverse of the ngx_add_event in
+        // ngx_event_process_init.  flags=0: drop the read event without
+        // closing the (shared) fd.
+        if let Some(del) = del_event {
+            // SAFETY: rev is the armed accept read event; del is the active
+            // event module's del fn.
+            unsafe {
+                del(rev, nginx_sys::NGX_READ_EVENT as nginx_sys::ngx_int_t, 0);
+            }
+        }
+        notice!(log, "otel: [spike dedicated-worker] removed accept event (slot {})", i);
+    }
+
+    closed_reuseport
 }
 
 /// Descriptor for one `#[cfg(test-support)]` gRPC smoke harness (see
