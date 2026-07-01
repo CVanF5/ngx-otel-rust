@@ -48,15 +48,11 @@ pub struct ServingCertSource<'a> {
 
 impl MetricSource for ServingCertSource<'_> {
     fn collect(&self) -> std::vec::Vec<Metric> {
-        // Wall clock, deliberately. Certificate validity (notBefore/notAfter)
-        // is wall time, so `time_to_expiration` MUST be `notAfter − wall_now`.
-        // Do NOT switch this to `ngx_current_msec`: that value is nginx's
-        // cached *monotonic-ish* ms-since-boot timer, and mixing it with epoch
-        // values has bitten this project before — error LogRecords once stamped
-        // with `ngx_current_msec` were rejected by Loki as 1970-era timestamps,
-        // 400'ing whole batches.
-        // `now_unix_secs` is `std::time::SystemTime` wall clock; appropriate
-        // here because `collect` runs only on the exporter process.
+        // Wall clock, deliberately: cert validity is wall time, so
+        // `time_to_expiration` MUST be `notAfter − wall_now`. Do NOT switch to
+        // `ngx_current_msec` (nginx's cached monotonic-ish ms-since-boot timer)
+        // — mixing it with epoch values has bitten this project before
+        // (error LogRecords stamped with it were rejected by Loki as 1970).
         let now_wall_secs = crate::util::now_unix_secs() as i64;
         self.collect_at(now_wall_secs, crate::util::now_unix_nano())
     }
@@ -112,11 +108,6 @@ impl ServingCertSource<'_> {
 /// `tls.server.certificate.serial_number`, `tls.server.certificate.public_key_algorithm`,
 /// `tls.server.certificate.signature_algorithm`, `server.address`.
 /// Nothing else: no PEM, no keys, no fingerprints, no full DNs, no SANs, no key_bits.
-///
-/// Bare keys `file_path`, `serial_number`, `public_key_algorithm`,
-/// `signature_algorithm` are now namespaced under `tls.server.certificate.*`
-/// for consistency with the already-namespaced `tls.server.subject` /
-/// `tls.server.issuer` attributes.
 fn cert_attrs(c: &CertInfo) -> std::vec::Vec<KeyValue> {
     let s = |key: &str, value: &str| KeyValue {
         key: key.into(),
@@ -164,9 +155,6 @@ mod tests {
     }
 
     /// The seven scope-guard attribute keys, in emission order.
-    ///
-    /// Bare keys are now namespaced under `tls.server.certificate.*`
-    /// for consistency with `tls.server.subject` / `tls.server.issuer`.
     const ALLOWED_KEYS: [&str; 7] = [
         "tls.server.certificate.file_path",
         "tls.server.subject",

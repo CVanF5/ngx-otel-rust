@@ -23,12 +23,11 @@ use crate::metric_source::MetricSource;
 /// All reads happen only on the designated export worker (`NgxProcess::Worker(0)`),
 /// never on the request path.
 pub struct StubStatusSource {
-    /// Exporter process start time (Unix epoch, nanoseconds). Used as the
-    /// `start_time_unix_nano` for the three monotonic cumulative Sums
-    /// (`nginx.connections.accepted`, `nginx.connections.handled`,
-    /// `nginx.requests.total`) so that downstream rate/delta-conversion
-    /// processors can anchor windows correctly. Captured once at exporter-loop
-    /// init (`export_loop`) and threaded in via `collect_all_sources`.
+    /// Exporter process start time (Unix epoch, nanoseconds), used as
+    /// `start_time_unix_nano` on the three monotonic cumulative Sums so
+    /// downstream rate/delta-conversion processors anchor windows correctly.
+    /// Captured once at exporter-loop init and threaded in via
+    /// `collect_all_sources`.
     pub start_time_unix_nano: u64,
 }
 
@@ -112,21 +111,13 @@ unsafe fn read_stats() -> (u64, u64, u64, u64, u64, u64, u64) {
 
     macro_rules! load {
         ($ptr:expr) => {
-            // ngx_stat_* is a *mut ngx_atomic_t (= *mut c_ulong).
-            // We treat the underlying memory as an AtomicU64.
-            // ngx_atomic_t is c_ulong-wide. This alias is correct on 64-bit
-            // Linux/macOS where c_ulong == u64, but would break on 32-bit platforms
-            // where c_ulong == u32. 32-bit targets are rejected at compile time by
-            // the compile_error! guard in lib.rs.
-            // SAFETY: `$ptr` is one of nginx's `ngx_stat_*` globals (a non-null
-            // `*mut ngx_atomic_t`), allocated and zero-initialised by nginx at
-            // startup before any worker runs (the `read_stats` fn contract requires
-            // nginx to have started), so it is valid and properly aligned. We only
-            // ever read it, never write, so casting to `*const AtomicU64` and taking
-            // an `Acquire` load is sound: `AtomicU64` matches `ngx_atomic_t`'s
-            // 8-byte layout on the supported 64-bit targets (see TODO above), and the
-            // atomic load is the correct way to observe a counter that other workers
-            // mutate concurrently via nginx's own atomic ops.
+            // SAFETY: `$ptr` is one of nginx's `ngx_stat_*` globals — a non-null
+            // `*mut ngx_atomic_t` (c_ulong-wide), zero-initialised by nginx before
+            // any worker runs. `AtomicU64` matches its 8-byte layout on the
+            // supported 64-bit targets (32-bit is rejected at compile time by
+            // lib.rs's compile_error! guard). We only read, never write, so the
+            // cast to `*const AtomicU64` and `Acquire` load is sound and observes
+            // concurrent writes from other workers' atomic ops correctly.
             unsafe { (*(($ptr) as *const core::sync::atomic::AtomicU64)).load(Ordering::Acquire) }
         };
     }
@@ -170,14 +161,9 @@ fn gauge_metric(name: &str, desc: &str, unit: &str, value: u64, time_ns: u64) ->
     }
 }
 
-// ─── tests ──────────────────────────────────────────────────────────────────
-
-// In a stub-enabled build (`--with-http_stub_status_module` → NGX_STAT_STUB →
-// `ngx_feature = "stat_stub"`) the source is registered and yields all 7 series.
-// See `collect_all_sources_omits_stub_status_without_stat_stub` in `export` for the
-// inverse (no-flag build): the source is NOT registered, so the 7 series are ABSENT.
-// The whole module is gated on `stat_stub` because its sole test exercises the
-// stub-enabled path; the no-stub inverse is asserted at the registration site.
+// Gated on `stat_stub`: this test exercises the stub-enabled path (7 series
+// registered). The no-flag inverse (source NOT registered) is asserted in
+// `collect_all_sources_omits_stub_status_without_stat_stub` in `export`.
 #[cfg(all(test, ngx_feature = "stat_stub"))]
 mod tests {
     use super::*;

@@ -28,8 +28,6 @@ use core::ptr;
 use nginx_sys::{ngx_http_complex_value_t, ngx_str_t};
 use ngx::http::{Merge, MergeConfigError};
 
-// ── LogExportMode ──────────────────────────────────────────────────────────────
-
 /// Per-location selection state for `otel_log_export`.
 ///
 /// Decides whether the LOG-phase handler exports an exception-tail log record
@@ -54,8 +52,6 @@ pub enum LogExportMode {
     If = 3,
 }
 
-// ── TraceContextMode ──────────────────────────────────────────────────────────
-
 /// Traceparent propagation mode for `otel_trace_context`.
 ///
 /// Controls whether the REWRITE-phase span-start handler reads the inbound
@@ -77,8 +73,6 @@ const TRACE_CONTEXT_UNSET: u8 = 0xFF;
 
 /// Raw byte encoding for "not set" (`log_export_raw` sentinel).
 const LOG_EXPORT_UNSET: u8 = LogExportMode::Unset as u8;
-
-// ── LocationConf ─────────────────────────────────────────────────────────────
 
 /// Per-location module configuration.
 ///
@@ -202,28 +196,23 @@ impl Default for LocationConf {
 
 impl Merge for LocationConf {
     fn merge(&mut self, prev: &LocationConf) -> Result<(), MergeConfigError> {
-        // Inherit otel_trace from parent when not set at this level.
         if self.otel_trace.is_null() {
             self.otel_trace = prev.otel_trace;
         }
-        // Inherit trace_context from parent when not set at this level.
         if !self.trace_context_is_set() {
             self.trace_context_raw = prev.trace_context_raw;
         }
-        // Inherit span_name_cv from parent when not set at this level.
         if self.span_name_cv.is_null() {
             self.span_name_cv = prev.span_name_cv;
         }
-        // Inherit otel_log_export from parent when not set at this level.
-        // An explicit `off`/`on`/`if=` at this level wins over the inherited
-        // value (mirrors core access_log inheritance).
+        // Explicit off/on/if= at this level wins over inherited (mirrors core
+        // access_log inheritance).
         if !self.log_export_is_set() {
             self.log_export_raw = prev.log_export_raw;
             self.log_export_cv = prev.log_export_cv;
         }
-        // span_attrs: each location defines its own independent set (child wins;
-        // no inheritance — mirrors the C++ module's addSpanAttr accumulation at
-        // each parse level).
+        // span_attrs: no inheritance, each location's set is independent
+        // (mirrors the C++ module's addSpanAttr accumulation per parse level).
         Ok(())
     }
 }

@@ -303,20 +303,11 @@ impl LogPhaseHandler {
         // `base_idx` is needed by the exemplar write (metrics) and the access-log
         // tail (logs), so it is computed here even when the metrics zone is absent.
         //
-        // Status 0 = client abort / no response sent.  `ngx_http_create_request`
-        // allocates the request struct with `ngx_pcalloc` (nginx src/http/ngx_http_request.c:588),
-        // so `headers_out.status` starts as 0 and stays 0 when the client disconnects
-        // before nginx sends response headers (port-scan SYN probe, TLS-to-plaintext
-        // probe, aborted keep-alive request, etc.).
-        //
-        // Per OTel HTTP semconv, `http.response.status_code` is CONDITIONALLY REQUIRED
-        // only when a response was sent; it is ABSENT for aborted requests.  Counting
-        // status-0 as 5xx was generating fake server-error counts on every port scan,
-        // inflating error-rate alerts.
-        //
-        // Fix: skip only the histogram bump when status == 0.  The route and upstream
-        // histograms (below) still record the duration — the request consumed real
-        // resources regardless of the abort.
+        // Status 0 = client abort / no response sent (`headers_out.status` is
+        // zero-initialised by `ngx_pcalloc` and stays 0 when the client
+        // disconnects before headers go out). `record_base_combo` skips the
+        // base-combo bump for status 0 per OTel semconv (see its doc); the
+        // route/upstream histograms below still record duration regardless.
         let method = HttpMethod::from_bytes(r.method_name.as_bytes());
         let status_class = StatusClass::from_status(status);
         let base_idx = combo_index(method, status_class, proto);
@@ -411,26 +402,20 @@ impl LogPhaseHandler {
         }
         // zone_ptr == 0 → no upstream → skip upstream histogram.
 
-        // ── request body bytes ────────────────────────────────────────────
         slot.request_body_bytes.record(r.request_length as u64, &BYTES_BOUNDS);
-
-        // ── response bytes ────────────────────────────────────────────────
         slot.response_body_bytes.record(meta.resp_bytes, &BYTES_BOUNDS);
 
-        // ── upstream timings (if an upstream was used) ────────────────────
-        // Sum the timings/bytes across ALL upstream attempts, not just the
-        // current (last) `u->state`.  When `proxy_next_upstream` retries a peer,
-        // nginx pushes a fresh `ngx_http_upstream_state_t` per attempt onto
-        // `r->upstream_states` (an `ngx_array_t`); `u->state` points only at the
-        // last one.  The core `$upstream_response_time` / `$upstream_*_bytes`
-        // variables iterate the whole `r->upstream_states` array
-        // (`ngx_http_upstream_response_time_variable` /
+        // Upstream timings (if an upstream was used): sum across ALL upstream
+        // attempts, not just the current (last) `u->state`. When
+        // `proxy_next_upstream` retries a peer, nginx pushes a fresh
+        // `ngx_http_upstream_state_t` per attempt onto `r->upstream_states`
+        // (an `ngx_array_t`); `u->state` points only at the last one. The core
+        // `$upstream_response_time` / `$upstream_*_bytes` variables iterate the
+        // whole array (`ngx_http_upstream_response_time_variable` /
         // `..._response_length_variable`, ngx_http_upstream.c:6027,6105), so
-        // reading only `u->state` undercounts multi-attempt requests.  Walk the
-        // same array and aggregate so the metric matches the total upstream cost
-        // those variables report.
-        // `r.upstream` being non-null confirms this request actually went
-        // through an upstream, so `r->upstream_states` is meaningful.
+        // reading only `u->state` would undercount multi-attempt requests —
+        // walk the same array to match what those variables report.
+        // `r.upstream` non-null confirms this request went through an upstream.
         if !r.upstream.is_null() {
             // SAFETY: `r` is the live request for this LOG-phase handler;
             // `upstream_states` is either null (no upstream attempts) or a valid
@@ -574,13 +559,11 @@ impl LogPhaseHandler {
         let trace_context: Option<([u8; 16], [u8; 8])> =
             ctx.span_ctx.filter(|c| c.sampled).map(|c| (c.trace_id, c.span_id));
 
-        // url.path: r.uri (decoded path, WITHOUT query string / args).
-        // Use r.uri, NOT r.unparsed_uri (= $request_uri, which includes
-        // '?args') — including args would be a semconv violation and a
-        // PII/credential-leak vector (e.g. ?token=SECRET ends up in
-        // exported tails + exemplars).
-        // r.uri is the normalised, args-stripped equivalent of $uri;
-        // the query string lives separately in r.args and is NOT recorded.
+        // url.path: r.uri (decoded path, WITHOUT query string / args). Use
+        // r.uri, NOT r.unparsed_uri (= $request_uri, includes '?args') —
+        // args would be a semconv violation and a PII/credential-leak vector
+        // (e.g. ?token=SECRET reaching exported tails + exemplars). r.args
+        // (the query string) is deliberately not recorded.
         // High-cardinality — stays on the tail record ONLY, never a metric dim.
         let url_path: &[u8] = ctx.r.uri.as_bytes();
 
@@ -637,8 +620,8 @@ impl LogPhaseHandler {
             None => return,
         };
 
-        // ── Exemplar write (OTel TraceBased exemplar filter) ───────────────
-        // Record an exemplar into the metrics slot ONLY when the metrics zone
+        // Exemplar write (OTel TraceBased exemplar filter). Record an
+        // exemplar into the metrics slot ONLY when the metrics zone
         // is present (exemplar reservoirs live in the metrics shm slot).
         // Skipped when `otel_metrics off` — the span record below still runs.
         // <https://opentelemetry.io/docs/specs/otel/metrics/sdk/#exemplar-defaults>
@@ -752,7 +735,7 @@ impl LogPhaseHandler {
         let end_time_unix_nano =
             ctx.start_time_unix_nano.saturating_add(ectx.duration_us.saturating_mul(1_000));
 
-        // ── HTTP semconv coverage sources (already materialized) ───────
+        // HTTP semconv coverage sources (already materialized).
         let conn_ptr = ectx.r.connection;
 
         // url.scheme: TLS connection ⇒ "https".
@@ -940,28 +923,26 @@ fn build_span_name(buf: &mut [u8; MAX_SPAN_NAME], method: &[u8], route: &[u8]) -
 /// `network.peer.address` / `network.peer.port` span attributes.
 ///
 /// nginx's realip module (`real_ip_header` / PROXY protocol) rewrites
-/// `c->addr_text` / `c->sockaddr` **in place** to the logical client, but it
+/// `c->addr_text` / `c->sockaddr` **in place** to the logical client, but
 /// first stashes the original socket peer in its per-request module context
-/// (`ngx_http_realip_module.c:285-292`).  The `$realip_remote_addr` /
-/// `$realip_remote_port` variables return that saved original when the context
-/// is present, else the live connection values
+/// (`ngx_http_realip_module.c:285-292`). The `$realip_remote_addr` /
+/// `$realip_remote_port` variables return that saved original when the
+/// context is present, else the live connection values
 /// (`ngx_http_realip_remote_addr_variable`, `ngx_http_realip_module.c:580,602`).
 ///
 /// **Primary path** (realip compiled in): evaluate `$realip_remote_addr` /
-/// `$realip_remote_port` — this always yields the true socket peer regardless of
-/// whether a realip rewrite occurred, because the variable handler returns
-/// `ctx->addr_text` when a context exists (realip active and matched) and
-/// `connection->addr_text` otherwise (realip inactive or unmatched).
+/// `$realip_remote_port` — always yields the true socket peer regardless of
+/// whether a rewrite occurred, since the handler returns `ctx->addr_text`
+/// when a context exists and `connection->addr_text` otherwise.
 ///
-/// **Fallback path** (realip not compiled, or variable lookup returns empty):
-/// read `connection->addr_text` directly for the address and derive the port
-/// via `sockaddr_port(connection->sockaddr)`.  When realip is absent the
-/// connection's `addr_text` is never rewritten, so it equals the socket peer
-/// exactly — the same value `$realip_remote_addr` would have returned.
+/// **Fallback path** (realip not compiled, or lookup returns empty): read
+/// `connection->addr_text` directly and derive the port via
+/// `sockaddr_port(connection->sockaddr)`. Without realip, `addr_text` is
+/// never rewritten, so it already equals the socket peer.
 ///
-/// The realip module's context type and its module descriptor are both
-/// file-`static` in nginx, so they cannot be referenced directly from Rust —
-/// the variable is the only sound public accessor when realip is compiled in.
+/// The realip module's context type and module descriptor are both
+/// file-`static` in nginx and can't be referenced directly from Rust — the
+/// variable is the only sound public accessor when realip is compiled in.
 ///
 /// Returns the peer address bytes (slice into request/connection memory, valid
 /// for this LOG-phase call) and the peer port (0 when unavailable).
@@ -1735,8 +1716,6 @@ impl InstrumentedSource {
     }
 }
 
-// ─── helpers ────────────────────────────────────────────────────────────────
-
 /// Convert a millisecond-summed explicit histogram data tuple for export as a
 /// **seconds** histogram (`nginx.upstream.*.duration`).
 ///
@@ -1876,8 +1855,6 @@ fn make_exp_dp(
     })
 }
 
-// ── Unit tests ───────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use crate::logs::ring::tests::make_ring_with_cap;
@@ -1888,32 +1865,18 @@ mod tests {
     use crate::metric_source::location_conf::LogExportMode;
 
     /// Regression: `(ngx_msec_t)-1` sentinel must NOT be recorded into
-    /// upstream timing histograms.
-    ///
-    /// Pre-fix: `response_time`, `connect_time`, and `header_time` were cast
-    /// unconditionally to `u64` and passed to `record()`, which does a
-    /// `fetch_add` on the sum.  With the sentinel value (`usize::MAX as u64`
-    /// = `u64::MAX` on 64-bit), one refused-connection event adds ~1.8 × 10^19
-    /// to the cumulative sum, permanently poisoning the metric.
-    ///
-    /// This test would FAIL TO COMPILE on pre-fix code because
-    /// `NGX_MSEC_SENTINEL` did not exist.  On post-fix code it verifies the
-    /// sentinel value and the filter invariant using a stack-allocated
-    /// `Histogram`.
+    /// upstream timing histograms (see `NGX_MSEC_SENTINEL` doc for why an
+    /// unconditional record would poison the cumulative sum).
     #[test]
     fn c1_upstream_sentinel_not_recorded() {
         use crate::shm::{Histogram, DURATION_BOUNDS_MS, N_DURATION_BUCKETS};
 
-        // Verify the sentinel constant matches (ngx_msec_t)-1.
-        // On 64-bit: usize::MAX as u64 = u64::MAX.
-        // On 32-bit: usize::MAX as u64 = u32::MAX as u64 = 4_294_967_295.
         assert_eq!(
             super::NGX_MSEC_SENTINEL,
             usize::MAX as u64,
             "NGX_MSEC_SENTINEL must equal (ngx_msec_t)-1 cast to u64"
         );
 
-        // Create a histogram on the stack (AtomicU64 fields, safe to use in tests).
         // SAFETY: all AtomicU64 fields are zero-initialised (from Default/const).
         let hist: Histogram<N_DURATION_BUCKETS> = unsafe { core::mem::zeroed() };
 
@@ -2120,25 +2083,11 @@ mod tests {
         assert!(!ring.pop_into(&mut out2), "ring must be empty after one record");
     }
 
-    /// Regression: `url.path` must use `r.uri` (path only) not `r.unparsed_uri`
-    /// (which includes `?args`).
-    ///
-    /// Pre-fix: both call sites in `log_phase_handler` used `r.unparsed_uri.as_bytes()`.
-    /// That field is `$request_uri` — the raw HTTP request-line URI including the query
-    /// string.  A request like `GET /api/users?token=SECRET HTTP/1.1` would export
-    /// `url.path = "/api/users?token=SECRET"`, violating OTel semconv (`url.path` must
-    /// not include the query component) and leaking PII / credentials into tails and
-    /// exemplars.
-    ///
-    /// Post-fix: both sites use `r.uri.as_bytes()` — the decoded, args-stripped path
-    /// equivalent of `$uri`, matching the OTel semconv requirement.
-    ///
-    /// Mutation check (inline): the test constructs a fake `ngx_http_request_s` with
-    /// distinct `uri` (path only) and `unparsed_uri` (path+args).  It asserts that
-    /// `r.uri.as_bytes()` does NOT contain `?` (post-fix, correct), and that
-    /// `r.unparsed_uri.as_bytes()` DOES contain `?` (what pre-fix code used — wrong).
-    /// This confirms the test distinguishes the two fields and documents expected
-    /// behavior as a regression guard.
+    /// Regression: `url.path` must use `r.uri` (path only), not `r.unparsed_uri`
+    /// (`$request_uri`, includes `?args`) — see the `url_path` production
+    /// comment for the semconv/PII rationale. Mutation check: constructs a
+    /// fake request with distinct `uri`/`unparsed_uri` and confirms the test
+    /// actually distinguishes the two fields (unparsed_uri DOES contain `?`).
     #[test]
     fn c2_url_path_excludes_query_string() {
         use nginx_sys::{ngx_http_request_s, ngx_str_t};
@@ -2175,19 +2124,10 @@ mod tests {
     }
 
     /// Regression: client-abort requests (status 0) must NOT be recorded into
-    /// `request_duration_combos`.
-    ///
-    /// Pre-fix: `StatusClass::from_status(0)` returns `S5xx` (catch-all), so every
-    /// port-scan / TLS-probe / aborted keep-alive incremented the S5xx combo,
-    /// inflating server-error-rate metrics.
-    ///
-    /// Post-fix: `record_base_combo` skips the histogram bump when `status == 0`.
-    /// Route and upstream histograms are unaffected (they still record, as the
-    /// request consumed real resources regardless of the abort).
-    ///
-    /// This test calls the PRODUCTION `record_base_combo` function (not an
-    /// inline copy of its guard), so reverting the `status != 0` check in that
-    /// function causes this test to FAIL.
+    /// `request_duration_combos` (see `record_base_combo` doc: `from_status(0)`
+    /// maps to the S5xx catch-all, so an unguarded bump would inflate
+    /// server-error metrics on every port-scan/aborted keep-alive). Calls the
+    /// PRODUCTION `record_base_combo`, not a reimplementation of its guard.
     #[test]
     fn f2_status_zero_skips_base_combo() {
         use crate::shm::{
@@ -2205,7 +2145,7 @@ mod tests {
         let proto = ProtoVersion::Http11;
         let duration_us: u64 = 1_500;
 
-        // ── status == 0: production record_base_combo must skip the bump ──
+        // status == 0: production record_base_combo must skip the bump.
         // The S5xx combo is computed (as production code does — needed for the
         // exemplar reservoir) but the histogram bump must be skipped.
         let status: u16 = 0;
@@ -2224,8 +2164,8 @@ mod tests {
             );
         }
 
-        // ── Confirm S5xx IS the slot pre-fix would have touched ──
-        // (Validates the test is meaningful: status 0 maps to S5xx, not skipped.)
+        // Confirm S5xx IS the slot pre-fix would have touched (validates the
+        // test is meaningful: status 0 maps to S5xx, not skipped).
         let s5xx_idx = combo_index(method, StatusClass::S5xx, proto);
         assert_eq!(
             base_idx_0, s5xx_idx,
@@ -2239,7 +2179,7 @@ mod tests {
             "sanity: S5xx combo must be the one that would otherwise be incremented"
         );
 
-        // ── status 200: production record_base_combo must record into S2xx ──
+        // status 200: production record_base_combo must record into S2xx.
         let status200: u16 = 200;
         let status_class_200 = StatusClass::from_status(status200);
         let base_idx_200 = combo_index(method, status_class_200, proto);

@@ -44,8 +44,6 @@ use crate::traces::ctx::{
 };
 use crate::HttpOtelModule;
 
-// ── One-shot OOM warn ─────────────────────────────────────────────────────────
-
 use std::cell::Cell;
 
 thread_local! {
@@ -105,47 +103,37 @@ impl HttpRequestHandler for SpanStartHandler {
     /// `SpanCtx` with `sampled=false` and stores it.  LOG reads it and skips
     /// ring work.  The pool alloc is a bump pointer — effectively free.
     fn handler(request: &mut Request) -> Status {
-        // ── Gate 0: internal-redirect / subrequest guard ──────────────────────
-        // Mirrors the C++ module's REWRITE early-return
-        // (`nginx-otel/src/http_module.cpp:356-361`): "don't let internal
-        // redirects override the sampling decision".  nginx re-runs the REWRITE
-        // phase after an internal redirect (`error_page`, `try_files`, named
-        // location) and for subrequests, both of which set `r->internal`.  If we
-        // re-entered span-start here we would generate a *second* span (and a
-        // fresh sampling decision) for what is one logical request.  Returning
-        // NGX_DECLINED before any span-start work yields exactly ONE span per
-        // request, with pass-1's parent + timing intact (recovered at LOG via
-        // `recover_span_ctx`).
-        //
-        // NOTE: `r->internal` is also set for subrequests, so this guard means
-        // subrequests do NOT get their own span — a deliberate, upstream-mirrored
-        // semantic (the C++ module behaves identically).
+        // Gate 0: internal-redirect / subrequest guard. Mirrors the C++ module's
+        // REWRITE early-return (`nginx-otel/src/http_module.cpp:356-361`): nginx
+        // re-runs REWRITE after an internal redirect (`error_page`, `try_files`,
+        // named location) and for subrequests, both of which set `r->internal`.
+        // Re-entering span-start here would generate a second span (and a fresh
+        // sampling decision) for one logical request; declining before any
+        // span-start work yields exactly ONE span per request, with pass-1's
+        // parent + timing intact (recovered at LOG via `recover_span_ctx`).
+        // Also means subrequests don't get their own span — deliberate,
+        // upstream-mirrored semantic.
         //
         // Read via the C shim, NOT the bindgen `internal()` accessor: bindgen
         // mis-lays-out this struct's bitfields and reads `internal` 2 bits low
         // (see `crate::shim`).
         //
-        // Ordering: we check `internal` BEFORE the config/location gates,
-        // mirroring the C++ module (`http_module.cpp:356-361`, which checks
-        // `r->internal` first).  The cost is one extern call + branch per request
-        // — but it is NOT a zero-cost-when-disabled regression: an unconfigured
+        // Ordering: checked BEFORE the config/location gates, mirroring the C++
+        // module. Not a zero-cost-when-disabled regression: an unconfigured
         // location never registers this handler at all (see
-        // `lib.rs::postconfiguration`), so the shim call only runs when tracing
-        // is in play.  Keeping the C++ ordering preserves the redirect semantics
-        // (an internal redirect must not re-enter span-start regardless of how
-        // the location gates would evaluate on pass 2).
-        //
-        // Cost: one extern (C-shim) call + branch on the hot path.
+        // `lib.rs::postconfiguration`), so this shim call only runs when tracing
+        // is in play — and keeping the C++ ordering preserves redirect semantics
+        // regardless of how the location gates would evaluate on pass 2.
         let r_const = request.as_ref() as *const nginx_sys::ngx_http_request_t;
         // SAFETY: `r_const` is the live request pointer borrowed from `request`.
         if unsafe { crate::shim::r_internal(r_const) } != 0 {
             return Status::NGX_DECLINED;
         }
 
-        // ── Gate 1: module not configured → zero cost ────────────────────────
-        // NGX_DECLINED passes to the next handler in the REWRITE phase (correct
-        // passthrough).  NGX_OK in the REWRITE phase re-enters the phase checker
-        // from the top (re-location-matching), which would hang the request.
+        // Gate 1: module not configured → zero cost. NGX_DECLINED passes to the
+        // next REWRITE handler (correct passthrough); NGX_OK here would
+        // re-enter the phase checker from the top (re-location-matching),
+        // hanging the request.
         let amcf = match HttpOtelModule::main_conf(request) {
             Some(c) => c,
             None => return Status::NGX_DECLINED,
@@ -154,10 +142,9 @@ impl HttpRequestHandler for SpanStartHandler {
             return Status::NGX_DECLINED;
         }
 
-        // ── Gate 2: per-location `otel_trace` directive ──────────────────────
-        // Pull both the complex-value pointer and trace_context mode from
-        // LocationConf in one borrow so the borrow ends before we call
-        // set_module_ctx (which borrows mutably).
+        // Gate 2: per-location `otel_trace` directive. Pull both the
+        // complex-value pointer and trace_context mode from LocationConf in one
+        // borrow so it ends before set_module_ctx's mutable borrow.
         // as_mut() yields &mut provenance; casting immediately to *mut releases
         // the Rust borrow so subsequent immutable borrows of `request` are valid.
         let r_ptr = request.as_mut() as *mut nginx_sys::ngx_http_request_t;
@@ -182,17 +169,15 @@ impl HttpRequestHandler for SpanStartHandler {
         // process lifetime; `addr_of!` yields a stable pointer to it.
         let module_ref = unsafe { &*core::ptr::addr_of!(crate::ngx_http_otel_module) };
 
-        // ── Parse inbound `traceparent` BEFORE Gate 2 ────────────────────────
-        // `$otel_parent_sampled` reads its value from the request's SpanCtx.
-        // Gate 2 calls `ngx_http_complex_value` which evaluates whatever
-        // `otel_trace` is set to — including `$otel_parent_sampled`.  In the old
-        // ordering the traceparent parse ran AFTER the gate, so SpanCtx was never
-        // set at Gate 2 time: `$otel_parent_sampled` always returned not_found →
-        // parent-based sampling was permanently broken regardless of config.
-        //
-        // Fix: parse the inbound traceparent here (before Gate 2) and set a
-        // minimal pre-gate SpanCtx with the inbound flags so Gate 2 sees the
-        // correct `$otel_parent_sampled` value.
+        // Parse inbound `traceparent` BEFORE Gate 2: `$otel_parent_sampled`
+        // reads from the request's SpanCtx, and Gate 2's `ngx_http_complex_value`
+        // evaluates whatever `otel_trace` references — including
+        // `$otel_parent_sampled`. Parsing after the gate (the old ordering)
+        // meant SpanCtx was never set at Gate 2 time, so
+        // `$otel_parent_sampled` always returned not_found and parent-based
+        // sampling was permanently broken regardless of config. Fix: parse here
+        // and set a minimal pre-gate SpanCtx with the inbound flags so Gate 2
+        // sees the correct value.
         //
         // Semantic contract:
         //   • have_traceparent=true  → pre-gate SpanCtx.flags = inbound_flags
@@ -202,14 +187,12 @@ impl HttpRequestHandler for SpanStartHandler {
         //     → `otel_trace $otel_parent_sampled` gate declines (correct: no parent)
         //
         // On gate decline: clear the pre-gate SpanCtx so `$otel_trace_id` stays
-        // empty for declined requests (same semantics as before this fix).
+        // empty for declined requests.
         //
-        // Cost: one header scan + one pool alloc for every request at configured
-        // locations that has a traceparent header.  This is within the
-        // "bounded-when-unsampled" budget described in the module doc.
-        //
-        // Skip the scan for Ignore (neither read nor write) and Inject (start a
-        // fresh trace, do not inherit the inbound trace context).
+        // Cost (within the bounded-when-unsampled budget): one header scan + one
+        // pool alloc per request at configured locations with a traceparent
+        // header. Skip the scan for Ignore (neither read nor write) and Inject
+        // (start a fresh trace, do not inherit the inbound trace context).
         use crate::logs::access::parse_traceparent_full;
         let mut parent_trace_id: Option<[u8; 16]> = None;
         let mut parent_span_id: [u8; 8] = [0u8; 8];
@@ -236,16 +219,15 @@ impl HttpRequestHandler for SpanStartHandler {
         // Pre-gate SpanCtx: allocate and store only when we have a traceparent so
         // Gate 2 can read `$otel_parent_sampled` from the SpanCtx.flags field.
         // `sampled` is left false (zeroed) — the full sampling decision is made
-        // post-gate.  If Gate 2 declines, we clear this ctx before returning.
+        // post-gate. If Gate 2 declines, we clear this ctx before returning.
         //
-        // Use `alloc_span_ctx_plain` (NO cleanup anchor) here, NOT
-        // `alloc_span_ctx`.  The pre-gate ctx only needs to live for Gate 2's
-        // `$otel_parent_sampled` read within this handler pass; it must NOT be
-        // redirect-survivable.  If it registered the cleanup anchor, a
+        // Use `alloc_span_ctx_plain` (NO cleanup anchor), NOT `alloc_span_ctx`:
+        // this ctx only needs to live for Gate 2's read within this handler
+        // pass, and must NOT be redirect-survivable. With the anchor, a
         // Gate-2-declined request that then internally redirects would have
-        // `recover_span_ctx` re-install this stale pre-gate ctx, making
-        // `$otel_trace_id` non-empty for a declined request.  Only the final
-        // post-gate alloc (gate-PASS path) registers the anchor.
+        // `recover_span_ctx` re-install this stale ctx, making `$otel_trace_id`
+        // non-empty for a declined request. Only the final post-gate alloc
+        // (gate-PASS path) registers the anchor.
         if have_traceparent {
             // SAFETY: `r_ptr` is the live `ngx_http_request_t*`; `(*r_ptr).pool`
             // is the request-scoped pool valid for the request lifetime.
@@ -269,8 +251,8 @@ impl HttpRequestHandler for SpanStartHandler {
             request.set_module_ctx(pre_ctx.cast::<c_void>(), module_ref);
         }
 
-        // ── Evaluate Gate 2 ──────────────────────────────────────────────────
-        // `$otel_parent_sampled` now finds the pre-gate SpanCtx (if have_traceparent).
+        // Evaluate Gate 2. `$otel_parent_sampled` now finds the pre-gate
+        // SpanCtx (if have_traceparent).
         // SAFETY: `ngx_str_t` is a plain C struct (len + data pointer); zeroing it
         // produces a valid "empty string" representation — no invariants violated.
         let mut cv_result: nginx_sys::ngx_str_t = unsafe { core::mem::zeroed() };
@@ -303,8 +285,8 @@ impl HttpRequestHandler for SpanStartHandler {
 
         // Gate passed.
 
-        // ── Record span start time (OTel-SDK-idiomatic dual-clock) ─────────
-        // Moved after Gate 2: avoids vDSO calls for gate-declined requests.
+        // Record span start time (OTel-SDK-idiomatic dual-clock), after Gate 2
+        // to avoid vDSO calls for gate-declined requests.
         // Wall-clock anchor: SystemTime::now() → absolute start timestamp.
         // Monotonic anchor: Instant::now() → elapsed at LOG gives duration,
         //   always ≥ 0 (NTP-immune).
@@ -312,29 +294,26 @@ impl HttpRequestHandler for SpanStartHandler {
         //   http.server.request.duration = start_mono.elapsed() (same value).
         // Result: µs precision kept, end ≥ start guaranteed, span (end−start)
         //   == attribute (coherent), histogram NTP-exposure removed.
-        // Both reads are vDSO calls on Linux — not kernel syscalls.
+        // Both reads are vDSO calls on Linux, not kernel syscalls.
         let start_time_unix_nano: u64 = {
             use std::time::{SystemTime, UNIX_EPOCH};
             SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
         };
         let start_mono = std::time::Instant::now();
 
-        // ── OS-RNG seed failed → tracing disabled for this worker ────────────
-        // If `getrandom` failed at worker init (e.g. seccomp denial), the
-        // worker-local DRBG is unseeded and `drbg64()` returns 0; calling
-        // `gen_trace_id`/`gen_span_id` here would spin forever rerolling for a
-        // non-zero value.  Degrade exactly like a gate-declined request: clear
-        // any pre-gate SpanCtx (so `$otel_trace_id` is empty) and return
-        // NGX_DECLINED — the request is served, no span is emitted, and we never
-        // produce weak/predictable IDs.  One `Cell` load + branch on this path.
+        // OS-RNG seed failed → tracing disabled for this worker. If `getrandom`
+        // failed at worker init (e.g. seccomp denial), the worker-local DRBG is
+        // unseeded and `drbg64()` returns 0; `gen_trace_id`/`gen_span_id` would
+        // spin forever rerolling for a non-zero value. Degrade like a
+        // gate-declined request: clear any pre-gate SpanCtx and decline — the
+        // request is served, no span emitted, and we never produce
+        // weak/predictable IDs. One `Cell` load + branch on this path.
         if crate::traces::ctx::tracing_disabled() {
             request.set_module_ctx(core::ptr::null_mut(), module_ref);
             return Status::NGX_DECLINED;
         }
 
-        // ── Worker-side sampling decision ────────────────────────────────────
-        // Gate 2 has passed: the request is supposed to produce a span.
-        //
+        // Worker-side sampling decision (Gate 2 passed, so a span is due).
         // Parent flag path: inbound traceparent present → honour the W3C sampled bit.
         // Root span path:   no inbound traceparent → sample all (Gate 2 is the guard).
         let sampled = if have_traceparent {
@@ -343,7 +322,7 @@ impl HttpRequestHandler for SpanStartHandler {
             true // Gate 2 (otel_trace complex value / split_clients) is the sampling guard
         };
 
-        // ── Assign trace/span IDs ────────────────────────────────────────────
+        // Assign trace/span IDs.
         // `gen_trace_id` / `gen_span_id` return `None` when the DRBG appears
         // broken (exhausted retries on all-zero output), in which case they
         // also set the tracing-disabled flag.  Treat that the same as a
@@ -373,10 +352,10 @@ impl HttpRequestHandler for SpanStartHandler {
             0x01 // sampled
         };
 
-        // ── Allocate full SpanCtx on the request pool ─────────────────────────
-        // This replaces the pre-gate SpanCtx if one was set.  The pre-gate
-        // allocation (have_traceparent=true path) is wasted pool memory
-        // (≈sizeof(SpanCtx) bytes) — acceptable for a bump allocator.
+        // Allocate full SpanCtx on the request pool, replacing the pre-gate
+        // SpanCtx if one was set. The pre-gate allocation (have_traceparent=true
+        // path) is wasted pool memory (~sizeof(SpanCtx) bytes) — acceptable for
+        // a bump allocator.
         // SAFETY: `r_ptr` is the live `ngx_http_request_t*` for this request;
         // `(*r_ptr).pool` is nginx's request-scoped pool, valid for the full
         // request lifetime — exactly what `pool_from_request` requires.
@@ -416,7 +395,7 @@ impl HttpRequestHandler for SpanStartHandler {
         // our module's ctx_index — no aliasing concern.
         request.set_module_ctx(ctx_ptr.cast::<c_void>(), module_ref);
 
-        // ── Inject outbound `traceparent` header ──────────────────────────────
+        // Inject outbound `traceparent` header.
         // For `inject` and `propagate` modes, push a W3C traceparent into the
         // request headers so that downstream proxy_pass modules forward it to
         // the upstream.  The header value is allocated on the request pool.
@@ -434,8 +413,6 @@ impl HttpRequestHandler for SpanStartHandler {
         Status::NGX_DECLINED
     }
 }
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Hex-encodes `src` bytes into `dst`.
 ///
@@ -473,41 +450,37 @@ fn build_traceparent_value(trace_id: &[u8; 16], span_id: &[u8; 8], trace_flags: 
 }
 
 /// Injects (or *updates in place*) a W3C `traceparent` header in
-/// `r->headers_in.headers` so that nginx proxy modules forward it to the
-/// upstream.
+/// `r->headers_in.headers` so nginx proxy modules forward it upstream.
 ///
-/// **Update-don't-append (mirrors the C++ `setHeader`,
-/// `nginx-otel/src/http_module.cpp:278-307`):** an inbound request may already
-/// carry a `traceparent` (the common case under `propagate`).  Always pushing a
-/// *new* entry would leave the inbound header in place — so the
-/// upstream received TWO `traceparent` headers (the stale inbound one and our
-/// freshly-minted one), and the downstream span linkage was ambiguous.  This
-/// function now finds the existing `traceparent` and overwrites its value in
-/// place; it pushes a new entry only when none is present.  Result: exactly one
-/// outbound `traceparent`, carrying our trace_id / span_id.
+/// **Update-don't-append** (mirrors the C++ `setHeader`,
+/// `nginx-otel/src/http_module.cpp:278-307`): an inbound request may already
+/// carry a `traceparent` (common under `propagate`). Always pushing a new
+/// entry would leave the stale inbound header in place too, so upstream saw
+/// TWO `traceparent` headers and span linkage was ambiguous. This function
+/// finds an existing entry and overwrites its value in place, pushing a new
+/// entry only when none is present — exactly one outbound `traceparent`.
 ///
-/// The 55-byte value string (always version-00, fixed length) is allocated on the
-/// request pool.  When updating in place, if the existing value buffer is exactly
-/// 55 bytes we overwrite it directly; otherwise we re-point the entry at a fresh
-/// pool allocation (the C++ module re-points unconditionally — we keep the
-/// in-place write as a cheap fast path).
+/// The 55-byte value (always version-00, fixed length) is allocated on the
+/// request pool. When updating in place, an existing 55-byte value buffer is
+/// overwritten directly; otherwise the entry is re-pointed at a fresh pool
+/// allocation (the C++ module re-points unconditionally — the in-place write
+/// here is a cheap fast path).
 ///
-/// **hash-consistency (`updateRequestHeader`) finding:** the C++ module calls
-/// `updateRequestHeader` to keep nginx's typed `headers_in` fields consistent
-/// after mutating a header.  That step is a NO-OP for `traceparent`: it is NOT a
-/// member of nginx's `ngx_http_headers_in[]` hash table (verified — `traceparent`
-/// does not appear in `src/http/ngx_http_request.c`), so the `headers_in_hash`
-/// lookup returns NULL and the C++ path returns `NGX_OK` without doing anything.
-/// We therefore intentionally do NOT mirror that call.  Setting `entry->hash` to
-/// a non-zero value is sufficient for the proxy module's generic header copy.
+/// **hash-consistency finding:** the C++ module calls `updateRequestHeader`
+/// after mutating a header, to keep nginx's typed `headers_in` fields
+/// consistent. That call is a no-op for `traceparent` — it's not a member of
+/// nginx's `ngx_http_headers_in[]` hash table (verified against
+/// `src/http/ngx_http_request.c`), so the lookup returns NULL and the C++
+/// path does nothing. We therefore don't mirror that call; a non-zero
+/// `entry->hash` is sufficient for the proxy module's generic header copy.
 ///
 /// **Flags field:** `trace_flags` is the full 8-bit W3C trace-flags octet
 /// (W3C Trace Context §3.2, <https://www.w3.org/TR/trace-context/#trace-flags>).
 /// All bits are preserved — callers MUST NOT collapse it to a 1-bit `sampled`
-/// boolean before passing, as that silently drops any future flag bits.
+/// boolean, which would silently drop future flag bits.
 ///
-/// On pool-allocation failure the function silently returns — tracing continues;
-/// only the inject step is skipped.
+/// On pool-allocation failure the function silently returns; tracing
+/// continues, only the inject step is skipped.
 ///
 /// # Safety
 /// `r` must be a valid, non-null `*mut ngx_http_request_t`.
@@ -522,13 +495,13 @@ unsafe fn inject_traceparent_header(
 
     let value = build_traceparent_value(trace_id, span_id, trace_flags);
 
-    // ── Find an existing `traceparent` in headers_in (mirrors C++ findHeader) ──
+    // Find an existing `traceparent` in headers_in (mirrors C++ findHeader).
     // SAFETY: `r` is valid; we walk the inbound headers list parts. The list is
     // initialised by nginx in `ngx_http_process_request_headers`.
     let existing = unsafe { find_header_in(&raw mut (*r).headers_in.headers, b"traceparent") };
 
     if !existing.is_null() {
-        // ── Update in place ───────────────────────────────────────────────────
+        // Update in place.
         // SAFETY: `existing` points to a live `ngx_table_elt_t` in headers_in.
         unsafe {
             let dst = if (*existing).value.len == 55 && !(*existing).value.data.is_null() {
@@ -554,7 +527,7 @@ unsafe fn inject_traceparent_header(
         return;
     }
 
-    // ── Absent → push a new entry (mirrors C++ ngx_list_push branch) ──────────
+    // Absent → push a new entry (mirrors C++ ngx_list_push branch).
     // Allocate key ("traceparent", 11 bytes) and value (55 bytes) on pool.
     // SAFETY: `pool` is a valid nginx pool pointer.
     let key_buf = unsafe { nginx_sys::ngx_pcalloc(pool, 11) } as *mut u8;
@@ -634,8 +607,6 @@ unsafe fn find_header_in(
     core::ptr::null_mut()
 }
 
-// ── Unit tests ────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -693,14 +664,12 @@ mod tests {
         assert_ne!(sid, [0u8; 8]);
     }
 
-    // ── update-vs-append decision (find_header_in) ───────────────────────────
-    //
-    // These tests fabricate a single-part `ngx_list_t` of `ngx_table_elt_t` on
-    // the Rust heap (both are `#[repr(C)]` POD structs) and exercise the
-    // find-then-update/push *decision*.  They do NOT touch a real nginx pool —
-    // the FFI list mutation (`ngx_list_push`) is covered by the integration test
-    // (run_traces.sh's single-traceparent assertion); here we prove the
-    // find/length logic that decides update-in-place vs push.
+    // update-vs-append decision (find_header_in): these tests fabricate a
+    // single-part `ngx_list_t` of `ngx_table_elt_t` on the Rust heap (both
+    // `#[repr(C)]` POD structs) and exercise the find-then-update/push
+    // *decision* only — they do NOT touch a real nginx pool (the FFI list
+    // mutation is covered by the integration test, run_traces.sh's
+    // single-traceparent assertion).
 
     /// Build a heap-backed single-part `ngx_list_t` from a vector of (key,value)
     /// byte pairs.  Returns the boxed list and keeps the backing storage alive in
@@ -800,7 +769,7 @@ mod tests {
         assert_eq!(flags, 0x01);
     }
 
-    // ── Regression: full trace-flags octet round-trip (finding ~433) ──────────
+    // Regression: full trace-flags octet round-trip (finding ~433).
 
     /// `build_traceparent_value` (and therefore `inject_traceparent_header`)
     /// must carry the full 8-bit W3C trace-flags octet, not just bit-0
