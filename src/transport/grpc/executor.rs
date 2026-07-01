@@ -11,13 +11,12 @@
 /// so it runs to completion independent of any handle.
 ///
 /// # No Tokio
-/// This executor does **not** use a Tokio runtime.  All wakeups go through
-/// NGINX's `ngx_post_event` / `ngx_process_events_and_timers` machinery.
+/// Wakeups go through NGINX's `ngx_post_event` /
+/// `ngx_process_events_and_timers` machinery, not a Tokio runtime.
 ///
 /// # Safety note
-/// `ngx::async_::spawn` is single-thread-only (the NGINX worker).
-/// `NgxExecutor` must only be used from within a running NGINX worker
-/// process.
+/// `ngx::async_::spawn` is single-thread-only; `NgxExecutor` must only be
+/// used from within a running NGINX worker process.
 #[derive(Clone, Copy, Default, Debug)]
 pub struct NgxExecutor;
 
@@ -37,17 +36,14 @@ where
 mod tests {
     use super::NgxExecutor;
 
-    /// Type-level check: `NgxExecutor` must implement
-    /// `hyper::rt::Executor<F>` for a concrete `F`.
-    /// This test does **not** drive a NGINX event loop; it only checks that
-    /// the impl compiles and that the trait constraint is satisfied.
+    /// Type-level check only: `NgxExecutor` implements `hyper::rt::Executor<F>`.
+    /// Does not drive a NGINX event loop.
     #[test]
     fn ngx_executor_implements_hyper_executor() {
         use core::future::Future;
         use core::pin::Pin;
         use core::task::{Context, Poll};
 
-        /// A trivially-complete future that records whether it was polled.
         struct OneShotFuture {
             polled: bool,
         }
@@ -60,7 +56,6 @@ mod tests {
             }
         }
 
-        // Type-level assertion: NgxExecutor implements Executor<OneShotFuture>.
         fn assert_executor<E, F>(_e: &E)
         where
             E: hyper::rt::Executor<F>,
@@ -71,7 +66,6 @@ mod tests {
         let exec = NgxExecutor;
         assert_executor::<NgxExecutor, OneShotFuture>(&exec);
 
-        // Also verify Clone / Copy / Default / Debug derive correctly.
         let _cloned = exec;
         let _default: NgxExecutor = Default::default();
         let _dbg = std::format!("{:?}", exec);

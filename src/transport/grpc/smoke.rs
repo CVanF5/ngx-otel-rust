@@ -5,17 +5,14 @@
 
 //! In-worker unary gRPC viability harness.
 //!
-//! The two reusable artifacts —
 //! [`NgxExecutor`](super::executor::NgxExecutor) and
-//! [`SendRequestService`](super::shim::SendRequestService) — must be exercised
+//! [`SendRequestService`](super::shim::SendRequestService) must be exercised
 //! by the REAL production pipeline `tonic → SendRequest → NgxConnIo → C event
-//! handlers`, not by a freestanding `cargo test` smoke that drives its own
+//! handlers`, not a freestanding `cargo test` smoke driving its own
 //! non-production executor and `SpinTcpIo` instead of the real [`NgxConnIo`].
-//!
-//! This module is the fix.  When the `test-support` feature is enabled
-//! (set in `Cargo.toml`'s `[features]` block and passed to
-//! `cargo build --features test-support`), nginx's `init_process`
-//! callback on Worker 0 calls [`fire_one_grpc_export`] if the directive
+//! This module is that harness: with the `test-support` feature enabled,
+//! nginx's `init_process` callback on Worker 0 calls [`fire_one_grpc_export`]
+//! if this directive is set:
 //!
 //! ```nginx
 //! http {
@@ -23,8 +20,7 @@
 //! }
 //! ```
 //!
-//! is set in the running configuration.  The fire function exercises the
-//! whole stack end-to-end:
+//! The fire function exercises the whole stack end-to-end:
 //!
 //! ```text
 //!   ngx::async_::spawn   →  fire_one_grpc_export(...)
@@ -46,23 +42,17 @@
 //!                                   export(request).await
 //! ```
 //!
-//! When the worker is built with `--with-debug` (the canonical `make
-//! build` path), this same stack runs under nginx's `NGX_DEBUG`-enabled
-//! C event handlers — the exact path that previously surfaced the
-//! `pc.name` NULL deref.  Passing under `--with-debug` is the meaningful
-//! viability proof.
+//! Under `--with-debug` (the canonical `make build` path) this runs under
+//! nginx's `NGX_DEBUG`-enabled C event handlers — the exact path that
+//! previously surfaced the `pc.name` NULL deref, making that build flag the
+//! meaningful viability proof.
 //!
 //! # Production builds
 //!
-//! In builds where `test-support` is **not** enabled (i.e., the normal
-//! production `cargo build --release` or `make build-release`), this
-//! module is not compiled at all.  The `otel_grpc_smoke_endpoint`
-//! directive is still parsed for forward-compatibility but the trigger
-//! logic in `src/lib.rs::init_process` is `#[cfg]`-gated to match, so the
-//! directive becomes a silent no-op.  Production builds carry no gRPC
-//! code beyond the small `NgxExecutor` + `SendRequestService` types,
-//! which are themselves dead-code unless a future change swaps
-//! the export loop onto the gRPC transport.
+//! Without `test-support` this module is not compiled at all; the
+//! `otel_grpc_smoke_endpoint` directive is still parsed for
+//! forward-compatibility but the trigger in `src/lib.rs::init_process` is
+//! `#[cfg]`-gated to match, so it becomes a silent no-op.
 
 use core::ptr::NonNull;
 
@@ -189,14 +179,12 @@ pub async fn fire_one_grpc_export(
     endpoint_str: &str,
     log: NonNull<ngx_log_t>,
 ) -> Result<(), SmokeError> {
-    // 1. Parse the endpoint string using the same parser as
-    //    HyperHttpTransport so the configuration semantics match.
+    // 1. Parse using the same parser as HyperHttpTransport (matching config semantics).
     let endpoint = ParsedEndpoint::parse(endpoint_str)
         .map_err(|e| SmokeError::InvalidEndpoint(std::format!("{e:?}")))?;
 
-    // 2. Build the URI string we need later for `Grpc::with_origin` BEFORE
-    //    moving `endpoint` into `connector.connect(&...)` — needed because
-    //    the connect call borrows `endpoint` and we need this string after.
+    // 2. Build the origin URI string before moving `endpoint` into
+    //    `connector.connect(&...)`, which borrows it.
     let origin_str = match &endpoint {
         ParsedEndpoint::Http { host, port, .. } => {
             std::format!("http://{host}:{port}")
@@ -217,10 +205,9 @@ pub async fn fire_one_grpc_export(
         .parse()
         .map_err(|e: http::uri::InvalidUri| SmokeError::InvalidOrigin(std::format!("{e}")))?;
 
-    // 3. Connect via the production transport's NgxConnector.  This is the
-    //    same code path the OTLP/HTTP transport uses — every byte of the
-    //    eventual gRPC traffic will flow through `NgxConnIo`'s
-    //    `poll_read`/`poll_write` with C-handler-driven wakeups (no spin).
+    // 3. Connect via the production NgxConnector — same path the OTLP/HTTP
+    //    transport uses; all gRPC traffic flows through NgxConnIo's
+    //    poll_read/poll_write with C-handler-driven wakeups (no spin).
     let connector = NgxConnector::new(log);
     let log_ptr = log.as_ptr();
     let io = connector
@@ -228,32 +215,20 @@ pub async fn fire_one_grpc_export(
         .await
         .map_err(|e| SmokeError::Connect(std::format!("{e:?}")))?;
 
-    // 4. HTTP/2 handshake driven by NgxExecutor.  The handshake performs
-    //    the SETTINGS exchange and returns:
-    //      - `sender`: hyper's `SendRequest`, our handle for issuing requests.
-    //      - `conn`: hyper's `Connection` — the user-side request dispatcher.
+    // 4. HTTP/2 handshake driven by NgxExecutor. `conn` (the request-stream
+    //    dispatcher) must be polled for `sender` to actually send requests —
+    //    the h2-frame-level ConnTask is already spawned inside
+    //    `handshake.await` via NgxExecutor's `Http2ClientConnExec` impl.
+    //    Turbofish `<_, _, tonic::body::Body>` is required because `B` isn't
+    //    inferable from the handshake call alone.
     //
-    //    Hyper's docs require that `conn` be polled (typically by spawning
-    //    `conn.await` on the same executor) for `sender` to actually send
-    //    requests.  The underlying h2-frame-level ConnTask was already
-    //    spawned by hyper internally inside `handshake.await` (via the
-    //    `Http2ClientConnExec` impl on `NgxExecutor`); the `conn` we get
-    //    back is the request-stream dispatcher on top of that.
-    //
-    //    The turbofish `<_, _, tonic::body::Body>` is required because the
-    //    body type `B` can't be inferred from the handshake call alone —
-    //    it's determined by what the returned `SendRequest` will be used
-    //    for downstream (tonic's body type).
-    //
-    //    Background — what this fix relies on:
-    //    h2's `Streams::drop` calls `task.wake()` while holding its
-    //    `Arc<Mutex<Inner>>` guard.  Prior to the ngx-rust patch on the
-    //    `ngx-otel-rust-deadlock-fix` branch (see ngx-rust/src/async_/
-    //    spawn.rs::schedule), `Waker::wake()` synchronously re-polled the
-    //    parked task on the same call stack, which then tried to re-acquire
-    //    the same Mutex — deadlock.  Patched `schedule()` always defers
-    //    via `ngx_post_event`, matching what every other "custom executor
-    //    for h2" (Tokio's LocalSet, async-executor) does by design.
+    //    Depends on the ngx-rust `ngx-otel-rust-deadlock-fix` patch
+    //    (ngx-rust/src/async_/spawn.rs::schedule): h2's `Streams::drop` calls
+    //    `task.wake()` while holding its `Arc<Mutex<Inner>>` guard. Before the
+    //    patch, `wake()` synchronously re-polled the parked task on the same
+    //    call stack, re-acquiring the same Mutex → deadlock. Patched
+    //    `schedule()` always defers via `ngx_post_event`, matching every
+    //    other "custom executor for h2" (Tokio's LocalSet, async-executor).
     let handshake_fut =
         hyper::client::conn::http2::handshake::<_, _, tonic::body::Body>(NgxExecutor, io);
 
@@ -311,11 +286,10 @@ async fn mpsc_send_one(
 /// and receive-half **asymmetrically** to prove they are independently
 /// pollable without deadlock, livelock, or a Tokio runtime.
 ///
-/// The asymmetric drain sequence (Phase A: send 3, drain 3; Phase B: send 7,
-/// drain 7; Phase C: close then confirm stream end) is the mechanical contract.
-/// These A/B/C labels name the steps of this one test, not project milestones.
-/// If the bridge serializes send and receive,
-/// the Phase-A drain hangs — the function reports that via `BidiCall`.
+/// Mechanical contract (Phase A/B/C name the steps of this one test, not
+/// project milestones): Phase A send 3, drain 3; Phase B send 7, drain 7;
+/// Phase C close then confirm stream end. If the bridge serializes send and
+/// receive, the Phase-A drain hangs and the function reports that via `BidiCall`.
 ///
 /// On success logs `"bidi smoke: bidi complete (sent=10, received=10)"` at
 /// NOTICE — the exact string `run_grpc_bidi_smoke.sh` asserts on.
@@ -608,25 +582,8 @@ pub async fn fire_bidi_overload(
 
     // 8. Overload loop.
     //
-    // Design rationale for the in-flight counter approach
-    // ────────────────────────────────────────────────────
-    // The natural "race mpsc::poll_ready against a timer" pattern would
-    // require the mpsc channel to actually fill.  On localhost, tonic+h2
-    // buffers all frames internally in h2's send queue, so the mpsc receiver
-    // (tonic) drains as fast as the nginx event loop schedules it — the
-    // channel never fills and poll_ready never returns Pending.
-    //
-    // Instead we track `in_flight = sent − received_ctr`.  When in_flight
-    // reaches WINDOW we know the server is lagging by WINDOW messages.  We
-    // then wait give_up_ms for a pong to arrive.  If no pong arrives the
-    // iteration is counted as a drop: the producer would have had to wait
-    // longer than the give-up budget to make progress.
-    //
-    // This is semantically equivalent to the poll_ready timeout on a system
-    // where h2 backpressure propagates all the way to the mpsc sender, and
-    // produces the same observable guarantee: a slow server causes drops,
-    // drops are counted, and the stream is not deadlocked.
-
+    // In-flight counter approach — see "Drop-counting mechanism" in the
+    // function doc above for the full rationale.
     let received_ctr = std::sync::Arc::new(core::sync::atomic::AtomicU64::new(0));
     let drain_done = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
 
@@ -655,11 +612,7 @@ pub async fn fire_bidi_overload(
     let overload_start = std::time::Instant::now();
 
     while overload_start.elapsed() < duration {
-        // ── Backpressure check ───────────────────────────────────────────────
-        //
-        // If in_flight has reached WINDOW, the server is WINDOW messages
-        // behind.  Wait give_up for a pong; if none arrives, count a drop.
-        // This loop re-checks until in_flight < WINDOW or the overload ends.
+        // Backpressure check: re-check until in_flight < WINDOW or time is up.
         loop {
             let recv = received_ctr.load(Ordering::Relaxed);
             let in_flight = sent.saturating_sub(recv);
@@ -691,11 +644,8 @@ pub async fn fire_bidi_overload(
             break;
         }
 
-        // ── Send a ping ─────────────────────────────────────────────────────
-        //
         // poll_ready is required by futures_channel's contract before
-        // start_send.  On localhost it always returns Ready immediately, but
-        // the contract must be upheld.
+        // start_send, even though it's always Ready on localhost.
         match core::future::poll_fn(|cx| tx.poll_ready(cx)).await {
             Ok(()) => {}
             Err(_) => break, // receiver dropped

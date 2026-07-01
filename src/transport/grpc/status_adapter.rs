@@ -5,18 +5,14 @@
 
 //! OTLP/gRPC status → `DeliveryOutcome` adapter.
 //!
-//! This module provides two reusable, testable free functions:
+//! Two free functions, kept separate so a future OTAP adapter can reuse
+//! `grpc_code_to_outcome` with its own hint-extraction path (OTAP may surface
+//! the pushback hint differently from OTLP/gRPC):
 //!
 //! - `extract_grpc_retry_hint` — reads both `RetryInfo` detail **and** the
-//!   `grpc-retry-pushback-ms` trailer from a `tonic::Status`, returning the
-//!   strongest hint available as a `Duration`.
-//!
+//!   `grpc-retry-pushback-ms` trailer, returning the strongest hint as a `Duration`.
 //! - `grpc_code_to_outcome` — maps a `tonic::Code` + an optional retry hint
 //!   to a [`DeliveryOutcome`].
-//!
-//! They are kept separate so that a future OTAP adapter can reuse
-//! `grpc_code_to_outcome` with its own hint-extraction path (OTAP may surface
-//! the pushback hint differently from OTLP/gRPC).
 //!
 //! # gRPC code space
 //!
@@ -48,31 +44,14 @@ use crate::transport::DeliveryOutcome;
 
 // ── Minimal google.rpc proto decode types ────────────────────────────────────
 //
-// These are the minimum structures needed to decode `google.rpc.RetryInfo`
-// from the binary payload in `tonic::Status::details()`.
+// Minimum structures to decode `google.rpc.RetryInfo` from the binary
+// payload in `tonic::Status::details()` (a `google.rpc.Status` proto: field 3
+// = `repeated google.protobuf.Any details`; each `Any` has field 1 =
+// `type_url: string`, field 2 = `value: bytes`).
 //
-// The `status.details()` bytes are the raw encoding of a `google.rpc.Status`
-// proto (field 3 = `repeated google.protobuf.Any details`; each `Any` has
-// field 1 = `type_url: string` and field 2 = `value: bytes`).
-//
-// We hand-write these with `#[derive(prost::Message)]` rather than adding a
-// full `googleapis` proto dependency: the structs below are structurally
-// identical to the generated forms, and the `prost_types` crate (already a
-// transitive dep) provides `prost_types::Duration` for the `retry_delay` field.
-
-// Field-number source pins:
-//   google.rpc.Status:    https://github.com/googleapis/googleapis/blob/master/google/rpc/status.proto
-//     field 1  code    int32
-//     field 2  message string
-//     field 3  details repeated google.protobuf.Any   ← the only field we decode
-//   google.protobuf.Any:  https://github.com/protocolbuffers/protobuf/blob/main/src/google/protobuf/any.proto
-//     field 1  type_url string
-//     field 2  value    bytes
-//   google.rpc.RetryInfo: https://github.com/googleapis/googleapis/blob/master/google/rpc/error_details.proto
-//     field 1  retry_delay google.protobuf.Duration
-//   google.protobuf.Duration: https://github.com/protocolbuffers/protobuf/blob/main/src/google/protobuf/duration.proto
-//     field 1  seconds int64
-//     field 2  nanos   int32
+// Hand-written with `#[derive(prost::Message)]` rather than a full
+// `googleapis` dependency — structurally identical to the generated forms,
+// and `prost_types` (already a transitive dep) supplies `Duration`.
 
 /// Minimal decode of `google.protobuf.Any` (field layout is canonical protobuf).
 ///
@@ -235,42 +214,17 @@ fn proto_duration_to_std(d: prost_types::Duration) -> Option<Duration> {
 
 /// Map a `tonic::Code` + an optional retry hint to a [`DeliveryOutcome`].
 ///
-/// This function encodes the OTLP/gRPC retry classification mandated by the
-/// OTLP specification's failure-handling rules
-/// (<https://opentelemetry.io/docs/specs/otlp/#failures>):
-///
-/// - `OK` → `Accepted` (the caller handles `partial_success`; this function is
-///   only called on error paths — see `grpc_status_to_outcome` for the full
-///   flow).
-///
-/// - Retryable set (unconditional): `CANCELLED`, `DEADLINE_EXCEEDED`,
-///   `ABORTED`, `OUT_OF_RANGE`, `UNAVAILABLE`, `DATA_LOSS` →
-///   `Retryable { retry_after: hint }`.
-///
-/// - `RESOURCE_EXHAUSTED` → `Retryable { retry_after: hint }` **only** when
-///   `hint.is_some()`; with no hint → `Permanent` (spec: retryable only when
-///   the server signals recoverability).
-///
-/// - `INVALID_ARGUMENT`, `INTERNAL`, `UNIMPLEMENTED` → `Permanent`.
-///
-/// - `UNAUTHENTICATED`, `PERMISSION_DENIED` → `Unauthorized` (non-retryable;
-///   same drop action as `Permanent`, distinct counter + "check credentials"
-///   log).
-///
-/// - All other codes (unknown, failed_precondition, not_found, etc.) →
-///   `Permanent` (conservative: unknown codes are not retried).
+/// Encodes the OTLP/gRPC retry classification mandated by the OTLP
+/// specification's failure-handling rules
+/// (<https://opentelemetry.io/docs/specs/otlp/#failures>); see the per-arm
+/// comments below for the exact mapping.
 ///
 /// # Reusability for OTAP
 ///
 /// OTAP's `BatchStatus.StatusCode` uses the **same gRPC code space**
-/// (`arrow_service.proto:132`).  A future OTAP adapter can call this function
-/// with the mapped `tonic::Code` and its own hint (e.g. from a different
-/// source), so no changes to this function are needed for OTAP.
-///
-/// The hint is intentionally a parameter (not derived internally here) so that
-/// callers with different hint sources (e.g., OTAP's in-proto pushback field)
-/// can pass their own `Option<Duration>` without duplicating the code
-/// classification logic.
+/// (`arrow_service.proto:132`), so a future OTAP adapter can call this
+/// function with its own hint source without duplicating the classification
+/// logic — hence `hint` is a parameter rather than derived internally here.
 pub(crate) fn grpc_code_to_outcome(code: tonic::Code, hint: Option<Duration>) -> DeliveryOutcome {
     match code {
         // ── Accepted ──────────────────────────────────────────────────────

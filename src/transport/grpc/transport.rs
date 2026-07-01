@@ -9,10 +9,10 @@
 //!
 //! # Connection lifecycle
 //!
-//! The h2 connection is established lazily on the first `send`
-//! call and reused across subsequent calls.  If any call fails, the client
-//! is dropped so the next `send` reconnects fresh.  This matches
-//! the reconnect-on-failure parity expected of the HTTP transport.
+//! The h2 connection is established lazily on the first `send` call and
+//! reused across subsequent calls; any call failure drops the client so the
+//! next `send` reconnects fresh (reconnect-on-failure parity with the HTTP
+//! transport).
 //!
 //! # No Tokio runtime
 //!
@@ -22,11 +22,10 @@
 //!
 //! # Encode → decode round-trip
 //!
-//! The incoming `bytes` are an already-encoded `ExportMetricsServiceRequest`
-//! (the same bytes the HTTP path POSTs).  `prost::Message::decode` recovers
-//! the typed struct, which is then passed to `client.export()`.  The encode
-//! → decode round-trip is cold-path and cheap; a zero-copy codec optimisation
-//! is deferred to a later phase.
+//! `bytes` is an already-encoded `ExportMetricsServiceRequest` (the same
+//! bytes the HTTP path POSTs); `prost::Message::decode` recovers the typed
+//! struct for `client.export()`.  Cold-path and cheap; a zero-copy codec
+//! optimisation is deferred to a later phase.
 
 use core::ptr::NonNull;
 use std::boxed::Box;
@@ -134,11 +133,8 @@ impl<C: Connector> GrpcTransport<C> {
     pub(crate) fn with_connector(endpoint_str: &str, connector: C) -> Result<Self, TransportError> {
         let endpoint = ParsedEndpoint::parse(endpoint_str)?;
 
-        // Build the origin URI: `http://host:port` or `https://host:port` (no path).
-        // This is what tonic's `MetricsServiceClient::with_origin` expects.
-        // For HTTPS endpoints the scheme is `https://` so tonic's H2 framing
-        // uses the correct authority and scheme in the :authority / :scheme
-        // pseudo-headers.
+        // Origin URI (no path) for `MetricsServiceClient::with_origin`; scheme
+        // must match so tonic's H2 framing sets the right :authority/:scheme.
         let origin_str = match &endpoint {
             ParsedEndpoint::Http { host, port, .. } => {
                 std::format!("http://{host}:{port}")
@@ -218,11 +214,9 @@ where
         &mut self,
         bytes: std::vec::Vec<u8>,
     ) -> Result<crate::transport::DeliveryOutcome, TransportError> {
-        // ── Decode bytes → typed request ──────────────────────────────────
-        //
         // The encoder (OtlpHttpEncoder) emits a bare ExportMetricsServiceRequest
-        // protobuf (verified by encoder::tests::round_trip_produces_valid_protobuf).
-        // Decoding here is cold-path and cheap (~microseconds for typical batches).
+        // protobuf (verified by encoder::tests::round_trip_produces_valid_protobuf);
+        // decoding here is cold-path and cheap.
         let req = ExportMetricsServiceRequest::decode(bytes.as_slice()).map_err(|e| {
             TransportError::Connection {
                 cause: std::format!(
@@ -231,20 +225,15 @@ where
             }
         })?;
 
-        // ── Lazy connect ──────────────────────────────────────────────────
-        //
-        // If we don't have a live client (first send, or after a prior failure
-        // dropped the connection), build one now.  This mirrors the construction
-        // in smoke.rs:200-271.
+        // Lazy connect: build a client only if none is live (first send, or
+        // after a prior failure dropped the connection). Mirrors smoke.rs:200-271.
         if self.client.is_none() {
-            // 1. Connect via the configured connector (NgxConnector in
-            //    production); for https:// endpoints this wraps the stream in
-            //    TLS (ALPN h2) so the h2 handshake runs encrypted.
+            // 1. Connect (wraps in TLS w/ ALPN h2 for https:// endpoints).
             let io = self.connect_io().await?;
 
-            // 2. HTTP/2 handshake driven by NgxExecutor.
-            //    Turbofish `<_, _, tonic::body::Body>` required so hyper knows
-            //    the body type the returned SendRequest will be used for.
+            // 2. HTTP/2 handshake driven by NgxExecutor. Turbofish
+            //    `<_, _, tonic::body::Body>` required so hyper knows the body
+            //    type the returned SendRequest will be used for.
             let (sender, conn) =
                 hyper::client::conn::http2::handshake::<_, _, tonic::body::Body>(NgxExecutor, io)
                     .await
@@ -252,9 +241,8 @@ where
                         cause: std::format!("gRPC h2 handshake failed: {e}"),
                     })?;
 
-            // 3. Drive `conn` (the request-stream dispatcher) on the NGINX event loop.
-            //    Detached: we don't need to await its completion; it runs until the
-            //    connection closes (at which point it resolves and the task is cleaned up).
+            // 3. Drive `conn` (request-stream dispatcher) on the NGINX event
+            //    loop, detached — it runs until the connection closes.
             ngx::async_::spawn(async move {
                 let _ = conn.await;
             })
@@ -267,19 +255,14 @@ where
             ));
         }
 
-        // ── Issue unary Export ────────────────────────────────────────────
-        //
-        // Take ownership of the client (Option::take) so there is no
-        // borrow of `self.client` across the `.await` point, allowing us to
-        // either put it back (on success) or drop it (on failure) afterward.
+        // Option::take avoids a borrow of `self.client` across the `.await`
+        // point, so we can put it back (success) or drop it (failure) after.
         let mut client = self.client.take().expect("just connected above");
         let result = client.export(tonic::Request::new(req)).await;
 
         match result {
             Ok(resp) => {
-                // Connection still alive — store the client back for reuse.
                 self.client = Some(client);
-                // decode partial_success from the OK response.
                 // partial_success.rejected_data_points > 0 → PartialReject; else Accepted.
                 let rejected = resp
                     .into_inner()
@@ -300,15 +283,10 @@ where
                 }
             }
             Err(status) => {
-                // `client` is dropped here (not stored back), forcing a fresh
-                // reconnect on the next `send`.  This matches the reconnect-on-
-                // failure parity with HyperHttpTransport (which opens a new
-                // connection on every send).
-                //
-                // map the gRPC status code to a protocol-neutral outcome
-                // instead of folding all errors into TransportError::Connection.
-                // The caller (drain loop) matches on DeliveryOutcome and applies
-                // the right policy (retry / drop / backoff / unauthorized).
+                // `client` is dropped here (not stored back) to force a fresh
+                // reconnect next `send` — reconnect-on-failure parity with
+                // HyperHttpTransport. Map to a protocol-neutral outcome so the
+                // drain loop can apply retry/drop/backoff/unauthorized policy.
                 Ok(grpc_status_to_outcome(&status))
             }
         }
@@ -471,13 +449,12 @@ mod tests {
     use crate::transport::hyper_http::NgxConnector;
     use crate::transport::TransportError;
 
-    /// Type-level check: `GrpcTransport<NgxConnector>` is constructible from
-    /// a valid endpoint string.  No live collector required — this only tests
-    /// the parse/construction path.
+    /// `GrpcTransport<NgxConnector>` must be constructible from a valid
+    /// endpoint string (no live collector required — parse/construction only).
     #[test]
     fn grpc_transport_valid_endpoint_parses() {
-        // Safety: we never actually use this pointer in the test; we only
-        // construct GrpcTransport to verify the parse + URI build succeeds.
+        // Never dereferenced: only used to construct GrpcTransport and verify
+        // parse + URI build succeeds.
         let log_ptr = core::ptr::NonNull::dangling();
         let t =
             GrpcTransport::<NgxConnector>::with_ngx_log("http://127.0.0.1:4317", log_ptr, None, 0);
@@ -496,12 +473,8 @@ mod tests {
         );
     }
 
-    /// HTTPS endpoints must be accepted by `GrpcTransport`.
-    ///
-    /// `ParsedEndpoint::parse("https://...")` returns `Https { .. }` instead
-    /// of an error; `GrpcTransport::with_connector` builds an `https://` origin
-    /// URI for tonic.  The TLS handshake is wired in the connector dispatch
-    /// layer; construction itself must succeed here.
+    /// HTTPS endpoints must be accepted by `GrpcTransport` (construction only
+    /// — the TLS handshake is wired in the connector dispatch layer).
     #[test]
     fn grpc_transport_accepts_https_endpoint() {
         let log_ptr = core::ptr::NonNull::dangling();
@@ -522,13 +495,9 @@ mod tests {
         assert_send::<GrpcTransport<NgxConnector>>();
     }
 
-    /// A DNS-name endpoint must parse and construct a `GrpcTransport` without
-    /// error.  The transport inherits DNS resolution from `NgxConnector`
-    /// via the `Connector::connect` delegation — `GrpcTransport` has no own
-    /// connect logic.  The resolver is `None` here; if `send` were called it
-    /// would produce a clear `TransportError::Connection` ("configure nginx's
-    /// resolver directive…").  This test verifies parse + origin-URI construction
-    /// succeed for a hostname endpoint.
+    /// A DNS-name endpoint must parse and construct without error. DNS
+    /// resolution itself is delegated to `NgxConnector::connect`, not tested
+    /// here (this only covers parse + origin-URI construction).
     #[test]
     fn grpc_transport_dns_endpoint_constructs_ok() {
         let log_ptr = core::ptr::NonNull::dangling();
