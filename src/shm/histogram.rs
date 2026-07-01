@@ -48,8 +48,10 @@ pub const EXP_HISTOGRAM_BUCKET_OFFSET: i32 = -160;
 /// `SECONDS_BUCKET_UPPER_US[i] = floor(1e6 · 2^((i + EXP_HISTOGRAM_BUCKET_OFFSET + 1) / 8))`.
 /// A duration `value_us` lands in the smallest `i` with `value_us ≤
 /// SECONDS_BUCKET_UPPER_US[i]` (upper-inclusive; see [`ExpHistogramSlot::record`]).
-/// Integer-µs octave boundaries (`15625 … 16000000`) land exactly on indices
-/// `111, 119, …, 191`.
+/// **Monotonically non-decreasing** (the lowest sub-µs spec buckets collapse to
+/// threshold 1, unreachable above 0 µs) — required for the `partition_point`
+/// binary search in [`ExpHistogramSlot::record`]. Integer-µs octave boundaries
+/// (`15625 … 16000000`) land exactly on indices `111, 119, …, 191`.
 ///
 /// Generated (and re-verified in `exp_histogram_seconds_bucket_exact`) with:
 /// `python3 -c "from decimal import Decimal as D, getcontext; getcontext().prec=80;
