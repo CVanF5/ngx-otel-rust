@@ -3,42 +3,22 @@
 // This source code is licensed under the Apache License, Version 2.0 license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! Drain loop running in the `nginx: otel exporter` process.
+//! Cold-path drain loop running inside the `nginx: otel exporter` process —
+//! the consumer side of the shm ring buffers written by workers. (The
+//! `exporter/` module owns process lifecycle: spawn, signals, privilege drop.)
+//! See `docs/ARCHITECTURE.md` ("Cold path" / "Windowed aggregation") for the
+//! hot/cold design and the per-signal drain-window rationale.
 //!
-//! This module (`drain/`) implements the cold-path drain loop that runs
-//! **inside the exporter process** — it is the consumer side of the shm
-//! ring buffers written by workers.  The `exporter/` module handles the
-//! exporter process lifecycle (spawn, signals, privilege drop); the one-letter
-//! difference between `export` and `exporter` made those two modules easy to
-//! confuse at a glance.
+//! [`export_loop`], spawned by `otel_exporter_cycle`: sleeps for
+//! `otel_metric_interval`, collects from all [`MetricSource`]s, encodes via
+//! [`OtlpHttpEncoder`], and ships via [`HyperHttpTransport<NgxConnector>`]
+//! (production only — `SpinConnector` is test-only). On send failure the
+//! batch is enqueued in a bounded retry buffer (drop-oldest on overflow). On
+//! `ngx_quit`: flushes the retry buffer, sends one final batch, sets
+//! [`EXPORT_LOOP_DONE`]. On `ngx_terminate`: returns immediately, no drain.
 //!
-//! [`export_loop`] runs inside the **exporter process**, spawned by
-//! `otel_exporter_cycle` in `src/exporter/mod.rs`. It:
-//!   1. Sleeps for the configured `otel_metric_interval`.
-//!   2. Collects metrics from all configured [`MetricSource`]s.
-//!      (shm rings written by workers, mapped via fork-shared pages)
-//!   3. Encodes via [`OtlpHttpEncoder`].
-//!   4. Ships via [`HyperHttpTransport<NgxConnector>`] (production transport only;
-//!      `SpinConnector` is test-only and never used here).
-//!   5. On send failure: enqueues bytes in a bounded retry buffer; drops the
-//!      oldest entry when the buffer is full.
-//!   6. On `ngx_quit`: flushes the retry buffer and sends one final batch,
-//!      then sets [`EXPORT_LOOP_DONE`] and returns cleanly.
-//!   7. On `ngx_terminate`: returns immediately without any drain.
-//!
-//! # Config capture
-//! `MainConfig` is captured at spawn time (exporter startup). On SIGHUP
-//! reload nginx creates a new exporter process with a new cycle and config.
-//! The new exporter spawns its own `export_loop` task.
-//! `MainConfig::old_config` provides the hook for cross-cycle
-//! state transfer (TLS connection reuse, etc.).
-//!
-//! # Graceful drain on SIGQUIT-during-sleep
-//! The exporter is not a worker and is not subject to
-//! `ngx_event_no_timers_left`. Cancelable timers fire normally
-//! when the exporter exits on `ngx_quit`, so the chunked sleep reliably
-//! detects shutdown and runs the drain (see [`graceful_drain`]). No separate
-//! `exit_process` flush path on the worker side is needed.
+//! `MainConfig` is captured at spawn time; a SIGHUP reload spawns a new
+//! exporter process with its own config and `export_loop` task.
 
 use core::future::Future;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -118,15 +98,11 @@ use graceful::account_drops_and_clear;
 /// RAII guard that stores `true` to [`EXPORT_LOOP_DONE`] on every exit path of
 /// [`export_loop`], including early returns on startup failures.
 ///
-/// Before this guard existed, early returns at the endpoint-parse and
-/// transport-construction paths left `EXPORT_LOOP_DONE` unset. The drain-wait
-/// loop in `otel_exporter_cycle` then blocked indefinitely inside
-/// `ngx_process_events_and_timers` (no active fds or timers → epoll/kqueue
-/// never returned) → `nginx -s quit` hung until manual SIGTERM.
-///
-/// A local `let _done_guard = ExportLoopDoneGuard;` at the top of `export_loop`
-/// ensures the flag is set whenever the future resolves, regardless of which
-/// `return` is taken.
+/// Without it, an early return (endpoint-parse / transport-construction
+/// failure) leaves the flag unset and `otel_exporter_cycle`'s drain-wait
+/// blocks indefinitely in `ngx_process_events_and_timers` — `nginx -s quit`
+/// hangs until manual SIGTERM. A local `let _done_guard = ExportLoopDoneGuard;`
+/// at the top of `export_loop` covers every `return`.
 struct ExportLoopDoneGuard;
 
 impl Drop for ExportLoopDoneGuard {
@@ -145,29 +121,14 @@ const GRACEFUL_DRAIN_PER_ATTEMPT_BUDGET: Duration = Duration::from_secs(2);
 /// Per-attempt wall-clock budget for every *periodic* (non-drain) send —
 /// fresh metrics/logs/spans batches and their retry-queue drains.
 ///
-/// Why this is needed: periodic sends were previously awaited bare. The only
-/// backstop is the transport's read timer (`DEFAULT_READ_TIMEOUT_MS` = 60 s),
-/// and that only covers connect + read — a `poll_write` that returns `NGX_AGAIN`
-/// against a collector whose receive window has stalled arms NO timer, so a
-/// write can hang unbounded. Even within the 60 s read backstop, a single
-/// export wake chains several sends (3 retry drains + up to 3 fresh sends), so
-/// one wake could stall for minutes, and shutdown flags are only polled
-/// *between* wakes — `nginx -s quit` would block for that whole time.
-///
-/// Value choice (15 s): it must be ≤ the 60 s read backstop (so it is the
-/// effective cap, not a no-op) yet comfortably larger than a healthy send's
-/// latency so a momentarily slow-but-live collector is not falsely treated as
-/// failed (a healthy OTLP POST completes in well under a second). It is
-/// deliberately *much* larger than the 250 ms `SHUTDOWN_POLL_INTERVAL` drain
-/// tick and independent of `otel_metric_interval` (which gates how often a wake
-/// occurs, not how long one send may take): the budget bounds a single hung
-/// send, while the inter-send flag checks added in `export_loop` bound how many
-/// such sends a quit can wait behind within one wake. Worst-case quit latency
-/// is therefore one in-flight send's remaining budget (< 15 s), not minutes.
-/// On expiry the batch takes the EXISTING transient-failure path (retry-queue
-/// enqueue with eviction + failure-counter bump + ERR log) — no new semantics,
-/// no wire-byte change (the in-flight future is dropped, cancelling the
-/// connection via `Drop`, exactly as a transport error would unwind).
+/// The transport's read timer (60 s) does not bound `poll_write` against a
+/// stalled receive window, so a write can hang unbounded; a single export
+/// wake chains up to 6 sends, so an unbounded hang could block `nginx -s
+/// quit` for minutes. 15 s: below the 60 s read backstop (stays the
+/// effective cap), well above a healthy send's latency (sub-second). On
+/// expiry the batch takes the existing transient-failure path (retry-queue
+/// enqueue + failure-counter bump + ERR log) — no wire-byte change, the
+/// in-flight future is dropped exactly as a transport error would unwind.
 const PERIODIC_SEND_BUDGET: Duration = Duration::from_secs(15);
 
 /// Maximum slice of the export interval that may pass between `ngx_quit`
@@ -197,21 +158,10 @@ const BACKOFF_CAP_MS: u64 = 30_000;
 /// Selects between the HTTP and gRPC production transports.
 ///
 /// Built once in [`export_loop`] from `amcf.export_protocol()` and threaded
-/// through [`graceful_drain`].  A concrete enum (rather than a boxed trait
-/// object) keeps `send` statically dispatched (both variants are cold-path
-/// anyway — the export loop runs in a dedicated process that is not on the hot
-/// request path).
-///
-/// # Exit-time flush note
-///
-/// The final flush is handled uniformly for both transports by the in-loop
-/// async [`graceful_drain`], which runs while the nginx event loop is still
-/// alive. There is no separate synchronous exit-time flush path: it would
-/// mean building a blocking one-shot stack after the async runtime has been
-/// torn down, which is fragile (and impossible for gRPC's h2). This is safe
-/// because the exporter process stays alive until `EXPORT_LOOP_DONE` is set
-/// (by `graceful_drain` after it completes), so `graceful_drain` always runs
-/// before `process::exit`.
+/// through [`graceful_drain`], which is the sole exit-time flush path (see
+/// `docs/ARCHITECTURE.md`, "Cold path"). A concrete enum (rather than a boxed
+/// trait object) keeps `send` statically dispatched — both variants are
+/// cold-path anyway.
 #[allow(clippy::large_enum_variant)]
 enum ExportTransport {
     Http(HyperHttpTransport<NgxConnector>),
@@ -307,21 +257,10 @@ fn shutdown_requested() -> bool {
 
 // ── Main export loop ─────────────────────────────────────────────────────────
 
-/// Async export loop — spawned by `otel_exporter_cycle` inside the exporter process.
-///
-/// Runs in the `nginx: otel exporter` process, not a worker.
-/// The shm rings (written by worker bumps) are read across the fork boundary
-/// via the same mapped pages — fork-shared memory is coherent for atomic reads.
-///
-/// Takes `&'static MainConfig` because the loop task outlives the spawn call;
-/// NGINX allocates MainConfig from the cycle pool which has exporter lifetime.
-///
-/// Decide which per-signal endpoint directives are silently ignored under
-/// gRPC transport (path routing is not applicable to gRPC). Returns the signal
-/// names (in metrics/logs/traces order) whose endpoint field is non-empty — the
-/// caller logs one WARN per returned name. Extracted so the predicate is unit-
-/// testable without a live exporter loop (the production `export_loop` calls this
-/// exact function; see `grpc_ignored_endpoint_names_predicate`).
+/// Names of per-signal endpoint directives (in metrics/logs/traces order)
+/// that are non-empty and therefore silently ignored under gRPC transport
+/// (path routing does not apply to gRPC). Caller logs one WARN per name.
+/// Extracted so the predicate is unit-testable without a live exporter loop.
 fn grpc_ignored_endpoint_names(
     metrics: &nginx_sys::ngx_str_t,
     logs: &nginx_sys::ngx_str_t,
@@ -342,19 +281,16 @@ fn grpc_ignored_endpoint_names(
 
 // ── QUIT-DEFER test-support hook ───────────────────────────────────────────────
 //
-// `NGX_OTEL_QUIT_DEFER_TICKS` delays `ngx_quit` processing for N × 250 ms
+// `NGX_OTEL_QUIT_DEFER_TICKS` delays `ngx_quit` processing for N x 250ms
 // periodic ticks, keeping the old exporter's ring drains alive during the
-// overlap window with a newly-started successor exporter.  Used by
-// mutation-evidence runs to create a deterministic SPSC race window:
-//   fixed code  + defer → abdicates within one tick (`successor_announced`
-//               returns true) → chaos PASSES
-//   mutated code + defer → both exporters drain the same rings for N ticks
-//               → duplicates / conservation FAIL
+// overlap window with a newly-started successor exporter — creates a
+// deterministic SPSC race window for mutation-evidence runs (fixed code
+// abdicates within one tick; mutated code lets both exporters drain the same
+// rings, producing duplicates/conservation failures).
 //
-// The whole mechanism is compiled in ONLY under the "test-support" feature.
-// In production builds `QuitDefer` is a zero-sized type whose predicates are
-// `const false`, so the dual-`cfg` branching is funnelled into a single set of
-// uniform call sites in `export_loop` with zero production code change.
+// Compiled in ONLY under "test-support". In production `QuitDefer` is a
+// zero-sized type with `const false` predicates, so call sites in
+// `export_loop` are uniform with zero production code change.
 #[cfg(feature = "test-support")]
 struct QuitDefer {
     ticks: u32,
@@ -525,7 +461,9 @@ async fn send_fresh_batch(
 
 /// When `ngx_quit` is detected, runs [`graceful_drain`], sets
 /// [`EXPORT_LOOP_DONE`], and returns. The exporter cycle polls
-/// `EXPORT_LOOP_DONE` before calling `process::exit`.
+/// `EXPORT_LOOP_DONE` before calling `process::exit`. The shm rings, written
+/// by worker bumps, are read here across the fork boundary via the same
+/// mapped pages — fork-shared memory is coherent for atomic reads.
 pub async fn export_loop(amcf: &'static MainConfig) {
     let log = ngx::log::ngx_cycle_log();
 
@@ -1360,17 +1298,13 @@ impl RetrySend for MetricsRetry<'_> {
     }
 }
 
-/// Per-batch retry-drain helper shared by all three signal lanes.
+/// Per-batch retry-drain helper shared by all three signal lanes (logs,
+/// spans, metrics).
 ///
 /// Drains `queue` by attempting to send each batch via `sender.send_batch`.
 /// On permanent 4xx rejection: drops the batch, bumps `failure_counter`, ERR-logs.
 /// On transient error: re-enqueues (bounded by `retry_buffer_depth`), ERR-logs,
 /// and stops attempting sends for the rest of this drain pass.
-///
-/// Called by:
-///   logs lane    — src/drain/mod.rs (logs retry drain, `&LOGS_SEND_FAILURES`)
-///   spans lane   — src/drain/mod.rs (spans retry drain, `&TRACES_SEND_FAILURES`)
-///   metrics lane — src/drain/mod.rs (metrics retry drain, `&SEND_FAILURES`)
 ///
 /// # Safety
 /// `log` must point to a valid `ngx_log_t` or be `null_mut()`.  All log calls

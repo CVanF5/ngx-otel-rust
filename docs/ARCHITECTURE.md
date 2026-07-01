@@ -80,6 +80,15 @@ hyper / h2 / tonic HTTP-2 and gRPC stack, but **no Tokio runtime is ever
 instantiated** — the export loop runs entirely on `ngx-rust`'s single-threaded
 executor over NGINX's event loop, and workers spawn no threads or runtime.
 
+Shutdown flush is handled uniformly for both transports by the in-loop async
+`graceful_drain` (`src/drain/graceful.rs`), which runs while the nginx event
+loop is still alive. There is no separate synchronous exit-time flush path —
+that would mean building a blocking one-shot stack after the async runtime
+has torn down, which is fragile (and impossible for gRPC's h2). This is safe
+because the exporter process stays alive until `EXPORT_LOOP_DONE` is set (by
+`graceful_drain` after it completes), so the drain always runs before
+`process::exit`.
+
 A small control shared-memory zone carries a liveness heartbeat plus a flags
 word. Workers load that flags word once per request — one `Relaxed` atomic read,
 the sole hot-path branch, reserved for future dynamic reconfiguration.

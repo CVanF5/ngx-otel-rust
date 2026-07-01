@@ -193,21 +193,14 @@ pub(super) struct DrainQueues<'a> {
 ///
 /// # Why the chunked sleep timer fires on quit
 ///
-/// `ngx_event_no_timers_left()` returns `NGX_OK` (worker may exit) when the
-/// only pending timers are `cancelable`. The ngx-rust SDK marks every
-/// [`ngx::async_::sleep`] timer as cancelable
-/// (`ngx-rust/src/async_/sleep.rs:94: ev.set_cancelable(1)`), so a worker
-/// between intervals would be treated as idle and exit before its timer fired.
-/// The exporter, however, is not a worker and is not subject to
-/// `ngx_event_no_timers_left`. When SIGQUIT arrives while the exporter is
-/// between intervals, nginx's event loop does NOT cancel the sleep timer — it
-/// fires normally, the export loop detects `ngx_quit`, and runs this drain.
-/// The chunked sleep ([`super::SHUTDOWN_POLL_INTERVAL`]) caps detection latency at
-/// 250 ms.
-///
-/// This async drain is the sole final-flush path. The exporter cycle waits
-/// for `EXPORT_LOOP_DONE` before calling `process::exit`, ensuring the
-/// drain always completes.
+/// `ngx_event_no_timers_left()` treats a process as idle-exitable when only
+/// `cancelable` timers remain, and every [`ngx::async_::sleep`] timer is
+/// marked cancelable — but that check is worker-specific. The exporter is not
+/// a worker, so a SIGQUIT arriving mid-sleep does not cancel the timer; it
+/// fires normally, `export_loop` observes `ngx_quit`, and runs this drain.
+/// The chunked sleep ([`super::SHUTDOWN_POLL_INTERVAL`]) caps detection
+/// latency at 250 ms. This async drain is the sole final-flush path — the
+/// exporter cycle waits for `EXPORT_LOOP_DONE` before `process::exit`.
 ///
 /// # Reload-safe graceful drain.
 ///
