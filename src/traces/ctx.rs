@@ -9,14 +9,10 @@
 //! and stored via `set_module_ctx`.  The Log phase reads it back via
 //! `get_module_ctx` — no second header scan, no heap allocation.
 //!
-//! # Budget invariants
-//! - **Zero cost when disabled:** `SpanCtx` is only allocated when the REWRITE
-//!   handler runs AND `amcf.is_configured()` is true (handler not registered
-//!   when unconfigured — see `lib.rs postconfiguration`).
-//! - **Bounded when unsampled:** pool-alloc + one header scan + PRNG + branch.
-//!   `sampled = false` → LOG phase reads ctx and skips all ring work.
-//! - No heap (`Vec`, `Box`, `String`), no locks, no syscalls beyond the nginx
-//!   pool allocator (which is a bump allocator — effectively free).
+//! Zero-cost when disabled (allocated only when REWRITE runs and the module is
+//! configured; see `lib.rs postconfiguration`); bounded when unsampled
+//! (pool-alloc + one header scan + PRNG + branch, then LOG skips all ring
+//! work); no heap, no locks, no syscalls beyond the pool bump allocator.
 
 use nginx_sys::ngx_http_request_t;
 use ngx::core::Pool;
@@ -31,21 +27,17 @@ use ngx::http::Request;
 /// tail/exemplar and (when sampled) push a span record to the ring.
 ///
 /// # Safety / layout
-/// `Copy` is required for `Pool::calloc_type::<SpanCtx>()`.  All fields are
-/// plain arrays/scalars — no pointers into request memory.
-/// `std::time::Instant` is `Copy` on all supported platforms.
-/// The pool-alloc zeroes memory; since the entire struct is overwritten
-/// before use (see `span_start.rs`), the zeroed-bytes state is never observed.
-///
-/// Fields `parent_span_id`, `flags`, `start_time_unix_nano`, and `start_mono`
-/// are written in REWRITE and consumed in the LOG span record.
+/// `Copy` is required for `Pool::calloc_type::<SpanCtx>()`: all fields are
+/// plain arrays/scalars (no pointers into request memory), and
+/// `std::time::Instant` is `Copy` on all supported platforms.  The pool-alloc
+/// zeroes memory, but the whole struct is overwritten before use (see
+/// `span_start.rs`), so the zeroed state is never observed.
 ///
 /// # Dual-clock span timing
-/// Two anchors are captured at REWRITE:
-/// - `start_time_unix_nano`: wall-clock absolute timestamp for the span start.
-/// - `start_mono`: monotonic anchor; `start_mono.elapsed()` at LOG gives the
-///   request duration.  Span end = `start_time_unix_nano + elapsed`; guaranteed
-///   `end ≥ start` and `span (end−start) == http.server.request.duration`.
+/// Two anchors captured at REWRITE: `start_time_unix_nano` (wall-clock) and
+/// `start_mono` (monotonic). `start_mono.elapsed()` at LOG gives the request
+/// duration; span end = `start_time_unix_nano + elapsed`, guaranteeing
+/// `end ≥ start` and `span (end−start) == http.server.request.duration`.
 #[derive(Copy, Clone, Debug)]
 pub struct SpanCtx {
     /// W3C trace ID (16 bytes).
@@ -53,26 +45,22 @@ pub struct SpanCtx {
     /// This request's span ID (8 bytes, newly generated in REWRITE).
     pub span_id: [u8; 8],
     /// Inbound parent span ID from `traceparent` (zeros = root span).
-    /// Written in REWRITE; read in the LOG span record.
     pub parent_span_id: [u8; 8],
     /// W3C trace flags low byte (bit 0 = sampled, as recorded in traceparent).
-    /// Written in REWRITE; read in the LOG span record.
     pub flags: u32,
-    /// Span start time — Unix epoch, nanoseconds (set at REWRITE phase entry).
-    /// Wall-clock anchor for the absolute span start timestamp.
-    /// Written in REWRITE; read in the LOG span record.
+    /// Span start time — Unix epoch, nanoseconds (set at REWRITE phase entry);
+    /// wall-clock anchor for the absolute span start timestamp.
     pub start_time_unix_nano: u64,
     /// Monotonic anchor captured alongside `start_time_unix_nano` at REWRITE.
     ///
     /// `start_mono.elapsed()` at LOG gives the request duration, always ≥ 0.
-    /// Span end = `start_time_unix_nano + elapsed_nanos`.
-    /// Also used for the `http.server.request.duration` histogram (coherent).
-    /// Written in REWRITE; read in the LOG span record.
+    /// Span end = `start_time_unix_nano + elapsed_nanos`, also used for the
+    /// `http.server.request.duration` histogram (coherent with the span).
     pub start_mono: std::time::Instant,
     /// Whether this request is sampled.
     ///
     /// `true`  → LOG phase builds + pushes a `SpanRecord` to the spans ring.
-    /// `false` → LOG phase skips all ring work (but ctx is still available for
+    /// `false` → LOG phase skips all ring work (ctx is still available for
     ///           W3C propagation via `otel_trace_context inject`).
     pub sampled: bool,
 }
@@ -86,19 +74,17 @@ pub struct SpanCtx {
 /// nginx zeroes the whole per-request module-ctx array on an internal redirect
 /// (`ngx_http_internal_redirect` / `ngx_http_named_location`, both call
 /// `ngx_memzero(r->ctx, …)` — verified `src/http/ngx_http_core_module.c:2614`
-/// and `:2688`), which would orphan the `SpanCtx` pointer stored via
-/// `set_module_ctx`.  By allocating the `SpanCtx` as the payload of a
-/// `ngx_pool_cleanup_add` node, the node survives the redirect (it lives on the
-/// pool's cleanup list, not the ctx array) and `recover_span_ctx` can walk the
-/// list to re-install the pointer post-redirect.
+/// and `:2688`), orphaning the `SpanCtx` pointer stored via `set_module_ctx`.
+/// Allocating `SpanCtx` as the payload of a `ngx_pool_cleanup_add` node keeps
+/// it alive across the redirect (the cleanup list, unlike the ctx array,
+/// isn't zeroed), and `recover_span_ctx` walks that list to re-install it.
 ///
 /// # Drop-safety
-/// `SpanCtx` is `Copy` (all fields are plain arrays/scalars plus `std::time::Instant`,
-/// which is `Copy` on all supported platforms) — i.e. trivially destructible with
-/// no `Drop` side-effects.  A no-op handler is therefore correct: there is nothing
-/// to run at pool teardown, and the pool reclaims the bump-allocated bytes wholesale.
-/// (If `SpanCtx` ever gains a non-`Copy`, `Drop`-relevant field, this handler must
-/// run `ptr::drop_in_place` — guarded by the `Copy` assertion in the unit tests.)
+/// `SpanCtx` is `Copy` (plain arrays/scalars plus `std::time::Instant`, `Copy`
+/// on all supported platforms) — trivially destructible, so a no-op handler
+/// is correct and the pool reclaims the bytes wholesale at teardown.  If
+/// `SpanCtx` ever gains a non-`Copy`, `Drop`-relevant field, this handler must
+/// run `ptr::drop_in_place` — guarded by the `Copy` assertion in the unit tests.
 ///
 /// # Safety
 /// nginx calls this with the `data` pointer of the cleanup node at pool teardown.
@@ -133,11 +119,10 @@ pub fn alloc_span_ctx(pool: &Pool) -> *mut SpanCtx {
     if cln.is_null() {
         return core::ptr::null_mut();
     }
-    // SAFETY: `cln` is a freshly-returned, exclusively-owned cleanup node; we set
-    // its handler to the anchor and zero its payload.  `ngx_pool_cleanup_add`
-    // allocates the payload with `ngx_palloc` (NOT zeroed), so we must zero it
-    // here to preserve the previous `calloc`-based contract that callers writing
-    // only some fields (e.g. the pre-gate ctx, which sets only `flags`) rely on.
+    // SAFETY: `cln` is a freshly-returned, exclusively-owned cleanup node.
+    // `ngx_pool_cleanup_add`'s payload is `ngx_palloc`'d (NOT zeroed), so we
+    // zero it here to preserve the calloc-based contract that partial-field
+    // writers (e.g. the pre-gate ctx, which sets only `flags`) rely on.
     unsafe {
         (*cln).handler = Some(cleanup_span_ctx);
         let ctx = (*cln).data.cast::<SpanCtx>();
@@ -151,16 +136,16 @@ pub fn alloc_span_ctx(pool: &Pool) -> *mut SpanCtx {
 /// re-install it after a redirect clears the module-ctx slot.
 ///
 /// Used for the PRE-GATE `SpanCtx`: that ctx exists only so Gate 2's
-/// `$otel_parent_sampled` complex-value read can see the inbound flags WITHIN the
-/// same span-start handler pass.  It must never outlive a decline.  If the
+/// `$otel_parent_sampled` complex-value read can see the inbound flags within
+/// the same span-start handler pass, and must never outlive a decline.  If the
 /// pre-gate path registered the cleanup anchor (as [`alloc_span_ctx`] does), a
 /// Gate-2-DECLINED request that then internally redirects would have
 /// `recover_span_ctx` walk the cleanup list, find the orphaned pre-gate anchor,
-/// and re-install the stale ctx — making `$otel_trace_id` return non-empty for a
-/// declined request.  A plain alloc has no anchor, so a declined request leaves
-/// nothing for `recover_span_ctx` to find.  The final POST-GATE [`alloc_span_ctx`]
-/// (only reached when the gate PASSES) still registers the anchor, preserving the
-/// redirect-survival semantics for spans that are actually emitted.
+/// and re-install the stale ctx — making `$otel_trace_id` non-empty for a
+/// declined request.  A plain alloc leaves nothing for `recover_span_ctx` to
+/// find.  The final POST-GATE [`alloc_span_ctx`] (reached only when the gate
+/// PASSES) still registers the anchor, preserving redirect-survival for spans
+/// that are actually emitted.
 ///
 /// Returns `null_mut()` on OOM (pool bump failure — extremely rare).
 ///
@@ -173,8 +158,7 @@ pub fn alloc_span_ctx_plain(pool: &Pool) -> *mut SpanCtx {
     // valid for the request lifetime (or null on OOM).
     let ctx = unsafe { nginx_sys::ngx_pcalloc(pool.as_ptr(), core::mem::size_of::<SpanCtx>()) }
         .cast::<SpanCtx>();
-    // ngx_pcalloc already zeroes; the cast is to a freshly-zeroed SpanCtx (which is
-    // a valid all-zero bit pattern). No cleanup anchor is registered.
+    // No cleanup anchor is registered — by design (see doc comment above).
     ctx
 }
 
@@ -189,9 +173,8 @@ pub fn alloc_span_ctx_plain(pool: &Pool) -> *mut SpanCtx {
 /// `set_module_ctx`, and returns it.  Returns NULL if no anchor is found.
 ///
 /// # Hot-path note
-/// The cleanup-list walk runs **only** on the NULL-slot + redirect branch — i.e.
-/// post-redirect/filter-finalize.  On the normal (non-redirect) request path the
-/// slot is non-NULL and this is a single pointer load + branch.
+/// The cleanup-list walk runs only on the NULL-slot + redirect branch. On the
+/// normal (non-redirect) path the slot is non-NULL: a single pointer load + branch.
 ///
 /// # Safety
 /// `r` must be a valid, non-null `ngx_http_request_t`; `module` must be the
@@ -216,25 +199,22 @@ pub unsafe fn recover_span_ctx(
     if !is_redirect {
         return core::ptr::null_mut();
     }
-    // Walk the pool cleanup list for our anchor handler.
     // SAFETY: `(*r).pool` is the request pool; `.cleanup` is the head of the
     // cleanup list (possibly NULL); each node's `handler`/`data`/`next` are valid.
     unsafe {
         let mut cln = (*(*r).pool).cleanup;
         while !cln.is_null() {
-            // Identity-compare the handler pointer against our anchor.  This is
-            // the same mechanism the C++ module uses (`cln->handler ==
-            // cleanupOtelCtx`); `fn_addr_eq` is the sanctioned API for it.  The
-            // anchor is a single symbol within this cdylib, so the address is
-            // stable across all cleanup nodes we created this run.
+            // Identity-compare against our anchor — the same mechanism the C++
+            // module uses (`cln->handler == cleanupOtelCtx`); `fn_addr_eq` is the
+            // sanctioned API.  The anchor is a single symbol in this cdylib, so
+            // its address is stable across all cleanup nodes created this run.
             if (*cln)
                 .handler
                 .is_some_and(|h| core::ptr::fn_addr_eq(h, cleanup_span_ctx as NgxCleanupPt))
             {
                 let ctx = (*cln).data.cast::<SpanCtx>();
-                // Re-install into the (zeroed) module-ctx slot via the same
-                // `set_module_ctx` helper used everywhere else, ensuring
-                // consistent slot indexing and cleanup/altitude semantics.
+                // Re-install via the same `set_module_ctx` helper used
+                // everywhere else, for consistent slot/cleanup semantics.
                 // SAFETY: `r` is a valid request pointer; `Request` is a
                 // transparent newtype over `ngx_http_request_t`.
                 Request::from_ngx_http_request(r)
@@ -261,24 +241,18 @@ pub unsafe fn pool_from_request(r: *mut ngx_http_request_t) -> Pool {
 // ── DRBG — per-thread ChaCha20 CSPRNG ───────────────────────────────────────
 //
 // A reversible PRNG (e.g. xorshift64) would let an observer of a few IDs
-// recover the state and predict future trace IDs.  A seeded ChaCha20 DRBG
-// gives cryptographically-unpredictable IDs with zero per-request syscalls.
+// predict future trace IDs; a seeded ChaCha20 DRBG gives cryptographically
+// unpredictable IDs with zero per-request syscalls.  Seeded EAGERLY in worker
+// `init_process` (off the request path, one OS-entropy syscall per worker);
+// thereafter pure ChaCha20 block ops via a thread-local `Cell<Option<..>>`.
 //
-// Design (OTel-SDK-idiomatic):
-//   - Seeded EAGERLY in worker `init_process` (off the request path) via the
-//     fallible `eager_seed_drbg()` — one OS-entropy syscall per worker at
-//     worker init, not on the first traced request.
-//   - Thereafter: pure ChaCha20 block operations, no syscall per request.
-//   - Thread-local `Cell<Option<ChaCha20Rng>>` (infallible take/set access).
-//
-// Non-panicking OS-RNG failure handling:
-//   A persistent OS-RNG failure (e.g. seccomp denying `getrandom(2)`) must NOT
-//   panic inside the `extern "C"` REWRITE handler — that aborts the worker and
-//   every respawn aborts on its first traced request (a crash loop).  Instead,
-//   on seed failure we set a worker-local "tracing-disabled" flag.  Span-start
-//   reads the flag and treats the request as unsampled (serve traffic, emit no
-//   span).  We never fall back to weak/predictable IDs.  The lazy path is kept
-//   as a fallback but is likewise non-panicking (sets the same flag on failure).
+// A persistent OS-RNG failure (e.g. seccomp denying `getrandom(2)`) must NOT
+// panic inside the `extern "C"` REWRITE handler — that aborts the worker, and
+// every respawn re-aborts on its first traced request (a crash loop).
+// Instead, seed failure sets a worker-local "tracing-disabled" flag; span-start
+// reads it and treats the request as unsampled (serve traffic, emit no span).
+// We never fall back to weak/predictable IDs. The lazy path (fallback for a
+// thread that skipped eager seeding) is likewise non-panicking.
 
 use std::cell::Cell;
 
@@ -291,28 +265,23 @@ thread_local! {
     /// Worker-local "tracing disabled because OS-RNG seeding failed" flag.
     ///
     /// Set (once) when `getrandom` fails at seed time.  When set, span-start
-    /// treats every request as unsampled — no span IDs are generated, so no
-    /// weak/predictable IDs ever reach the wire.  Metrics and logs are
-    /// unaffected (they do not consult this flag).
+    /// treats every request as unsampled — no weak/predictable IDs reach the
+    /// wire.  Metrics and logs are unaffected (they don't consult this flag).
     static TRACING_DISABLED: Cell<bool> = const { Cell::new(false) };
 
     /// One-shot guard for the LAZY seed-failure EMERG log.
     ///
-    /// The lazy path is entered when a thread calls `drbg64()` without having
-    /// run `eager_seed_drbg()` first.  Unlike the eager path (where the caller
-    /// holds a `cycle` pointer and emits the EMERG itself), the lazy path must
-    /// retrieve the log handle from the nginx global cycle.  This flag ensures
-    /// the resulting log line is emitted at most once per worker thread,
-    /// matching the eager path's EMERG-once guarantee.
+    /// Entered when a thread calls `drbg64()` without having run
+    /// `eager_seed_drbg()` first; unlike the eager path, it must fetch the log
+    /// handle from the nginx global cycle.  Ensures the log line fires at most
+    /// once per worker thread, matching the eager path's EMERG-once guarantee.
     static LAZY_SEED_EMERG_LOGGED: Cell<bool> = const { Cell::new(false) };
 }
 
-// Worker-local failure-injection switch for the seed path.
-//
-// Only compiled with `#[cfg(any(test, feature = "test-support"))]` — in
-// production the seed path carries zero injection cost.  When set, the next
+// Worker-local failure-injection switch for the seed path. Compiled only
+// under test/test-support (zero production cost). When set, the next
 // `try_seed_drbg()` returns `Err` as if `getrandom` failed, exercising the
-// non-panicking degrade path without an actual seccomp sandbox.
+// non-panicking degrade path without a real seccomp sandbox.
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static INJECT_SEED_FAILURE: Cell<bool> = const { Cell::new(false) };
@@ -368,13 +337,10 @@ pub(crate) fn eager_seed_drbg() -> Result<(), getrandom::Error> {
 /// Emit a single NGX_LOG_EMERG line for a lazy DRBG seed failure.
 ///
 /// Called ONLY on the cold seed-failure branch of `drbg64()`.  Retrieves the
-/// nginx worker log handle from the nginx global `ngx_cycle` pointer (set by
-/// nginx before any worker runs, valid for the process lifetime).  Guarded by
-/// `LAZY_SEED_EMERG_LOGGED` so the message is emitted at most once per worker
-/// thread — matching the eager path's EMERG-once contract.
-///
-/// **Must not be called on the hot path** — the `#[cold]` attribute ensures
-/// the optimiser does not inline this into the normal `drbg64()` return.
+/// worker log handle from the nginx global `ngx_cycle` pointer (set by nginx
+/// before any worker runs, valid for the process lifetime).  Guarded by
+/// `LAZY_SEED_EMERG_LOGGED` for the EMERG-once contract (matches the eager
+/// path).  Must not be called on the hot path — `#[cold]` keeps it uninlined.
 #[cold]
 fn log_lazy_seed_failure_once(e: getrandom::Error) {
     if LAZY_SEED_EMERG_LOGGED.with(Cell::get) {
@@ -384,11 +350,10 @@ fn log_lazy_seed_failure_once(e: getrandom::Error) {
     #[cfg(not(any(test, feature = "test-support")))]
     {
         // SAFETY: `nginx_sys::ngx_cycle` is a process-global pointer set by
-        // nginx before `fork()`-ing workers; it remains valid for the worker
-        // lifetime.  `(*ngx_cycle).log` is the worker's primary log handle
-        // (always non-null at this point — nginx aborts worker start if log
-        // initialisation fails).  We read the pointer once, under a `#[cold]`
-        // path, and do not retain it.
+        // nginx before `fork()`-ing workers, valid for the worker lifetime.
+        // `(*ngx_cycle).log` is the worker's primary log handle (always
+        // non-null here — nginx aborts worker start if log init fails). Read
+        // once, under a `#[cold]` path, and not retained.
         let log = unsafe {
             let cycle = nginx_sys::ngx_cycle;
             if cycle.is_null() {
@@ -413,14 +378,11 @@ fn log_lazy_seed_failure_once(e: getrandom::Error) {
 /// Return the next pseudo-random `u64` from the per-thread ChaCha20 DRBG.
 ///
 /// In production the DRBG is eagerly seeded in `init_process`, so this is a
-/// pure ChaCha20 word extraction — lock-free, no syscall.  As a fallback (e.g.
-/// a thread that skipped eager seeding), it seeds lazily.  On seed failure it
-/// sets the tracing-disabled flag, emits a single NGX_LOG_EMERG line (see
-/// `log_lazy_seed_failure_once`), and returns 0 (callers must consult
-/// `tracing_disabled()` before relying on generated IDs — span-start does).
-///
-/// **Hot-path note:** TLS lookup + ChaCha20 word extraction — effectively
-/// free relative to the request path.
+/// pure ChaCha20 word extraction — lock-free, no syscall, effectively free on
+/// the hot path.  As a fallback (a thread that skipped eager seeding), it
+/// seeds lazily.  On seed failure it sets the tracing-disabled flag, emits a
+/// single NGX_LOG_EMERG line (see `log_lazy_seed_failure_once`), and returns 0
+/// (callers must consult `tracing_disabled()` before trusting the ID — span-start does).
 #[inline]
 pub(crate) fn drbg64() -> u64 {
     DRBG.with(|c| match c.take() {
@@ -467,24 +429,20 @@ fn try_seed_drbg() -> Result<ChaCha20Rng, getrandom::Error> {
 
 /// Maximum reroll attempts when `drbg64()` returns 0 for a W3C ID.
 ///
-/// Under a healthy ChaCha20 DRBG the all-zero output has probability < 2^-64
-/// per call; three retries without a non-zero result means the DRBG is either
-/// completely broken (e.g. stuck outputting 0 due to a persistent OS-RNG fault)
-/// or seeding genuinely failed and `drbg64()` is returning its failure sentinel
-/// (0) on every call.  In either case further retries cannot help and looping
-/// forever would hang the worker.  Instead we treat exhaustion as a
-/// DRBG-unavailable condition and disable tracing for this request.
+/// A healthy ChaCha20 DRBG has all-zero-output probability < 2^-64 per call,
+/// so three zero retries mean the DRBG is broken or `drbg64()` is returning
+/// its failure sentinel every time — further retries can't help, and looping
+/// forever would hang the worker. Exhaustion instead disables tracing for
+/// this request.
 const MAX_ID_RETRIES: u32 = 3;
 
 /// Generate a fresh 16-byte W3C trace ID.
 ///
-/// Returns `Some(id)` on success — guaranteed non-zero per the W3C
-/// Trace Context spec (§3.3: "all-zeroes MUST be rejected").  Returns `None`
-/// when the DRBG appears broken: after [`MAX_ID_RETRIES`] attempts all
-/// returning zero (a DRBG fault / persistent OS-RNG failure), the
-/// worker-local tracing-disabled flag is set and the caller MUST NOT emit
-/// any ID to the wire.  Callers should decline the request exactly as they
-/// would when `tracing_disabled()` returns `true`.
+/// Returns `Some(id)`, guaranteed non-zero per the W3C Trace Context spec
+/// (§3.3: "all-zeroes MUST be rejected").  Returns `None` after
+/// [`MAX_ID_RETRIES`] all-zero attempts (DRBG fault / OS-RNG failure); the
+/// worker-local tracing-disabled flag is set and the caller MUST decline the
+/// request rather than emit any ID.
 #[inline]
 pub(crate) fn gen_trace_id() -> Option<[u8; 16]> {
     for _ in 0..MAX_ID_RETRIES {
@@ -506,10 +464,9 @@ pub(crate) fn gen_trace_id() -> Option<[u8; 16]> {
 
 /// Generate a fresh 8-byte W3C span ID.
 ///
-/// Returns `Some(id)` on success — guaranteed non-zero per the W3C
-/// Trace Context spec (§3.3: "all-zeroes MUST be rejected").  Returns `None`
-/// after [`MAX_ID_RETRIES`] all returning zero; sets the tracing-disabled flag.
-/// Callers should decline the request rather than emit an invalid all-zero ID.
+/// Same contract as [`gen_trace_id`]: non-zero per the W3C Trace Context spec
+/// (§3.3), `None` after [`MAX_ID_RETRIES`] all-zero attempts (tracing-disabled
+/// flag set) — decline the request rather than emit an all-zero ID.
 #[inline]
 pub(crate) fn gen_span_id() -> Option<[u8; 8]> {
     for _ in 0..MAX_ID_RETRIES {
@@ -531,23 +488,17 @@ mod tests {
     /// Under injected OS-RNG seed failure, the eager seed path must NOT
     /// panic; it must set the worker-local tracing-disabled flag and return Err.
     ///
-    /// Each assertion runs on a freshly-spawned thread so the `thread_local!`
-    /// DRBG / flag / injection state is isolated (the test runner reuses
-    /// threads across tests otherwise).
+    /// Runs on a freshly-spawned thread so `thread_local!` DRBG/flag/injection
+    /// state is isolated (the test runner reuses threads across tests).
     #[test]
     fn h3f2_eager_seed_failure_no_panic_sets_flag() {
         let outcome = std::thread::spawn(|| {
-            // Arm the injection BEFORE seeding.
             set_inject_seed_failure(true);
-            // (a) no panic: eager_seed_drbg returns Err rather than aborting.
             let res = std::panic::catch_unwind(eager_seed_drbg);
             assert!(res.is_ok(), "eager_seed_drbg must not panic on RNG failure");
             let seed_result = res.unwrap();
             assert!(seed_result.is_err(), "eager_seed_drbg must return Err on RNG failure");
-            // Flag set → span-start will treat every request as unsampled.
             assert!(tracing_disabled(), "tracing must be disabled after seed failure");
-            // (c, ID side) drbg64 stays non-panicking and returns 0 (the
-            // sentinel span-start checks `tracing_disabled()` to avoid).
             let v = std::panic::catch_unwind(drbg64);
             assert!(v.is_ok(), "drbg64 must not panic when seeding fails");
             assert_eq!(v.unwrap(), 0, "drbg64 returns 0 when unseeded under failure");
@@ -567,7 +518,7 @@ mod tests {
                 eager_seed_drbg().is_err(),
                 "first seed attempt must report failure (logs EMERG)"
             );
-            // Even with the injection still armed, the flag short-circuits:
+            // Injection still armed, but the flag short-circuits.
             assert!(
                 eager_seed_drbg().is_ok(),
                 "second call must NOT re-report (no duplicate EMERG)"
@@ -609,11 +560,9 @@ mod tests {
         assert_eq!(set.len(), vals.len(), "drbg64 sequence must not repeat in 64 calls");
     }
 
-    /// Two ChaCha20Rng instances with different seeds must diverge.
-    ///
-    /// Verifies the property that IDs from distinct workers (which each
-    /// seed their DRBG independently from `getrandom`) cannot collide in bulk.
-    /// Different seeds produce statistically independent streams.
+    /// Two ChaCha20Rng instances with different seeds must diverge — pins the
+    /// property that IDs from distinct workers (each seeding independently
+    /// from `getrandom`) cannot collide in bulk.
     #[test]
     fn drbg_different_seeds_diverge() {
         let seed1 = [0x01u8; 32];
@@ -724,16 +673,12 @@ mod tests {
 
     /// Read-once traceparent guard (parse-once design).
     ///
-    /// Proves the single-scan contract: the inbound `traceparent` header is parsed
-    /// **once** (by `parse_traceparent_full` in the REWRITE handler) and the result
-    /// cached on `SpanCtx`.  The LOG phase reads `SpanCtx` fields directly —
-    /// no second header scan.
-    ///
-    /// This test asserts the structural invariant: all trace-correlation data
-    /// (trace_id, parent_span_id, flags) that the LOG phase needs are present
-    /// directly on `SpanCtx` as plain fields, derivable from a single
-    /// `parse_traceparent_full` call.  If any field were removed from `SpanCtx`,
-    /// the LOG phase would need a second scan — breaking this test's setup.
+    /// Proves the single-scan contract: the inbound `traceparent` header is
+    /// parsed **once** (`parse_traceparent_full` in the REWRITE handler) and
+    /// cached on `SpanCtx`; LOG reads `SpanCtx` fields directly, no second
+    /// header scan.  The structural-completeness check below asserts all
+    /// trace-correlation fields LOG needs live on `SpanCtx` — if any were
+    /// removed, LOG would need a second scan and this test's setup would break.
     #[test]
     fn traceparent_parse_once_guard() {
         use crate::logs::access::parse_traceparent_full;
@@ -741,12 +686,12 @@ mod tests {
         // A valid W3C traceparent header: version-trace_id-parent_id-flags
         let header = b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
 
-        // Single parse — this is the ONLY call parse_traceparent_full gets in
-        // the production code path (span_start.rs REWRITE handler).
+        // Single parse — the only call parse_traceparent_full gets in the
+        // production path (span_start.rs REWRITE handler).
         let (trace_id, parent_span_id, flags) =
             parse_traceparent_full(header).expect("valid traceparent must parse");
 
-        // Simulate what REWRITE does: populate SpanCtx from the parse result.
+        // Simulate REWRITE: populate SpanCtx from the parse result.
         let span_id = gen_span_id().expect("gen_span_id must succeed with healthy DRBG");
         let ctx = SpanCtx {
             trace_id,
@@ -758,7 +703,7 @@ mod tests {
             sampled: (flags & 0x01) != 0,
         };
 
-        // ── Assert SpanCtx carries exactly what the traceparent contained ─────
+        // ── SpanCtx must carry exactly what the traceparent contained ────────
         // trace_id: 4bf92f3577b34da6a3ce929d0e0e4736 (big-endian hex)
         let expected_trace_id: [u8; 16] = [
             0x4b, 0xf9, 0x2f, 0x35, 0x77, 0xb3, 0x4d, 0xa6, 0xa3, 0xce, 0x92, 0x9d, 0x0e, 0x0e,
@@ -774,11 +719,9 @@ mod tests {
         assert_eq!(ctx.flags, 0x01, "flags must match traceparent");
         assert!(ctx.sampled, "sampled must be true when flags bit-0 is set");
 
-        // ── Structural completeness check ─────────────────────────────────────
-        // The LOG phase (instrumented.rs) needs: trace_id, span_id, parent_span_id,
-        // flags, start_time_unix_nano, sampled — all present on SpanCtx.
-        // This assertion is a no-op at runtime but documents the contract:
-        // if any field is removed, the LOG phase code will fail to compile.
+        // ── Structural completeness: LOG needs trace_id, span_id,
+        // parent_span_id, flags, start_time_unix_nano, sampled on SpanCtx.
+        // No-op at runtime; if a field were removed, this fails to compile.
         let _ = ctx.trace_id;
         let _ = ctx.span_id;
         let _ = ctx.parent_span_id;
@@ -800,14 +743,13 @@ mod tests {
     #[test]
     fn gen_id_bounded_on_stuck_drbg_returns_none() {
         std::thread::spawn(|| {
-            // Fresh thread: DRBG is None, flags are false.
-            // Arm seed-failure injection so every drbg64() call returns 0.
+            // Fresh thread (DRBG is None); arm seed-failure injection so every
+            // drbg64() call returns 0. tracing_disabled is NOT yet set — this
+            // models the (None, not-disabled) race window the finding describes.
             set_inject_seed_failure(true);
-            // tracing_disabled is NOT yet set — this models the (None, not-disabled)
-            // race window that the finding describes.
             assert!(!tracing_disabled(), "flag must be clear at test start");
 
-            // gen_trace_id must terminate (not loop forever) and return None.
+            // Must terminate (not loop forever) and return None.
             let tid = gen_trace_id();
             assert!(tid.is_none(), "gen_trace_id must return None when DRBG is stuck at 0");
             assert!(
@@ -847,19 +789,19 @@ mod tests {
     fn lazy_seed_failure_emerg_once_flag_set() {
         std::thread::spawn(|| {
             set_inject_seed_failure(true);
-            // Verify flag starts clear on this fresh thread.
             assert!(
                 !LAZY_SEED_EMERG_LOGGED.with(Cell::get),
                 "LAZY_SEED_EMERG_LOGGED must start false on a fresh thread"
             );
-            // Trigger lazy seed failure via drbg64 (DRBG is None on this thread).
-            let _ = drbg64(); // Err branch → log_lazy_seed_failure_once → sets flag
+            // Trigger lazy seed failure via drbg64 (DRBG is None on this thread):
+            // Err branch → log_lazy_seed_failure_once → sets flag.
+            let _ = drbg64();
             assert!(
                 LAZY_SEED_EMERG_LOGGED.with(Cell::get),
                 "LAZY_SEED_EMERG_LOGGED must be set after the first lazy seed failure"
             );
-            // Second call: flag already set → log_lazy_seed_failure_once is a no-op.
-            // (Injection still armed, DRBG still None after the first 0-return.)
+            // Second call: flag already set, so log_lazy_seed_failure_once is a
+            // no-op (injection still armed, DRBG still None after the 0-return).
             let flag_before = LAZY_SEED_EMERG_LOGGED.with(Cell::get);
             let _ = drbg64();
             assert_eq!(

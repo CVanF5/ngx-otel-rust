@@ -64,10 +64,8 @@
 pub mod ctx;
 
 use crate::logs::LogProducer;
-// method/url.path/user_agent/client.address caps are single-homed in
-// logs::access (same semantic field on the same nginx request).  Import them
-// here so span and access records always use the same value — a bump to
-// MAX_URL_PATH (etc.) propagates automatically.
+// Caps are single-homed in logs::access (same semantic field, same request);
+// importing them keeps span and access records in sync automatically.
 use crate::logs::access::{MAX_CLIENT_ADDR, MAX_METHOD, MAX_URL_PATH, MAX_USER_AGENT};
 
 // ── Named field caps ──────────────────────────────────────────────────────────
@@ -98,20 +96,10 @@ pub const MAX_SPAN_ATTR_VAL: usize = 64;
 /// + start_ns(8) + end_ns(8) + status_code(1) + kind(1)
 pub const SPAN_RECORD_FIXED_HDR: usize = 16 + 8 + 8 + 4 + 8 + 8 + 1 + 1;
 
-/// Worst-case span record length, derived from named caps.
-///
-/// Fixed header + name(2+MAX_SPAN_NAME) + method(2+MAX_METHOD)
-/// + http_status(2) + url_path(2+MAX_URL_PATH) + duration_us(8)
-/// + proto(1) + scheme(1) + server_port(2) + client_port(2) + peer_port(2)
-/// + req_body_size(8) + resp_body_size(8)
-/// + url_query(2+MAX_URL_QUERY) + route(2+MAX_SPAN_ROUTE)
-/// + user_agent(2+MAX_USER_AGENT) + server_addr(2+MAX_SERVER_ADDR)
-/// + client_addr(2+MAX_CLIENT_ADDR) + peer_addr(2+MAX_CLIENT_ADDR)
-/// + n_attrs(2) + MAX_SPAN_EXTRA_ATTRS × (1+MAX_SPAN_ATTR_KEY + 2+MAX_SPAN_ATTR_VAL)
-///
-/// `MAX_METHOD`, `MAX_URL_PATH`, `MAX_USER_AGENT`, and `MAX_CLIENT_ADDR` are
-/// imported from `crate::logs::access` (single-homed there — the same semantic
-/// field on the same nginx request).
+/// Worst-case span record length, derived from named caps (see field-by-field
+/// breakdown in the expression below). `MAX_METHOD`, `MAX_URL_PATH`,
+/// `MAX_USER_AGENT`, and `MAX_CLIENT_ADDR` are imported from
+/// `crate::logs::access` (single-homed there — same semantic field, same request).
 ///
 /// # Sizing / saturation note
 /// The HTTP-semconv coverage fields raise the worst-case record from 612 B to
@@ -228,14 +216,10 @@ pub struct SpanRecord<'a> {
 
 /// Emit one span record into the producer's ring.
 ///
-/// Serialises `rec` into a fixed-size stack buffer and calls
-/// `producer.push()`.  Returns `true` on success; `false` when the ring is full.
-///
-/// # No allocation
-/// All formatting is done into a `[u8; MAX_SPAN_RECORD]` stack buffer.
-/// No `Vec`, no `Box`, no heap use.
-///
-/// Called from `LogPhaseHandler` for every sampled request.
+/// Serialises `rec` into a fixed-size `[u8; MAX_SPAN_RECORD]` stack buffer
+/// (no `Vec`/`Box`/heap use) and calls `producer.push()`.  Returns `true` on
+/// success; `false` when the ring is full.  Called from `LogPhaseHandler` for
+/// every sampled request.
 #[inline]
 pub fn emit_span_record(producer: &dyn LogProducer, rec: &SpanRecord<'_>) -> bool {
     let mut buf = [0u8; MAX_SPAN_RECORD];
@@ -355,10 +339,9 @@ pub fn parse_span_record(buf: &[u8], observed_ns: u64) -> Option<crate::data_mod
     let span_id = buf[pos..pos + 8].to_vec();
     pos += 8;
     // Root spans store [0u8; 8] on the ring wire.  OTLP semantics require an
-    // **empty** parent_span_id bytes field for root spans (proto `bytes` default
-    // = empty means "no parent"); exporting [0u8;8] signals a non-existent
-    // parent to backends and breaks trace-root detection.
-    // Root spans export empty parent_span_id.
+    // **empty** parent_span_id bytes field for root spans (proto `bytes`
+    // default = empty means "no parent"); exporting [0u8;8] would signal a
+    // non-existent parent to backends and break trace-root detection.
     let parent_span_id = {
         let raw = &buf[pos..pos + 8];
         if raw == [0u8; 8] {
@@ -623,10 +606,9 @@ pub fn parse_span_record(buf: &[u8], observed_ns: u64) -> Option<crate::data_mod
             value: AnyValue::Int(peer_port as i64),
         });
     }
-    // error.type — derived (no worker-side field).  Per the OTel HTTP semconv,
-    // for a server span `error.type` is set when the request ended in error;
-    // for HTTP the canonical value is the response status code as a string, and
-    // a 5xx status is the error condition that also drives StatusCode::Error.
+    // error.type — derived (no worker-side field). Per the OTel HTTP semconv,
+    // a server span sets error.type to the status code string on a 5xx status
+    // (also the condition driving StatusCode::Error).
     // <https://opentelemetry.io/docs/specs/semconv/http/http-spans/#status>
     if http_status >= 500 {
         attributes.push(KeyValue {
@@ -661,11 +643,8 @@ pub fn parse_span_record(buf: &[u8], observed_ns: u64) -> Option<crate::data_mod
 mod tests {
     use super::*;
 
-    /// Verify MAX_SPAN_RECORD is correctly sized (compile-time guard smoke-test).
-    /// Verify the named caps produce expected absolute sizes.
-    /// The compile-time guard (`const _: ()`) already catches overflow;
-    /// this test pins the concrete values so a future cap change is
-    /// intentional (not silent).
+    /// Pins the concrete size constants so a future cap change is intentional,
+    /// not silent (the compile-time `const _: ()` guard only catches overflow).
     #[test]
     fn span_record_size_constants() {
         // SPAN_RECORD_FIXED_HDR = 16+8+8+4+8+8+1+1 = 54
@@ -682,8 +661,6 @@ mod tests {
         assert_eq!(SPAN_RECORD_WORST_CASE, 1124);
         // MAX_SPAN_RECORD = round_up(1124, 16) = 1136
         assert_eq!(MAX_SPAN_RECORD, 1136);
-        // The compile-time `const _: ()` guard covers the overflow relationship;
-        // the eq assertions above are sufficient to pin any accidental change.
     }
 
     /// Push a synthetic span record via a Vec-backed mock producer, then parse it.
@@ -785,12 +762,9 @@ mod tests {
     /// Structural golden: encode a maximally-populated SpanRecord, parse it
     /// back, and assert every decoded field value precisely.
     ///
-    /// This is a regression seal: the wire format is neutral for well-formed
-    /// input — this test MUST stay green.  A failure here means a
-    /// nominally-neutral change altered emitted bytes.
-    ///
-    /// Regeneration: update the `SpanRecord` input literal below if the wire
-    /// format is intentionally changed (requires deliberate review).
+    /// Regression seal — MUST stay green; a failure means a nominally-neutral
+    /// change altered emitted bytes.  If the wire format changes intentionally,
+    /// update the `SpanRecord` input literal below (requires deliberate review).
     #[test]
     fn span_golden_structural() {
         use crate::data_model::{AnyValue, SpanKind, StatusCode};
@@ -879,13 +853,11 @@ mod tests {
             span.attributes.iter().find(|kv| kv.key == key).map(|kv| &kv.value)
         };
 
-        // http.request.method
         match find_attr("http.request.method").expect("http.request.method must be present") {
             AnyValue::String(s) => assert_eq!(s, "GET", "method must be GET"),
             other => panic!("http.request.method must be String, got {other:?}"),
         }
 
-        // http.response.status_code
         match find_attr("http.response.status_code")
             .expect("http.response.status_code must be present")
         {
@@ -893,7 +865,6 @@ mod tests {
             other => panic!("http.response.status_code must be Int, got {other:?}"),
         }
 
-        // url.path
         match find_attr("url.path").expect("url.path must be present") {
             AnyValue::String(s) => {
                 assert_eq!(s, "/api/v1/users", "url.path must round-trip")
@@ -1097,7 +1068,6 @@ mod tests {
             span.attributes.iter().find(|kv| kv.key == key).map(|kv| &kv.value)
         };
 
-        // error.type present on a 5xx span, value = status code string.
         match find_attr("error.type").expect("error.type must be present on a 5xx span") {
             AnyValue::String(s) => {
                 assert_eq!(s, "503", "error.type must be the status code string")
@@ -1105,7 +1075,6 @@ mod tests {
             other => panic!("error.type must be String, got {other:?}"),
         }
 
-        // user_agent.original truncated at MAX_USER_AGENT.
         match find_attr("user_agent.original").expect("user_agent.original must be present") {
             AnyValue::String(s) => assert_eq!(
                 s.len(),
@@ -1140,10 +1109,9 @@ mod tests {
     /// Parser sanity cap: a corrupted `n_extra` field must not cause the
     /// parser to loop more than `MAX_SPAN_EXTRA_ATTRS` times.
     ///
-    /// Produces a well-formed span record with one extra attr, then patches the
-    /// raw `n_extra` wire field to a value far above the producer maximum.
-    /// The parser must clamp at `MAX_SPAN_EXTRA_ATTRS` and still return a valid
-    /// span (one or zero extra attrs, depending on how many bytes are valid).
+    /// Patches a well-formed record's raw `n_extra` wire field to a value far
+    /// above the producer maximum; the parser must clamp and still return a
+    /// valid span.
     #[test]
     fn span_parser_extra_attrs_sanity_cap() {
         use crate::data_model::{SpanKind, StatusCode};
@@ -1200,10 +1168,8 @@ mod tests {
         // Copy payload so we can mutate it.
         let mut payload = raw[4..4 + len].to_vec();
 
-        // Locate the n_extra field.  It appears right after the fixed header,
-        // name (2+len), method (2+len), http_status (2), url_path (2+len),
-        // duration_us (8).  Walk to it rather than hard-coding an offset so
-        // this test is resilient to field order changes.
+        // Walk to n_extra rather than hard-coding its offset, so this test
+        // stays resilient to field-order changes.
         let mut pos = SPAN_RECORD_FIXED_HDR;
         // name
         let name_len = u16::from_be_bytes(payload[pos..pos + 2].try_into().unwrap()) as usize;
@@ -1231,17 +1197,16 @@ mod tests {
         let n_extra_offset = pos;
         assert!(n_extra_offset + 2 <= payload.len(), "n_extra offset out of bounds");
 
-        // Corrupt n_extra to a large value (200 — well above MAX_SPAN_EXTRA_ATTRS * 4).
+        // Corrupt n_extra to 200 — well above MAX_SPAN_EXTRA_ATTRS * 4.
         let corrupt_n: u16 = 200;
         payload[n_extra_offset..n_extra_offset + 2].copy_from_slice(&corrupt_n.to_be_bytes());
 
-        // The parser must not panic or loop 200 times; it must clamp and return.
+        // Must not panic or loop 200 times; must clamp and return.
         let span = parse_span_record(&payload, 0).expect("parser must tolerate corrupted n_extra");
 
-        // With a corrupted n_extra the parser tries MAX_SPAN_EXTRA_ATTRS iterations
-        // at most.  Only the bytes for 1 real attr were serialized; the rest break
-        // inside the loop (pos overruns buf), so we get ≤ MAX_SPAN_EXTRA_ATTRS attrs
-        // in the final span (typically 0 or 1 extra, plus the standard HTTP attrs).
+        // Only 1 real attr's bytes were serialized; the rest break inside the
+        // loop (pos overruns buf), so the final span has ≤ MAX_SPAN_EXTRA_ATTRS
+        // extras (typically 0 or 1) plus the standard HTTP attrs.
         let extra_count = span
             .attributes
             .iter()
