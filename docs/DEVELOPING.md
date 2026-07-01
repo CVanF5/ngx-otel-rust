@@ -175,3 +175,31 @@ The bash integration scripts are due to be ported to Perl [`Test::Nginx`]
 `wrk`-driven benchmarks.
 
 [`Test::Nginx`]: https://github.com/openresty/test-nginx
+
+## Comment style
+
+Comments carry **rationale and invariants, not restatement**. Match the
+sparsity of nginx / nginx-acme — a comment that re-describes the next line
+is noise. Rules:
+
+1. Doc comments (`///`): one-line summary. Rationale goes in `# Safety` /
+   `# Errors` / `# Panics`, not free prose. No architectural footnotes in
+   API docs.
+2. Module docs (`//!`): one paragraph. Design narrative belongs in
+   [`ARCHITECTURE.md`](ARCHITECTURE.md), not a 30-line module header.
+3. Constants: one line. No multi-line "why this value" essays.
+4. Inline `//`: only where intent is non-obvious. Never narrate self-evident
+   code.
+5. Decision-record rationale: 1–3 lines at the decision point.
+
+**Always keep** (these are load-bearing, not bloat): `// SAFETY:` on every
+`unsafe` block (`undocumented_unsafe_blocks = deny`); FFI / bindgen-bitfield
+notes; memory-ordering / happens-before proofs; metric unit & semconv
+contracts; spec citations; mutation-evidence in tests ("what this pins").
+
+Do **not** chase a percentage. The FFI-heavy files legitimately sit at
+25–45% comment density because that residual is mandatory SAFETY/FFI/ordering
+content — cutting it would delete correctness anchors or break the lint. The
+goal is zero *removable* narrative, not a target ratio. A one-time whole-crate
+density pass ran 2026-07-01; following the rules above keeps it from being
+needed again.
