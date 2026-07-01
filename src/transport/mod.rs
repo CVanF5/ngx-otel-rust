@@ -24,25 +24,14 @@ use thiserror::Error;
 /// The collector's verdict on a delivered batch, normalized across all wire
 /// protocols.
 ///
-/// Protocol-agnostic **by construction**: the policy engine matches on this and
-/// never on a protocol-specific status code. Each wire protocol (OTLP/HTTP,
-/// OTLP/gRPC, OTAP, …) is an *adapter* that maps its native status into this
-/// neutral verdict — no protocol is the reference or the default. This type
-/// lives in the transport-neutral module (alongside [`TransportError`]) so the
-/// policy can be expressed once against it, not inside any OTLP-specific code.
+/// Protocol-agnostic by construction: the policy engine matches on this, never
+/// on a protocol-specific status code. Each wire protocol (OTLP/HTTP, OTLP/gRPC,
+/// OTAP, …) adapts its native status into this neutral verdict.
 ///
-/// Note the separation of concerns from [`TransportError`]:
-/// - [`TransportError`] = "we could not complete an exchange with the peer"
-///   (connection failed, timeout). The peer rendered *no* verdict.
-/// - `DeliveryOutcome` = "the peer received the exchange and rendered a verdict."
-///
-/// A send therefore returns `Result<DeliveryOutcome, TransportError>`:
-/// `Err` = couldn't talk; `Ok(outcome)` = the peer's verdict.
-///
-/// The status-classification adapters and the outcome-driven policy engine are
-/// added in later steps; until then every successful send maps to
-/// [`DeliveryOutcome::Accepted`] and the drain loop treats any `Ok(outcome)`
-/// exactly as it treated today's `Ok(())` (release).
+/// Distinct from [`TransportError`]: `TransportError` means the exchange itself
+/// failed (no verdict from the peer); `DeliveryOutcome` means the peer received
+/// the exchange and rendered a verdict. A send returns
+/// `Result<DeliveryOutcome, TransportError>` accordingly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeliveryOutcome {
     /// Fully accepted. Release the batch.

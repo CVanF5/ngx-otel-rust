@@ -5,39 +5,22 @@
 
 //! Hyper HTTP/1.1 transport for OTLP/HTTP protobuf export.
 //!
-//! # IO model
+//! Two IO adapters implement `hyper::rt::{Read, Write}`:
+//! - **`SpinIo`** (`SpinTcpIo` / `SpinUnixIo`, test-only) — non-blocking OS
+//!   streams that busy-wake on `WouldBlock`. **Never use in a NGINX worker
+//!   process** — this would spin the event loop thread.
+//! - **`NgxConnIo`** (production) — wraps an `ngx_peer_connection_t`, storing
+//!   the `Waker` and returning `Pending` without re-arming; the NGINX C event
+//!   handlers (`ngx_otel_conn_{read,write}_handler`) call `wake()` on
+//!   kqueue/epoll readiness. No busy-spinning, no blocking.
 //!
-//! Two IO adapter types are provided:
+//! `HyperHttpTransport<C: Connector>` is generic over the connector: tests use
+//! `SpinConnector` via `::new()`; the export loop uses `NgxConnector` via
+//! `::with_ngx_log()`.
 //!
-//! - **`SpinIo`** (wrapping `SpinTcpIo` / `SpinUnixIo`) — non-blocking OS
-//!   streams that return `Poll::Pending + wake_by_ref()` on `WouldBlock`.
-//!   Safe only inside the spin-loop test executor.
-//!   **Never use in a NGINX worker process** — they would busy-spin the event
-//!   loop thread.
-//!
-//! - **`NgxConnIo`** — wraps an `ngx_peer_connection_t` and implements
-//!   `hyper::rt::{Read, Write}` by storing the `Waker` and returning
-//!   `Poll::Pending` *without* re-arming.  The NGINX C event handlers
-//!   (`ngx_otel_conn_read_handler` / `ngx_otel_conn_write_handler`) call
-//!   `Waker::wake()` when the kernel signals readiness via kqueue/epoll.
-//!   This is the correct integration — no busy-spinning, no blocking.
-//!
-//! # Architecture
-//!
-//! `HyperHttpTransport<C: Connector>` is generic over the connector:
-//! - Tests use `HyperHttpTransport<SpinConnector>` via `::new()`.
-//! - The export loop uses `HyperHttpTransport<NgxConnector>` via
-//!   `::with_ngx_log()`.
-//!
-//! # Precedent
-//!
-//! `NgxConnIo` is a direct port of the pattern in
-//! `nginx-acme/src/net/peer_conn.rs`:
-//! - `connect_peer` ← `PeerConnection::connect_peer`
-//! - `poll_connect`  ← `PeerConnection::poll_connect`
-//! - `poll_read`     ← `impl hyper::rt::Read for PeerConnection`
-//! - `poll_write`    ← `impl hyper::rt::Write for PeerConnection`
-//! - event handlers  ← `ngx_peer_conn_read_handler` / `ngx_peer_conn_write_handler`
+//! `NgxConnIo` ports the `nginx-acme/src/net/peer_conn.rs` pattern
+//! (`PeerConnection::{connect_peer,poll_connect}` and its `Read`/`Write`
+//! impls, plus the `ngx_peer_conn_*_handler`s).
 
 use core::future;
 use core::future::Future;
@@ -157,45 +140,21 @@ pub(crate) fn parse_retry_after(value: &str) -> Option<Duration> {
 
 /// Parse an IMF-fixdate string into a `SystemTime`.
 ///
-/// Accepts only the canonical form mandated by RFC 9110 §5.6.7:
-/// `Day, DD Mon YYYY HH:MM:SS GMT`
-/// (e.g. `"Thu, 01 Jan 1970 00:00:00 GMT"`).
+/// Accepts only the canonical RFC 9110 §5.6.7 form: `Day, DD Mon YYYY
+/// HH:MM:SS GMT` (e.g. `"Thu, 01 Jan 1970 00:00:00 GMT"`). Legacy obs-date
+/// forms (RFC 850, asctime) return `None`, same as any malformed input.
 ///
-/// We parse IMF-fixdate ONLY (RFC 9110 §5.6.7).  Legacy obs-date forms
-/// (RFC 850 and asctime) are treated as unparseable: they return `None` and
-/// the caller falls through to the exporter's default backoff.  The caller
-/// (parse_retry_after) uses this to compute a `now`-relative `Duration` from a
-/// server-supplied `Retry-After` header — an attacker-influenceable input — so
-/// the function MUST NOT panic on any input, however short or malformed.
-///
-/// To guarantee that, the parser operates entirely on the raw byte slice and
-/// never uses `&str` indexing (which panics on a multibyte UTF-8 boundary).
-///
-/// Returns `None` for any input that does not match the exact format.
+/// Input is server-supplied (`Retry-After`) and thus attacker-influenceable,
+/// so this MUST NOT panic on any input. The parser therefore works entirely
+/// on the raw byte slice — never `&str` indexing, which panics on a
+/// multibyte UTF-8 boundary.
 fn parse_imf_fixdate(s: &str) -> Option<std::time::SystemTime> {
-    // Structural skeleton (0-indexed byte positions):
-    //   0..3   day-of-week name (ignored; not validated beyond syntax)
-    //   3      ','
-    //   4      ' '
-    //   5..7   DD (2-digit day)
-    //   7      ' '
-    //   8..11  Mon (3-letter month abbreviation)
-    //   11     ' '
-    //   12..16 YYYY (4-digit year)
-    //   16     ' '
-    //   17..19 HH
-    //   19     ':'
-    //   20..22 MM
-    //   22     ':'
-    //   23..25 SS
-    //   25     ' '
-    //   26..29 "GMT"
-    //
-    // RFC 9110 §5.6.7.  Expected length is exactly 29 bytes.
+    // Byte layout (RFC 9110 §5.6.7, fixed 29-byte length):
+    //   0..3 dow (unvalidated)  3 ','  4 ' '  5..7 DD  7 ' '  8..11 Mon
+    //   11 ' '  12..16 YYYY  16 ' '  17..19 HH  19 ':'  20..22 MM  22 ':'
+    //   23..25 SS  25 ' '  26..29 "GMT"
     let b = s.as_bytes();
-    // Reject anything not exactly the IMF-fixdate length.  This bound makes the
-    // fixed-index `b[..]` accesses below in-range; byte indexing never panics on
-    // a UTF-8 boundary the way `&str[..]` slicing does.
+    // Exact-length check makes every fixed-index access below in-range.
     if b.len() != 29 {
         return None;
     }
@@ -366,11 +325,8 @@ pub(crate) fn map_http_status_to_outcome(
     retry_after: Option<Duration>,
 ) -> DeliveryOutcome {
     match status {
-        // Retryable: EXACTLY this set per the OTLP spec. All others MUST NOT be retried.
         429 | 502 | 503 | 504 => DeliveryOutcome::Retryable { retry_after },
-        // Auth failures: non-retryable, distinct counter + "check credentials" log.
         401 | 403 => DeliveryOutcome::Unauthorized,
-        // Everything else (400, 404, 413, 501, 5xx not in the retryable set, ...) → Permanent.
         _ => DeliveryOutcome::Permanent,
     }
 }
@@ -394,7 +350,6 @@ pub(crate) fn http_response_to_outcome(
     signal: OtlpSignal,
 ) -> DeliveryOutcome {
     if status.is_success() {
-        // Decode the OTLP partial_success from the protobuf body.
         let rejected = decode_partial_success_rejected(signal, body);
         if rejected > 0 {
             DeliveryOutcome::PartialReject { rejected }
@@ -402,7 +357,6 @@ pub(crate) fn http_response_to_outcome(
             DeliveryOutcome::Accepted
         }
     } else {
-        // Parse Retry-After header for retryable codes.
         let retry_after = headers
             .get(hyper::header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
@@ -436,12 +390,6 @@ pub(crate) enum ParsedEndpoint {
         path: std::string::String,
     },
     /// HTTPS (TLS) endpoint.
-    ///
-    /// Default port is 4317 (same as `http://` for gRPC) when the URL contains
-    /// no explicit port — this matches OTel spec § `OTEL_EXPORTER_OTLP_ENDPOINT`
-    /// default-port behaviour for both OTLP/HTTP (`/v1/*` paths, port 4318) and
-    /// OTLP/gRPC (no path, port 4317).  Like `Http`, the caller determines which
-    /// default applies based on the configured `otel_export_protocol`.
     Https {
         host: std::string::String,
         port: u16,
@@ -463,9 +411,6 @@ impl ParsedEndpoint {
                 Some(i) => (&rest[..i], std::string::String::from(&rest[i..])),
                 None => (rest, std::string::String::from("/")),
             };
-            // Default port 80 (HTTP convention); callers that want 4317/4318
-            // will override at construction time, but `parse` stores whatever
-            // the URL says (or 80 as the fallback for bare http://).
             let (host, port) = parse_authority(authority, 80);
             Ok(ParsedEndpoint::Http { host: std::string::String::from(host), port, path })
         } else if let Some(rest) = input.strip_prefix("https://") {
@@ -473,8 +418,6 @@ impl ParsedEndpoint {
                 Some(i) => (&rest[..i], std::string::String::from(&rest[i..])),
                 None => (rest, std::string::String::from("/")),
             };
-            // Default port 443 (HTTPS convention); OTel collectors typically
-            // advertise 4317 (gRPC) or 4318 (HTTP) explicitly in the URL.
             let (host, port) = parse_authority(authority, 443);
             Ok(ParsedEndpoint::Https { host: std::string::String::from(host), port, path })
         } else if let Some(rest) = input.strip_prefix("unix:///") {
@@ -847,14 +790,10 @@ impl NgxConnIo {
             // SAFETY: `c` is non-null here (checked above), so it is a live
             // `ngx_connection_t` from a prior `connect_peer`; its `read`/`write`
             // fields point to nginx-owned `ngx_event_t`s valid for the
-            // connection's lifetime. We read the `timedout` bitfield and (on
-            // timeout) hand `c` back to `ngx_close_connection`, or re-install our
-            // handlers on the still-open connection.
-            // SAFETY: `c` is non-null here (checked above, `c = self.pc.connection`).
-            // On timeout, `close_and_clear` closes the connection AND nulls
-            // `self.pc.connection` so the Drop/close() path cannot double-close.
-            // Without the null, Drop calls close() → ngx_close_connection(stale ptr)
-            // → ALERT spam + potential use-after-recycle if the slot is reused (E1).
+            // connection's lifetime. On timeout, `close_and_clear` closes the
+            // connection AND nulls `self.pc.connection` (E1 regression: without
+            // the null, a later Drop/close() double-closes the stale pointer —
+            // ALERT spam + potential use-after-recycle if the slot is reused).
             let rv = unsafe {
                 if (*(*c).read).timedout() != 0 || (*(*c).write).timedout() != 0 {
                     close_and_clear(&mut self.pc.connection);
@@ -993,18 +932,9 @@ impl hyper::rt::Read for NgxConnIo {
         if n == NGX_AGAIN as isize {
             // No data yet — store waker; C handler fires wake() on readiness.
             // NO wake_by_ref(): that would busy-spin the NGINX worker thread.
-            //
-            // The debug line below logs `prev_was_some` because — with multiple
-            // task contexts polling the same `NgxConnIo` (e.g., hyper's h2 client
-            // spawning a `ConnTask` driver via `NgxExecutor`) — overwriting a
-            // previously-stored waker silently loses a wakeup for the other task.
-            // An investigation into an h2 wake stall used this exact log to rule
-            // out a waker-overwrite race; the
-            // actual root cause turned out to be a deadlock during `_conn` drop
-            // (h2's `Streams::drop` calls `Waker::wake()` while holding its
-            // internal mutex, which ngx-rust's old `schedule()` would resolve
-            // by synchronously re-polling — see the corresponding ngx-rust
-            // patch on the `ngx-otel-rust-deadlock-fix` branch).
+            // `prev_was_some` diagnoses a lost-wakeup race from overwriting this
+            // single waker slot under multi-task h2 drivers — see
+            // docs/ARCHITECTURE.md "Known pitfall: single-slot waker storage".
             // SAFETY: `c` is the live nginx connection from this poll; reading
             // its `log` pointer field for the debug log below.
             let log = unsafe { (*c).log };
@@ -1490,8 +1420,8 @@ impl Connector for NgxConnector {
                 // such as `http://[::1]:4317/`, so we must strip here.
                 let host_str = strip_v6_brackets(host.as_str());
 
-                // Branch on address family.  DNS names fall through to the
-                // error arm below; DNS names fall through to the resolution path.
+                // Branch on address family; DNS names fall through to the
+                // resolution path below.
                 let (sockaddr_ptr, socklen) = match host_str.parse::<std::net::IpAddr>() {
                     Ok(std::net::IpAddr::V4(v4)) => (
                         build_ipv4_sockaddr(&io.pool, v4, *port)?,
@@ -2708,22 +2638,13 @@ mod tests {
     }
 
     /// E1 regression: `close_and_clear` must null the owning pointer after
-    /// calling `ngx_close_connection`.
+    /// calling `ngx_close_connection`, so a later `Drop`/`close()` cannot
+    /// double-close a stale pointer (ALERT spam + potential use-after-recycle
+    /// if the slot is reassigned first). Under ASan a double-close also shows
+    /// as a use-after-free report.
     ///
-    /// Pre-fix: the timeout path in `poll_connect` (line ~386) called
-    /// `ngx_close_connection(c)` without nulling `self.pc.connection`.
-    /// Subsequent `Drop` → `close()` → `ngx_close_connection(stale_ptr)`
-    /// → double-close → ALERT spam + potential use-after-recycle if the
-    /// freed slot is reassigned before Drop runs.
-    ///
-    /// This test verifies the structural invariant: any call to
-    /// `close_and_clear` nulls the slot.  If the invariant is violated
-    /// (e.g. the null is removed), the assertion below fails.
-    /// Under ASan the double-close also shows as a use-after-free report.
-    ///
-    /// The `ngx_close_connection` call in `close_and_clear` is safe to make
-    /// with a sentinel pointer in test because `lib.rs` provides a no-op
-    /// stub for the test-support build (`#[cfg(test)]`).
+    /// Safe to exercise with a sentinel pointer: `lib.rs` provides a no-op
+    /// `ngx_close_connection` stub for `#[cfg(test)]`.
     #[test]
     fn e1_close_and_clear_nulls_slot() {
         // Sentinel: `NonNull::dangling()` gives a non-null, well-aligned,
@@ -2742,19 +2663,12 @@ mod tests {
     // ── E2: bracket-aware IPv6 authority parsing ──────────────────────────
 
     /// E2 regression: `parse_authority` must only split on the port-separator
-    /// colon, not on colons inside an IPv6 bracket literal.
-    ///
-    /// Pre-fix: bare `rfind(':')` on `"[::1]"` returned index 2 (last colon
-    /// inside the brackets), producing host `"[:"` and a failed port parse
-    /// (default).  DNS lookup of that garbage host fails permanently — telemetry
-    /// is silently broken for any IPv6 literal endpoint that omits the port.
-    ///
-    /// Post-fix: `parse_authority` skips to after the closing `]` before
-    /// searching for `:` — the port-separator colon is unambiguous from there.
-    ///
-    /// Regression marker: the `[::1]`-no-port and `[2001:db8::1]`-no-port rows
-    /// assert `host == "[::1]"` / `"[2001:db8::1]"` respectively.  On pre-fix
-    /// code those assertions fail (`host == "[:"` / `"[2001:db8:"`).
+    /// colon, not on colons inside an IPv6 bracket literal. A bare
+    /// `rfind(':')` on `"[::1]"` finds the last colon inside the brackets,
+    /// producing host `"[:"` and a bogus default port — a garbage host that
+    /// fails DNS lookup permanently. The `[::1]`/`[2001:db8::1]` no-port rows
+    /// below are the regression markers (pre-fix they'd assert `"[:"` /
+    /// `"[2001:db8:"`).
     #[test]
     fn e2_parse_authority_ipv6_bracket_aware() {
         // (url, expected_host, expected_port)

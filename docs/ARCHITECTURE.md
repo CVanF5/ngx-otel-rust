@@ -97,6 +97,21 @@ The `MetricSource` and `Encoder` trait boundaries, plus the `ExportTransport`
 enum that dispatches between OTLP/HTTP and OTLP/gRPC, keep an eventual OTAP /
 columnar migration an encoder swap rather than a rewrite.
 
+### Known pitfall: single-slot waker storage under multi-task h2 drivers
+
+`NgxConnIo::poll_read`/`poll_write` (`src/transport/hyper_http.rs`) each store
+at most one waker (`rev`/`wev`); a second task polling the same `NgxConnIo`
+before the first is woken would silently overwrite it and lose that task's
+wakeup. hyper's h2 client can spawn more than one task context against a
+connection (its `ConnTask` driver via `NgxExecutor`), so this is a real
+possibility, not a hypothetical. An investigation into an observed h2 wake
+stall added a debug log (`prev_was_some`) to rule this race in or out; it
+ruled it out — the actual root cause was a deadlock during `_conn` drop (h2's
+`Streams::drop` calls `Waker::wake()` while holding its internal mutex, which
+ngx-rust's old `schedule()` resolved by synchronously re-polling), fixed on
+the ngx-rust side. The debug log stays as a diagnostic for any future
+recurrence of either failure mode.
+
 This one dedicated exporter is deliberately the **single cold path for all three
 signals** — metrics (Phase 1), logs (Phase 2), and traces (Phase 3) — so
 per-signal differences stay confined to the shared-memory shape while one process

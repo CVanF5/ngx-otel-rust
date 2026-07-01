@@ -20,62 +20,49 @@
 //! # BIO ↔ poll re-entrancy contract (THE risk of this module)
 //!
 //! OpenSSL's `SSL_connect` / `SSL_read` / `SSL_write` need to read and write
-//! raw bytes. We give the `SSL` a custom `BIO` whose read/write callbacks
-//! forward to the inner stream's `poll_read` / `poll_write`. The danger is
-//! re-entrancy: the callbacks fire *synchronously from inside* an `SSL_*` call,
-//! which is itself called from inside one of *our* `poll_*` methods. The
-//! contract that makes this sound and deadlock-free:
+//! raw bytes; the `SSL`'s custom `BIO` forwards its read/write callbacks to
+//! the inner stream's `poll_read` / `poll_write`. The danger is re-entrancy:
+//! those callbacks fire *synchronously from inside* the `SSL_*` call that our
+//! own `poll_*` is making. Three rules keep this sound and deadlock-free:
 //!
-//! 1. **Single direction of calls.** Calls only ever go *down* the stack:
-//!    `Self::poll_*` → `SSL_*` → `bio_read/bio_write` → `inner.poll_*`. The BIO
-//!    callbacks NEVER call back into any `SSL_*` function, so there is no
-//!    `SSL_* → BIO → SSL_*` recursion and no lock to re-enter.
-//!
-//! 2. **The `Context` is published, not captured.** Before every `SSL_*`
-//!    invocation, the calling `poll_*` stores a raw pointer to its live
-//!    `Context` (and a pinned pointer to the inner IO) into a `BioCtx` that
-//!    the BIO's `data` slot points at. The BIO callbacks dereference that
-//!    pointer to build the `Context` they hand to `inner.poll_*`. The pointer
-//!    is valid for exactly the duration of the `SSL_*` call (the `Context`
-//!    lives on the `poll_*` stack frame, which strictly outlives the nested
-//!    `SSL_*` call). After the `SSL_*` call returns we clear the pointers so a
-//!    stale `Context`/IO pointer can never be dereferenced later.
-//!
+//! 1. **Single direction of calls.** `Self::poll_*` → `SSL_*` → `bio_read` /
+//!    `bio_write` → `inner.poll_*`, never the reverse — the BIO callbacks
+//!    never call back into `SSL_*`, so there is no recursion and no lock to
+//!    re-enter.
+//! 2. **The `Context` is published, not captured.** Before each `SSL_*` call
+//!    the calling `poll_*` stores a raw pointer to its live `Context` (and a
+//!    pinned pointer to the inner IO) into a `BioCtx` that the BIO's `data`
+//!    slot points at; the callbacks dereference it to build the `Context`
+//!    they hand to `inner.poll_*`. The pointer is valid only for that call's
+//!    duration (the `Context` lives on the `poll_*` stack frame, which
+//!    outlives the nested call); it is cleared immediately after so a stale
+//!    pointer can never be dereferenced later.
 //! 3. **Pending → retry, never recurse.** When `inner.poll_*` returns
-//!    `Poll::Pending` the callback signals it to OpenSSL with
-//!    `BIO_set_retry_read` / `BIO_set_retry_write` and returns `-1`. OpenSSL
-//!    propagates this as `SSL_ERROR_WANT_READ` / `WANT_WRITE`; our `poll_*`
-//!    then returns `Poll::Pending`. The inner IO has already stored the waker
-//!    (its own contract), so the inner C handler fires `wake()` on readiness
-//!    and the whole stack is re-driven from the top. Nothing busy-spins;
-//!    nothing polls recursively.
+//!    `Pending`, the callback signals `BIO_set_retry_read`/`_write` and
+//!    returns `-1`, which OpenSSL turns into `SSL_ERROR_WANT_READ`/`WRITE`;
+//!    our `poll_*` then returns `Pending` too. The inner IO's own waker
+//!    contract handles the wakeup — no busy-spin, no recursive poll.
 //!
 //! # OpenSSL object ownership (free exactly once; no double-free)
 //!
-//! - `SSL_CTX` (in [`TlsConfig::build_ctx`]): created by `SSL_CTX_new`, owned by
-//!   [`SslCtx`], freed once by `SslCtx::drop` via `SSL_CTX_free`.
-//! - `SSL` (in [`TlsNgxConnIo`]): created by `SSL_new` (which takes its own ref
-//!   on the `SSL_CTX`), owned by the `TlsNgxConnIo`, freed once by its `Drop`
-//!   via `SSL_free`.
-//! - `BIO`: created by `BIO_new`. We call `SSL_set_bio(ssl, bio, bio)` passing
-//!   the **same** `BIO` as both the read and write side. OpenSSL's documented
-//!   rule (`SSL_set_bio(3)`): when `rbio == wbio`, exactly **one** reference is
-//!   consumed for that BIO. Ownership of that single reference transfers to the
-//!   `SSL`; `SSL_free` frees the BIO. Therefore we MUST NOT call
-//!   `BIO_free_all` on it ourselves — doing so would double-free. The BIO is
-//!   freed exactly once, by `SSL_free`, in `TlsNgxConnIo::drop`. In
-//!   `TlsNgxConnIo::new`, the only early-return path before `SSL_set_bio` is
-//!   `BIO_new` returning null (no BIO was created, so there is nothing to
-//!   free); once `BIO_new` succeeds, `SSL_set_bio` is called unconditionally
-//!   (no fallible operations intervene) and takes ownership of the single BIO
-//!   reference.
+//! - `SSL_CTX` (in [`TlsConfig::build_ctx`]): `SSL_CTX_new`-created, owned by
+//!   [`SslCtx`], freed once via `SslCtx::drop`'s `SSL_CTX_free`.
+//! - `SSL` (in [`TlsNgxConnIo`]): `SSL_new`-created (takes its own ref on the
+//!   `SSL_CTX`), owned by the `TlsNgxConnIo`, freed once by its `Drop`.
+//! - `BIO`: `BIO_new`-created. `SSL_set_bio(ssl, bio, bio)` passes the same
+//!   `BIO` as both read and write side; per `SSL_set_bio(3)`, when
+//!   `rbio == wbio` exactly **one** reference is consumed, and ownership
+//!   transfers to the `SSL` — `SSL_free` frees it. We therefore MUST NOT call
+//!   `BIO_free_all` ourselves (double-free). In `TlsNgxConnIo::new` the only
+//!   early-return before `SSL_set_bio` is `BIO_new` returning null (nothing to
+//!   free yet); once it succeeds, `SSL_set_bio` runs unconditionally.
 //! - `BIO_METHOD`: created once **per concrete inner-IO type `I`** (keyed by
-//!   `TypeId` in the `BIO_METHODS` registry) via `BIO_meth_new`, and never
-//!   freed (it lives for the life of the exporter process, like a `'static`).
-//!   Per-`I` keying is required for soundness: the callbacks are
-//!   `I`-monomorphized and cast the BIO `data` slot to `*mut BioCtx<I>`, so a
-//!   method must never be shared across different `I`s. OpenSSL does not free a
-//!   method when a BIO using it is freed.
+//!   `TypeId` in `BIO_METHODS`) via `BIO_meth_new`, never freed (process-
+//!   lifetime, like `'static`). Per-`I` keying is required for soundness: the
+//!   callbacks are `I`-monomorphized and cast the BIO `data` slot to
+//!   `*mut BioCtx<I>`, so a method built for one `I` must never attach to a
+//!   BIO carrying another `I`'s `BioCtx` — that would type-pun the pointer.
+//!   OpenSSL does not free a method when a BIO using it is freed.
 
 extern crate alloc;
 
@@ -788,21 +775,14 @@ impl<I: hyper::rt::Read + hyper::rt::Write + Unpin + 'static> TlsNgxConnIo<I> {
         });
         if rc == 1 {
             self.handshake = HandshakeState::Done;
-            // Capture collector cert notAfter on first successful handshake.
-            //
-            // `SSL_get_peer_certificate` returns an OWNED `X509*` (unlike the
-            // get0 variants it increments the reference count); we MUST call
-            // `X509_free` after reading the field to avoid a reference leak.
-            //
-            // We call the SHARED `asn1_time_to_unix` helper from
-            // `crate::cert_table` — zero duplication of the epoch math.  The
-            // unit test asserts this reuse seam directly.
-            //
-            // Absent-not-zero: on failure (null cert or conversion error) the
-            // atomic is left at its initial value (0), so the metric stays
-            // absent.  On success the atomic is written once; subsequent
-            // handshakes (one new `TlsNgxConnIo` per send) overwrite with the
-            // same value (stable per endpoint/generation).
+            // Capture collector cert notAfter on first successful handshake,
+            // via the SHARED `asn1_time_to_unix` helper from `crate::cert_table`
+            // (zero duplication of the epoch math; a unit test asserts this
+            // reuse seam directly). Absent-not-zero: on failure (null cert or
+            // conversion error) the atomic stays at its initial value (0), so
+            // the metric stays absent; on success it is overwritten with the
+            // same value on every subsequent handshake (stable per
+            // endpoint/generation).
             //
             // SAFETY:
             // - `self.ssl` is the owned, non-null SSL; handshake just succeeded.
@@ -810,13 +790,10 @@ impl<I: hyper::rt::Read + hyper::rt::Write + Unpin + 'static> TlsNgxConnIo<I> {
             //   variant increments the refcount; rc 1 guarantees handshake
             //   completed and the peer cert was verified); NULL if the peer
             //   sent no cert (should not happen for a server, but we guard).
+            //   We MUST call `X509_free` exactly once after reading to avoid a
+            //   reference leak.
             // - `X509_getm_notAfter` returns an INTERNAL (get0) pointer owned by
             //   the cert; valid until `X509_free` is called below.
-            // - `X509_free` decrements the refcount exactly once; we do not use
-            //   `cert` after this call.
-            // SAFETY: `SSL_get1_peer_certificate` returns an OWNED `X509*`
-            // (the get1 variant increments the refcount, unlike get0 which is
-            // borrowed).  We MUST call `X509_free` exactly once after reading.
             let cert = unsafe { ssl::SSL_get1_peer_certificate(self.ssl) };
             if !cert.is_null() {
                 // SAFETY: `cert` is the owned, non-null X509 obtained above;
@@ -826,9 +803,7 @@ impl<I: hyper::rt::Read + hyper::rt::Write + Unpin + 'static> TlsNgxConnIo<I> {
                 // SAFETY: `not_after_asn1` is a valid borrow of `cert`'s
                 // notAfter field; `asn1_time_to_unix` only reads it; `cert`
                 // stays live until `X509_free` below.
-                let epoch_opt =
-                    // SAFETY: see comment above.
-                    unsafe { crate::cert_table::asn1_time_to_unix(not_after_asn1) };
+                let epoch_opt = unsafe { crate::cert_table::asn1_time_to_unix(not_after_asn1) };
                 if let Some(epoch_secs) = epoch_opt {
                     // Relaxed is sound: the exporter is single-threaded; the
                     // write and the read in `collect_all_sources` happen on the
