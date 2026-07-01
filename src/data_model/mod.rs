@@ -64,13 +64,9 @@ pub struct Metric {
 
 /// The data payload of a metric.
 ///
-/// Carries several shapes: histograms for the request-duration /
-/// upstream-latency surface, sums for monotonic counters (`ngx_otel.dropped_records`,
-/// `ngx_otel.send_failures`), gauges for non-monotonic instantaneous
-/// readings (`ngx_otel.export_interval_seconds`), and an exponential histogram
-/// for the request-duration metric.  Per OTLP semantics these
-/// must be distinct variants — emitting a counter as a single-bucket histogram
-/// causes downstream backends to misclassify the metric type.
+/// Per OTLP semantics these must be distinct variants — emitting a counter as
+/// a single-bucket histogram causes downstream backends to misclassify the
+/// metric type.
 #[derive(Debug, Clone)]
 pub enum MetricData {
     Histogram(HistogramData),
@@ -88,8 +84,8 @@ pub struct HistogramData {
 
 /// A sum metric aggregation (monotonic counter or non-monotonic gauge-summed).
 ///
-/// Use `is_monotonic = true` for counters that only increase
-/// (e.g. `ngx_otel.dropped_records`).
+/// `is_monotonic = true` for counters that only increase (e.g.
+/// `ngx_otel.dropped_records`).
 #[derive(Debug, Clone)]
 pub struct SumData {
     pub aggregation_temporality: AggregationTemporality,
@@ -174,9 +170,9 @@ pub struct Exemplar {
 
 /// One data point in an OTel exponential histogram metric.
 ///
-/// The internal representation uses scale 3 (`EXP_HISTOGRAM_SCALE`), so bucket
-/// `k` covers approximately `(2^(k/8), 2^((k+1)/8)]` µs.  All durations are
-/// non-negative so `negative` is always empty.  Values of 0 µs go in `zero_count`.
+/// Scale 3 (`EXP_HISTOGRAM_SCALE`): bucket `k` covers ~`(2^(k/8), 2^((k+1)/8)]`
+/// µs. Durations are non-negative, so `negative` is always empty; 0 µs goes
+/// in `zero_count`.
 #[derive(Debug, Clone)]
 pub struct ExponentialHistogramDataPoint {
     /// Attributes for this data point (method, status class, protocol, route, upstream zone).
@@ -193,14 +189,11 @@ pub struct ExponentialHistogramDataPoint {
     pub scale: i32,
     /// Count of values exactly 0 µs.
     pub zero_count: u64,
-    /// Positive-range bucket counts.  Bucket k covers ~(2^(k/8), 2^((k+1)/8)] µs.
-    /// `offset` is the index of the first entry (always 0 for scale 0 with our
-    /// fixed-offset storage).
+    /// Index of the first bucket entry (fixed-offset storage).
     pub positive_offset: i32,
     pub positive_bucket_counts: std::vec::Vec<u64>,
     // `negative` is always empty for request durations (non-negative).
-    /// Exemplars sampled from the reservoir.  One per representative
-    /// observation for this histogram data point.  May be empty.
+    /// Exemplars sampled from the reservoir; may be empty.
     pub exemplars: std::vec::Vec<Exemplar>,
 }
 
@@ -225,9 +218,8 @@ pub struct Batch {
 
 /// OTel severity number per the OTel Log Data Model spec.
 ///
-/// Values mirror the `SeverityNumber` enum in `logs.proto`; only the
-/// subset used by the nginx-level → OTel mapping is listed here.
-/// Numeric values match the proto field numbers.
+/// Mirrors `SeverityNumber` in `logs.proto` (numeric values match the proto
+/// field numbers); only the subset used by the nginx→OTel mapping is listed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 pub enum SeverityNumber {
@@ -258,12 +250,11 @@ pub enum SeverityNumber {
     Fatal4 = 24,
 }
 
-/// A single OTel log record.
+/// A single OTel log record — mirrors the `LogRecord` proto message shape.
 ///
-/// Mirrors the `LogRecord` proto message shape.
-/// `trace_id` / `span_id` may be left empty when there is no span to correlate
-/// with.  `body` carries a short string for access logs; structured
-/// attributes carry the HTTP semconv fields.
+/// `trace_id` / `span_id` are empty when there is no span to correlate with.
+/// `body` carries a short string for access logs; structured attributes
+/// carry the HTTP semconv fields.
 #[derive(Debug, Clone)]
 pub struct LogRecord {
     /// When the event occurred (Unix epoch, nanoseconds).
@@ -357,12 +348,8 @@ pub struct SpanLink {
     pub attributes: std::vec::Vec<KeyValue>,
 }
 
-/// A single OTel server span.
-///
-/// Rule: do NOT `use opentelemetry_proto::*` in this module.
-/// Raw field bytes are carried here; protobuf is built in the exporter.
-///
-/// Represents one OTel span.
+/// A single OTel server span. Raw field bytes are carried here; protobuf is
+/// built in the exporter.
 #[derive(Debug, Clone)]
 pub struct Span {
     /// 16-byte W3C trace ID.
@@ -408,12 +395,10 @@ pub struct SpansBatch {
 /// Unified exporter payload — the native currency flowing through
 /// `drain → process → encode → send`.
 ///
-/// Each variant wraps one of the three signal batch types. The `Processor`
-/// trait operates on `&mut Pdata` and dispatches on the variant internally,
-/// keeping signal-specific logic inside the processor while exposing a
-/// single entry point to the pipeline.
+/// The `Processor` trait operates on `&mut Pdata` and dispatches on the
+/// variant internally, keeping signal-specific logic inside the processor.
 ///
-/// **Row-backed, no Arrow** — a future OTel Arrow transport would be a
+/// Row-backed, no Arrow — a future OTel Arrow transport would be a
 /// representation swap inside the same enum shape.
 #[derive(Debug, Clone)]
 pub enum Pdata {
@@ -433,8 +418,6 @@ pub enum Pdata {
 pub(crate) mod tests {
     use super::*;
 
-    /// Construct a Batch with one histogram metric, one resource attribute,
-    /// and 8 explicit buckets; inspect the shape manually.
     #[test]
     fn batch_construction() {
         let resource = Resource {
@@ -474,7 +457,6 @@ pub(crate) mod tests {
 
         let batch = Batch { resource, scope, metrics: std::vec![metric] };
 
-        // Structural assertions
         assert_eq!(batch.resource.attributes.len(), 1);
         assert_eq!(batch.resource.attributes[0].key, "service.name");
         assert_eq!(batch.metrics.len(), 1);
@@ -493,7 +475,6 @@ pub(crate) mod tests {
         assert_eq!(dp.attributes[0].value, AnyValue::Int(200));
     }
 
-    /// Construct a LogsBatch with two LogRecords; inspect the shape manually.
     #[test]
     fn logs_batch_round_trip() {
         let resource = Resource {
@@ -547,7 +528,6 @@ pub(crate) mod tests {
         assert_eq!(batch.logs[1].severity_number as i32, 17);
     }
 
-    /// Construct a [`SpansBatch`] with one server span; inspect the shape manually.
     #[test]
     fn spans_batch_construction() {
         let resource = Resource {
@@ -582,7 +562,6 @@ pub(crate) mod tests {
 
         let batch = SpansBatch { resource, scope, spans: std::vec![span] };
 
-        // Structural assertions.
         assert_eq!(batch.resource.attributes[0].key, "service.name");
         assert_eq!(batch.spans.len(), 1);
         let s = &batch.spans[0];

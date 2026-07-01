@@ -3,55 +3,28 @@
 // This source code is licensed under the Apache License, Version 2.0 license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! Config-driven `Processor` trait for the exporter pipeline — Step U (signal-generic).
-//!
-//! # Pipeline position
-//!
-//! ```text
-//! drain → [Processor::process(&mut Pdata)] → encode → send
-//! ```
-//!
-//! The trait is **signal-generic**: it receives `&mut Pdata` and dispatches
-//! on the variant internally, so one processor handles all three signals.
-//! Processors are constructed once at exporter startup via [`Processor::from_config`].
-//! The default processor is [`NoopProcessor`] — a zero-overhead passthrough.
-//!
-//! # Staged follow-on: remote reconfiguration
-//!
-//! **Static config only** for now — the processor config is read once at exporter
-//! startup and never reloaded.  A future bidi control loop will deliver a
-//! new config payload to the exporter via the control-shm channel; the exporter
-//! will then call [`Processor::from_config`] with the new blob and swap the processor.
-//! The `from_config` API is designed for this: it is a pure function returning a new value,
-//! so the swap is a single assignment with no state migration.
-//!
-//! # Static dispatch
-//!
-//! [`Processor`] is a concrete enum over all built-in processor implementations.
-//! This keeps dispatch static and matches the pattern used by [`crate::drain`]'s
-//! `ExportTransport` — the exporter is already on the heap; one enum avoids a
-//! `Box<dyn ProcessorImpl>` indirection.
+//! Config-driven `Processor` trait for the exporter pipeline — Step U
+//! (signal-generic): `drain → [Processor::process(&mut Pdata)] → encode →
+//! send`. The trait receives `&mut Pdata` and dispatches on the variant
+//! internally, so one processor handles all three signals; [`Processor`] is
+//! a concrete enum (static dispatch, no `Box<dyn ProcessorImpl>`), matching
+//! [`crate::drain`]'s `ExportTransport` pattern. Config is static, read once
+//! at exporter startup via [`Processor::from_config`] (default
+//! [`NoopProcessor`]) — a future bidi control loop can swap processors by
+//! calling `from_config` again since it is a pure constructor.
 
 use crate::data_model::Pdata;
 
 // ── `Processor` trait ────────────────────────────────────────────────────────
 
-/// Exporter-side processing stage — signal-generic (Step U).
-///
-/// Receives `&mut Pdata` after drain and before encode. May filter,
-/// transform, or enrich the payload in-place. Dispatches on the variant
-/// internally so signal-specific logic stays inside the processor.
-///
-/// # Config-driven construction
+/// Exporter-side processing stage — signal-generic (Step U). Receives
+/// `&mut Pdata` after drain and before encode; may filter, transform, or
+/// enrich the payload in-place, dispatching on the variant internally.
 ///
 /// Every implementation provides [`ProcessorImpl::from_config`] so the
 /// exporter can instantiate processors from a JSON config blob (operator
-/// directive, or — in a future phase — the bidi control channel).
-///
-/// # Static config only
-///
-/// This phase: static config, read once at exporter startup.
-/// Remote reconfiguration (bidi + control-shm) is a staged follow-on.
+/// directive, or — in a future phase — the bidi control channel). Static
+/// config only for now: read once at exporter startup.
 pub trait ProcessorImpl {
     /// Construct a processor from a JSON config blob.
     ///
@@ -68,10 +41,8 @@ pub trait ProcessorImpl {
 
 // ── NoopProcessor ─────────────────────────────────────────────────────────────
 
-/// Passthrough processor — leaves the payload unchanged.
-///
-/// This is the default [`Processor`] variant.  It adds no overhead beyond
-/// a function call; no clone or move of the data.
+/// Passthrough processor — leaves the payload unchanged. The default
+/// [`Processor`] variant; no clone or move of the data.
 pub struct NoopProcessor;
 
 impl ProcessorImpl for NoopProcessor {
@@ -89,14 +60,13 @@ impl ProcessorImpl for NoopProcessor {
 
 /// Drops spans based on their OTel status code.
 ///
-/// Config JSON example:
 /// ```json
 /// {"type": "status_filter", "drop_errors": true}
 /// ```
 ///
-/// When `drop_errors` is `true`, spans with `status.code == Error` are dropped.
-/// This is primarily a demonstration of the config-driven `from_config` pattern;
-/// it is not the recommended production treatment for error spans (errors are
+/// When `drop_errors` is `true`, spans with `status.code == Error` are
+/// dropped. Primarily a demonstration of the config-driven `from_config`
+/// pattern — not the recommended production treatment (errors are
 /// high-signal and should normally be shipped).
 pub struct StatusFilterProcessor {
     /// Drop spans whose status code is `Error`.
@@ -122,19 +92,11 @@ impl ProcessorImpl for StatusFilterProcessor {
 
 // ── ProbeDropProcessor ────────────────────────────────────────────────────────
 
-/// Drops spans whose `url.path` attribute matches a probe/health-check path.
+/// Drops spans whose `url.path` attribute matches a probe/health-check path
+/// (`/healthz`, `/readyz`, etc.) — high-frequency, zero-signal spans that
+/// waste trace storage and inflate cardinality. Filters after ring drain,
+/// before encode, so probe traffic never leaves the nginx host.
 ///
-/// Health-check endpoints (`/healthz`, `/readyz`, `/livez`, `/ping`,
-/// `/metrics`, etc.) generate high-frequency, zero-signal spans that waste
-/// trace storage and inflate cardinality.  This processor filters them in the
-/// exporter pipeline — after ring drain, before encode — so probe traffic
-/// never leaves the nginx host.
-///
-/// The drop list is configurable to avoid hard-coding deployment-specific
-/// paths; the default list covers the common Kubernetes health-check and
-/// Prometheus scrape paths.
-///
-/// # Config JSON example
 /// ```json
 /// {
 ///   "type": "probe_drop",
@@ -142,9 +104,8 @@ impl ProcessorImpl for StatusFilterProcessor {
 /// }
 /// ```
 ///
-/// `paths` absent ⇒ the default list `["/healthz", "/readyz", "/livez",
-/// "/ping", "/metrics"]` is used.  An empty `[]` disables all dropping
-/// (equivalent to Noop for `Pdata::Spans`).
+/// `paths` absent ⇒ the default list above is used. An empty `[]` disables
+/// all dropping (equivalent to Noop for `Pdata::Spans`).
 ///
 /// Non-`Pdata::Spans` variants are always passed through unchanged.
 pub struct ProbeDropProcessor {
@@ -171,7 +132,6 @@ impl ProcessorImpl for ProbeDropProcessor {
     fn process(&self, data: &mut Pdata) {
         if let Pdata::Spans(batch) = data {
             batch.spans.retain(|span| {
-                // Look up the url.path attribute and check against the drop list.
                 let url_path = span.attributes.iter().find_map(|kv| {
                     if kv.key == "url.path" {
                         if let crate::data_model::AnyValue::String(ref s) = kv.value {
@@ -180,7 +140,6 @@ impl ProcessorImpl for ProbeDropProcessor {
                     }
                     None
                 });
-                // Retain the span unless its url.path is in the drop list.
                 match url_path {
                     Some(path) => !self.paths.iter().any(|p| p == path),
                     None => true, // no url.path attribute → keep (conservative)

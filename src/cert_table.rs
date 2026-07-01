@@ -8,29 +8,26 @@
 //! At `postconfiguration` time (single-threaded master, before workers fork)
 //! we walk every `server {}` block, find its `ngx_http_ssl_module` srv conf,
 //! and enumerate EVERY leaf certificate installed in the server's `SSL_CTX`
-//! (dual RSA+ECDSA blocks must yield BOTH certs).  Each cert is
-//! reduced to a [`CertInfo`] row — identity fields only:
-//! file path, server name, validity window, subject/issuer CN, serial,
-//! public-key algorithm, signature algorithm.  Nothing else is extracted (no
-//! PEM, no keys, no fingerprints, no full DNs, no SANs, no key sizes).
+//! (dual RSA+ECDSA blocks must yield BOTH certs). Each cert is reduced to a
+//! [`CertInfo`] row — identity fields only (file path, server name, validity
+//! window, subject/issuer CN, serial, pubkey/sig algorithm); nothing else is
+//! extracted (no PEM, keys, fingerprints, full DNs, SANs, or key sizes).
 //!
 //! The resulting `Vec<CertInfo>` is stored on `MainConfig` (plain Rust heap,
-//! written once here, read-only afterwards) and is inherited by the exporter
-//! process at fork.  The `ngx_otel.tls.certificate.*` gauges are built on top.
+//! written once here, read-only afterwards) and inherited by the exporter
+//! process at fork; the `ngx_otel.tls.certificate.*` gauges build on top.
 //!
-//! Layering notes:
-//! - `ngx_http_ssl_srv_conf_t` is dereferenced ONLY in the C shim
-//!   (`src/shim/ngx_otel_ssl_shim.c`) — see the shim header for the rationale.
-//!   `ngx_ssl_t`'s `ctx`/`certs` fields are the exception read directly from
-//!   Rust (bitfield-free core struct, layout verified against nginx).
-//! - The `ngx_http_ssl_module` global symbol is deliberately NEVER referenced
-//!   from Rust: nginx loads dynamic modules with `dlopen(RTLD_NOW)`, so an
-//!   undefined data symbol would make a no-ssl nginx binary REFUSE to load us.
-//!   Instead the module is located by NAME in `cycle->modules`; when absent,
-//!   the table stays empty and a single NOTICE explains why.
-//! - Variable (`$var`) certificate paths are skipped with a config-time
-//!   NOTICE: nginx defers such certs to per-handshake loading
-//!   (`certificate_values`), so they are not in the `SSL_CTX` at config time.
+//! Layering: `ngx_http_ssl_srv_conf_t` is dereferenced ONLY in the C shim
+//! (`src/shim/ngx_otel_ssl_shim.c`) — `ngx_ssl_t`'s `ctx`/`certs` fields are
+//! the exception, read directly from Rust (bitfield-free, layout verified
+//! against nginx). The `ngx_http_ssl_module` global symbol is deliberately
+//! NEVER referenced from Rust: nginx loads dynamic modules with
+//! `dlopen(RTLD_NOW)`, so an undefined data symbol would make a no-ssl nginx
+//! binary REFUSE to load us — the module is located by NAME in
+//! `cycle->modules` instead; when absent, the table stays empty with a
+//! NOTICE. Variable (`$var`) certificate paths are skipped with a NOTICE:
+//! nginx defers those to per-handshake loading (`certificate_values`), so
+//! they are not in the `SSL_CTX` at config time.
 
 use core::ffi::{c_char, c_int, c_void, CStr};
 use core::ptr;
@@ -84,15 +81,15 @@ extern "C" {
     fn ngx_otel_srv_ssl(ssl_srv_conf: *mut c_void) -> *mut nginx_sys::ngx_ssl_t;
     /// `((ngx_http_ssl_srv_conf_t *) conf)->certificates`; may be NULL.
     fn ngx_otel_srv_ssl_certificates(ssl_srv_conf: *mut c_void) -> *mut ngx_array_t;
-    /// Config-order index of `cert` within `ssl->certs` (the configured-order
-    /// array, 1:1 with `certificates`/the path list), matched by `X509_cmp`
-    /// identity (DER encoding) — NOT pointer identity, since the enumeration
-    /// returns OpenSSL's internal X509 object.  `-1` when no loaded cert
-    /// matches.  See the shim header for why identity matching is required.
+    /// Config-order index of `cert` in `ssl->certs` (1:1 with the path list),
+    /// matched by `X509_cmp` DER identity — NOT pointer identity, since
+    /// enumeration returns OpenSSL's own internal X509 object. `-1` if no
+    /// loaded cert matches. See the shim header for why identity matching
+    /// is required.
     fn ngx_otel_cert_config_index(ssl: *mut nginx_sys::ngx_ssl_t, cert: *mut ossl::X509) -> c_int;
     /// Full leaf-cert enumeration via OpenSSL's `SSL_CTX_set_current_cert`
-    /// cursor macros (config-time only; see the shim header).  `cb` returns 0
-    /// to continue.  Returns the number of certificates visited.
+    /// cursor (config-time only). `cb` returns 0 to continue; returns the
+    /// number of certificates visited.
     fn ngx_otel_foreach_ctx_cert(
         ctx: *mut ossl::SSL_CTX,
         cb: Option<unsafe extern "C" fn(cert: *mut ossl::X509, data: *mut c_void) -> c_int>,
@@ -151,10 +148,9 @@ pub(crate) unsafe fn build_cert_table(amcf: &mut MainConfig, cf: *mut ngx_conf_t
     }
 }
 
-/// No-ssl-bindings fallback: the module was built against an nginx source
-/// tree configured WITHOUT `--with-http_ssl_module`, so the ssl types are
-/// absent from the bindings and the C shim compiled its stub variants.  The
-/// cert table stays empty; emit the same operator-visible NOTICE as the
+/// No-ssl-bindings fallback: built against an nginx tree configured WITHOUT
+/// `--with-http_ssl_module`, so the ssl types are absent and the C shim
+/// compiled its stub variants. Cert table stays empty; same NOTICE as the
 /// runtime no-ssl path.
 ///
 /// # Safety
@@ -301,7 +297,6 @@ unsafe fn collect_server_certs(
     // declares another; the pointee is identical.
     let ssl_ctx: *mut ossl::SSL_CTX = ngx_ssl_ctx.cast::<ossl::SSL_CTX>();
 
-    // Enumerate every leaf cert in the ctx (full enumeration).
     let mut enumerated: Vec<*mut ossl::X509> = Vec::new();
     // SAFETY: `ssl_ctx` is the server's live config-time SSL_CTX; we are in
     // the single-threaded master before workers fork, which is the shim
@@ -365,20 +360,18 @@ unsafe extern "C" fn collect_cert_cb(cert: *mut ossl::X509, data: *mut c_void) -
 /// Map an enumerated cert back to its configured file path by cert identity.
 ///
 /// `config_idx` is the cert's position in nginx's configured-order `ssl->certs`
-/// array — 1:1 with the `paths` list — as resolved by `ngx_otel_cert_config_index`
-/// (an `X509_cmp` DER-identity match), or `-1` when no loaded cert matched.
+/// array (1:1 with `paths`), resolved by `ngx_otel_cert_config_index` via
+/// `X509_cmp` DER identity, or `-1` when no loaded cert matched.
 ///
 /// Identity matching (not enumeration position) is required because the
-/// `SSL_CTX` current-cert cursor used by `ngx_otel_foreach_ctx_cert` walks
-/// certs in OpenSSL key-type-slot order (`ssl/ssl_cert.c` `ssl_cert_set_current()`
-/// iterates `c->pkeys[i]` by `SSL_PKEY_RSA`, `RSA_PSS`, `DSA`, `SSL_PKEY_ECC`, …),
-/// NOT the config/insertion order of the `paths` list.  For a dual-cert block
-/// whose `ssl_certificate` directives are listed ECDSA-before-RSA, the cursor
-/// still yields RSA first, so the enumeration index would mislabel every path.
+/// `SSL_CTX` current-cert cursor (`ssl/ssl_cert.c` `ssl_cert_set_current()`)
+/// walks certs in OpenSSL key-type-slot order (RSA, RSA_PSS, DSA, ECC, …),
+/// NOT config/insertion order — a block listing ECDSA-before-RSA still gets
+/// RSA first from the cursor, so positional indexing would mislabel every path.
 ///
-/// Fallbacks (a match should always be found for a config-loaded cert): a single
-/// configured path is the only candidate and is returned as-is; otherwise (no
-/// match, multiple paths) the path is left empty rather than guessing wrong.
+/// Fallback (a match should always be found for a config-loaded cert): with
+/// exactly one configured path it's the only candidate; otherwise (no match,
+/// multiple paths) the path is left empty rather than guessing wrong.
 #[cfg(ngx_feature = "http_ssl")]
 fn path_for_cert(config_idx: c_int, paths: &[String]) -> String {
     if config_idx >= 0 {
@@ -593,12 +586,8 @@ unsafe fn asn1_integer_hex(ser: *const ossl::ASN1_INTEGER) -> String {
         // SAFETY: `hex` was allocated by BN_bn2hex and must be released with
         // OPENSSL_free exactly once.
         unsafe { ossl::OPENSSL_free(hex.cast::<c_void>()) };
-        // Strip the leading `-` that BN_bn2hex emits for negative BIGNUMs
-        // (see BN_bn2bin(3): "BN_bn2hex() ... negative numbers are prefixed
-        // with a minus sign").  Serial numbers are rendered as their absolute
-        // hex value — matches `openssl x509 -serial` canonical output.  If
-        // the string has no leading `-`, `strip_prefix` returns None and `s`
-        // is returned as-is.
+        // Strip the sign BN_bn2hex prepends for negative BIGNUMs (see doc
+        // comment above); absent, strip_prefix returns None and `s` is used as-is.
         s.strip_prefix('-').map(String::from).unwrap_or(s)
     };
     // SAFETY: `bn` was allocated by ASN1_INTEGER_to_BN and not yet freed.

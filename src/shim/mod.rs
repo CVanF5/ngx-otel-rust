@@ -42,12 +42,11 @@ extern "C" {
     fn ngx_otel_shim_r_filter_finalize(r: *const ngx_http_request_t) -> core::ffi::c_uint;
 }
 
-// `r_header_only`'s only caller is the `otel_status_endpoint` content handler,
-// which is gated on `cfg(any(test, feature = "test-support"))`; gate the shim
-// accessor identically so the production cdylib does not carry an unused FFI
-// import (the C symbol is always compiled by build.rs, but the Rust import is
-// dead in a plain release build). The misread it corrects is real on all
-// platforms — see the audit note in `ngx_otel_bitfield_shim.c`.
+// `r_header_only`'s only caller (`otel_status_endpoint`) is gated on
+// `cfg(any(test, feature = "test-support"))`; gate this accessor identically
+// so a plain release build does not carry an unused FFI import (the C symbol
+// is always compiled; only the Rust import would be dead). The misread it
+// corrects is real on all platforms — see `ngx_otel_bitfield_shim.c`.
 #[cfg(any(test, feature = "test-support"))]
 extern "C" {
     /// C accessor for `r->header_only` — see module docs / the `.c` header.
@@ -61,8 +60,8 @@ extern "C" {
 /// `r` must be a valid, non-null `*const ngx_http_request_t`.
 #[inline]
 pub unsafe fn r_internal(r: *const ngx_http_request_t) -> core::ffi::c_uint {
-    // SAFETY: caller guarantees `r` is a valid request pointer; the C shim only
-    // reads the `internal` bitfield through nginx's own header layout.
+    // SAFETY: caller guarantees `r` is valid; the shim only reads `internal`
+    // through nginx's own header layout.
     unsafe { ngx_otel_shim_r_internal(r) }
 }
 
@@ -72,8 +71,8 @@ pub unsafe fn r_internal(r: *const ngx_http_request_t) -> core::ffi::c_uint {
 /// `r` must be a valid, non-null `*const ngx_http_request_t`.
 #[inline]
 pub unsafe fn r_filter_finalize(r: *const ngx_http_request_t) -> core::ffi::c_uint {
-    // SAFETY: caller guarantees `r` is a valid request pointer; the C shim only
-    // reads the `filter_finalize` bitfield through nginx's own header layout.
+    // SAFETY: caller guarantees `r` is valid; the shim only reads
+    // `filter_finalize` through nginx's own header layout.
     unsafe { ngx_otel_shim_r_filter_finalize(r) }
 }
 
@@ -90,8 +89,8 @@ pub unsafe fn r_filter_finalize(r: *const ngx_http_request_t) -> core::ffi::c_ui
 #[cfg(any(test, feature = "test-support"))]
 #[inline]
 pub unsafe fn r_header_only(r: *const ngx_http_request_t) -> core::ffi::c_uint {
-    // SAFETY: caller guarantees `r` is a valid request pointer; the C shim only
-    // reads the `header_only` bitfield through nginx's own header layout.
+    // SAFETY: caller guarantees `r` is valid; the shim only reads
+    // `header_only` through nginx's own header layout.
     unsafe { ngx_otel_shim_r_header_only(r) }
 }
 

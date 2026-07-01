@@ -3,61 +3,38 @@
 // This source code is licensed under the Apache License, Version 2.0 license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! Exporter liveness detection (heartbeat-stale alert).
+//! Exporter liveness detection (heartbeat-stale alert). Turns a *silent*
+//! exporter death (esp. the gen-1 `daemon on` case — see `LIFECYCLE.md`
+//! §"Known limitation: gen-1 exporter under `daemon on`") into a prompt,
+//! **latched** ALERT in the worker's error log, the only channel still
+//! working when the exporter is dead.
 //!
-//! Turns a *silent* exporter death (especially the gen-1 `daemon on` case,
-//! where the exporter's PPID is init and the master's crash-respawn never
-//! fires — see `LIFECYCLE.md` §"Known limitation: gen-1 exporter under
-//! `daemon on`") into a prompt, **latched** ALERT in the worker's error log —
-//! the only channel that still works when the exporter is dead.
-//!
-//! # Design: the drop is the TRIGGER, the heartbeat is the VERDICT
-//!
-//! - **Trigger**: a ring-full drop on the worker's span/access-tail push path.
-//!   This is an already-counted *symptom* path — it adds **zero cost** to the
-//!   healthy hot path (the push's boolean result was previously discarded).
-//!   There is NO per-request liveness check.
-//! - **Verdict**: the exporter's heartbeat timestamp
-//!   ([`crate::exporter::control_shm::ControlShm::last_beat_msec`]).  A
-//!   saturated-but-alive exporter beats normally (the beat timer is
-//!   independent of drain/send progress) and keeps exporting
-//!   `*.dropped_records` — drops alone never alert.  Only a heartbeat older
-//!   than [`HEARTBEAT_STALE_THRESHOLD_MS`] does.
-//!
-//! # False-positive guards (hard requirements)
-//!
-//! - The beat is bumped by a dedicated `ngx_event_t` timer on the exporter's
-//!   event loop (`heartbeat_timer_handler` in `exporter/mod.rs`), independent
-//!   of drain/send progress: all transport IO is non-blocking and futures are
-//!   woken via `ngx_post_event` (never re-polled synchronously), so a
-//!   blackholed-collector send stall cannot delay beats.
-//! - The staleness threshold is derived from the **beat period** (a constant
-//!   we own), never from the drain interval (`otel_metric_interval` is
-//!   operator-configurable and must not be load-bearing for liveness).
-//! - Both sides use `ngx_current_msec` (nginx's cached `CLOCK_MONOTONIC`
-//!   millisecond clock) — the same monotonic basis, never wall-clock.
-//! - The alert is latched per worker per exporter generation
-//!   (`ControlShm::successor_gen`): one line per worker, re-armed only by a
-//!   SIGHUP reload (which spawns a fresh, supervised exporter generation —
-//!   hence the "nginx -s reload restores" remedy in the alert text).
+//! Design: the **drop is the TRIGGER** (a ring-full drop on the worker's
+//! span/access-tail push path — an already-counted symptom, zero added cost
+//! on the healthy hot path, no per-request check) and the **heartbeat is the
+//! VERDICT** ([`crate::exporter::control_shm::ControlShm::last_beat_msec`]):
+//! a saturated-but-alive exporter keeps beating and exporting
+//! `*.dropped_records`, so drops alone never alert — only a heartbeat older
+//! than [`HEARTBEAT_STALE_THRESHOLD_MS`] does. The beat is bumped by a
+//! dedicated timer independent of drain/send progress (a blackholed-collector
+//! stall cannot delay beats), and the staleness threshold is derived from the
+//! **beat period we own, never from the drain interval**
+//! (`otel_metric_interval` is operator-configurable and must not be
+//! load-bearing for liveness meaning). Both sides read `ngx_current_msec`
+//! (same monotonic basis). The alert latches per worker per exporter
+//! generation (`ControlShm::successor_gen`), re-armed only by a SIGHUP reload.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-/// Exporter heartbeat period in milliseconds: how often the dedicated beat
-/// timer re-arms and stamps `ControlShm::last_beat_msec`.
-///
-/// 1 s — frequent enough that the staleness threshold can sit at single-digit
-/// seconds, cheap enough to be negligible (one atomic store + one timer
-/// insertion per second in the exporter; nothing in workers).
+/// How often the dedicated beat timer re-arms and stamps
+/// `ControlShm::last_beat_msec`. 1 s: negligible cost, and lets the
+/// staleness threshold sit at single-digit seconds.
 pub const HEARTBEAT_PERIOD_MS: u64 = 1_000;
 
-/// Staleness threshold in milliseconds, **derived from the beat period**
-/// (5 beat periods = 5 s): ≫ the beat period (tolerates scheduling jitter and
-/// several missed expirations), ≪ operator timescales.
-///
-/// Deliberately NOT derived from the drain interval: `otel_metric_interval`
-/// is (or will become) operator-configurable, and liveness detection must not
-/// silently change meaning when an operator tunes export cadence.
+/// Staleness threshold, derived from the beat period (5× = 5 s — tolerates
+/// jitter/missed beats, still far below operator timescales). Deliberately
+/// NOT derived from the drain interval (`otel_metric_interval` is
+/// operator-configurable and must not change liveness meaning).
 pub const HEARTBEAT_STALE_THRESHOLD_MS: u64 = 5 * HEARTBEAT_PERIOD_MS;
 
 // Hard requirement (b): threshold must be whole seconds, at least 5 s, and a
@@ -73,58 +50,45 @@ const _: () = assert!(HEARTBEAT_STALE_THRESHOLD_MS / HEARTBEAT_PERIOD_MS >= 2);
 /// can never realistically reach `u64::MAX`.
 pub const LATCH_UNSET: u64 = u64::MAX;
 
-/// Staleness predicate (pure, unit-tested).
+/// Staleness predicate (pure, unit-tested). Both args share the same
+/// monotonic basis (`ngx_current_msec`, system-wide, so cross-process
+/// comparison is sound).
 ///
-/// `now_msec` and `last_beat_msec` must share the same monotonic basis
-/// (`ngx_current_msec`, i.e. nginx's cached `CLOCK_MONOTONIC` milliseconds —
-/// system-wide, so cross-process comparison is sound).
-///
-/// - `last_beat_msec == 0` → exporter has never beaten (fresh zone / early
-///   startup) → **not** stale (startup grace; avoids a false alert in the
-///   window between worker fork and the exporter's first beat).
-/// - `last_beat_msec > now_msec` (exporter's cached clock marginally ahead of
-///   the worker's) → `saturating_sub` yields 0 → not stale.
+/// `last_beat_msec == 0` (never beaten) → not stale (startup grace, avoids a
+/// false alert between worker fork and the exporter's first beat).
+/// `last_beat_msec > now_msec` (clocks marginally skewed) → `saturating_sub`
+/// yields 0 → not stale.
 #[inline]
 pub fn heartbeat_is_stale(now_msec: u64, last_beat_msec: u64) -> bool {
     last_beat_msec != 0 && now_msec.saturating_sub(last_beat_msec) > HEARTBEAT_STALE_THRESHOLD_MS
 }
 
-/// Latch decision (pure, unit-tested): should this worker emit the alert?
-///
-/// `latched_gen` is the generation for which this worker already alerted
-/// ([`LATCH_UNSET`] if never); `current_gen` is the live
-/// `ControlShm::successor_gen`.  Returns `true` exactly when the heartbeat is
-/// stale AND no alert has been emitted for this generation yet.  A SIGHUP
-/// reload bumps `successor_gen`, so `latched_gen != current_gen` re-arms the
+/// Latch decision (pure, unit-tested): `true` exactly when stale AND no
+/// alert has been emitted for `current_gen` yet. A SIGHUP reload bumps
+/// `ControlShm::successor_gen`, so `latched_gen != current_gen` re-arms the
 /// latch for the new exporter generation.
 #[inline]
 pub fn latch_should_alert(latched_gen: u64, current_gen: u64, stale: bool) -> bool {
     stale && latched_gen != current_gen
 }
 
-/// Per-worker-process latch: the `successor_gen` for which this worker has
-/// already emitted the heartbeat-stale ALERT ([`LATCH_UNSET`] = none).
-///
-/// Process-local by construction (each worker is a separate process; statics
-/// are not shared after fork).  Atomic only for Rust's `static` rules — the
-/// worker event loop is single-threaded.
+/// Per-worker-process latch: the `successor_gen` already alerted for
+/// ([`LATCH_UNSET`] = none). Process-local by construction (statics are not
+/// shared after fork); atomic only for Rust's `static` rules — the worker
+/// event loop is single-threaded.
 static ALERT_LATCHED_GEN: AtomicU64 = AtomicU64::new(LATCH_UNSET);
 
 /// Ring-full drop hook: check exporter liveness and emit ONE latched ALERT.
 ///
-/// Called by the worker LOG-phase handler **only when a ring push returned
-/// `false`** (ring full — the counted symptom path).  Cost on that path: two
-/// relaxed/acquire atomic loads + one comparison in the common
-/// saturated-but-alive case.  Never called on the healthy hot path.
+/// Called by the worker LOG-phase handler only when a ring push returned
+/// `false` (ring full — the counted symptom path; never on the healthy hot
+/// path). `log` must be a valid nginx log.
 ///
-/// `log` must be a valid nginx log (e.g. the request connection's log).
-///
-/// # Why the error-ring drop path does NOT call this
-/// The error-ring producer runs inside the error-log writer chain; emitting
-/// an ALERT from there would re-enter the writer that is currently executing.
-/// The latch would bound the recursion, but the span/access-tail drop paths
-/// fire under the same conditions (a dead exporter stops draining ALL rings),
-/// so hooking them is sufficient and avoids the reentrancy hazard entirely.
+/// The error-ring drop path deliberately does NOT call this: the error-ring
+/// producer runs inside the error-log writer chain, so an ALERT from there
+/// would re-enter the writer currently executing. The span/access-tail drop
+/// paths fire under the same conditions (a dead exporter stops draining ALL
+/// rings), so hooking only them avoids the reentrancy hazard entirely.
 pub(crate) fn check_exporter_liveness_on_drop(
     amcf: &crate::config::MainConfig,
     log: *mut nginx_sys::ngx_log_t,
@@ -135,9 +99,9 @@ pub(crate) fn check_exporter_liveness_on_drop(
     let Some(ctrl) = amcf.control_shm_ptr() else {
         return;
     };
-    // SAFETY: `control_shm_ptr()` returned `Some`, so `ctrl` points to the live
-    // `ControlShm` in the mapped control zone (valid for the worker's
-    // lifetime); all fields read below are atomics, so cross-process access is
+    // SAFETY: `control_shm_ptr()` returned `Some`, so `ctrl` points to the
+    // live `ControlShm` in the mapped control zone (valid for the worker's
+    // lifetime); fields read below are atomics, so cross-process access is
     // well-defined.
     let ctrl = unsafe { &*ctrl };
 
