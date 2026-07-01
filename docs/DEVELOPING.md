@@ -178,9 +178,8 @@ The bash integration scripts are due to be ported to Perl [`Test::Nginx`]
 
 ## Comment style
 
-Comments carry **rationale and invariants, not restatement**. Match the
-sparsity of nginx / nginx-acme — a comment that re-describes the next line
-is noise. Rules:
+Comments carry **rationale and invariants, not restatement**. They stay
+sparse — a comment that re-describes the next line is noise. Rules:
 
 1. Doc comments (`///`): one-line summary. Rationale goes in `# Safety` /
    `# Errors` / `# Panics`, not free prose. No architectural footnotes in
@@ -203,3 +202,24 @@ content — cutting it would delete correctness anchors or break the lint. The
 goal is zero *removable* narrative, not a target ratio. A one-time whole-crate
 density pass ran 2026-07-01; following the rules above keeps it from being
 needed again.
+
+## Code conventions
+
+Beyond formatting (`rustfmt`) and comments (above), the crate follows idiomatic,
+review-ready Rust:
+
+- **Errors:** a type that is logged or displayed derives `thiserror::Error` with
+  `#[error("…")]` so each message has one source of truth (e.g. `TransportError`).
+  A purely internal enum whose callers `match` every variant to take tailored
+  action needs no `Display` — do not add an unused one (e.g. `TlsConfigError`,
+  mapped variant-by-variant to `NGX_LOG_EMERG` lines).
+- **Error propagation:** use `?` in functions that return `Result`. `extern "C"`
+  callbacks and the no-alloc / no-panic request hot path have no `Result` to
+  propagate — handle failures inline there; that is deliberate, not a gap.
+- **Naming:** concise `snake_case` that reads as prose; production names stay
+  short. Test names may be fully descriptive — they document what they pin.
+- **Visibility:** `pub(crate)` for cross-module internal API; reserve `pub` for
+  the crate's genuine public surface.
+- **Decomposition:** small, single-purpose functions; split pure logic out from
+  FFI glue so it is unit-testable without an nginx context (e.g.
+  `validate_endpoint_tls`).

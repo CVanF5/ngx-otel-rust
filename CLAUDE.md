@@ -1,10 +1,10 @@
 # ngx-otel-rust — project instructions
 
-## Comment style (enforced)
+## Code style (enforced)
 
-Comments carry **rationale and invariants, not restatement**. Keep the
-sparsity of nginx / nginx-acme. Full convention: [`docs/DEVELOPING.md` →
-Comment style](docs/DEVELOPING.md#comment-style). In short:
+Comments carry **rationale and invariants, not restatement** — sparse, never
+narrating self-evident code. Full convention:
+[`docs/DEVELOPING.md`](docs/DEVELOPING.md#comment-style). In short:
 
 - `///` = one-line summary; rationale in `# Safety`/`# Errors`/`# Panics`.
 - `//!` = one paragraph; design narrative goes in `docs/ARCHITECTURE.md`.
@@ -16,8 +16,17 @@ Comment style](docs/DEVELOPING.md#comment-style). In short:
 - Do **not** chase a density percentage — FFI-heavy files sit at 25–45% on
   mandatory SAFETY/FFI content. The goal is zero *removable* narrative.
 
-When writing or reviewing code, apply this by default so a bulk
-comment-density cleanup is never needed again.
+Code conventions (full text in
+[`docs/DEVELOPING.md`](docs/DEVELOPING.md#code-conventions)):
+
+- Errors that are logged/displayed derive `thiserror::Error` + `#[error("…")]`;
+  a purely internal `match`-ed enum needs no `Display`.
+- Propagate with `?` in `Result` fns; `extern "C"` callbacks and the no-alloc
+  hot path handle failures inline (no `Result` to propagate).
+- Concise `snake_case`; `pub(crate)` for internal API, `pub` only for the real
+  public surface; split pure logic out of FFI glue so it stays unit-testable.
+
+Apply by default when writing or reviewing so no bulk cleanup is ever needed.
 
 ## Verification
 
