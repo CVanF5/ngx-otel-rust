@@ -43,7 +43,7 @@ use ngx_http_otel_module::data_model::{
     MetricData, Resource, Scope,
 };
 use ngx_http_otel_module::encoder::{Encoder, OtlpHttpEncoder};
-use ngx_http_otel_module::transport::{HyperHttpTransport, Transport};
+use ngx_http_otel_module::transport::HyperHttpTransport;
 
 /// OTLP endpoint for the local test-harness OTel collector.
 const COLLECTOR_ENDPOINT: &str = "http://127.0.0.1:4318/v1/metrics";

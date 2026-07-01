@@ -282,13 +282,13 @@ thread_local! {
 // under test/test-support (zero production cost). When set, the next
 // `try_seed_drbg()` returns `Err` as if `getrandom` failed, exercising the
 // non-panicking degrade path without a real seccomp sandbox.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 thread_local! {
     static INJECT_SEED_FAILURE: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Test-support: arm/disarm the seed-failure injection for this worker thread.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub(crate) fn set_inject_seed_failure(on: bool) {
     INJECT_SEED_FAILURE.with(|c| c.set(on));
 }
@@ -415,7 +415,7 @@ pub(crate) fn drbg64() -> u64 {
 /// never aborts the worker.
 #[cold]
 fn try_seed_drbg() -> Result<ChaCha20Rng, getrandom::Error> {
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     if INJECT_SEED_FAILURE.with(Cell::get) {
         // Simulate a persistent OS-RNG failure without a real seccomp sandbox.
         return Err(getrandom::Error::UNSUPPORTED);

@@ -145,6 +145,8 @@ build: $(TEST_NGINX_BINARY) ## Build the module
 check: $(NGINX_BUILD_DIR)/Makefile ## Check style and lint
 	$(BUILD_ENV) $(NGX_CARGO) fmt --all -- --check
 	$(BUILD_ENV) $(NGX_CARGO) clippy --all-targets --verbose -- -D warnings
+	# Compile-check the test-support-gated tests (skipped above) — catches broken imports there.
+	$(BUILD_ENV) $(NGX_CARGO) test --no-run --features test-support
 	$(MAKE) doc-check
 
 # `cargo clippy` does not run rustdoc lints, so the crate-root

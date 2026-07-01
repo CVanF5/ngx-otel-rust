@@ -22,7 +22,7 @@
 mod support;
 use support::block_on;
 
-use ngx_http_otel_module::transport::{HyperHttpTransport, Transport, TransportError};
+use ngx_http_otel_module::transport::{HyperHttpTransport, TransportError};
 
 /// Connecting to a port with nothing listening returns a Connection error.
 ///
