@@ -79,19 +79,19 @@ ngx-otel-rust/
 │                          # metrics, logs, trace + their collector service protos
 │                          # (metrics/logs/trace _service); echo/ for the gRPC bidi smoke
 ├── src/
-│   ├── lib.rs             # module declaration, init_process, exit_process, zero-cost-when-disabled invariant
-│   ├── config.rs          # directives, MainConfig, old_config accessor for SIGHUP reload
-│   ├── shm.rs             # per-worker shm slot setup, atomic increment helpers
+│   ├── lib.rs             # module declaration, init_process/exit_process, phase-handler gating
+│   ├── log.rs             # logging macros (error!/warn!/info!/debug!) over ngx_log
+│   ├── config/            # directives, MainConfig, endpoint/TLS validation, SIGHUP old_config
+│   ├── shm/               # per-worker shm layout, atomic counters, exp-histogram slots
 │   ├── data_model/        # OTel-abstract types (Histogram / Sum / Gauge variants)
 │   ├── metric_source/     # MetricSource trait + StubStatusSource + InstrumentedSource
 │   ├── encoder/           # Encoder trait + OTLP/HTTP protobuf encoder
-│   ├── transport/         # Transport trait; hyper_http.rs (OTLP/HTTP async),
-│   │                      # grpc/ (OTLP/gRPC unary production transport + bidi
-│   │                      # smoke harnesses on a runtime-less h2 executor)
+│   ├── transport/         # hyper_http.rs (OTLP/HTTP async), grpc/ (OTLP/gRPC unary
+│   │                      # transport + bidi smoke on a runtime-less h2 executor)
 │   ├── exporter/          # dedicated "nginx: otel exporter" process: control_shm
 │   │                      # (flags + heartbeat), worker->exporter channel
-│   ├── export/            # export loop, graceful drain, retry buffer,
-│   │                      # SelfMetricsSource (13 self-metrics incl. exporter.restarts)
+│   ├── drain/             # drain loop, graceful drain, retry buffer, backoff,
+│   │                      # SelfMetricsSource (self-metrics incl. exporter.restarts)
 │   ├── traces/            # span instrumentation, W3C traceparent, sampling
 │   ├── logs/              # access and error log record assembly
 │   ├── processor/         # exporter-pipeline Processor (drain→process→encode; e.g. probe_drop span filter)
