@@ -41,12 +41,6 @@ cleanly from collector downtime.
 
 - NGINX sources, 1.22.0 or later, as a sibling checkout at `../nginx`
   (override with `NGINX_SOURCE_DIR`). Tested against nginx 1.31.1.
-- The **patched `ngx-rust` fork** at `../ngx-rust`:
-  ```sh
-  git clone -b ngx-otel-rust-deadlock-fix git@github.com:CVanF5/ngx-rust.git
-  ```
-  `Cargo.toml` path-pins `../ngx-rust`. Stock `nginx/ngx-rust` will fail with
-  missing symbols. (Tracking upstream via `ngx-rust` PR #295.)
 - Regular NGINX build dependencies: C compiler, `make`, PCRE2, Zlib.
 - OpenSSL 1.1.1 or later (system-wide).
 - Rust 1.85.0 or later (MSRV set by `ngx-rust`).
