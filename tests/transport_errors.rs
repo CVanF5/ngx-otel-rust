@@ -24,15 +24,10 @@ use support::block_on;
 
 use ngx_http_otel_module::transport::{HyperHttpTransport, Transport, TransportError};
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Error-path tests
-// ──────────────────────────────────────────────────────────────────────────────
-
 /// Connecting to a port with nothing listening returns a Connection error.
 ///
-/// Port 1 on loopback is not used by any standard service and will always
-/// refuse connections immediately.  The OS returns ECONNREFUSED, which the
-/// transport wraps in `TransportError::Connection`.
+/// Port 1 on loopback is unused by any standard service and always refuses
+/// immediately; the OS's ECONNREFUSED is wrapped in `TransportError::Connection`.
 #[test]
 fn connection_refused_returns_error() {
     let mut transport = HyperHttpTransport::new("http://127.0.0.1:1/v1/metrics", vec![])
@@ -40,16 +35,13 @@ fn connection_refused_returns_error() {
 
     let result = block_on(transport.send(vec![0u8; 16]));
     match result {
-        Err(TransportError::Connection { .. }) => { /* expected */ }
+        Err(TransportError::Connection { .. }) => {}
         other => panic!("expected TransportError::Connection, got: {:?}", other),
     }
 }
 
-/// A second call on the same transport after a connection failure must not
-/// panic and must return another `TransportError::Connection`.
-///
-/// This verifies the reconnect path: each `send()` opens a fresh connection
-/// even after a prior failure.
+/// Pins the reconnect path: each `send()` opens a fresh connection, so a
+/// second call after a connection failure must not panic — just fail again.
 #[test]
 fn second_send_after_failure_does_not_panic() {
     let mut transport = HyperHttpTransport::new("http://127.0.0.1:1/v1/metrics", vec![])
@@ -58,7 +50,6 @@ fn second_send_after_failure_does_not_panic() {
     let first = block_on(transport.send(vec![0u8; 16]));
     assert!(first.is_err(), "first send to closed port must fail");
 
-    // Must not panic; must return an error (not Ok).
     let second = block_on(transport.send(vec![0u8; 16]));
     assert!(second.is_err(), "second send to closed port must also fail");
 }
@@ -69,7 +60,7 @@ fn second_send_after_failure_does_not_panic() {
 fn invalid_scheme_rejected_at_construction() {
     let result = HyperHttpTransport::new("grpc://127.0.0.1:4317/", vec![]);
     match result {
-        Err(TransportError::InvalidEndpoint { .. }) => { /* expected */ }
+        Err(TransportError::InvalidEndpoint { .. }) => {}
         other => panic!("expected TransportError::InvalidEndpoint, got: {:?}", other),
     }
 }
@@ -79,7 +70,7 @@ fn invalid_scheme_rejected_at_construction() {
 fn https_returns_tls_config_error() {
     let result = HyperHttpTransport::new("https://127.0.0.1:4318/v1/metrics", vec![]);
     match result {
-        Err(TransportError::TlsConfig { .. }) => { /* expected */ }
+        Err(TransportError::TlsConfig { .. }) => {}
         Ok(transport) => {
             panic!("expected TransportError::TlsConfig for https://, got Ok: {:?}", transport)
         }
@@ -99,7 +90,7 @@ fn unix_socket_not_found_returns_error() {
 
     let result = block_on(transport.send(vec![0u8; 16]));
     match result {
-        Err(TransportError::Connection { .. }) => { /* expected */ }
+        Err(TransportError::Connection { .. }) => {}
         other => panic!("expected TransportError::Connection for missing socket, got: {:?}", other),
     }
 }

@@ -45,20 +45,12 @@ use ngx_http_otel_module::data_model::{
 use ngx_http_otel_module::encoder::{Encoder, OtlpHttpEncoder};
 use ngx_http_otel_module::transport::{HyperHttpTransport, Transport};
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Test constants
-// ──────────────────────────────────────────────────────────────────────────────
-
 /// OTLP endpoint for the local test-harness OTel collector.
 const COLLECTOR_ENDPOINT: &str = "http://127.0.0.1:4318/v1/metrics";
 
 /// Path to the collector JSONL log file (one JSON object per received batch).
 const METRICS_LOG_PATH: &str =
     "/Users/c.vandesande/project-nginx-otel/test-harness/logs/metrics.json";
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Test helpers
-// ──────────────────────────────────────────────────────────────────────────────
 
 /// Returns the current time as Unix nanoseconds.
 fn now_unix_nano() -> u64 {
@@ -68,10 +60,9 @@ fn now_unix_nano() -> u64 {
         .as_nanos() as u64
 }
 
-/// Returns a unique service name for this test run to avoid assertion
-/// collisions when tests run in parallel.  Appends a microsecond timestamp
-/// nonce so the "appended-since-snapshot" check in each test always sees
-/// *its own* service name in the newly written log lines.
+/// Unique service name per test run: a microsecond nonce so the
+/// "appended-since-snapshot" check in each test always sees *its own* service
+/// name in the newly written log lines, even when tests run in parallel.
 fn unique_service_name(test_fn: &str) -> std::string::String {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -81,12 +72,10 @@ fn unique_service_name(test_fn: &str) -> std::string::String {
 }
 
 /// Construct a minimal OTLP batch with a recognisable service.name attribute.
-///
-/// Timestamps reflect the actual wall-clock time so collector logs show
-/// sensible values rather than a hardcoded 2023 date.
+/// Timestamps use real wall-clock time (10s window ending now) so collector
+/// logs show sensible values rather than a hardcoded date.
 fn make_test_batch(service_name: &str) -> Batch {
     let end_ns = now_unix_nano();
-    // Use a 10-second measurement window ending now.
     let start_ns = end_ns.saturating_sub(10_000_000_000);
 
     Batch {
@@ -120,53 +109,39 @@ fn make_test_batch(service_name: &str) -> Batch {
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Integration tests
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// Happy-path test: send a real OTLP payload to the local collector.
-///
-/// Asserts a 2xx response AND checks that the payload arrived in the
-/// collector's JSONL log (`test-harness/logs/metrics.json`).
-///
-/// Requires the collector container to be running.
+/// Happy-path test: send a real OTLP payload to the local collector, assert a
+/// 2xx response, and confirm the payload arrived in the collector's JSONL log
+/// (`test-harness/logs/metrics.json`). Requires the collector container.
 #[test]
 #[ignore = "requires the ngx-otel-test-collector container to be up"]
 fn send_otlp_to_live_collector() {
     let service_name = unique_service_name("send-otlp");
 
-    // ── Encode a batch ────────────────────────────────────────────────────
     let batch = make_test_batch(&service_name);
     let encoder = OtlpHttpEncoder;
     let bytes = encoder.encode(&batch);
     assert!(!bytes.is_empty(), "encoded bytes must be non-empty");
 
-    // ── Record log file position BEFORE the send ─────────────────────────
-    // The collector may flush its JSON log synchronously (before sending the
-    // HTTP 200 response), so we must snapshot the file size *before* the
-    // network round-trip rather than after.
+    // Snapshot the log size BEFORE the send: the collector may flush its JSON
+    // log synchronously, before the HTTP 200 response, so snapshotting after
+    // the round-trip could miss or double-count this request's line.
     let pre_size = std::fs::metadata(METRICS_LOG_PATH).map(|m| m.len()).unwrap_or(0);
 
-    // ── Send via HyperHttpTransport ───────────────────────────────────────
     let mut transport =
         HyperHttpTransport::new(COLLECTOR_ENDPOINT, vec![]).expect("endpoint must parse");
 
     let result = block_on(transport.send(bytes));
     assert!(result.is_ok(), "send must succeed against live collector: {:?}", result.err());
 
-    // ── Verify the payload arrived in the collector log ───────────────────
     // Give the collector a moment to flush if it writes asynchronously.
     std::thread::sleep(std::time::Duration::from_millis(300));
 
     let log_content =
         std::fs::read_to_string(METRICS_LOG_PATH).expect("metrics.json must be readable");
 
-    // Only examine bytes appended after we sent the request.
-    //
-    // `pre_size` is a byte offset from `std::fs::Metadata::len()`, which may
-    // not fall on a UTF-8 character boundary if the file happened to be
-    // written mid-codepoint.  Slice on bytes first, then convert lossily so
-    // the assertion produces a readable message rather than an opaque panic.
+    // Slice to bytes appended since `pre_size`, then convert lossily: a byte
+    // offset from Metadata::len() may split a UTF-8 codepoint, and lossy
+    // conversion keeps the assertion message readable instead of panicking.
     let log_bytes = log_content.as_bytes();
     let new_bytes = if pre_size as usize <= log_bytes.len() {
         &log_bytes[pre_size as usize..]

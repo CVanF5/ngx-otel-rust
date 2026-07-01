@@ -491,20 +491,10 @@ pub unsafe extern "C" fn ngx_http_send_header(
     nginx_sys::NGX_ERROR as nginx_sys::ngx_int_t
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Minimal spin-loop executor for async transport tests.
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// Drives a future to completion using a spin-loop executor with a 30-second
-/// wall-clock deadline.
-///
-/// The waker is a no-op; forward progress relies on the spin loop.  Each
-/// `Poll::Pending` arm yields the thread to avoid a hot spin.  If the future
-/// has not completed within the deadline the test panics with a clear timeout
-/// message rather than hanging indefinitely.
-///
-/// 30 seconds is intentionally generous: it must accommodate a slow CI box
-/// while still surfacing a genuinely stalled collector in a reasonable time.
+/// Drives a future to completion with a spin-loop executor (no-op waker,
+/// `yield_now()` on Pending) and a 30 s wall-clock deadline — generous for a
+/// slow CI box, still catches a genuinely stalled collector. Panics with a
+/// clear message on timeout rather than hanging indefinitely.
 pub fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     use std::time::Instant;
@@ -543,10 +533,9 @@ pub fn block_on<F: std::future::Future>(fut: F) -> F::Output {
 mod tests {
     use super::*;
 
-    // Finding #3 regression: block_on must panic with a clear message when the
-    // future stays Pending past the deadline.  We use a short deadline via a
-    // helper that mirrors block_on but accepts an explicit duration, confirming
-    // the timeout path fires rather than spinning forever.
+    // Pins Finding #3: block_on must time out (not spin forever) when a
+    // future stays Pending past the deadline. Uses a short-deadline variant
+    // of block_on so the test itself runs fast.
     #[test]
     fn block_on_times_out_on_stalled_future() {
         use std::future::Future;
@@ -554,7 +543,6 @@ mod tests {
         use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
         use std::time::{Duration, Instant};
 
-        // A future that never resolves.
         struct NeverReady;
         impl Future for NeverReady {
             type Output = ();
@@ -563,7 +551,6 @@ mod tests {
             }
         }
 
-        // Inline copy of block_on with a 100 ms deadline so the test is fast.
         fn block_on_with_deadline<F: Future>(fut: F, timeout: Duration) -> Option<F::Output> {
             unsafe fn noop_clone(_: *const ()) -> RawWaker {
                 RawWaker::new(std::ptr::null(), &VTABLE)
@@ -581,7 +568,7 @@ mod tests {
                     Poll::Ready(val) => return Some(val),
                     Poll::Pending => {
                         if Instant::now() >= deadline {
-                            return None; // timed out
+                            return None;
                         }
                         std::thread::yield_now();
                     }
@@ -589,7 +576,6 @@ mod tests {
             }
         }
 
-        // The stalled future must time out (return None) rather than looping forever.
         let result = block_on_with_deadline(NeverReady, Duration::from_millis(100));
         assert!(
             result.is_none(),
@@ -597,12 +583,11 @@ mod tests {
         );
     }
 
-    // Finding #4 regression: each ngx_stat_* pointer must point to a distinct
-    // memory location.  Writing through one must not be visible through any other.
+    // Pins Finding #4: each ngx_stat_* pointer must be a distinct memory
+    // location so a write through one is never visible through another.
     #[test]
     fn ngx_stat_pointers_are_distinct() {
-        // Collect raw pointer values for each stat pointer.
-        // Safety: we only read the pointer addresses, never dereference.
+        // SAFETY: we only read the pointer addresses, never dereference.
         let ptrs: [*mut nginx_sys::ngx_atomic_t; 7] = unsafe {
             [
                 ngx_stat_accepted,

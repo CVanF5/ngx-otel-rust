@@ -5,52 +5,19 @@
 
 //! In-process bidi gRPC smoke test.
 //!
-//! Replaces the two-process approach (`bidi_echo_server` binary +
-//! `run_grpc_bidi_smoke.sh`) with a single self-contained Rust test.
+//! Self-contained replacement for the two-process approach (`bidi_echo_server`
+//! binary + `run_grpc_bidi_smoke.sh`): test thread runs a spin-loop
+//! `TaskQueueExecutor` (no Tokio) driving `SpinTcpIo` over an ephemeral TCP
+//! loopback port; a background thread runs a small Tokio runtime hosting the
+//! `tonic` echo server. `SpinConnector`'s `TcpStream` has no
+//! `AsyncRead + AsyncWrite` seam for `tokio::io::duplex`, so a real ephemeral
+//! port is the simplest fit — and keeps Tokio out of the module's production
+//! dependency graph (only the background server thread uses it).
 //!
-//! # Architecture
-//!
-//! ```text
-//!   ┌─────────────────────────────────────────────────┐
-//!   │  test thread                                    │
-//!   │                                                 │
-//!   │  TaskQueueExecutor (spin-loop, no Tokio)        │
-//!   │    └─ hyper HTTP/2 client                       │
-//!   │         └─ SpinTcpIo (non-blocking TcpStream)   │
-//!   │              └─ connects to 127.0.0.1:<port>    │
-//!   └──────────────────────┬──────────────────────────┘
-//!                          │ TCP (ephemeral port)
-//!   ┌──────────────────────▼──────────────────────────┐
-//!   │  background thread (small Tokio rt)             │
-//!   │    tonic::transport::Server                     │
-//!   │    bound to 127.0.0.1:0                         │
-//!   │    implements Echo.BidiEcho (echo server)       │
-//!   └─────────────────────────────────────────────────┘
-//! ```
-//!
-//! Transport seam: **ephemeral TCP port**.
-//!
-//! `SpinConnector` opens a real non-blocking `TcpStream` — it has no
-//! `AsyncRead + AsyncWrite` interface that would accept a `tokio::io::duplex`
-//! half.  Binding the server to `127.0.0.1:0` and reading back the assigned
-//! port is the simplest fit.  The server thread carries its own small
-//! `#[tokio::main]`-style single-threaded runtime so Tokio never appears in
-//! the module's production dependency graph.
-//!
-//! # Coverage
-//!
-//! Covers all bidi-specific assertions from `run_grpc_bidi_smoke.sh`:
-//!
-//! | Shell assertion | Rust equivalent |
-//! |-----------------|-----------------|
-//! | 1 "bidi smoke: firing one bidi stream" line | `fire_one_bidi_stream_inprocess` called once |
-//! | 1 "bidi smoke: bidi complete (sent=10, received=10)" line | `result.is_ok()` + counts asserted |
-//! | 0 "bidi smoke: bidi failed" lines | no panic / no Err returned |
-//!
-//! The unary regression gate (shell assertions 1-5) and overload test remain
-//! in their respective shell scripts (`run_grpc_bidi_smoke.sh`,
-//! `run_grpc_bidi_overload.sh`); the overload test requires a live nginx
-//! worker and `ngx::async_::sleep` so it cannot be expressed here.
+//! Covers the bidi-specific assertions from `run_grpc_bidi_smoke.sh` (stream
+//! fires once, sent=10/received=10, no failure). The unary regression gate and
+//! overload test stay in their shell scripts; the overload test needs a live
+//! nginx worker + `ngx::async_::sleep` so it can't be expressed here.
 //!
 //! # Running
 //!
@@ -76,13 +43,8 @@ use futures_channel::mpsc;
 use ngx_http_otel_module::transport::grpc::shim::SendRequestService;
 use ngx_http_otel_module::transport::hyper_http::SpinTcpIo;
 
-// ── Echo proto — server+client generated code ────────────────────────────────
-//
-// The server stub (build.rs → OUT_DIR/echo_server_gen/) is generated with
-// `build_server(true)` and is full-std-safe.  Tests are full-std binaries
-// so we can include it here directly, removing the need for the
-// `examples/bidi_echo_server.rs` binary.
-
+// Server+client generated code (build.rs → OUT_DIR/echo_server_gen/, full-std
+// safe); included directly since tests are full-std binaries.
 pub mod ngx_otel_echo_v1 {
     include!(concat!(env!("OUT_DIR"), "/echo_server_gen/ngx.otel.echo.v1.rs"));
 }
@@ -92,12 +54,8 @@ use ngx_otel_echo_v1::{
     Ping, Pong,
 };
 
-// ── EchoSvc — tonic Echo service implementation ───────────────────────────────
-//
-// Implements `Echo.BidiEcho`: streams one `Pong` per received `Ping`,
-// copying `seq` and `payload`.  Identical in logic to the former
-// `examples/bidi_echo_server.rs`.
-
+/// Implements `Echo.BidiEcho`: streams one `Pong` per received `Ping`, copying
+/// `seq` and `payload`.
 struct EchoSvc;
 
 #[tonic::async_trait]
@@ -139,14 +97,10 @@ impl Echo for EchoSvc {
 
 // ── Echo server — start on a background thread ────────────────────────────────
 
-/// Start the echo gRPC server on `127.0.0.1:0` (ephemeral port).
-///
-/// Spawns a background thread carrying a small Tokio `current_thread` runtime.
-/// Returns the `SocketAddr` the server is actually bound to.
-///
-/// The server runs for the lifetime of the returned `Arc<tokio::sync::Notify>`:
-/// when the `Arc` is dropped (i.e., when the test drops its handle) the server
-/// shuts down gracefully.
+/// Start the echo gRPC server on `127.0.0.1:0` (ephemeral port), on a
+/// background thread carrying a small Tokio `current_thread` runtime.
+/// Returns the bound `SocketAddr`. The server shuts down gracefully when the
+/// returned `Arc<tokio::sync::Notify>` is dropped.
 fn start_echo_server() -> (SocketAddr, Arc<tokio::sync::Notify>) {
     // Bind synchronously so the caller gets the port before connecting.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind echo server");
@@ -162,7 +116,6 @@ fn start_echo_server() -> (SocketAddr, Arc<tokio::sync::Notify>) {
             .expect("build tokio runtime for echo server");
 
         rt.block_on(async move {
-            // Convert the std TcpListener to a tokio one so tonic can use it.
             listener.set_nonblocking(true).expect("set_nonblocking");
             let tokio_listener =
                 tokio::net::TcpListener::from_std(listener).expect("from_std listener");
@@ -182,12 +135,9 @@ fn start_echo_server() -> (SocketAddr, Arc<tokio::sync::Notify>) {
     (addr, shutdown)
 }
 
-// ── Task-queue executor (mirrors grpc_smoke.rs) ───────────────────────────────
-//
-// A `hyper::rt::Executor<F>` that collects futures in a `VecDeque` rather
-// than spawning to a thread pool.  `block_on_with_tasks` drains and polls the
-// queue on every spin-loop iteration.
-
+// Task-queue executor (mirrors grpc_smoke.rs): collects futures in a
+// `VecDeque` instead of spawning to a thread pool; `block_on_with_tasks`
+// drains and polls the queue each spin-loop iteration.
 type BoxFuture = Pin<Box<dyn Future<Output = ()> + 'static>>;
 
 #[derive(Clone)]
@@ -213,8 +163,6 @@ where
         self.queue.borrow_mut().push_back(Box::pin(fut));
     }
 }
-
-// ── block_on_with_tasks — spin-loop executor ──────────────────────────────────
 
 /// Drive `fut` to completion, co-polling background tasks in `exec` on every
 /// iteration.  No-op waker; progress via spin.  30-second wall-clock timeout.
@@ -256,20 +204,14 @@ fn block_on_with_tasks<F: Future>(exec: &TaskQueueExecutor, fut: F) -> F::Output
     }
 }
 
-// ── Async send helper ─────────────────────────────────────────────────────────
-
-/// Async send-one over a `futures_channel::mpsc::Sender<Ping>`.
-///
-/// Mirrors the helper in `src/transport/grpc/smoke.rs` so we can call it
-/// from the spin-loop client without pulling in `futures-util`.
+/// Async send-one over a `futures_channel::mpsc::Sender<Ping>`; mirrors the
+/// helper in `src/transport/grpc/smoke.rs` to avoid pulling in `futures-util`.
 async fn mpsc_send_one(tx: &mut mpsc::Sender<Ping>, msg: Ping) -> Result<(), String> {
     core::future::poll_fn(|cx| tx.poll_ready(cx))
         .await
         .map_err(|e| format!("send channel closed: {e}"))?;
     tx.start_send(msg).map_err(|e| format!("start_send: {e}"))
 }
-
-// ── In-process bidi smoke exercise ────────────────────────────────────────────
 
 /// Exercise the bidi bridge against `addr` using the spin-loop executor +
 /// `SpinTcpIo` (no Tokio runtime).
@@ -286,7 +228,6 @@ async fn mpsc_send_one(tx: &mut mpsc::Sender<Ping>, msg: Ping) -> Result<(), Str
 async fn fire_one_bidi_stream_inprocess(addr: SocketAddr, exec: &TaskQueueExecutor) {
     use ngx_otel_echo_v1::echo_client::EchoClient;
 
-    // 1. Open a non-blocking TCP connection to the echo server.
     let stream =
         TcpStream::connect_timeout(&addr, Duration::from_secs(5)).expect("connect to echo server");
     stream.set_read_timeout(Some(Duration::from_secs(30))).expect("set_read_timeout");
@@ -294,7 +235,6 @@ async fn fire_one_bidi_stream_inprocess(addr: SocketAddr, exec: &TaskQueueExecut
     stream.set_nonblocking(true).unwrap();
     let io = SpinTcpIo::new(stream);
 
-    // 2. HTTP/2 handshake.
     let origin: http::Uri = format!("http://{}:{}", addr.ip(), addr.port()).parse().unwrap();
     let handshake_fut =
         hyper::client::conn::http2::handshake::<_, _, tonic::body::Body>(exec.clone(), io);
@@ -309,13 +249,10 @@ async fn fire_one_bidi_stream_inprocess(addr: SocketAddr, exec: &TaskQueueExecut
     let svc = SendRequestService::new(sender);
     let mut client = EchoClient::with_origin(svc, origin);
 
-    // 5. Open the bidi stream.
     let (mut tx, rx) = mpsc::channel::<Ping>(16);
     let response = block_on_with_tasks(exec, client.bidi_echo(tonic::Request::new(rx)))
         .expect("bidi_echo call failed");
     let mut inbound = response.into_inner();
-
-    // 6. Asymmetric drain.
 
     // Phase A: send 3 pings, drain 3 pongs.
     let mut sent: u64 = 0;
@@ -356,34 +293,22 @@ async fn fire_one_bidi_stream_inprocess(addr: SocketAddr, exec: &TaskQueueExecut
         block_on_with_tasks(exec, inbound.message()).expect("Phase C: recv error after tx drop");
     assert!(final_msg.is_none(), "Phase C: expected stream end after tx drop, got another pong");
 
-    // Verify counts — these map directly to the shell assertion
-    // "bidi smoke: bidi complete (sent=10, received=10)".
+    // Maps to shell assertion "bidi smoke: bidi complete (sent=10, received=10)".
     assert_eq!(sent, 10, "sent count mismatch");
     assert_eq!(received, 10, "received count mismatch");
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-/// In-process bidi gRPC round-trip test.
-///
-/// Covers the bidi-specific assertions from `run_grpc_bidi_smoke.sh`:
-/// - bidi stream fires (sent=10, received=10)
-/// - no failures / panics
-///
-/// Does NOT require a collector, Docker, or nginx binary.
+/// In-process bidi gRPC round-trip test: pins bidi stream fires
+/// (sent=10, received=10) with no failures/panics. Does NOT require a
+/// collector, Docker, or nginx binary.
 #[test]
 fn grpc_bidi_smoke_inprocess() {
-    // Start echo server on a background thread (Tokio-backed).
     let (addr, _shutdown) = start_echo_server();
 
-    // Give the server a moment to start accepting connections.
-    // The `TcpListenerStream` is ready immediately after `from_std`, but the
-    // tonic server needs one event loop tick to register interest.
+    // `TcpListenerStream` is ready immediately after `from_std`, but tonic
+    // needs one event loop tick to register interest — give it a moment.
     std::thread::sleep(Duration::from_millis(50));
 
-    // Create the task-queue executor (spin-loop, no Tokio).
     let exec = TaskQueueExecutor::new();
-
-    // Drive the bidi smoke exercise.
     block_on_with_tasks(&exec, fire_one_bidi_stream_inprocess(addr, &exec));
 }

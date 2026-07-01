@@ -26,9 +26,7 @@
 // library (which this binary doesn't actually call).
 mod support;
 
-// ──────────────────────────────────────────────────────────────────────────────
 // Finding #3 — block_on timeout
-// ──────────────────────────────────────────────────────────────────────────────
 
 /// A future that never resolves.
 struct NeverReady;
@@ -43,11 +41,8 @@ impl std::future::Future for NeverReady {
     }
 }
 
-/// Mirrors `support::block_on` but with a caller-supplied deadline.
-///
-/// Returns `Some(output)` if the future completed, `None` if the deadline
-/// elapsed.  This lets the test assert on timeout without actually panicking
-/// so the test output stays readable.
+/// Mirrors `support::block_on` but with a caller-supplied deadline, returning
+/// `None` on timeout instead of panicking, so the test can assert on it.
 fn block_on_deadline<F: std::future::Future>(
     fut: F,
     timeout: std::time::Duration,
@@ -98,15 +93,12 @@ fn block_on_completes_immediately_ready_future() {
     assert_eq!(result, Some(42u32), "immediately-Ready future should complete");
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
 // Finding #4 — ngx_stat_* pointer aliasing
-// ──────────────────────────────────────────────────────────────────────────────
 
-/// Finding #4 regression: each `ngx_stat_*` pointer must point to a distinct
-/// memory location.  A write through one must not be visible through any other.
+/// Pins Finding #4: each `ngx_stat_*` pointer must point to a distinct
+/// memory location — a write through one must not be visible through any other.
 #[test]
 fn ngx_stat_pointers_are_distinct() {
-    // Collect raw pointer values.
     // SAFETY: we only read the pointer values (addresses), never dereference.
     let ptrs: [*mut nginx_sys::ngx_atomic_t; 7] = unsafe {
         [

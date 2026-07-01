@@ -49,12 +49,9 @@ use std::time::Duration;
 use ngx_http_otel_module::transport::grpc::shim::SendRequestService;
 use ngx_http_otel_module::transport::hyper_http::SpinTcpIo;
 
-// ── Generated protobuf types ─────────────────────────────────────────────────
-//
-// Mirror the include! hierarchy from src/encoder/mod.rs so that the
-// `super::super::super::metrics::v1::...` cross-references inside the
-// generated code resolve correctly at the correct nesting depth.
-
+// Mirrors the include! hierarchy from src/encoder/mod.rs so the generated
+// code's `super::super::super::metrics::v1::...` cross-references resolve at
+// the correct nesting depth.
 mod opentelemetry {
     pub mod proto {
         pub mod common {
@@ -97,23 +94,17 @@ use opentelemetry::proto::metrics::v1::{
 };
 use opentelemetry::proto::resource::v1::Resource;
 
-// ── Task-queue executor ───────────────────────────────────────────────────────
-//
-// A `hyper::rt::Executor<F>` that collects futures in an `Rc<RefCell<VecDeque>>`
-// rather than spawning to a thread pool.  `block_on_with_tasks` drains and
-// polls that queue on every spin-loop iteration.
-//
-// The executor is intentionally `!Send + !Sync` — this is fine because:
-//   * `Http2ClientConnExec` does not require `E: Send`.
-//   * All driving happens on a single test thread.
-
+// Collects futures in an `Rc<RefCell<VecDeque>>` rather than spawning to a
+// thread pool; `block_on_with_tasks` drains and polls the queue each
+// spin-loop iteration. Intentionally `!Send + !Sync`: `Http2ClientConnExec`
+// doesn't require `E: Send`, and all driving happens on one test thread.
 type BoxFuture = Pin<Box<dyn Future<Output = ()> + 'static>>;
 
 #[derive(Clone)]
 struct TaskQueueExecutor {
-    /// Newly spawned futures waiting to be moved into `running`.
+    // Newly spawned futures waiting to be moved into `running`.
     queue: Rc<RefCell<VecDeque<BoxFuture>>>,
-    /// Futures that have been polled at least once and are still pending.
+    // Futures polled at least once and still pending.
     running: Rc<RefCell<Vec<BoxFuture>>>,
 }
 
@@ -126,8 +117,6 @@ impl TaskQueueExecutor {
     }
 }
 
-/// `hyper::rt::Executor<F>` — stores `fut` in the task queue for later
-/// driving by `block_on_with_tasks`.
 impl<F> hyper::rt::Executor<F> for TaskQueueExecutor
 where
     F: Future<Output = ()> + 'static,
@@ -137,20 +126,11 @@ where
     }
 }
 
-// ── Spin-loop that co-drives background tasks ─────────────────────────────────
-
 /// Drive `fut` to completion, polling all background tasks in `exec` on every
-/// iteration.  Returns `F::Output`.
-///
-/// The waker is a no-op; forward progress relies on the spin loop (every task
-/// is polled unconditionally on each iteration).  `SpinTcpIo` calls
-/// `wake_by_ref()` on `WouldBlock`, which is safe here because the loop
-/// retries immediately.
-///
-/// A 30-second wall-clock deadline is enforced.  If the future has not
-/// resolved within that window the test panics with a clear message instead
-/// of hanging indefinitely.  30 seconds is generous enough for a slow CI
-/// box while still detecting a genuinely stalled collector.
+/// iteration. No-op waker; progress relies on the spin loop re-polling every
+/// task unconditionally, so `SpinTcpIo`'s `wake_by_ref()` on `WouldBlock` is
+/// safe (the loop retries immediately regardless). 30 s wall-clock deadline —
+/// generous for a slow CI box, still catches a genuinely stalled collector.
 fn block_on_with_tasks<F: Future>(exec: &TaskQueueExecutor, fut: F) -> F::Output {
     unsafe fn noop_clone(_: *const ()) -> RawWaker {
         RawWaker::new(std::ptr::null(), &VTABLE)
@@ -170,36 +150,24 @@ fn block_on_with_tasks<F: Future>(exec: &TaskQueueExecutor, fut: F) -> F::Output
              collector may have stalled or the connection is hung"
         );
 
-        // ① Move newly queued tasks into the running set.
         exec.running.borrow_mut().extend(exec.queue.borrow_mut().drain(..));
 
-        // ② Take ownership of running tasks (avoids holding the RefCell borrow
-        //    while tasks are polled, since polling may call execute() → borrow
-        //    exec.queue, which is a *different* RefCell, so there's no conflict).
+        // Take ownership before polling: polling may call execute() which
+        // borrows exec.queue — a *different* RefCell, so no borrow conflict.
         let mut tasks = std::mem::take(&mut *exec.running.borrow_mut());
-
-        // ③ Poll each task; discard Ready ones, keep Pending ones.
         tasks.retain_mut(|t| t.as_mut().poll(&mut cx).is_pending());
-
-        // ④ Drain anything the tasks spawned while being polled.
         tasks.extend(exec.queue.borrow_mut().drain(..));
-
-        // ⑤ Put the survivors back.
         *exec.running.borrow_mut() = tasks;
 
-        // ⑥ Poll the main future.
         match fut.as_mut().poll(&mut cx) {
             Poll::Ready(val) => return val,
             Poll::Pending => {
-                // Drain tasks spawned by the main future before sleeping.
                 exec.running.borrow_mut().extend(exec.queue.borrow_mut().drain(..));
                 std::thread::yield_now();
             }
         }
     }
 }
-
-// ── Test payload ──────────────────────────────────────────────────────────────
 
 fn build_export_request() -> ExportMetricsServiceRequest {
     ExportMetricsServiceRequest {
@@ -248,12 +216,9 @@ fn build_export_request() -> ExportMetricsServiceRequest {
 #[test]
 #[ignore = "requires OTel collector at 127.0.0.1:4317  (run with -- --ignored)"]
 fn grpc_smoke_unary_export() {
-    // 1. Open a non-blocking TCP connection to the OTel collector.
-    //
-    //    Read/write timeouts are set so that a collector that accepts the
-    //    connection but then stalls on I/O causes the socket to return an
-    //    error rather than blocking the spin loop forever.  30 seconds matches
-    //    the wall-clock deadline in block_on_with_tasks.
+    // Read/write timeouts (matching block_on_with_tasks's 30s deadline) make a
+    // collector that accepts then stalls on I/O return a socket error instead
+    // of blocking the spin loop forever.
     let addr: SocketAddr = "127.0.0.1:4317".parse().unwrap();
     let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
         .expect("cannot connect to 127.0.0.1:4317 — start OTel collector first");
@@ -264,38 +229,29 @@ fn grpc_smoke_unary_export() {
     stream.set_nonblocking(true).unwrap();
     let io = SpinTcpIo::new(stream);
 
-    // 2. Create the task-queue executor.
-    //    During h2 handshake, hyper calls exec.execute(ConnTask) to spawn the
-    //    connection driver.  ConnTask lives in exec.running for the lifetime of
-    //    the test.
+    // During h2 handshake hyper calls exec.execute(ConnTask) to spawn the
+    // connection driver, which then lives in exec.running for the test.
     let exec = TaskQueueExecutor::new();
 
-    // 3. HTTP/2 handshake.
-    //    The turbofish `::<_, _, tonic::body::Body>` is required because the
-    //    body type `B` cannot be inferred from the handshake call alone — it
-    //    is determined by what `SendRequest` will later be used for.
+    // Turbofish required: body type `B` isn't inferable from the handshake
+    // call alone — it's determined by what `SendRequest` is later used for.
     let handshake_fut =
         hyper::client::conn::http2::handshake::<_, _, tonic::body::Body>(exec.clone(), io);
 
     let (sender, conn) =
         block_on_with_tasks(&exec, handshake_fut).expect("HTTP/2 handshake failed");
 
-    // 4. Drive the `Connection` (h2 client-task / request dispatcher) as a
-    //    background task.  ConnTask (the TCP I/O driver) is already in
-    //    exec.running from step 3.
+    // Drive the Connection (h2 dispatcher) as a background task; the TCP I/O
+    // driver (ConnTask) is already in exec.running from the handshake above.
     exec.queue.borrow_mut().push_back(Box::pin(async move {
         let _ = conn.await;
     }));
 
-    // 5. Build the generated tonic gRPC client over our shim.
-    //    ready() + path + codec are encapsulated inside the generated export() method.
     let origin: http::Uri = "http://127.0.0.1:4317".parse().unwrap();
     let mut client = MetricsServiceClient::with_origin(SendRequestService::new(sender), origin);
 
-    // 6. Issue a unary ExportMetrics call.
     let request = tonic::Request::new(build_export_request());
     let result = block_on_with_tasks(&exec, client.export(request));
 
-    // 7. Assert success.
     assert!(result.is_ok(), "gRPC unary call failed: {:?}", result.err());
 }
