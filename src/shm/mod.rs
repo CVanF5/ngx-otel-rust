@@ -35,10 +35,8 @@ mod histogram;
 pub use histogram::*;
 
 // ── Closed cardinality dimension enums ──────────────────────────────────────
-//
-// Attribute keys MUST be drawn from OTel HTTP semconv ONLY (see TELEMETRY_MODEL.md).
-// All variants are WithinU8 cardinality so the OTAP classifier can
-// dictionary-encode every per-point column at u8 key width.
+// Attribute keys MUST be drawn from OTel HTTP semconv ONLY (TELEMETRY_MODEL.md).
+// All variants are WithinU8 cardinality for OTAP u8-width dictionary encoding.
 
 /// OTel `http.request.method` — 7 standard values + catch-all.
 ///
@@ -231,16 +229,11 @@ impl ProtoVersion {
 }
 
 // ── Route and upstream-zone dimensions (DECOMPOSED) ─────────────────────────
-//
-// **Decomposed, not cross-producted**: route and upstream are now
-// *separate* histogram tables alongside the base `method × status-class ×
-// protocol` (160 combos), not multiplied into it.  This:
-//   • Restores the intended caps (64/32) — the prior attempt shrunk them 4×
-//     to fit the cross-product budget.
-//   • Keeps the two independent latency views (per-route + per-upstream).
-//   • Drops the joint route×upstream cell that inflated memory.
-//
-// Memory: (160 + 65 + 33) × 136 bytes ≈ 34 KB per worker — easily within budget.
+// Route and upstream are separate histogram tables alongside the base
+// `method × status-class × protocol` (160 combos), not cross-producted into
+// it — that keeps the intended caps (64/32) and the two independent latency
+// views, at the cost of dropping the joint route×upstream cell.
+// Memory: (160 + 65 + 33) × 136 bytes ≈ 34 KB per worker — within budget.
 
 /// Maximum number of named `http.route` slots (matched location blocks).
 /// Named routes receive indices 0..ROUTE_CAP-1; anything beyond → ROUTE_CAP.
@@ -338,18 +331,11 @@ pub fn severity_class_index(ngx_level: u8) -> usize {
 /// the shared memory zone. A worker only ever writes to its own slot
 /// (`ngx_worker`-indexed); the export worker reads from all slots.
 ///
-/// **Decomposed dimensions**: three independent histogram arrays:
-/// 1. `request_duration_combos[160]`: base `{method × status_class × protocol}`.
-/// 2. `route_duration_combos[65]`: per-route (`http.route` = location name).
-/// 3. `upstream_duration_combos[33]`: per-upstream zone (`nginx.upstream.zone`).
-///
-/// Each request bumps ONE slot in each of the three arrays.  The joint
+/// **Decomposed dimensions**: three independent `ExpHistogramSlot` arrays,
+/// each bumped once per request — `request_duration_combos[160]` (base
+/// `method × status_class × protocol`), `route_duration_combos[65]`
+/// (per-route), `upstream_duration_combos[33]` (per-upstream-zone). The joint
 /// route×upstream cell is intentionally dropped.
-///
-/// Each slot is an `ExpHistogramSlot` (exponential histogram).
-///
-/// The five `status_Nxx` counters have been removed — their information is
-/// captured by the per-combination histograms.
 #[repr(C)]
 pub struct WorkerSlots {
     /// Base duration histogram: `{method × status_class × protocol}` — 160 slots.
@@ -397,36 +383,31 @@ pub struct WorkerSlots {
 
 // ── Exemplar reservoir ─────────────────────────────
 
-/// Per-data-point exemplar reservoir size.
+/// Per-data-point exemplar reservoir size, fixed at 2.
 ///
-/// OTel's `SimpleFixedSizeExemplarReservoir` defaults its size to the
-/// number of concurrent threads/CPUs purely as a *contention* heuristic for
-/// multi-threaded SDKs where many threads offer to one shared reservoir; that
-/// does not bind us — nginx workers are single-threaded event loops and we
-/// already keep one reservoir per worker (≈ one per CPU), so the per-CPU
-/// spreading is achieved at the worker level.  The remaining choice is "how
-/// many example traces per data point per interval is useful", which is a
-/// small number.  We lock this at 2.
+/// OTel's `SimpleFixedSizeExemplarReservoir` default-sizes to thread/CPU count
+/// as a contention heuristic for multi-threaded SDKs; that doesn't apply here
+/// since nginx workers are single-threaded and already get one reservoir each
+/// (≈ one per CPU), so 2 is just "how many example traces per data point per
+/// interval is useful".
 /// <https://opentelemetry.io/docs/specs/otel/metrics/sdk/#exemplar-defaults>
 pub const EXEMPLAR_RESERVOIR_SIZE: usize = 2;
 
 /// A single exemplar entry in a per-data-point reservoir.
 ///
-/// Written on the hot path with `Ordering::Relaxed` stores.  The fields are
-/// the canonical OTel exemplar payload — `value`, `time_unix_nano`,
-/// `trace_id`, `span_id`.  No `filtered_attributes` are stored: `url.path` /
-/// `user_agent` were a misuse of that field (they are not metric-measurement
-/// attributes) and a redaction hazard, and the linked trace already carries
-/// `url.path`.
+/// Written on the hot path with `Ordering::Relaxed` stores. Fields are the
+/// canonical OTel exemplar payload — `value`, `time_unix_nano`, `trace_id`,
+/// `span_id`. No `filtered_attributes`: `url.path`/`user_agent` would be a
+/// misuse of that field (not a metric-measurement attribute) and a redaction
+/// hazard, and the linked trace already carries `url.path`.
 /// <https://opentelemetry.io/docs/specs/otel/metrics/data-model/#exemplars>
 ///
-/// There is no per-entry commit barrier: the reservoir `count` is the only
-/// synchronisation point and the individual fields are written `Relaxed`, so a
-/// concurrent cross-process reader can observe a *torn* exemplar (a value
-/// paired with the wrong trace_id).  This is an intentional hot-path
-/// trade-off: exemplars are sampling hints for drill-down, not an
-/// authoritative record (see TELEMETRY_MODEL.md "Exemplars are best-effort
-/// hints").
+/// No per-entry commit barrier: `seen` (on the reservoir) is the only sync
+/// point and individual fields are `Relaxed`, so a concurrent cross-process
+/// reader can observe a *torn* exemplar (a value paired with the wrong
+/// trace_id) — intentional, since exemplars are best-effort drill-down hints,
+/// not an authoritative record (TELEMETRY_MODEL.md "Exemplars are
+/// best-effort hints").
 ///
 /// Size: 5 × AtomicU64 + AtomicU32 + AtomicU8 + 3 pad = 40 + 4 + 1 + 3 = 48 bytes.
 #[repr(C)]
@@ -458,27 +439,22 @@ pub struct ExemplarEntry {
 ///
 /// # Sampling discipline
 ///
-/// Each candidate calls `seen.fetch_add(1)` to obtain `n` (the number of
-/// measurements seen this cycle, 0-based).  Following OTel's
-/// `SimpleFixedSizeExemplarReservoir`: when `n < size` the candidate is written
-/// to slot `n` (fill phase); otherwise `bucket = rand_index(n)` in `0..=n` and
-/// the candidate is written to slot `bucket` only if `bucket < size`.
-///
-/// Every measurement therefore has equal probability of being retained
-/// (uniform), not the recency bias of a `n % size` ring.  The "random" index
-/// is a cheap alloc-free, lock-free integer hash of `n` (no `rand`/`Math.random`
-/// on the hot path); over a cycle it is uniform enough for sampling hints.
-/// The single `fetch_add` IS the one permitted hot-path write.
+/// Each candidate calls `seen.fetch_add(1)` to obtain `n` (0-based count seen
+/// this cycle). Following OTel's `SimpleFixedSizeExemplarReservoir`: when `n
+/// < size` write to slot `n` (fill phase); otherwise `bucket = rand_index(n)`
+/// in `0..=n`, written only if `bucket < size`. This gives every measurement
+/// equal retention probability (uniform), not the recency bias of `n % size`.
+/// `rand_index` is a cheap alloc-free integer hash of `n` standing in for an
+/// RNG. The single `fetch_add` is the one permitted hot-path write.
 /// <https://opentelemetry.io/docs/specs/otel/metrics/sdk/#exemplar-defaults>
 ///
 /// # Reset (one cross-process write)
-/// The exporter calls [`ExemplarReservoir::reset`] after [`ExemplarReservoir::snapshot`]
-/// every collection cycle, storing `0` into `seen` (the spec's
-/// `num_measurements_seen` reset).  `seen` is only ever touched atomically —
-/// `fetch_add(Relaxed)` by the worker, `store(0, Release)` by the exporter — so
-/// the store-vs-RMW interleaving is well-defined (no data race).  A worker
-/// write landing in the same instant the exporter zeroes is a benign
-/// lost-update, consistent with the best-effort-hint semantics above.
+/// The exporter calls [`ExemplarReservoir::reset`] after
+/// [`ExemplarReservoir::snapshot`] each cycle, storing `0` into `seen` (the
+/// spec's `num_measurements_seen` reset). `seen` is touched only atomically —
+/// `fetch_add(Relaxed)` by the worker, `store(0, Release)` by the exporter —
+/// so the interleaving is well-defined; a worker write racing the reset is a
+/// benign lost-update per the best-effort semantics above.
 #[repr(C)]
 pub struct ExemplarReservoir {
     /// `num_measurements_seen` this collection cycle (OTel spec name).  Reset to
@@ -497,14 +473,7 @@ impl ExemplarReservoir {
     pub fn write(&self, req: &SampledRequest<'_>) {
         let n = self.seen.fetch_add(1, Ordering::Relaxed);
         let size = EXEMPLAR_RESERVOIR_SIZE as u64;
-        // SimpleFixedSizeExemplarReservoir slot selection.
-        let bucket = if n < size {
-            n
-        } else {
-            // rand_index in 0..=n; cheap integer hash (SplitMix64 finaliser) of
-            // `n` mapped into the inclusive range, in lieu of an RNG.
-            Self::rand_index(n) % (n + 1)
-        };
+        let bucket = if n < size { n } else { Self::rand_index(n) % (n + 1) };
         if bucket >= size {
             return; // measurement not retained (uniform eviction)
         }
@@ -538,30 +507,18 @@ impl ExemplarReservoir {
 
     /// Snapshot the active entries of this reservoir.
     ///
-    /// Occupancy is the reservoir's own `seen` count clamped to the reservoir
-    /// size (`filled = seen.min(size)`).  This replaces the old
-    /// `combo_idx == 0 && ts == 0` sentinel, which is invalid now that combo 0
-    /// is a legitimate data point with its own reservoir.
+    /// Occupancy is `filled = seen.min(size)`.
     ///
     /// # Non-atomic snapshot semantics (intentional best-effort)
     ///
-    /// Each field in an [`ExemplarEntry`] is read individually with
-    /// `Ordering::Acquire`.  There is no per-entry fence or lock spanning all
-    /// fields, so a worker `write()` that is concurrent with this snapshot can
-    /// produce a *torn* exemplar — for example, the `value_us` of one request
-    /// paired with the `trace_id` of a different request that raced into the
-    /// same slot.
-    ///
-    /// This is **intentional**: exemplars are sampling hints for trace drill-down,
-    /// not an authoritative or transactionally consistent record.  The OTel
-    /// metrics specification describes exemplars as best-effort:
-    /// <https://opentelemetry.io/docs/specs/otel/metrics/sdk/#exemplar>.
-    /// A torn exemplar may produce a trace link that resolves to the wrong span,
-    /// or a value that doesn't match the linked trace — both are acceptable for
-    /// a "sample for investigation" hint.  Adding a per-entry mutex or a
-    /// seqlock would add a lock acquisition and a conditional branch to the
-    /// worker's hot request path for a correctness guarantee the spec does not
-    /// require.
+    /// Each [`ExemplarEntry`] field is read individually with `Ordering::Acquire`;
+    /// there is no per-entry fence or lock spanning all fields, so a concurrent
+    /// `write()` can produce a *torn* exemplar (e.g. one request's `value_us`
+    /// paired with another's `trace_id`). Intentional per the struct-level
+    /// best-effort semantics — the OTel spec itself describes exemplars as
+    /// best-effort (<https://opentelemetry.io/docs/specs/otel/metrics/sdk/#exemplar>),
+    /// and a lock/seqlock here would add hot-path cost for a guarantee the spec
+    /// does not require.
     pub fn snapshot(&self) -> std::vec::Vec<ExemplarSnapshot> {
         let seen = self.seen.load(Ordering::Acquire) as usize;
         let filled = seen.min(EXEMPLAR_RESERVOIR_SIZE);
@@ -591,23 +548,16 @@ impl ExemplarReservoir {
         out
     }
 
-    /// Reset the sampling state (the OTel `num_measurements_seen` count) after a
-    /// collection cycle.  This is the single cross-process write into the
-    /// reservoir; see the struct doc for its race semantics.
+    /// Reset the sampling state (`num_measurements_seen`) after a collection
+    /// cycle — the single cross-process write into the reservoir; see the
+    /// struct doc for its race semantics.
     ///
-    /// The stale entry payloads are intentionally NOT zeroed — once `seen` is 0
-    /// the next snapshot reports `filled = 0`, and the fill phase overwrites the
-    /// slots before they can be observed again.
-    ///
-    /// # Non-atomic reset semantics (intentional best-effort)
-    ///
-    /// `seen` is reset to 0 with `Ordering::Release`; the entry payloads
-    /// (`value_us`, `trace_id`, etc.) are NOT atomically cleared.  A worker
-    /// `write()` landing in the same collection interval as this reset is a
-    /// benign lost-update: the worker's `fetch_add(Relaxed)` on `seen` and the
-    /// exporter's `store(0, Release)` are both well-defined atomic operations,
-    /// and a lost-update means one fewer exemplar for that interval — consistent
-    /// with the best-effort semantics described on [`Self::snapshot`].
+    /// Stale entry payloads are intentionally NOT zeroed: once `seen` is 0 the
+    /// next snapshot reports `filled = 0`, and the fill phase overwrites the
+    /// slots before they can be observed again. `seen` itself is reset with
+    /// `Ordering::Release`; a worker `write()` racing this reset is a benign
+    /// lost-update (one fewer exemplar that interval), consistent with
+    /// [`Self::snapshot`]'s best-effort semantics.
     pub fn reset(&self) {
         self.seen.store(0, Ordering::Release);
     }
@@ -776,31 +726,29 @@ unsafe fn wp_from_cycle(cycle: *const ngx_cycle_t) -> Option<usize> {
 ///
 /// # F1 — reload partial-zero helper
 ///
-/// `route_duration_combos` and `upstream_duration_combos` are indexed by position
-/// in `route_table` / `upstream_table`, which are rebuilt on every SIGHUP reload
-/// (new `ngx_http_core_loc_conf_t*` and `ngx_shm_zone_t*` values; traversal order
-/// may differ if locations are added/removed/reordered).  Any count accumulated
-/// under the old index assignment would be re-attributed to whichever route/upstream
-/// now owns that slot number.  To prevent this, `otel_shm_zone_init` zeros ONLY
-/// these two arrays on reload.
+/// `route_duration_combos` / `upstream_duration_combos` are indexed by
+/// position in `route_table` / `upstream_table`, which are rebuilt on every
+/// SIGHUP (traversal order may shift if locations are added/removed/
+/// reordered) — an old-index count would get re-attributed to whichever
+/// route/upstream now owns that slot. `otel_shm_zone_init` zeros ONLY these
+/// two arrays on reload.
 ///
 /// Fields that CARRY OVER on reload (indices are config-stable):
-///   - `request_duration_combos` (method × status_class × protocol — no config dependency)
+///   - `request_duration_combos` (method × status_class × protocol)
 ///   - `request_body_bytes`, `response_body_bytes` (global aggregates)
 ///   - `upstream_response_ms`, `upstream_header_ms`, `upstream_connect_ms`,
-///     `upstream_bytes_received`, `upstream_bytes_sent` (global upstream aggregates)
-///   - `exemplar_reservoirs` (indexed by base `combo_idx`, which refs
-///     `request_duration_combos` — config-stable)
-///   - `error_rate_counters` (severity class — config-stable)
+///     `upstream_bytes_received`, `upstream_bytes_sent` (global aggregates)
+///   - `exemplar_reservoirs` (indexed by base `combo_idx`, config-stable)
+///   - `error_rate_counters` (severity class, config-stable)
 ///
-/// `start_time_unix_nano` resets per-reload (export/mod.rs:487 — new exporter process
-/// calls `now_unix_nano()`), so zeroing the route/upstream slots produces a valid
-/// OTLP cumulative reset at the reload boundary.
+/// `start_time_unix_nano` resets per-reload (export/mod.rs:487), so zeroing
+/// route/upstream slots here produces a valid OTLP cumulative reset at the
+/// reload boundary.
 ///
-/// Dying old workers may write a few more counts into just-zeroed slots in the seconds
-/// before they exit.  Each word is zeroed via AtomicU64::store(Relaxed), so concurrent
-/// fetch_add from old workers is well-defined; the stale counts vanish with the old
-/// workers and are negligible versus incoming new traffic.  Accepted.
+/// Dying old workers may write a few more counts into just-zeroed slots
+/// before they exit; each word is zeroed via `AtomicU64::store(Relaxed)`, so
+/// concurrent `fetch_add` from old workers is well-defined and the stale
+/// counts vanish with them — accepted as negligible.
 ///
 /// # Safety
 /// `base` must point to at least `n_slots` contiguous `WorkerSlots` objects within
@@ -845,23 +793,16 @@ pub unsafe extern "C" fn otel_shm_zone_init(
     old_data: *mut core::ffi::c_void,
 ) -> ngx_int_t {
     if !old_data.is_null() {
-        // SIGHUP reload: the same physical shm pages are re-mapped.
+        // SIGHUP reload: same physical shm pages re-mapped. See the F1 doc
+        // comment on `zero_route_upstream_histograms` above for which fields
+        // carry over vs. must be zeroed and why.
         //
-        // Most WorkerSlots fields carry over correctly (see the doc-comment on
-        // `zero_route_upstream_histograms` above for the full list).  The two
-        // exceptions are route_duration_combos and upstream_duration_combos: their
-        // slot indices come from build_route_table / build_upstream_table, which
-        // rebuilds with new clcf_ptr / shm_zone_ptr values on every reload.  Any
-        // location add/remove/reorder shifts the index, silently re-attributing old
-        // counts to a different route/upstream name in the next export.
-        //
-        // zero ALL reserved slots, not just the new active count.  On a
-        // scale-down reload (e.g. worker_processes 4→1) the old higher-numbered
-        // slots retain counts recorded under the OLD route-index assignment.  The
-        // exporter always sums all reserved slots, so those stale counts get
-        // attributed to whichever route now owns that index — silent misattribution.
-        // Zeroing all reserved slots is safe: they are already atomic (H2F2) and the
-        // memory is already mapped (same physical shm pages), so no new page faults.
+        // Zero ALL reserved slots, not just the new active count: on a
+        // scale-down reload the old higher-numbered slots would otherwise
+        // retain counts under the OLD route-index assignment, and the exporter
+        // sums all reserved slots — silent misattribution. Safe to zero: the
+        // memory is already mapped (no new page faults) and the writes are
+        // atomic (H2F2).
         // SAFETY: nginx invokes this callback with a valid, non-null `ngx_shm_zone_t`
         // (fn contract); the reference does not outlive the call.
         let zone = unsafe { &*shm_zone };
@@ -928,22 +869,15 @@ use crate::logs::ring::{ring_size_bytes, WorkerSignalRing, WorkerSignalRingHeade
 
 // ── Compile-time alignment guards ───────────────────────────────────────
 //
-// The logs shm slot layout is:
-//   [0, ring_size_bytes(cap))                 — access ring header + payload
-//   [ring_size_bytes(cap), 2*rbs)             — error ring header + payload
-//   [2*ring_size_bytes(cap), 2*rbs+tbl)       — CoalesceSlot table
-//
-// `WorkerSignalRingHeader` contains four `AtomicU64` fields → alignment = 8 bytes.
-// `CoalesceSlot` contains an `AtomicU64` at offset 0 → alignment = 8 bytes.
-//
-// For both sub-structures to land at aligned addresses:
-//   1. RING_HEADER_SIZE % 8 == 0  (so header + 8-aligned cap → rbs % 8 == 0)
-//   2. coalesce_table_bytes() % 8 == 0  (so slot stride is 8-aligned)
-//   3. data_offset() % 8 == 0  (so slot 0 starts 8-aligned inside the mmap zone)
-//
-// cap % 8 == 0 holds by construction: the production ring cap is the fixed,
-// 8-aligned `DEFAULT_LOG_RING_CAP`; any test-only ring-size override aligns its
-// argument to 8 at parse time.
+// Logs shm slot layout: [0, rbs) access ring, [rbs, 2*rbs) error ring,
+// [2*rbs, 2*rbs+tbl) CoalesceSlot table, where rbs = ring_size_bytes(cap).
+// `WorkerSignalRingHeader` and `CoalesceSlot` both need 8-byte alignment
+// (each starts with an AtomicU64), which requires all three of:
+//   1. RING_HEADER_SIZE % 8 == 0  (header + 8-aligned cap → rbs % 8 == 0)
+//   2. coalesce_table_bytes() % 8 == 0  (slot stride 8-aligned)
+//   3. data_offset() % 8 == 0  (slot 0 starts 8-aligned in the mmap zone)
+// `cap % 8 == 0` holds by construction (fixed `DEFAULT_LOG_RING_CAP`, or a
+// test override rounded to 8 at parse time).
 const _: () = assert!(
     crate::logs::ring::RING_HEADER_SIZE % 8 == 0,
     "WorkerSignalRingHeader size must be a multiple of 8: error-ring header alignment depends on this",
@@ -1165,17 +1099,16 @@ pub unsafe extern "C" fn logs_shm_zone_init(
     old_data: *mut core::ffi::c_void,
 ) -> ngx_int_t {
     if !old_data.is_null() {
-        // SIGHUP: same physical pages re-mapped.  Ring offsets carry over.
-        // H2F3: On scale-up reload, new worker slots are OS-zeroed (cap==0).
-        // Stamp cap into ALL active-slot ring headers (idempotent for existing
-        // slots; required for new slots added by the worker_processes increase).
+        // SIGHUP: same physical pages re-mapped; ring offsets carry over. On
+        // scale-up, new worker slots are OS-zeroed (cap==0), so stamp cap into
+        // ALL active-slot ring headers (idempotent for existing slots,
+        // required for new ones added by a worker_processes increase).
         //
-        // SAFETY: nginx guarantees shm_zone is a valid non-null pointer (fn contract).
-        // zone.data was written by register_logs_zone to point at a ZoneInitData in
-        // amcf (nginx conf pool, outlives reload); cycle is from cf->cycle at
-        // postconfiguration; shm.addr is the mapped zone base.
-        // slot_off = w * slot_sz with w < n_active ≤ n_reserved = zone_data_bytes / slot_sz,
-        // so both ring header accesses are within the mapped zone.
+        // SAFETY: nginx guarantees shm_zone is a valid non-null pointer.
+        // zone.data was written by register_logs_zone to point at a ZoneInitData
+        // in amcf (nginx conf pool, outlives reload); slot_off = w * slot_sz
+        // with w < n_active ≤ n_reserved = zone_data_bytes / slot_sz, so both
+        // ring header accesses stay within the mapped zone.
         let ret = unsafe {
             let zone = &*shm_zone;
             let offset = data_offset();
@@ -1219,8 +1152,6 @@ pub unsafe extern "C" fn logs_shm_zone_init(
     // `addr + offset` is within the mapped zone (past the slab-pool header).
     let base: *mut u8 = unsafe { zone.shm.addr.cast::<u8>().add(offset) };
 
-    // recover cap and cycle from ZoneInitData stored in zone->data.
-    // `register_logs_zone` now stores `*mut ZoneInitData` instead of a tagged cap.
     // SAFETY: zone->data was written by `register_logs_zone` to point at a
     // `ZoneInitData` in amcf (nginx conf pool, outlives this callback); or null
     // for a legacy caller — handled by the `else` branch.
@@ -1235,28 +1166,24 @@ pub unsafe extern "C" fn logs_shm_zone_init(
         return Status::NGX_OK.into();
     }
 
+    // Only initialise ACTIVE worker slots — reserved-but-inactive slots are
+    // OS-zeroed anonymous pages and must not be touched (would fault them in).
     let n_reserved = zone_data_bytes / slot_sz;
-    // only initialise ACTIVE worker slots — reserved-but-inactive slots
-    // are OS-zeroed anonymous pages and must not be touched here.
-    // `wp_from_cycle` returns the final value after `ngx_core_module_init_conf`.
     // SAFETY: cycle is non-null (set from cf->cycle at postconfiguration) and
     // valid for the duration of this ngx_init_cycle call.
     let n_active = unsafe { wp_from_cycle(cycle) }.unwrap_or(n_reserved).min(n_reserved).max(1);
 
-    // Zero the ACTIVE slot area only.
     // SAFETY: `base` is past the slab-pool header; `n_active * slot_sz ≤ zone_data_bytes`.
     unsafe { ptr::write_bytes(base, 0, n_active * slot_sz) };
 
     // Stamp `cap` into the ring headers of active slots only.
     for w in 0..n_active {
         let slot_off = w * slot_sz;
-        // Access ring header.
         // SAFETY: `slot_off = w * slot_sz` with `w < n_active ≤ n_reserved`,
         // so `base + slot_off` is within the just-zeroed active slot area.
         let access_hdr = unsafe { base.add(slot_off).cast::<WorkerSignalRingHeader>() };
         // SAFETY: valid just-zeroed header; exclusive init-time write.
         unsafe { (*access_hdr).cap.store(cap as u64, Ordering::Relaxed) };
-        // Error ring header (immediately follows the access ring payload).
         // SAFETY: the error header sits one `ring_size_bytes(cap)` past the
         // access header, still within the same in-bounds slot.
         let error_hdr =
@@ -1270,17 +1197,11 @@ pub unsafe extern "C" fn logs_shm_zone_init(
 
 // ── Spans shm zone ───────────────────────────────────────────────
 //
-// The spans shm zone holds one `WorkerSignalRing` per worker (one ring per slot,
-// unlike the logs zone which holds two rings + a coalescer table per slot).
-// The ring is the same `WorkerSignalRingHeader` + payload layout reused from logs.
-//
-// Layout per worker slot:
-//   slot_i = base + i × spans_slot_size(cap)
-//   spans_ring_header  = slot_i + 0
-//   spans_ring_payload = slot_i + RING_HEADER_SIZE
-//
-// Memory per worker = `cap + RING_HEADER_SIZE` bytes.
-// Total spans shm = `slab_pool_header + n_workers × spans_slot_size(cap)`.
+// One `WorkerSignalRing` per worker per slot (vs. logs' two rings + a
+// coalescer table per slot), reusing the same `WorkerSignalRingHeader` +
+// payload layout. Layout: slot_i = base + i × spans_slot_size(cap);
+// spans_ring_header = slot_i + 0; spans_ring_payload = slot_i + RING_HEADER_SIZE.
+// Total spans shm = slab_pool_header + n_workers × spans_slot_size(cap).
 
 /// Default spans ring capacity per worker in bytes.
 ///
@@ -1344,16 +1265,13 @@ pub unsafe extern "C" fn spans_shm_zone_init(
     old_data: *mut core::ffi::c_void,
 ) -> ngx_int_t {
     if !old_data.is_null() {
-        // SIGHUP: same physical pages re-mapped; ring offsets carry over.
-        // H2F3: On scale-up reload, new worker slots are OS-zeroed (cap==0).
-        // Stamp cap into ALL active-slot ring headers (idempotent for existing
-        // slots; required for new slots added by the worker_processes increase).
+        // SIGHUP: same physical pages re-mapped, ring offsets carry over —
+        // same rationale as logs_shm_zone_init's reload path.
         //
-        // SAFETY: nginx guarantees shm_zone is a valid non-null pointer (fn contract).
-        // zone.data was written by register_spans_zone to point at a ZoneInitData in
-        // amcf (nginx conf pool, outlives reload); cycle is from cf->cycle at
-        // postconfiguration; shm.addr is the mapped zone base.
-        // slot_off = w * slot_sz with w < n_active ≤ zone_data_bytes / slot_sz.
+        // SAFETY: nginx guarantees shm_zone is a valid non-null pointer.
+        // zone.data was written by register_spans_zone to point at a
+        // ZoneInitData in amcf (nginx conf pool, outlives reload); slot_off =
+        // w * slot_sz with w < n_active ≤ zone_data_bytes / slot_sz.
         let ret = unsafe {
             let zone = &*shm_zone;
             let offset = data_offset();
@@ -1993,15 +1911,9 @@ mod tests {
         );
     }
 
-    /// Guard: verify that the histogram combo set remains
-    /// `method × status_class × protocol × route × upstream` and that url.path,
-    /// user_agent, and client.address appear ONLY on tail/exemplar records —
-    /// NOT as metric dimensions.
-    ///
-    /// This test asserts structural invariants at the TYPE level.
-    /// Sub-ms values (90µs, 150µs, 200µs) must land in distinct buckets.
-    /// This directly tests the "scale 3 resolves the ~90–200µs regime" claim.
-    /// Rejects the prior scale-0+ms design where all three would be zero_count.
+    /// Pins that sub-ms values (90µs, 150µs, 200µs) land in distinct buckets —
+    /// the "scale 3 resolves the ~90–200µs regime" claim. Rejects the prior
+    /// scale-0+ms design where all three would collapse into `zero_count`.
     #[test]
     fn sub_ms_values_land_in_distinct_buckets() {
         let mut buf = std::vec![0u8; core::mem::size_of::<ExpHistogramSlot>()];
@@ -2039,6 +1951,10 @@ mod tests {
         assert_eq!(buckets[61], 1, "200µs → internal bucket 61");
     }
 
+    /// Guards that the histogram combo set stays `method × status_class ×
+    /// protocol` (route/upstream as separate tables) and that url.path/
+    /// user_agent/client.address appear ONLY on tail/exemplar records, never
+    /// as a metric dimension.
     #[test]
     fn high_cardinality_only_on_tail_not_metric() {
         // 1. N_COMBOS is the base 160 (method × sc × proto) ONLY.
@@ -2113,26 +2029,12 @@ mod tests {
 
     // ── F1: reload must zero route/upstream histograms ───────────────────────
 
-    /// F1 regression: `zero_route_upstream_histograms` must zero ONLY
-    /// `route_duration_combos` and `upstream_duration_combos`, leaving all other
-    /// `WorkerSlots` fields untouched.
-    ///
-    /// Pre-fix: `otel_shm_zone_init` returned `NGX_OK` immediately on reload
-    /// without zeroing any fields.  After a reload the route/upstream tables are
-    /// rebuilt (new clcf_ptr / shm_zone_ptr values; any location add/remove/reorder
-    /// shifts the slot index).  Counts recorded pre-reload under route X ended up
-    /// attributed to whichever route now owned that index — silent misattribution.
-    ///
-    /// Post-fix: `zero_route_upstream_histograms` is called on reload for each
-    /// active WorkerSlot.  This test verifies:
-    /// 1. route_duration_combos and upstream_duration_combos are zeroed (no
-    ///    misattribution from old indices).
-    /// 2. request_duration_combos is NOT zeroed (stable method×status×protocol
-    ///    index; clearing it would lose correct data).
-    ///
-    /// Fail-before proof: without calling `zero_route_upstream_histograms`, the
-    /// route/upstream counts remain non-zero — the `assert_eq!(..., 0)` assertions
-    /// below would fail.
+    /// F1 regression: pins that `zero_route_upstream_histograms` zeros ONLY
+    /// `route_duration_combos`/`upstream_duration_combos` on reload (their
+    /// slot indices are rebuilt each reload — see the F1 doc comment above),
+    /// leaving `request_duration_combos` (config-stable index) untouched.
+    /// Fails without the call: the `assert_eq!(..., 0)` below would see
+    /// nonzero stale counts.
     #[test]
     fn f1_zero_route_upstream_histograms_on_reload() {
         // Allocate a zero-initialised buffer sized for one WorkerSlots.
@@ -2185,21 +2087,12 @@ mod tests {
 
     // ── Scale-down reload must zero ALL reserved slots ──────────────────────
 
-    /// Regression: on a scale-down SIGHUP reload (worker_processes 2→1),
-    /// slot indices above the new active count must be zeroed.
-    ///
-    /// Pre-fix: `otel_shm_zone_init` called `zero_route_upstream_histograms`
-    /// with `n_zero = n_active.min(n_reserved).max(1)` — only the NEW active
-    /// worker count.  On scale-down the higher-numbered slots retained counts
-    /// recorded under the OLD route-index assignment.  The exporter sums ALL
-    /// reserved slots, so those stale counts were attributed to whichever route
-    /// now owns that index — silent misattribution.
-    ///
-    /// Post-fix: `n_zero = n_reserved`, zeroing all reserved slots on reload.
-    ///
-    /// Fail-before proof: restore `n_active.min(n_reserved).max(1)` in
-    /// `otel_shm_zone_init` — the assertion on slot 1 below will fail because
-    /// its route/upstream counts are never zeroed.
+    /// Pins that a scale-down SIGHUP reload (worker_processes 2→1) zeros ALL
+    /// reserved slots, not just the new active count — otherwise the
+    /// higher-numbered slots retain stale route/upstream counts that the
+    /// exporter (which sums all reserved slots) misattributes to whichever
+    /// route now owns that index. Fails if `otel_shm_zone_init` reverts to
+    /// `n_zero = n_active.min(n_reserved).max(1)`.
     #[test]
     fn h3f4_scale_down_reload_zeros_all_reserved_slots() {
         use nginx_sys::ngx_shm_zone_t;
@@ -2265,21 +2158,14 @@ mod tests {
 
     /// F3 regression: `snapshot()` must never observe `count > Σbuckets + zero_count`.
     ///
-    /// Pre-fix: `record()` wrote `count` last with `Ordering::Relaxed` (no Release);
-    /// `snapshot()` read `count` last with `Acquire` that had no paired Release.
-    /// On weakly-ordered hardware (ARM64) a concurrent snapshot could see `count`
-    /// incremented while the corresponding bucket write had not yet propagated →
-    /// `count > Σbuckets` is observable.
-    ///
-    /// Post-fix: `record()` writes `count` last with `Release`; `snapshot()` reads
-    /// `count` first with `Acquire`.  The Acquire-Release pair on `count` establishes
-    /// a happens-before edge covering all prior bucket/sum writes from completed
-    /// `record()` calls, so `Σbuckets + zero_count ≥ count` always holds.
-    ///
-    /// This test FAILS on pre-fix code on weakly-ordered hardware (ARM64) because the
-    /// stress loop will observe violations.  On strongly-ordered hardware (x86) the
-    /// violation may be rare but the fix is still correct (it eliminates a data race
-    /// in the C++ / Rust memory model sense, independent of hardware).
+    /// Pre-fix, `count` was written last with `Relaxed` and read last with an
+    /// unpaired `Acquire`, so on weakly-ordered hardware (ARM64) a concurrent
+    /// snapshot could see `count` incremented before the matching bucket write
+    /// propagated. Post-fix (`Release` on the `record()` write, `Acquire` first
+    /// on the `snapshot()` read) the pair establishes a happens-before edge
+    /// over all prior writes in that `record()` call, so the invariant always
+    /// holds. This test fails on pre-fix code on ARM64 (rarely on x86, but the
+    /// fix is still correct — it removes a data race, not a hardware-specific bug).
     #[test]
     fn f3_snapshot_count_le_bucket_sum_concurrent() {
         use std::sync::atomic::AtomicBool;
@@ -2333,25 +2219,21 @@ mod tests {
         assert_eq!(violations, 0, "F3: count > Σbuckets observed {violations} times — pre-fix code (count written Relaxed, read last) is the root cause; post-fix Release+Acquire on count makes this invariant unconditional");
     }
 
-    /// H2F2 regression: `zero_route_upstream_histograms` must use AtomicU64::store(Relaxed),
-    /// not ptr::write_bytes, to avoid UB when old-generation workers concurrently fetch_add
-    /// the same words during SIGHUP reload.
+    /// H2F2 regression: `zero_route_upstream_histograms` must use
+    /// `AtomicU64::store(Relaxed)`, not `ptr::write_bytes`, to avoid UB when
+    /// old-generation workers concurrently `fetch_add` the same words during
+    /// SIGHUP reload. Spawns a thread doing `fetch_add` on one AtomicU64 in
+    /// `route_duration_combos` while the main thread zeroes it; the point is
+    /// that it runs without sanitizer warnings, not a specific post-race value
+    /// (stale counts vanishing with old workers is accepted).
     ///
-    /// This test spawns a thread doing fetch_add in a tight loop on one AtomicU64 inside
-    /// route_duration_combos while the main thread calls zero_route_upstream_histograms.
-    /// The point is that it compiles and runs without TSAN/sanitizer warnings — not that
-    /// a particular value is observed after the race (the race outcome is intentionally
-    /// "stale counts vanish with old workers", which is accepted).
+    /// **TSAN-guard caveat:** inert on non-sanitizer builds — `AtomicU64::store`
+    /// asserts nothing without `-Zsanitizer=thread`, so a green macOS run is NOT
+    /// race coverage. Real evidence: `tests/RESULTS-tsan-2026-06-11-h2fu.txt`
+    /// (commit 841827c) — passes under TSAN, zero warnings, in the full
+    /// make-tsan-test run.
     ///
-    /// **TSAN-guard caveat:** This test is inert on non-sanitizer builds.
-    /// `AtomicU64::store` makes no runtime assertion without `-Zsanitizer=thread`;
-    /// the test will pass on macOS / release / debug builds whether the H2F2 fix
-    /// is present or not.  A green macOS run is NOT race coverage.
-    /// The real evidence lives in `tests/RESULTS-tsan-2026-06-11-h2fu.txt`
-    /// (commit 841827c): the test passes under TSAN with 42 `__tsan_*` symbols
-    /// loaded and zero ThreadSanitizer warnings in the full make-tsan-test run.
-    ///
-    /// Guarded by #[cfg(not(miri))] because Miri is single-threaded and would deadlock.
+    /// `#[cfg(not(miri))]`: Miri is single-threaded and would deadlock here.
     #[test]
     #[cfg(not(miri))]
     fn f_shm_atomic_zero() {
@@ -2393,17 +2275,11 @@ mod tests {
         // If we reach here without TSAN/sanitizer complaints the test passes.
     }
 
-    /// H2F3 regression: after a SIGHUP reload that increases worker_processes,
-    /// new worker slots (which are OS-zeroed) must have cap stamped by the reload
-    /// path of logs_shm_zone_init.
-    ///
-    /// Pre-fix: the reload path returned NGX_OK immediately — cap remained 0 for
-    ///   new slots → every push from new workers returned false (dropped silently).
-    /// Post-fix: reload path stamps cap for all active slots (idempotent for
-    ///   existing slots, required for new slots).
-    ///
-    /// Fail-before proof: comment out the H2F3 reload block in logs_shm_zone_init
-    /// and this test's assertion on step (4) will fail.
+    /// H2F3 regression: a SIGHUP reload that increases worker_processes must
+    /// stamp `cap` into the new (OS-zeroed, cap==0) worker slots too, or every
+    /// push from a new worker silently drops (cap==0 reads as "push disabled").
+    /// Fails if the H2F3 reload block in `logs_shm_zone_init` is removed —
+    /// step (4)'s assertion would see cap still 0.
     #[test]
     fn b1_cap_survives_reload() {
         use crate::logs::ring::{ring_size_bytes, WorkerSignalRingHeader};
@@ -2499,16 +2375,10 @@ mod tests {
         assert_eq!(access_cap0, CAP as u64, "H2F3: reload must not corrupt slot 0 cap");
     }
 
-    /// H2F3 regression: spans_shm_zone_init must stamp `cap` into new-worker
-    /// slots on SIGHUP reload (scale-up path).
-    ///
-    /// Each spans slot contains ONE `WorkerSignalRingHeader` at slot base
-    /// (spans_slot_size = ring_size_bytes; no separate error ring).
-    /// Also asserts read_offset / write_offset are untouched by the reload
-    /// path (reload stamps cap only; offsets survive from the old generation).
-    ///
-    /// Fail-before proof: comment out the H2F3 reload block in spans_shm_zone_init
-    /// and this test's assertion on step (4) will fail.
+    /// H2F3 regression (spans variant): same as `b1_cap_survives_reload` for
+    /// the single-ring spans slot layout. Also asserts `read_offset`/
+    /// `write_offset` are untouched by the reload path (it stamps cap only;
+    /// offsets survive from the old generation).
     #[test]
     fn b1_spans_cap_survives_reload() {
         use crate::logs::ring::WorkerSignalRingHeader;
@@ -2603,24 +2473,15 @@ mod tests {
         assert_eq!(cap0, CAP as u64, "H2F3: reload must not corrupt slot 0 cap");
     }
 
-    /// Regression: `logs_access_ring` / `logs_error_ring` / `logs_error_ring_ptr` /
-    /// `logs_coalesce_table` must derive their slot stride from the ring header's
-    /// cap, NOT from the config `cap` parameter.  A mismatch (e.g. from a SIGHUP
-    /// that changes the log ring cap) would compute wrong slot addresses.
-    ///
-    /// This test sets the header cap to `HDR_CAP` while passing `CONFIG_CAP`
-    /// (different) to the stride functions.  The fix reads `HDR_CAP` from the
-    /// header; pre-fix code would use `CONFIG_CAP` and land on the wrong address.
-    ///
-    /// # Mutation evidence (revert == pre-fix)
-    /// In `logs_access_ring`/`logs_error_ring`/`logs_error_ring_ptr`/
-    /// `logs_coalesce_table`, remove the `logs_zone_cap` call and use `cap`
-    /// (the parameter) directly for `stride_cap`.  Re-run this test:
-    ///   - `ring_ptr_stride_matches_header_cap` fails because the returned pointer
-    ///     is offset by `worker_id * logs_slot_size(CONFIG_CAP)` instead of
-    ///     `worker_id * logs_slot_size(HDR_CAP)`.
-    ///   - `ring_ptr_fallback_before_zone_init` still passes (header cap == 0
-    ///     → the fallback branch is the only path, so mutation has no effect there).
+    /// Pins that `logs_access_ring`/`logs_error_ring`/`logs_error_ring_ptr`/
+    /// `logs_coalesce_table` derive slot stride from the ring header's cap,
+    /// NOT the config `cap` parameter (a mismatch — e.g. a SIGHUP that changes
+    /// the log ring cap — would compute wrong slot addresses). Sets the
+    /// header cap to `HDR_CAP` while passing a different `CONFIG_CAP` to the
+    /// stride functions; if `logs_zone_cap`'s header read is removed in favour
+    /// of using `cap` directly, this test fails (wrong offset) while
+    /// `ring_ptr_fallback_before_zone_init` still passes (header cap == 0
+    /// there, so the fallback branch is unaffected).
     #[test]
     fn ring_ptr_stride_matches_header_cap() {
         use crate::logs::ring::{ring_size_bytes, WorkerSignalRingHeader};

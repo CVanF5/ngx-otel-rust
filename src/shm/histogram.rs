@@ -7,23 +7,15 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-/// Duration histogram bucket boundaries in **milliseconds**.
-///
-/// These are the default OTel HTTP server latency boundaries (seconds × 1000).
-/// Used for the upstream explicit-boundary histograms — nginx reports upstream
-/// timings in ms so the worker records raw ms values against these bounds;
-/// the exporter publishes the same thresholds expressed in seconds (see
-/// `DURATION_BOUNDS_S`) and converts the scalar sum by ÷1000 at export.
+/// Default OTel HTTP server latency boundaries, in **milliseconds** — the
+/// worker records raw upstream ms values against these (nginx reports
+/// upstream timings in ms); the exporter republishes them via
+/// `DURATION_BOUNDS_S` and divides the scalar sum by 1000.
 pub const DURATION_BOUNDS_MS: [u64; 14] =
     [5, 10, 25, 50, 75, 100, 250, 500, 750, 1000, 2500, 5000, 7500, 10000];
 
-/// Duration histogram bucket boundaries expressed in **seconds** (f64).
-///
-/// These are `DURATION_BOUNDS_MS ÷ 1000`, used exclusively in the exporter
-/// when publishing the `nginx.upstream.*.duration` histograms with unit `"s"`.
-/// The worker still records raw ms values against `DURATION_BOUNDS_MS`; the
-/// bucket counts are unchanged — only the published boundary scale and the
-/// scalar sum (÷1000) change at export.
+/// `DURATION_BOUNDS_MS ÷ 1000` — used only by the exporter when publishing
+/// `nginx.upstream.*.duration` with unit `"s"`; bucket counts are unchanged.
 pub const DURATION_BOUNDS_S: [f64; 14] =
     [0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0];
 
@@ -32,46 +24,31 @@ pub const N_DURATION_BUCKETS: usize = 15;
 
 // ── Exponential-histogram constants ─────────────────────────
 
-/// OTel exponential histogram scale for `request_duration_combos`.
-///
-/// **Resolution:** scale 3 → base = 2^(2^-3) = 2^0.125 ≈ 1.091
-/// → 8 buckets per power-of-2.  The metric is published in **seconds**
-/// (`http.server.request.duration`, semconv unit `s`), so a duration of
-/// ~150µs (≈ p50) resolves to ~13µs near that point — seconds is the unit,
-/// not the resolution.
+/// OTel exponential histogram scale for `request_duration_combos`: base =
+/// 2^(2^-3) ≈ 1.091 → 8 buckets per power-of-2. Metric unit is seconds
+/// (`http.server.request.duration`, semconv unit `s`).
 /// <https://opentelemetry.io/docs/specs/otel/metrics/data-model/#exponentialhistogram>
 pub const EXP_HISTOGRAM_SCALE: i32 = 3;
 
-/// Number of positive-range bucket slots in each `ExpHistogramSlot`.
-///
-/// At scale 3, 192 buckets covers ~24 octaves [~1µs, ~16.7s) of request
-/// duration.  Durations ≥ ~16.7s clamp to the last bucket (191).  A
-/// duration of 0 µs goes to `zero_count` (should not occur in practice).
-/// The array size is unchanged from the prior µs-indexed scheme; only the
-/// per-bucket meaning (now seconds) and the published offset change.
+/// Positive-range bucket count: at scale 3, 192 buckets covers ~24 octaves
+/// [~1µs, ~16.7s). Durations ≥ ~16.7s clamp to the last bucket (191); 0µs
+/// goes to `zero_count`.
 pub const N_EXP_BUCKETS: usize = 192;
 
 /// Fixed bucket offset (OTel `positive.offset` field in the wire format).
-///
-/// The histogram is published in **seconds**.  The OTel exponential-histogram
-/// bucket index for a value `v` (seconds) at scale 3 is `ceil(log2(v)·8) − 1`
-/// (upper-inclusive).  Internal bucket `0` is the lowest covered seconds
-/// bucket, holding the smallest non-zero observation of `1µs = 1e-6 s`:
-/// `ceil(log2(1e-6)·8) − 1 = −160`.  The encoder emits this value verbatim as
-/// `positive.offset` so consumers interpret bucket counts in seconds.
+/// Internal bucket `0` is the lowest covered seconds bucket, holding the
+/// smallest non-zero observation `1µs = 1e-6 s`: `ceil(log2(1e-6)·8) − 1 =
+/// −160`. Emitted verbatim as `positive.offset`.
 /// <https://opentelemetry.io/docs/specs/otel/metrics/data-model/#exponentialhistogram>
 pub const EXP_HISTOGRAM_BUCKET_OFFSET: i32 = -160;
 
 /// Per-bucket **upper bound in integer microseconds** for the seconds-indexed
 /// exponential histogram (scale 3).
 ///
-/// `SECONDS_BUCKET_UPPER_US[i] = floor(1e6 · 2^((i + EXP_HISTOGRAM_BUCKET_OFFSET + 1) / 8))`
-/// — the exact integer µs threshold below which a duration falls into internal
-/// bucket `i` (spec index `i − 160`).  A duration `value_us` lands in the
-/// smallest `i` with `value_us ≤ SECONDS_BUCKET_UPPER_US[i]` (upper-inclusive;
-/// see [`ExpHistogramSlot::record`]).  Monotonically non-decreasing (the lowest
-/// sub-µs spec buckets collapse to threshold 1, unreachable above 0 µs); the
-/// integer-µs octave boundaries `15625 … 16000000` appear verbatim at indices
+/// `SECONDS_BUCKET_UPPER_US[i] = floor(1e6 · 2^((i + EXP_HISTOGRAM_BUCKET_OFFSET + 1) / 8))`.
+/// A duration `value_us` lands in the smallest `i` with `value_us ≤
+/// SECONDS_BUCKET_UPPER_US[i]` (upper-inclusive; see [`ExpHistogramSlot::record`]).
+/// Integer-µs octave boundaries (`15625 … 16000000`) land exactly on indices
 /// `111, 119, …, 191`.
 ///
 /// Generated (and re-verified in `exp_histogram_seconds_bucket_exact`) with:
@@ -106,20 +83,18 @@ pub(super) const SECONDS_BUCKET_UPPER_US: [u64; N_EXP_BUCKETS] = [
 
 /// An OTel **exponential histogram** slot stored entirely in atomic counters.
 ///
-/// The published metric is in **seconds** (`http.server.request.duration`).
-/// The worker receives durations as integer microseconds and buckets them
-/// directly into the seconds spec mapping (see [`ExpHistogramSlot::record`])
-/// so the histogram is exact and single-sourced — the exporter is a faithful
-/// pass-through, not a second aggregation stage.
+/// Published metric unit is **seconds** (`http.server.request.duration`); the
+/// worker receives µs durations and buckets them directly into the seconds
+/// spec mapping (see [`ExpHistogramSlot::record`]) so the exporter is a
+/// faithful pass-through, not a second aggregation stage.
 ///
-/// **Resolution (scale 3):** internal bucket `i` maps to spec index
-/// `i + EXP_HISTOGRAM_BUCKET_OFFSET` (= `i − 160`); bucket boundaries are
-/// `2^(spec/8)` seconds (base = 2^(2^-3) ≈ 1.091).  All durations are positive
-/// so `negative` is empty.
+/// **Resolution (scale 3):** internal bucket `i` maps to spec index `i +
+/// EXP_HISTOGRAM_BUCKET_OFFSET` (= `i − 160`); boundaries are `2^(spec/8)`
+/// seconds. All durations are positive so `negative` is empty.
 ///
-/// The record function computes the seconds bucket index with an integer
-/// binary search over a precomputed boundary table + one `fetch_add` —
-/// alloc-free, lock-free, no float, no `log()`, no syscall on the hot path.
+/// `record` computes the bucket via integer binary search over a precomputed
+/// boundary table + one `fetch_add` — alloc-free, lock-free, no float/`log()`,
+/// no syscall on the hot path.
 ///
 /// Size: `(N_EXP_BUCKETS + 3) × 8 = 195 × 8 = 1560 bytes`.
 #[repr(C)]
@@ -138,41 +113,29 @@ pub struct ExpHistogramSlot {
 }
 
 impl ExpHistogramSlot {
-    /// Record one duration observation on the hot path.
-    ///
-    /// `value_us` is the duration in **microseconds**.  The published metric is
-    /// in **seconds**; the worker buckets the seconds value `v = value_us / 1e6`
-    /// into the OTel exponential-histogram bucket directly so the histogram is
-    /// exact and single-sourced.
+    /// Record one duration observation (µs) on the hot path.
     ///
     /// # Constraint: no allocation, no lock, no float
     ///
-    /// The OTel exp-histogram mapping is **upper-inclusive**: the bucket (spec)
-    /// index for a value `v` at scale 3 is `ceil(log2(v)·8) − 1`, i.e. `v` lands
-    /// in spec bucket `i` iff `2^(i/8) < v ≤ 2^((i+1)/8)`.  A value exactly on a
-    /// bucket boundary goes to the **lower** bucket.
+    /// The OTel exp-histogram mapping is **upper-inclusive**: the spec bucket
+    /// index for a value `v` (seconds) at scale 3 is `ceil(log2(v)·8) − 1`, i.e.
+    /// `v` lands in spec bucket `i` iff `2^(i/8) < v ≤ 2^((i+1)/8)`. A value
+    /// exactly on a boundary goes to the **lower** bucket.
     /// <https://opentelemetry.io/docs/specs/otel/metrics/data-model/#exponentialhistogram>
     ///
-    /// We bucket integer microseconds against the seconds mapping using a
-    /// precomputed integer-µs upper-bound table.  Internal bucket `i` (spec
-    /// index `i + EXP_HISTOGRAM_BUCKET_OFFSET`) has upper bound
-    /// `UB_us[i] = floor(1e6 · 2^((i + OFFSET + 1)/8))`.  The seconds bucket
-    /// edges in µs are generally non-integer, EXCEPT the octave edges
-    /// `1e6 · 2^k` which are exact integer µs (`15625` = 2⁻⁶s, `31250`, …,
-    /// `1000000` = 1s, …, `16000000` = 16s) because `1e6 = 2⁶·5⁶` — a naïve
-    /// `floor` seconds scheme would mis-bucket exactly those common operating
-    /// points.  Flooring the (mostly irrational) upper bound is exact for the
-    /// upper-inclusive test on integer input: `value_us ≤ UB ⇔ value_us ≤
-    /// floor(UB)` (and at the integer octave edges `floor(UB) = UB` exactly, so
-    /// the boundary value `value_us = UB_us[i]` satisfies `≤` and lands in the
-    /// lower bucket `i` — upper-inclusive, handled by construction).
+    /// We bucket integer µs directly against `SECONDS_BUCKET_UPPER_US`, whose
+    /// entries are `floor(1e6 · 2^((i+OFFSET+1)/8))`. Flooring is exact for the
+    /// upper-inclusive test on integer input (`value_us ≤ UB ⇔ value_us ≤
+    /// floor(UB)`), and at the integer-µs octave edges (`1e6 = 2⁶·5⁶`,
+    /// e.g. 15625, 1000000, 16000000) `floor(UB) = UB` exactly, so a naïve
+    /// non-table `floor` scheme would otherwise mis-bucket exactly those points.
     ///
-    /// The bucket is the smallest `i` with `value_us ≤ UB_us[i]` =
-    /// `partition_point(|t| t < value_us)`, clamped to the overflow bucket — an
-    /// integer binary search, no float / `log()` / syscall / alloc / lock.
+    /// Bucket = smallest `i` with `value_us ≤ UB_us[i]` =
+    /// `partition_point(|t| t < value_us)`, clamped to the overflow bucket —
+    /// integer binary search, no float/`log()`/syscall/alloc/lock.
     ///
-    /// **Correctness:** verified exact for all `v ∈ [1, 2^14]` and a
-    /// deterministic sample of `[1, 2^24]` (incl. every integer-µs octave
+    /// **Correctness:** verified exact for all `v ∈ [1, 2^14]` plus a
+    /// deterministic sample to `[1, 2^24]` (incl. every integer-µs octave
     /// boundary) against `ceil(log2(value_us/1e6)·8) − 1` — see
     /// `exp_histogram_seconds_bucket_exact`.
     #[inline]
@@ -197,17 +160,12 @@ impl ExpHistogramSlot {
 
     /// Snapshot all bucket counts, zero_count, sum, and count for export.
     ///
-    /// F3 fix: `count` is read **first** with `Acquire`, pairing with the
-    /// `Release` store in `record()`.  Since all `record()` calls on this slot
-    /// originate from the same single worker thread, by transitivity the
-    /// Acquire on count=N ensures all N bucket/sum/zero_count writes from
-    /// completed record() calls are visible.  The snapshot invariant
-    /// `Σbuckets + zero_count ≥ count` therefore holds.  Pre-fix code read
-    /// count **last** with an Acquire that had no paired Release → count >
-    /// Σbuckets was observable.
-    ///
-    /// Bucket/sum/zero_count loads use `Relaxed` — they are already ordered by
-    /// the `Acquire` load of count that precedes them.
+    /// `count` is read **first** with `Acquire`, pairing with the `Release`
+    /// store in `record()`. Since all `record()` calls on a slot originate
+    /// from one worker thread, the Acquire on count=N transitively makes all N
+    /// prior bucket/sum/zero_count writes visible, so `Σbuckets + zero_count ≥
+    /// count` always holds. Bucket/sum/zero_count loads use `Relaxed` — they
+    /// are already ordered by the preceding Acquire on count.
     pub fn snapshot(&self) -> ([u64; N_EXP_BUCKETS], u64, u64, u64) {
         // Read count FIRST to anchor the happens-before with record()'s Release.
         let count = self.count.load(Ordering::Acquire);
