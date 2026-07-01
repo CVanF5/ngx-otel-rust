@@ -3,14 +3,15 @@
 ## Directory layout
 
 ```
-../ngx-rust/   ← patched ngx-rust fork (branch ngx-otel-rust-deadlock-fix)
-../nginx/      ← NGINX source checkout
-ngx-otel-rust/ ← this repo
+ngx-otel-rust/   ← this repo
+<nginx-source>/  ← an NGINX source tree; NGINX_SOURCE_DIR points at it (default: ../nginx)
 ```
 
-The Makefile defaults (`NGINX_SOURCE_DIR=../nginx`) and `.cargo/config.toml`
-both expect sibling checkouts at these paths. Override via env vars if your
-layout differs.
+Building any nginx module needs an NGINX source tree. The Makefile and
+`.cargo/config.toml` default `NGINX_SOURCE_DIR` to a sibling `../nginx`;
+override it if your source lives elsewhere. The `ngx` SDK is a cargo git
+dependency pinned in `Cargo.toml` and fetched automatically — no local
+checkout required.
 
 ## First-time setup
 
@@ -67,7 +68,7 @@ Run `cargo clean` afterward to purge the stale release cache.
 
 ```
 ngx-otel-rust/
-├── auto/rust              # vendored ngx-rust shell library for autoconf integration
+├── auto/rust              # vendored shell library for autoconf integration
 ├── build/                 # per-flavor make includes (debug, release, sanitize, compat-*)
 ├── config                 # NGINX module config (sourced by auto/configure)
 ├── config.make            # NGINX module Makefile fragment

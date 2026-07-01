@@ -43,13 +43,12 @@ http = "1.4.0"
 http-body-util = "0.1.3"
 hyper = { version = "1.6.0", default-features = false, features = ["client", "http1", "http2"] }
 libc = "0.2.174"
-# Pinned to the local `../ngx-rust` checkout on branch
-# `ngx-otel-rust-deadlock-fix` (commit on top of upstream 13c0067) which
-# patches `src/async_/spawn.rs::schedule` to always defer wakes via
-# `ngx_post_event` instead of synchronously re-polling.  See the commit
-# message there for the full deadlock analysis.  Upstream PR pending.
-nginx-sys = { path = "../ngx-rust/nginx-sys" }
-ngx = { path = "../ngx-rust", features = ["async", "std"] }
+# ngx-rust fork carrying the deferred-wake fix: `src/async_/spawn.rs::schedule`
+# always defers wakes via `ngx_post_event` instead of synchronously re-polling
+# on the waker stack (which deadlocks under h2 teardown). Pinned by rev for
+# reproducible builds from a standalone clone; upstream PR pending.
+nginx-sys = { git = "https://github.com/CVanF5/ngx-rust.git", rev = "a7ecee829f8264a7a06c6a3b5ea1f097333c251a" }
+ngx = { git = "https://github.com/CVanF5/ngx-rust.git", rev = "a7ecee829f8264a7a06c6a3b5ea1f097333c251a", features = ["async", "std"] }
 openssl-sys = { version = "0.9.110", features = ["bindgen"] }
 pin-project-lite = "0.2.16"
 prost = "0.14"
