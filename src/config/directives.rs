@@ -78,10 +78,8 @@ pub(super) extern "C" fn cmd_exporter_set_trusted_cert(
     NGX_CONF_OK
 }
 
-/// Handler for `ssl_certificate <path>` inside `otel_exporter {}`.
-///
-/// Stores the client certificate path for mTLS.  Config-time validation of the
-/// cert+key pair is in `MainConfig::post_config`.
+/// `ssl_certificate <path>` inside `otel_exporter {}` — mTLS client cert path.
+/// Cert+key pairing validated in `MainConfig::post_config`.
 pub(super) extern "C" fn cmd_exporter_set_ssl_cert(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
@@ -98,10 +96,8 @@ pub(super) extern "C" fn cmd_exporter_set_ssl_cert(
     NGX_CONF_OK
 }
 
-/// Handler for `ssl_certificate_key <path>` inside `otel_exporter {}`.
-///
-/// Stores the client private key path for mTLS.  Config-time validation of the
-/// cert+key pair is in `MainConfig::post_config`.
+/// `ssl_certificate_key <path>` inside `otel_exporter {}` — mTLS client key
+/// path; see `cmd_exporter_set_ssl_cert`.
 pub(super) extern "C" fn cmd_exporter_set_ssl_cert_key(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
@@ -118,10 +114,8 @@ pub(super) extern "C" fn cmd_exporter_set_ssl_cert_key(
     NGX_CONF_OK
 }
 
-/// Handler for `ssl_verify on|off` inside `otel_exporter {}`.
-///
-/// Default (unset) → `on` (verify peer certificate).
-/// `ssl_verify off` is INSECURE; a WARN is emitted at `post_config` time.
+/// `ssl_verify on|off` inside `otel_exporter {}`. Default (unset) = on.
+/// `off` is INSECURE; a WARN is emitted at `post_config` time.
 pub(super) extern "C" fn cmd_exporter_set_ssl_verify(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
@@ -202,14 +196,10 @@ pub(super) extern "C" fn cmd_exporter_set_traces_endpoint(
     NGX_CONF_OK
 }
 
-/// Check whether a header name/value byte pair is syntactically valid.
-///
-/// Uses the same `hyper` parser as the transport layer so "accepted at
-/// config time" == "accepted at runtime" — no silent drops.  Returns `Ok(())`
-/// on success, or `Err(true)` when only the name is bad, `Err(false)` when
-/// only the value is bad (the bool distinguishes which message to emit).
-///
-/// This is a pure function and unit-testable without any nginx FFI context.
+/// Validates a header name/value byte pair using the same `hyper` parser as
+/// the transport layer, so "accepted at config time" == "accepted at
+/// runtime". `Err(true)` = bad name, `Err(false)` = bad value. Pure function,
+/// unit-testable without nginx FFI.
 #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
 pub(super) fn check_header_kv(name: &[u8], value: &[u8]) -> Result<(), bool> {
     if HeaderName::from_bytes(name).is_err() {
@@ -221,10 +211,8 @@ pub(super) fn check_header_kv(name: &[u8], value: &[u8]) -> Result<(), bool> {
     Ok(())
 }
 
-/// Validate a header name/value pair using the same parser the runtime uses.
-///
-/// Returns `true` when the pair is acceptable, `false` after logging an
-/// `NGX_LOG_EMERG` message so the directive handler can return `NGX_CONF_ERROR`.
+/// Validates a header name/value pair, logging `NGX_LOG_EMERG` and returning
+/// `false` on failure so the caller can return `NGX_CONF_ERROR`.
 ///
 /// # Safety
 /// `cf` must be the valid non-null directive parse context.
@@ -255,23 +243,17 @@ unsafe fn validate_header_kv(cf: *mut ngx_conf_t, name: &[u8], value: &[u8]) -> 
     }
 }
 
-/// Handler for `header <name> <value>` inside `otel_exporter { ... }`.
-///
-/// Appends the key-value pair to the same `exporter_headers` Vec that the
-/// top-level `otel_exporter_header` directive writes to.  Name lowercasing is
-/// left to the exporter transport layer (as for the top-level form).
-///
-/// The `conf` pointer is `&amcf.exporter` (an `ExporterConfig` embedded in
-/// `MainConfig`); the container `MainConfig` is recovered via its known offset.
+/// `header <name> <value>` inside `otel_exporter { ... }` — appends to the
+/// same `exporter_headers` Vec as the top-level `otel_exporter_header`
+/// directive. `conf` is `&amcf.exporter`; the containing `MainConfig` is
+/// recovered via its known field offset.
 pub(super) extern "C" fn cmd_exporter_block_add_header(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
-    // Recover the containing `MainConfig` from the `&amcf.exporter` pointer that
-    // `cmd_set_exporter_block` stored in `handler_conf`.
     // SAFETY: `conf` is `ptr::addr_of_mut!(amcf.exporter)` cast to `*mut c_void`
-    // (see `cmd_set_exporter_block`).  Subtracting `offset_of!(MainConfig, exporter)`
+    // (see `cmd_set_exporter_block`). Subtracting `offset_of!(MainConfig, exporter)`
     // yields the start of the enclosing `MainConfig`, which nginx allocated in its
     // conf pool and keeps live for the whole config cycle.
     let amcf = unsafe {
@@ -281,8 +263,6 @@ pub(super) extern "C" fn cmd_exporter_block_add_header(
     };
     // SAFETY: `cf` is the valid non-null directive parse context (TAKE2 args).
     let args = unsafe { cf_args(cf) };
-    // Validate name and value with the same hyper parser the runtime uses so that
-    // "accepted at config time" == "accepted at runtime" (no silent drops).
     // SAFETY: `cf` is the valid non-null parse context; args[1/2] are nginx pool
     // strings whose lifetime covers the whole config cycle.
     if !unsafe { validate_header_kv(cf, args[1].as_bytes(), args[2].as_bytes()) } {
@@ -292,18 +272,12 @@ pub(super) extern "C" fn cmd_exporter_block_add_header(
     NGX_CONF_OK
 }
 
-/// Handler for `interval <msec>` inside `otel_exporter { ... }`.
-///
-/// Parses the value as a nginx time string and writes
-/// `MainConfig.metric_interval_ms` — the same field as the top-level
-/// `otel_metric_interval` directive.
-///
-/// Accepts the nginx msec grammar (`500ms`, `5s`, `5m`, `2h`, `1d`, or a bare
-/// integer treated as seconds), matching the C++ `nginx-otel` `interval`
-/// directive which binds to `ngx_conf_set_msec_slot` (cpp:131).
-///
-/// The `conf` pointer is recovered to `MainConfig` via the same container-of
-/// pattern as [`cmd_exporter_block_add_header`].
+/// `interval <msec>` inside `otel_exporter { ... }` — writes
+/// `MainConfig.metric_interval_ms` (same field as `otel_metric_interval`).
+/// Accepts the nginx msec grammar (`500ms`, `5s`, `5m`, `2h`, `1d`, bare
+/// integer = seconds), matching the C++ `interval` directive
+/// (`ngx_conf_set_msec_slot`, cpp:131). `conf` recovered via the same
+/// container-of pattern as [`cmd_exporter_block_add_header`].
 pub(super) extern "C" fn cmd_exporter_block_set_interval(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
@@ -339,12 +313,9 @@ pub(super) extern "C" fn cmd_exporter_block_set_interval(
     }
 }
 
-/// Handler for `batch_size <n>` inside `otel_exporter { ... }`.
-///
-/// Accepted for C++ `nginx-otel` config compatibility and parsed with the
-/// nginx size-string grammar (`512`, `1k`, `2m`) matching the C++ binding to
-/// `ngx_conf_set_size_slot` (cpp:137), but the value is ignored: this module
-/// uses a fixed-size span ring with no per-batch-flush size knob.
+/// `batch_size <n>` inside `otel_exporter { ... }` — accepted for C++ config
+/// compatibility (nginx size grammar, matches `ngx_conf_set_size_slot`,
+/// cpp:137) but ignored: this module uses a fixed-size span ring.
 pub(super) extern "C" fn cmd_exporter_block_ignore_batch_size(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
@@ -370,12 +341,9 @@ pub(super) extern "C" fn cmd_exporter_block_ignore_batch_size(
     NGX_CONF_OK
 }
 
-/// Handler for `batch_count <n>` inside `otel_exporter { ... }`.
-///
-/// Accepted for C++ `nginx-otel` config compatibility and parsed with the
-/// nginx size-string grammar (`4`, `1k`, `2m`) matching the C++ binding to
-/// `ngx_conf_set_size_slot` (cpp:143), but the value is ignored: this module
-/// uses a fixed retry-buffer depth with no pending-batch count knob.
+/// `batch_count <n>` inside `otel_exporter { ... }` — accepted for C++ config
+/// compatibility (nginx size grammar, matches `ngx_conf_set_size_slot`,
+/// cpp:143) but ignored: this module uses a fixed retry-buffer depth.
 pub(super) extern "C" fn cmd_exporter_block_ignore_batch_count(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
@@ -401,8 +369,8 @@ pub(super) extern "C" fn cmd_exporter_block_ignore_batch_count(
     NGX_CONF_OK
 }
 
-/// Dispatcher invoked by ngx_conf_parse for each directive inside the
-/// `otel_exporter { ... }` block.
+/// Dispatcher invoked by `ngx_conf_parse` for each directive inside
+/// `otel_exporter { ... }`.
 pub(super) extern "C" fn cmd_exporter_block_handler(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
@@ -478,10 +446,8 @@ pub(super) extern "C" fn cmd_set_exporter_block(
     if !rc.is_null() {
         return rc; // a sub-directive already reported its own error
     }
-    // A present `otel_exporter` block must carry an `endpoint`. Silently dropping
-    // to zero-cost/disabled mode when the operator clearly intended export is a
-    // config error, not a default (nginx idiom: a required sub-directive is
-    // mandatory when its block is present).
+    // A present block without `endpoint` is a config error, not a silent
+    // fallback to disabled mode (nginx idiom: mandatory sub-directive).
     if amcf.exporter.endpoint.as_bytes().is_empty() {
         ngx_conf_log_error!(
             NGX_LOG_EMERG,
@@ -563,11 +529,7 @@ pub(super) extern "C" fn cmd_set_metric_interval(
     }
 }
 
-/// Directive callback for `otel_export_protocol otlp_http | otlp_grpc;`.
-///
-/// Accepts `otlp_http` and `otlp_grpc`.  Rejects `arrow` with a
-/// "not yet implemented" message.  Rejects any other value with
-/// an "unknown value" message listing the valid choices.
+/// `otel_export_protocol otlp_http | otlp_grpc;`. Rejects `arrow` as "not yet implemented".
 pub(super) extern "C" fn cmd_set_export_protocol(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
@@ -611,15 +573,10 @@ pub(super) extern "C" fn cmd_set_export_protocol(
     }
 }
 
-/// Directive callback for `otel_log_ring_size <size>;`.
-///
-/// Parses a size value (e.g. `"512k"`, `"1m"`) using `parse_size_bytes` and
-/// stores the result in `MainConfig::log_ring_size`.
-///
-/// Test-support only: production builds always use the auto-default ring
-/// capacity ([`crate::logs::ring::DEFAULT_LOG_RING_CAP`]).  This override is
-/// registered only in `test`/`test-support` builds so integration tests can
-/// shrink the ring to provoke ring-full overflow deterministically.
+/// `otel_log_ring_size <size>;` — stores into `MainConfig::log_ring_size`.
+/// Test-support only; production always uses the auto-default
+/// ([`crate::logs::ring::DEFAULT_LOG_RING_CAP`]) — this override lets
+/// integration tests shrink the ring to provoke overflow.
 #[cfg(any(test, feature = "test-support"))]
 pub(super) extern "C" fn cmd_set_log_ring_size(
     cf: *mut ngx_conf_t,
@@ -641,13 +598,10 @@ pub(super) extern "C" fn cmd_set_log_ring_size(
 
     match parse_size_bytes(raw) {
         Some(n) if n > 0 => {
-            // `WorkerSignalRingHeader` holds four `AtomicU64` fields (align = 8).
-            // `CoalesceSlot` holds an `AtomicU64` at offset 0 (align = 8).
-            // The error-ring header starts at slot_base + ring_size_bytes(cap) and
-            // the coalescer table starts at slot_base + 2 * ring_size_bytes(cap).
-            // For both to be 8-byte aligned, cap must be a multiple of 8.
-            // Round up to the next multiple of 8; use checked arithmetic to avoid
-            // a panic on values near usize::MAX (e.g. usize::MAX - 3 would overflow).
+            // The error-ring header and coalescer table start at multiples of
+            // ring_size_bytes(cap); both hold AtomicU64 fields (align 8), so
+            // cap must be a multiple of 8. Round up with checked arithmetic
+            // (avoids overflow panic near usize::MAX).
             let Some(aligned) = align_ring_size(n) else {
                 ngx_conf_log_error!(
                     NGX_LOG_EMERG,
@@ -679,21 +633,11 @@ pub(super) extern "C" fn cmd_set_log_ring_size(
     }
 }
 
-/// Directive callback for `otel_error_log [<level>];`.
-///
-/// Inserts a writer-only `ngx_log_t` node into `cycle->new_log` via
-/// `otel_log_insert`.  The node calls `ngx_otel_error_writer` for every error
-/// that passes the severity floor.
-///
-/// - **NOARGS** (bare `otel_error_log;`) — fixed default floor `NGX_LOG_ERR`
-///   (error severity = 4).  Intentionally decoupled from the core `error_log`
-///   level: mirroring couples the OTel floor to on-box debug verbosity and the
-///   parse-time read of `cycle->new_log` is directive-order dependent.
-/// - **TAKE1** (e.g. `otel_error_log warn;`) — explicit level override.
-///   Accepted values: `emerg`, `alert`, `crit`, `error`, `warn`, `notice`,
-///   `info`, `debug`.
-///
-/// Errors on duplicate directive.
+/// `otel_error_log [<level>];` — inserts a writer-only `ngx_log_t` node into
+/// `cycle->new_log` calling `ngx_otel_error_writer` for errors past the
+/// severity floor. NOARGS = fixed `NGX_LOG_ERR` (intentionally decoupled from
+/// core `error_log`, whose level is directive-order dependent at parse time);
+/// TAKE1 = explicit level override. Errors on duplicate directive.
 pub(super) extern "C" fn cmd_set_error_log(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
@@ -714,9 +658,7 @@ pub(super) extern "C" fn cmd_set_error_log(
         None => return NGX_CONF_ERROR,
     };
 
-    // Allocate the ngx_log_t node and OtelErrorWriterState from the config pool.
-    // ngx_pcalloc zero-initialises both — AtomicBool(false), null ptr, 0 level
-    // are the correct "unset" defaults.
+    // ngx_pcalloc zero-initialises both nodes — the correct "unset" defaults.
     // SAFETY: `cf` is the valid non-null parse context; `cf.pool` is nginx's conf
     // pool (null-checked below). `ngx_pcalloc` returns zeroed, suitably-aligned
     // memory of the requested size for `ngx_log_t` / `OtelErrorWriterState`, and
@@ -750,8 +692,8 @@ pub(super) extern "C" fn cmd_set_error_log(
         (log_ptr, state_ptr)
     };
 
-    // Fill the log node.  Writer-only: no `file` set (so this node never writes
-    // to any file; the core file node still writes via chain continuation).
+    // Writer-only node: no `file` set, so it never writes to a file itself;
+    // the core file node still writes via chain continuation.
     // SAFETY: `new_log` and `state` are the non-null, zeroed pool allocations from
     // the block above; writing their fields is sound and they outlive the cycle
     // (conf-pool lifetime).
@@ -759,12 +701,9 @@ pub(super) extern "C" fn cmd_set_error_log(
         (*new_log).log_level = level_floor;
         (*new_log).writer = Some(ngx_otel_error_writer);
         (*new_log).wdata = state as *mut core::ffi::c_void;
-        // Fill the state (pcalloc gave us zeros; only non-zero fields needed).
         (*state).level_floor = level_floor;
-        // busy, cleanup, logs_zone, coalesce_table stay zero/null — correct defaults.
-        // coalesce_enabled is false until init_process sets it from
-        // MainConfig::error_log_coalesce; the coalescer path is gated on
-        // coalesce_table != null anyway, so false here is harmless.
+        // Remaining state fields stay zero/null (correct defaults);
+        // coalesce_enabled is set later by init_process, gated on coalesce_table.
     }
 
     // Insert into cycle->new_log chain (sorted descending by log_level).
@@ -784,11 +723,8 @@ pub(super) extern "C" fn cmd_set_error_log(
     NGX_CONF_OK
 }
 
-/// Directive callback for `otel_error_log_coalesce on|off;`.
-///
-/// Sets `amcf.error_log_coalesce`.  The standard nginx flag handler
-/// (`ngx_conf_set_flag_slot`) is not used here because `error_log_coalesce`
-/// is a plain Rust `bool`, not a `ngx_flag_t` (`intptr_t`).
+/// `otel_error_log_coalesce on|off;` — sets `amcf.error_log_coalesce`. Not
+/// `ngx_conf_set_flag_slot` because the field is a plain `bool`, not `ngx_flag_t`.
 pub(super) extern "C" fn cmd_set_error_log_coalesce(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
@@ -816,15 +752,10 @@ pub(super) extern "C" fn cmd_set_error_log_coalesce(
     NGX_CONF_OK
 }
 
-/// Directive callback for `otel_status_endpoint;` (location-level, no args).
-///
-/// Sets the content handler for the location to
-/// [`crate::otel_status_content_handler`], which returns the current
-/// `control_shm.version` as plain text. Used by the heartbeat
-/// integration test to read the exporter liveness counter.
-///
-/// **Only compiled in test-support builds. The string "otel_status_endpoint"
-/// does NOT appear in production `.so` files.**
+/// `otel_status_endpoint;` (location-level, no args, test-support only) —
+/// installs [`crate::otel_status_content_handler`], which returns
+/// `control_shm.version` as plain text for the heartbeat integration test.
+/// Absent from production `.so` files.
 #[cfg(any(test, feature = "test-support"))]
 pub(super) extern "C" fn cmd_set_otel_status_endpoint(
     cf: *mut ngx_conf_t,
@@ -853,11 +784,9 @@ pub(super) extern "C" fn cmd_set_otel_status_endpoint(
 
 // ── Trace directive handlers ──────────────────────────────────────────────────
 
-/// Directive callback for `otel_trace <complex-value>;`.
-///
-/// The complex value is evaluated at request time: truthy (non-empty, not `"0"`,
-/// not `"off"`) ⇒ tracing enabled; falsy ⇒ disabled.  Absence of the directive
-/// leaves `otel_trace` null — zero-cost, no REWRITE handler work.
+/// `otel_trace <complex-value>;` — evaluated at request time: truthy
+/// (non-empty, not `"0"`/`"off"`) enables tracing. Absent leaves `otel_trace`
+/// null — zero cost, no REWRITE handler work.
 pub(super) extern "C" fn cmd_set_otel_trace(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
@@ -889,17 +818,10 @@ pub(super) extern "C" fn cmd_set_otel_trace(
     NGX_CONF_OK
 }
 
-/// Directive callback for `otel_log_export on | off | if=<cond>;`.
-///
-/// Selects which requests have an exception-tail log record exported, mirroring
-/// core `access_log … if=`:
-/// - bare `otel_log_export;` or `otel_log_export on;` → export all requests.
-/// - `otel_log_export off;` → disabled (overrides an inherited selection).
-/// - `otel_log_export if=<cond>;` → export when `<cond>` is truthy at request
-///   time (the remainder after `if=` is compiled as a complex value).
-///
-/// Setting any selecting form (`on`/bare/`if=`) flips the main-conf
-/// `any_log_export` flag so the logs shm zone is allocated.  `off` does not.
+/// `otel_log_export on | off | if=<cond>;` — mirrors core `access_log ... if=`.
+/// Bare/`on` = export all; `off` = disabled; `if=<cond>` compiles the
+/// remainder as a complex value. Setting any selecting form (`on`/bare/`if=`)
+/// flips the main-conf `any_log_export` flag so the logs shm zone is allocated.
 pub(super) extern "C" fn cmd_set_otel_log_export(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
@@ -918,10 +840,8 @@ pub(super) extern "C" fn cmd_set_otel_log_export(
     // SAFETY: `cf` is the valid non-null directive parse context.
     let args = unsafe { cf_args(cf) };
 
-    // args[0] is the directive name; args[1] (if present) is the single param.
     let mode = if args.len() < 2 {
-        // Bare `otel_log_export;` → export all.
-        LogExportMode::All
+        LogExportMode::All // bare `otel_log_export;`
     } else {
         let param = args[1].as_bytes();
         if param == b"on" {
@@ -929,7 +849,6 @@ pub(super) extern "C" fn cmd_set_otel_log_export(
         } else if param == b"off" {
             LogExportMode::Off
         } else if param.len() >= 3 && &param[..3] == b"if=" {
-            // Compile the remainder after `if=` as a complex value.
             let cond = &param[3..];
             let mut cond_str = ngx_str_t { len: cond.len(), data: cond.as_ptr().cast_mut() };
             // SAFETY: `cf` is valid; `cond_str` borrows the directive arg bytes,
@@ -958,9 +877,8 @@ pub(super) extern "C" fn cmd_set_otel_log_export(
 
     lcf.set_log_export_mode(mode);
 
-    // Flip the main-conf flag for selecting forms so the logs shm zone is
-    // allocated.  Parse-time is correct: directive callbacks run before
-    // postconfiguration, which reads the flag for the allocation decision.
+    // Flip the main-conf flag at parse time: directive callbacks run before
+    // postconfiguration, which reads the flag for the zone-allocation decision.
     if matches!(mode, LogExportMode::All | LogExportMode::If) {
         // SAFETY: `cf` is a valid non-null parse context; the shared borrow is
         // sound for reading the module main conf.
@@ -1007,10 +925,8 @@ pub(super) extern "C" fn cmd_set_otel_trace_context(
     NGX_CONF_OK
 }
 
-/// Directive callback for `otel_span_name <complex-value>;`.
-///
-/// Per-location span name override.  The complex value is evaluated at request
-/// time.  Absent ⇒ built-in `"METHOD route_name"` format.
+/// `otel_span_name <complex-value>;` — per-location override, evaluated at
+/// request time. Absent = built-in `"METHOD route_name"` format.
 pub(super) extern "C" fn cmd_set_otel_span_name(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
@@ -1040,11 +956,8 @@ pub(super) extern "C" fn cmd_set_otel_span_name(
     NGX_CONF_OK
 }
 
-/// Directive callback for `otel_span_attr <key> <value>;`.
-///
-/// Appends a static key/value pair to this location's span attribute list.
-/// Multiple directives accumulate; child locations define their own independent
-/// set (no inheritance from parent — mirrors the C++ `addSpanAttr` behaviour).
+/// `otel_span_attr <key> <value>;` — appends to this location's span
+/// attribute list; no inheritance from parent (mirrors C++ `addSpanAttr`).
 pub(super) extern "C" fn cmd_add_otel_span_attr(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
@@ -1092,10 +1005,9 @@ pub(super) fn already_set_error() -> *mut c_char {
     c"is duplicate".as_ptr().cast_mut()
 }
 
-/// Parse the `otel_error_log` severity floor from the directive arguments.
-///
-/// `TAKE1` parses the explicit level; `NOARGS` defaults to `NGX_LOG_ERR`.
-/// Returns `None` (after logging an `NGX_LOG_EMERG` line) on an unknown level.
+/// Parses the `otel_error_log` severity floor: TAKE1 = explicit level,
+/// NOARGS = `NGX_LOG_ERR` default. `None` (after an `NGX_LOG_EMERG` log) on
+/// an unknown level.
 ///
 /// # Safety
 /// `cf` must be the valid, non-null parse context nginx passes to the handler.
@@ -1105,7 +1017,6 @@ pub(super) unsafe fn parse_error_log_level_floor(cf: *mut ngx_conf_t) -> Option<
     unsafe {
         let args = cf_args(cf);
         if args.len() > 1 {
-            // TAKE1: parse the explicit level argument.
             let level_str = args[1].as_bytes();
             match parse_error_log_level(level_str) {
                 Some(l) => Some(l),
@@ -1119,30 +1030,23 @@ pub(super) unsafe fn parse_error_log_level_floor(cf: *mut ngx_conf_t) -> Option<
                 }
             }
         } else {
-            // NOARGS: fixed default floor = NGX_LOG_ERR (error severity).
-            // This is intentionally DECOUPLED from the core `error_log` level:
-            // mirroring couples the OTel floor to on-box debug verbosity
-            // (against orthogonality) and a parse-time read of cycle->new_log
-            // is directive-order dependent.
+            // Fixed default, intentionally decoupled from core error_log: mirroring
+            // couples the OTel floor to on-box debug verbosity, and a parse-time
+            // read of cycle->new_log is directive-order dependent.
             Some(nginx_sys::NGX_LOG_ERR as ngx_uint_t)
         }
     }
 }
 
-/// Returns `true` when `value` contains a scheme+authority marker (`://`),
-/// meaning the per-signal endpoint directive includes a host/port component
-/// that would be silently stripped at export time.
-///
-/// Pure predicate — testable without an nginx config context.
-/// Called by `warn_if_has_authority` (below) and its unit test
+/// `true` when `value` contains a scheme+authority marker (`://`) that would
+/// be silently stripped at export time. Pure predicate, unit-tested by
 /// `h2f5_per_signal_endpoint_host_detection`.
 pub(crate) fn has_authority(value: &[u8]) -> bool {
     value.windows(3).any(|w| w == b"://")
 }
 
-/// Emit a WARN if the per-signal endpoint value includes a scheme or authority
-/// (i.e. contains `://`).  Only the path component is used at export time;
-/// the host/port from the base `endpoint` directive is preserved.
+/// Emits a WARN when a per-signal endpoint value includes a scheme/authority:
+/// only the path component is used at export time.
 fn warn_if_has_authority(cf: *mut ngx_conf_t, signal: &str, value: &[u8]) {
     if has_authority(value) {
         ngx_conf_log_error!(
@@ -1156,12 +1060,8 @@ fn warn_if_has_authority(cf: *mut ngx_conf_t, signal: &str, value: &[u8]) {
     }
 }
 
-/// Compile a directive argument into a `ngx_http_complex_value_t` on the conf pool.
-///
-/// Allocates `ngx_http_complex_value_t` via `ngx_pcalloc`, fills
-/// `ngx_http_compile_complex_value_t`, and calls `ngx_http_compile_complex_value`.
-///
-/// Returns the allocated pointer on success, `null_mut()` on allocation or
+/// Compiles a directive argument into a `ngx_http_complex_value_t` on the
+/// conf pool. Returns the allocated pointer, or `null_mut()` on allocation or
 /// compilation failure (caller must log and return `NGX_CONF_ERROR`).
 ///
 /// # Safety
@@ -1172,7 +1072,6 @@ pub(super) unsafe fn compile_complex_value(
     cf: *mut ngx_conf_t,
     value: *mut ngx_str_t,
 ) -> *mut ngx_http_complex_value_t {
-    // Allocate a zeroed complex value on the nginx conf pool.
     // SAFETY: `cf` is a valid non-null parse context; `(*cf).pool` is the live
     // conf pool nginx manages for config-parse time allocations.
     let cv_ptr =
@@ -1188,7 +1087,7 @@ pub(super) unsafe fn compile_complex_value(
     ccv.cf = cf;
     ccv.value = value;
     ccv.complex_value = cv_ptr;
-    // zero, conf_prefix, root_prefix bitfields stay 0 — no special prefix handling.
+    // zero/conf_prefix/root_prefix bitfields stay 0 — no special prefix handling.
     // SAFETY: `ccv` is fully initialised; `ngx_http_compile_complex_value` reads
     // the `value` ngx_str_t (possibly modifying it temporarily) and writes into
     // `complex_value` (our pool allocation, valid for the conf lifetime).

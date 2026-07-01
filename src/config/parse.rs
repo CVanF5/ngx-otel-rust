@@ -3,23 +3,18 @@
 // This source code is licensed under the Apache License, Version 2.0 license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! Parsing helpers for nginx configuration directives.
-//!
-//! These functions parse the textual forms that nginx directive values take
-//! (time strings, size strings, decimal integers) into Rust numeric types.
-//! They have no dependency on nginx FFI and are unit-tested in `config/mod.rs`.
+//! Parsing helpers for nginx configuration directive values (time strings,
+//! size strings, decimal integers) into Rust numeric types. No nginx FFI
+//! dependency; unit-tested in `config/mod.rs`.
 
-/// Parse duration strings → milliseconds.
-///
-/// Accepted forms match the nginx `ngx_parse_time(value, /*is_sec=*/0)` grammar
-/// (millisecond mode): `500ms`, `5s`, `5m`, `2h`, `1d`, or a bare integer
-/// treated as **seconds** (e.g. `5` → 5000 ms).  This is the same grammar that
-/// the C++ `nginx-otel` `interval` directive uses via `ngx_conf_set_msec_slot`.
+/// Parses duration strings to milliseconds, matching the nginx
+/// `ngx_parse_time(value, /*is_sec=*/0)` grammar: `500ms`, `5s`, `5m`, `2h`,
+/// `1d`, or a bare integer treated as seconds — the same grammar the C++
+/// `nginx-otel` `interval` directive uses via `ngx_conf_set_msec_slot`.
 pub(crate) fn parse_duration_ms(s: &[u8]) -> Option<u64> {
     if s.is_empty() {
         return None;
     }
-    // Check for the two-character `ms` suffix first.
     if s.ends_with(b"ms") {
         let n = parse_u64_ascii(&s[..s.len() - 2])?;
         return n.checked_mul(1); // already in milliseconds
@@ -35,7 +30,7 @@ pub(crate) fn parse_duration_ms(s: &[u8]) -> Option<u64> {
     n.checked_mul(suffix)
 }
 
-/// Parse a size string like `1024`, `10k`, `5m`, `2g` → bytes.
+/// Parses a size string like `1024`, `10k`, `5m`, `2g` to bytes.
 pub(crate) fn parse_size_bytes(s: &[u8]) -> Option<usize> {
     if s.is_empty() {
         return None;
@@ -53,30 +48,22 @@ pub(crate) fn parse_size_bytes(s: &[u8]) -> Option<usize> {
         _ => (s, 1usize),
     };
     let n = parse_u64_ascii(num_bytes)?;
-    // Use `try_from` to avoid silent truncation on 32-bit targets where
-    // `n as usize` would silently discard the high 32 bits for values > u32::MAX,
-    // producing a wrong (smaller) size without an error.
+    // `try_from` (not `as usize`) avoids silently truncating values > u32::MAX
+    // on 32-bit targets into a wrong, smaller size.
     let n_usize = usize::try_from(n).ok()?;
     n_usize.checked_mul(mult)
 }
 
-/// Round `n` up to the nearest multiple of 8, returning `None` if the result
-/// would overflow `usize`.
-///
-/// The log-ring-size directive stores three contiguous sections in shared
-/// memory at offsets that are multiples of `ring_size_bytes(cap)`; for
-/// `AtomicU64` alignment at each boundary `cap` must be a multiple of 8.
-/// Values near `usize::MAX` where rounding up would overflow are rejected
-/// here so the caller can surface an error rather than panic.
-///
-/// Used only by the test-support `otel_log_ring_size` directive handler (and
-/// its unit test); production builds always use the auto-default ring size.
+/// Rounds `n` up to the nearest multiple of 8 (`None` on `usize` overflow).
+/// `otel_log_ring_size` needs this because the log ring's three shm sections
+/// sit at offsets that are multiples of `ring_size_bytes(cap)`, and each must
+/// be `AtomicU64`-aligned. Test-support only; production uses the auto-default.
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn align_ring_size(n: usize) -> Option<usize> {
     n.checked_next_multiple_of(8)
 }
 
-/// Parse a decimal ASCII string → u64.
+/// Parses a decimal ASCII string to u64.
 pub(crate) fn parse_u64_ascii(s: &[u8]) -> Option<u64> {
     if s.is_empty() {
         return None;
