@@ -42,38 +42,19 @@
 //!
 //! # Constraint: no allocation
 //! The entire record is formatted into a fixed-size stack buffer
-//! `[u8; MAX_ACCESS_RECORD]`.  If the formatted record would exceed the
-//! buffer (very long client address string), the field is silently truncated.
+//! `[u8; MAX_ACCESS_RECORD]`; fields that would overflow it are truncated.
 
 use super::LogProducer;
 
 /// Maximum size of a formatted access record in bytes.
 ///
-/// Breakdown (all fields at cap, `has_trace = 1`):
-/// - 1  (kind)
-/// - 8  (ts_unix_nano)
-/// - 1  (ngx_level)
-/// - 2  (method_len) + `MAX_METHOD` = 16 bytes
-/// - 2  (status_code)
-/// - 8  (request_length)
-/// - 8  (response_bytes)
-/// - 2  (client_addr_len) + `MAX_CLIENT_ADDR` = 46 bytes (max IPv6 with brackets + port)
-/// - 1  (has_trace) + 16 (trace_id) + 8 (span_id) = 25 bytes
-///
-/// High-cardinality detail:
-///
-/// - 2  (url_path_len) + `MAX_URL_PATH` = 64 bytes
-/// - 2  (user_agent_len) + `MAX_USER_AGENT` = 128 bytes
-///
-/// Request duration:
-///
-/// - 8  (duration_us, big-endian u64 — µs precision, same unit as exp-histogram)
-///
-/// Worst case: 1+8+1+(2+16)+2+8+8+(2+46)+(1+16+8)+(2+64)+(2+128)+8 = **323 bytes**
-/// → rounded up to 336 (16-byte aligned, ≥ 323).
-/// The compile-time guard `ACCESS_RECORD_WORST_CASE ≤ MAX_ACCESS_RECORD` makes any
-/// future field or cap increase that would overflow the buffer a **build failure**,
-/// not a latent panic.
+/// Worst case (all fields at cap, `has_trace = 1`): kind(1) + ts(8) +
+/// level(1) + method(2+16) + status(2) + req_len(8) + resp(8) +
+/// client_addr(2+46) + trace(1+16+8) + url_path(2+64) + user_agent(2+128) +
+/// duration_us(8) = **323 bytes**, rounded up to 336 (16-byte aligned).
+/// The compile-time guard `ACCESS_RECORD_WORST_CASE ≤ MAX_ACCESS_RECORD` below
+/// turns any future field/cap bump that would overflow this into a **build
+/// failure**, not a latent panic.
 pub const MAX_ACCESS_RECORD: usize = 336;
 
 /// Maximum `url.path` bytes stored in the record.
@@ -85,15 +66,11 @@ pub const MAX_USER_AGENT: usize = 128;
 /// Maximum `client.address` bytes stored in the record.
 pub const MAX_CLIENT_ADDR: usize = 46;
 /// Maximum `http.request.method` bytes stored in the record.
-/// Single-homed here; `emit_access_record` references this constant rather than the
-/// literal `16` so that the doc arithmetic and the wire layout stay in sync.
+/// Single-homed here so the doc arithmetic above and the wire layout stay in sync.
 pub const MAX_METHOD: usize = 16;
 
-/// Worst-case access record length, derived from named caps.
-///
-/// Formula: kind(1) + ts(8) + level(1) + (len+MAX_METHOD)(method) + status(2)
-///   + req_len(8) + resp(8) + (len+MAX_CLIENT_ADDR)(client) + (has+trace+span)(1+16+8)
-///   + (len+MAX_URL_PATH)(url) + (len+MAX_USER_AGENT)(ua) + duration(8)
+/// Worst-case access record length, derived from the named caps above
+/// (see `MAX_ACCESS_RECORD` for the field-by-field breakdown).
 pub const ACCESS_RECORD_WORST_CASE: usize = 1
     + 8
     + 1
@@ -107,9 +84,7 @@ pub const ACCESS_RECORD_WORST_CASE: usize = 1
     + (2 + MAX_USER_AGENT)
     + 8;
 
-/// Compile-time overflow guard: if a future field or cap bump would make
-/// `ACCESS_RECORD_WORST_CASE` exceed `MAX_ACCESS_RECORD`, this assertion
-/// turns the problem into a build failure rather than a latent runtime panic.
+/// Compile-time overflow guard (see `MAX_ACCESS_RECORD` doc).
 const _: () = assert!(
     ACCESS_RECORD_WORST_CASE <= MAX_ACCESS_RECORD,
     "ACCESS_RECORD_WORST_CASE exceeds MAX_ACCESS_RECORD — bump MAX_ACCESS_RECORD"
@@ -117,12 +92,11 @@ const _: () = assert!(
 
 /// Canonical producer-side sampled-request record.
 ///
-/// Built **once** on the stack from nginx request fields at the exception-tail /
-/// exemplar gate in `metric_source/instrumented.rs`; projected into both sinks
+/// Built **once** on the stack at the exception-tail / exemplar gate in
+/// `metric_source/instrumented.rs`; projected into both sinks
 /// (`emit_access_record` → log ring; `ExemplarReservoir::write` → exemplar
-/// reservoir) without a second gather pass.
-///
-/// All byte-slice fields borrow nginx request memory — no allocation.
+/// reservoir) without a second gather pass. All byte-slice fields borrow
+/// nginx request memory — no allocation.
 pub struct SampledRequest<'a> {
     // ── shared by both sinks ──────────────────────────────────────────────
     /// Unix epoch nanoseconds at request start.
@@ -167,12 +141,12 @@ const NGX_LEVEL_INFO: u8 = 7;
 /// Returns `true` if the record was pushed; `false` if the ring was full.
 ///
 /// # No allocation
-/// All formatting is done into a fixed-size stack buffer.  This function
-/// never calls `Vec::new`, `Box::new`, or any heap allocator.
+/// All formatting is done into a fixed-size stack buffer; never calls
+/// `Vec::new`, `Box::new`, or any heap allocator.
 ///
 /// # High-cardinality fields stay OFF the metric
 /// `url_path`, `user_agent`, and `client_addr` appear ONLY in this tail record
-/// and in exemplar `filtered_attributes`; they are NEVER used as metric dimensions.
+/// and in exemplar `filtered_attributes`; NEVER as metric dimensions.
 #[inline]
 pub fn emit_access_record(producer: &dyn LogProducer, req: &SampledRequest<'_>) -> bool {
     let mut buf = [0u8; MAX_ACCESS_RECORD];
@@ -208,11 +182,8 @@ pub fn emit_access_record(producer: &dyn LogProducer, req: &SampledRequest<'_>) 
         };
     }
 
-    // kind
     write_u8!(KIND_ACCESS);
-    // timestamp
     write_u64_be!(req.ts_unix_nano);
-    // ngx_level (info)
     write_u8!(NGX_LEVEL_INFO);
     // http.request.method
     write_bytes_with_u16_len!(req.method, MAX_METHOD);
@@ -225,7 +196,6 @@ pub fn emit_access_record(producer: &dyn LogProducer, req: &SampledRequest<'_>) 
     // client.address
     write_bytes_with_u16_len!(req.client_addr, MAX_CLIENT_ADDR);
 
-    // W3C trace correlation.
     match req.trace {
         Some((trace_id, span_id)) => {
             write_u8!(1u8); // has_trace = 1
@@ -254,16 +224,12 @@ pub fn emit_access_record(producer: &dyn LogProducer, req: &SampledRequest<'_>) 
 
 /// Parse a W3C `traceparent` header value and return `(trace_id[16], span_id[8])`.
 ///
-/// The format is: `{version}-{trace_id_hex32}-{parent_id_hex16}-{flags_hex2}`
-/// This function only handles the `00` version (the only standardised version).
+/// Format: `{version}-{trace_id_hex32}-{parent_id_hex16}-{flags_hex2}`; only
+/// the `00` version (the only standardised one) is handled. Returns `None`
+/// for absent, malformed, or non-`00`-version headers. No allocation.
 ///
-/// Returns `None` for absent, malformed, or non-`00`-version headers.
-///
-/// # No allocation
-/// Operates entirely on the `&[u8]` slice; no heap operations.
-///
-/// Used by tests and as the simplified accessor when flags are not needed.
-/// Production hot path uses [`parse_traceparent_full`] which also returns flags.
+/// Used by tests and as the simplified accessor when flags are not needed;
+/// the production hot path uses [`parse_traceparent_full`] instead.
 #[allow(dead_code)]
 pub fn parse_traceparent(header: &[u8]) -> Option<([u8; 16], [u8; 8])> {
     parse_traceparent_full(header).map(|(tid, sid, _)| (tid, sid))
@@ -271,13 +237,9 @@ pub fn parse_traceparent(header: &[u8]) -> Option<([u8; 16], [u8; 8])> {
 
 /// Parse a W3C `traceparent` header value and return `(trace_id[16], parent_span_id[8], flags)`.
 ///
-/// Extends `parse_traceparent` with the trace-flags byte (offset 52 of the header).
-/// Bit 0 of flags is the W3C `sampled` flag.
-///
-/// Returns `None` for absent, malformed, or non-`00`-version headers.
-///
-/// # No allocation
-/// Operates entirely on the `&[u8]` slice; no heap operations.
+/// Extends `parse_traceparent` with the trace-flags byte (offset 52); bit 0 of
+/// flags is the W3C `sampled` flag. Returns `None` for absent, malformed, or
+/// non-`00`-version headers. No allocation.
 pub fn parse_traceparent_full(header: &[u8]) -> Option<([u8; 16], [u8; 8], u32)> {
     // Minimum: "00-" + 32 hex + "-" + 16 hex + "-" + 2 hex = 55 bytes
     if header.len() < 55 {
@@ -358,11 +320,10 @@ fn decode_hex8(hex: &[u8], out: &mut [u8; 8]) -> bool {
 
 /// Convert a single ASCII hex character to its nibble value (0–15).
 ///
-/// Only lowercase hex is accepted.  W3C Trace Context §3.3 defines `HEXDIGLC`
-/// (`0`–`9`, `a`–`f`) as the required alphabet for all traceparent fields;
-/// uppercase letters are explicitly **not** in the grammar and MUST be
-/// rejected.  Accepting them would permit non-canonical headers that a strict
-/// downstream re-parse might reject, breaking trace correlation.
+/// Only lowercase hex is accepted: W3C Trace Context §3.3 defines `HEXDIGLC`
+/// (`0`–`9`, `a`–`f`) as the required alphabet, and uppercase MUST be
+/// rejected — accepting it would let non-canonical headers through that a
+/// strict downstream re-parse might reject, breaking trace correlation.
 #[inline]
 fn hex_nibble(c: u8) -> Option<u8> {
     match c {
@@ -404,15 +365,14 @@ mod tests {
 
         let mut record = std::vec::Vec::new();
         assert!(ring.pop_into(&mut record), "expected a record in the ring");
-        // Check kind byte.
         assert_eq!(record[0], KIND_ACCESS);
-        // Check ngx_level (at byte 9, after 1 kind + 8 ts).
+        // ngx_level at byte 9 (1 kind + 8 ts).
         assert_eq!(record[9], NGX_LEVEL_INFO);
-        // Check method length (bytes 10-11) and value (bytes 12-14).
+        // method length at bytes 10-11, value at 12..12+len.
         let method_len = u16::from_be_bytes([record[10], record[11]]) as usize;
         assert_eq!(method_len, 3);
         assert_eq!(&record[12..12 + method_len], b"GET");
-        // Check status code (at 12 + method_len).
+        // status code at 12 + method_len.
         let sc_off = 12 + method_len;
         let status = u16::from_be_bytes([record[sc_off], record[sc_off + 1]]);
         assert_eq!(status, 200);
@@ -422,21 +382,18 @@ mod tests {
     /// Absent ⇒ `has_trace = 0`.
     #[test]
     fn traceparent_roundtrips() {
-        // Valid traceparent: version 00, 32-char trace_id, 16-char span_id
         let header = b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
         let tc = parse_traceparent(header);
         assert!(tc.is_some(), "valid traceparent must parse");
         let (trace_id, span_id) = tc.unwrap();
-        // Expected trace_id bytes: 4bf92f35 77b34da6 a3ce929d 0e0e4736
         assert_eq!(trace_id[0], 0x4b);
         assert_eq!(trace_id[1], 0xf9);
         assert_eq!(trace_id[15], 0x36);
-        // Expected span_id bytes: 00f067aa 0ba902b7
         assert_eq!(span_id[0], 0x00);
         assert_eq!(span_id[1], 0xf0);
         assert_eq!(span_id[7], 0xb7);
 
-        // Emit record with trace context → has_trace = 1 in the byte stream.
+        // has_trace = 1 in the byte stream when trace context is present.
         let (_buf, ring) = make_ring_with_cap(4096);
         let producer = WorkerRingProducer { ring };
         emit_access_record(
@@ -476,7 +433,7 @@ mod tests {
             "span_id round-trips"
         );
 
-        // Emit record without trace context → has_trace = 0.
+        // has_trace = 0 when no trace context.
         let (_buf2, ring2) = make_ring_with_cap(4096);
         let producer2 = WorkerRingProducer { ring: ring2 };
         emit_access_record(
@@ -519,23 +476,16 @@ mod tests {
         );
     }
 
-    /// Table-driven W3C traceparent parser: strict rejection per spec.
-    ///
-    /// Each row is (header, expected_result_is_some, description).
-    ///
-    /// W3C Trace Context §3.3 rules exercised here:
-    ///   HEXDIGLC   – lowercase hex only; uppercase MUST be rejected.
-    ///   version-00 – trailing characters after trace-flags MUST be rejected.
-    ///   parent-id  – all-zeros MUST be rejected.
-    ///   trace-id   – all-zeros MUST be rejected (already tested above, included
-    ///                here for completeness in the table).
+    /// Table-driven W3C traceparent parser: strict rejection per spec (§3.3):
+    /// `HEXDIGLC` is lowercase-only (uppercase MUST reject), version-00 MUST
+    /// reject trailing characters, and parent-id/trace-id all-zeros MUST reject.
     ///
     /// Regression: `hex_nibble` previously accepted `A-F`; `parse_traceparent_full`
-    /// previously accepted len > 55 and all-zero parent-id.  All three cases now
-    /// return `None`.  This test FAILS on pre-fix code for those rows.
+    /// previously accepted len > 55 and all-zero parent-id — this test FAILS on
+    /// pre-fix code for those rows.
     #[test]
     fn f7_traceparent_parser_strict() {
-        // The canonical valid header used as the mutation base.
+        // Canonical valid header, used as the mutation base.
         let valid: &[u8] = b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
 
         struct Case {
@@ -777,7 +727,6 @@ mod tests {
     fn access_record_long_method_truncated() {
         let (_buf, ring) = make_ring_with_cap(4096);
         let producer = WorkerRingProducer { ring };
-        // Method longer than MAX_METHOD bytes should be truncated.
         let long_method = b"VERYLONGMETHODNAME_EXCEEDS_LIMIT";
         emit_access_record(
             &producer,
@@ -801,13 +750,12 @@ mod tests {
         assert!(method_len <= MAX_METHOD, "method must be truncated to MAX_METHOD bytes");
     }
 
-    /// Build a worst-case `SampledRequest` (every field at its cap, has_trace=1)
-    /// and verify that `emit_access_record` neither panics nor exceeds
-    /// `MAX_ACCESS_RECORD`.  Also verifies the record is exactly
-    /// `ACCESS_RECORD_WORST_CASE` bytes (all caps hit simultaneously).
+    /// Worst-case `SampledRequest` (every field at its cap, has_trace=1) must
+    /// not panic, must stay within `MAX_ACCESS_RECORD`, and must land exactly
+    /// at `ACCESS_RECORD_WORST_CASE` bytes.
     ///
-    /// This test guards against a regression where `MAX_ACCESS_RECORD = 320`
-    /// but the 323-byte worst-case record triggered an index-out-of-bounds panic.
+    /// Regression guard: `MAX_ACCESS_RECORD = 320` once let a 323-byte
+    /// worst-case record trigger an index-out-of-bounds panic.
     #[test]
     fn access_record_worst_case_fits_in_buffer() {
         let (_buf, ring) = make_ring_with_cap(4096);

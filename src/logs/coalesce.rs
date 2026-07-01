@@ -6,32 +6,31 @@
 //! Producer-side exact-hash coalescer for the OTel error-log writer.
 //!
 //! # Purpose
-//! Nginx error floods: one `connect() failed (111: Connection refused)` per failed
-//! request.  A naïve per-event ring would emit 1000 `LogRecord`s for a 1000-req
-//! flood — the same serialisation-point hazard the access log had.  The
-//! coalescer collapses them at the producer: *seen this (severity, core-hash) this
-//! interval? bump a count; else emit one verbatim sample to the ring and remember.*
+//! Nginx error floods emit one `connect() failed (...)` line per failed
+//! request; a naïve per-event ring would push 1000 `LogRecord`s for a
+//! 1000-req flood. The coalescer collapses them at the producer: seen this
+//! `(severity, core-hash)` this interval? bump a count; else emit one
+//! verbatim sample and remember it.
 //!
 //! # Design decisions
-//! - **Exact-hash only.** No producer-side IP/number normalisation; that is an
-//!   optional backend enhancement.
-//! - **Subsystem dim dropped.** Key = `(severity × stable_core_hash)` only.
-//! - **Stable-core extraction.** The writer's `buf` is the FULL formatted line
-//!   (`<cached-time> [<level>] <pid>#<tid>: [*<conn>] <msg>[, client:…]\n`);
+//! - **Exact-hash only** — no producer-side IP/number normalisation (an
+//!   optional backend enhancement).
+//! - **Subsystem dim dropped** — key = `(severity × stable_core_hash)` only.
+//! - **Stable-core extraction** — the writer's `buf` is the FULL formatted
+//!   line (`<cached-time> [<level>] <pid>#<tid>: [*<conn>] <msg>[, client:…]\n`);
 //!   hashing it verbatim collapses nothing (timestamp/conn/client all vary).
-//!   The stable core is extracted by skipping the variable prefix and cutting at
+//!   The stable core is found by skipping the variable prefix and cutting at
 //!   the handler-context boundary (` while ` / `, client:`).
 //!
 //! # Hot-path disciplines
-//! - **Alloc-free**: the table lives in shm; the hash/extraction operate on
-//!   stack-local bytes only.
-//! - **Lock-free**: the table is write-only on the writer path (busy-flag in
-//!   `OtelErrorWriterState` serialises writer calls); count/sample_emitted are
-//!   `Atomic*` for the drain (exporter) to read + reset concurrently.
+//! - **Alloc-free**: table lives in shm; hash/extraction use stack-local bytes.
+//! - **Lock-free**: write-only on the writer path (serialised by the writer's
+//!   busy-flag); `count`/`sample_emitted` are `Atomic*` so the drain can read
+//!   + reset them concurrently.
 //! - **Bounded**: fixed-capacity open-addressed table; table-full degrades to
-//!   verbatim (accounted but never blocks).
-//! - **Re-entrancy-safe**: the coalescer itself is called only after the busy-flag
-//!   swap in the writer; it does no logging and no allocation.
+//!   verbatim (accounted, never blocks).
+//! - **Re-entrancy-safe**: called only after the writer's busy-flag swap; does
+//!   no logging, no allocation.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
@@ -59,15 +58,14 @@ pub const COALESCE_CAPACITY: usize = 256;
 ///
 /// # Concurrency
 /// The writer (single-threaded per worker via the busy-flag) reads/writes all
-/// fields.  The drain (exporter process) atomically reads-and-resets `count` and
-/// `sample_emitted` only; it NEVER modifies `key_hash` or `severity`.
+/// fields. The drain (exporter process) atomically reads-and-resets `count`
+/// and `sample_emitted` only; it NEVER modifies `key_hash` or `severity`.
 ///
-/// All fields are atomics. `key_hash`/`severity` use `Relaxed`: they are
-/// write-once and ordered against the drain by the `count` Release/Acquire pair
-/// (the writer's `count.store(1, Release)` publishes them; the drain's
-/// `count.swap(0, AcqRel)` makes them visible). Atomics — rather than plain
-/// fields with `write_volatile` — give a clean cross-process shared-memory
-/// contract with no `&T → *mut T` casting.
+/// All fields are atomics. `key_hash`/`severity` use `Relaxed`: write-once,
+/// ordered against the drain by the `count` Release/Acquire pair (writer's
+/// `count.store(1, Release)` publishes them; drain's `count.swap(0, AcqRel)`
+/// makes them visible). Atomics give a clean cross-process shm contract with
+/// no `&T → *mut T` casting.
 #[repr(C)]
 pub struct CoalesceSlot {
     /// FNV-1a hash of `severity_byte ++ stable_core_bytes`.
@@ -117,26 +115,25 @@ pub enum CoalesceResult {
 /// (`ngx_log.c:155–188`, `ngx_http_request.c:4058–4086`)
 ///
 /// Hashing this verbatim collapses nothing (timestamp/conn/client all vary per
-/// call).  This function returns a subslice containing only the stable core —
-/// everything after the variable prefix and before the handler-context boundary.
+/// call); this returns the subslice between the variable prefix and the
+/// handler-context boundary.
 ///
 /// # Extraction algorithm (bounded forward-scan, no alloc)
-/// 1. Skip past `] ` to advance past `[<level>]`.
-/// 2. Skip past `: ` to advance past `<pid>#<tid>`.
+/// 1. Skip past `] ` (past `[<level>]`).
+/// 2. Skip past `: ` (past `<pid>#<tid>`).
 /// 3. Skip optional `*<digits> ` (connection context).
 /// 4. Return the subslice up to the first ` while ` or `, client:`.
 ///
 /// # Format dependency
-/// This scan hard-codes nginx's error-log line shape (the `] `, `: `, ` while `
-/// and `, client:` markers above).  If a future nginx release changes that
-/// format, extraction silently degrades: lines fall back to the verbatim buffer
-/// (see below) and coalescing of those lines stops, but no records are lost or
-/// mis-attributed.
+/// This scan hard-codes the markers above. If a future nginx release changes
+/// the line shape, extraction silently degrades — lines fall back to the
+/// verbatim buffer and coalescing of those lines stops, but no records are
+/// lost or mis-attributed.
 ///
 /// # Fallback
-/// If any marker is not found (malformed or truncated line), returns the largest
-/// reasonable subslice.  If that subslice is empty, the whole `buf` is returned
-/// verbatim so distinct malformed lines do not all collide on the same empty key.
+/// If a marker is missing (malformed/truncated line), returns the largest
+/// reasonable subslice; if that is empty, returns the whole `buf` so distinct
+/// malformed lines don't collide on the same empty key.
 pub fn stable_core(buf: &[u8]) -> &[u8] {
     let mut pos = 0;
     let len = buf.len();
@@ -159,23 +156,22 @@ pub fn stable_core(buf: &[u8]) -> &[u8] {
         pos += 1;
     }
 
-    // 3. Skip optional `*<digits> ` — connection context.
-    //    Detected by a literal `*` at the current position.
-    //    nginx messages do not start with `*`; this is safe.
+    // 3. Skip optional `*<digits> ` (connection context); nginx messages never
+    //    start with `*`, so detecting it here is safe.
     if pos < len && buf[pos] == b'*' {
-        pos += 1; // skip '*'
+        pos += 1;
         while pos < len && buf[pos].is_ascii_digit() {
             pos += 1;
         }
         if pos < len && buf[pos] == b' ' {
-            pos += 1; // skip ' '
+            pos += 1;
         }
     }
 
     let core_start = pos;
 
-    // 4. Find the handler-context boundary (cut before it).
-    //    Remove trailing newline first.
+    // 4. Find the handler-context boundary (cut before it, after trimming
+    //    the trailing newline).
     let mut end = len;
     if end > 0 && buf[end - 1] == b'\n' {
         end -= 1;
@@ -198,9 +194,8 @@ pub fn stable_core(buf: &[u8]) -> &[u8] {
 
     let core = &buf[core_start..end];
     if core.is_empty() {
-        // Extraction produced nothing (line did not match the expected shape):
-        // fall back to the whole buffer so distinct malformed lines do not all
-        // collide on the same empty key.
+        // Line didn't match the expected shape: fall back to the whole buffer
+        // so distinct malformed lines don't collide on the same empty key.
         return buf;
     }
     core
@@ -208,9 +203,9 @@ pub fn stable_core(buf: &[u8]) -> &[u8] {
 
 /// Compute the coalescer key: FNV-1a over `[severity_byte] ++ stable_core_bytes`.
 ///
-/// Severity is included in the key so the same message text at different
-/// severities gets distinct table entries (e.g. `[error]` vs `[warn]`).
-/// Returns 1 (not 0) if the hash happens to land on 0 (0 = empty sentinel).
+/// Severity is included so the same message text at different severities gets
+/// distinct table entries (e.g. `[error]` vs `[warn]`). Returns 1 (not 0) if
+/// the hash happens to land on 0 (0 = empty sentinel).
 #[inline]
 pub fn coalesce_key(severity: u8, core: &[u8]) -> u64 {
     const OFFSET_BASIS: u64 = 14695981039346656037;
@@ -238,16 +233,15 @@ pub const HIGH_SEVERITY_THRESHOLD: u8 = nginx_sys::NGX_LOG_CRIT as u8; // 3
 /// Decide how to handle an incoming error message.
 ///
 /// Called by [`super::error_writer::ngx_otel_error_writer`] after the severity
-/// floor and process-role guards pass.  The writer passes `coalesce_enabled`
-/// from `MainConfig::error_log_coalesce`.
+/// floor and process-role guards pass.
 ///
 /// # Arguments
 /// - `table`: pointer to the first slot of the `COALESCE_CAPACITY`-slot table
 ///   for the current worker (in the logs shm zone).
-/// - `severity`: nginx severity level (1=emerg … 8=debug) — must have passed
-///   the severity floor already.
-/// - `buf`: the full formatted error-log line (as received by the writer).
-/// - `coalesce_enabled`: from `MainConfig::error_log_coalesce` (directive flag).
+/// - `severity`: nginx severity level (1=emerg … 8=debug) — already passed the
+///   severity floor.
+/// - `buf`: the full formatted error-log line as received by the writer.
+/// - `coalesce_enabled`: from `MainConfig::error_log_coalesce`.
 ///
 /// # Returns
 /// `Coalesced` — count was bumped; do NOT push to ring.
@@ -275,7 +269,7 @@ pub unsafe fn coalesce(
         return CoalesceResult::EmitVerbatim { template_hash: 0 };
     }
 
-    // Compute the dedup key from the stable core (alloc-free, stack-only).
+    // Dedup key from the stable core (alloc-free, stack-only).
     let core = stable_core(buf);
     let key = coalesce_key(severity, core);
 
@@ -293,30 +287,27 @@ pub unsafe fn coalesce(
         let slot_key = slot.key_hash.load(Ordering::Relaxed);
 
         if slot_key == 0 {
-            // Empty slot — this template is novel.  Insert and emit one verbatim sample.
-            // Write key_hash and severity first (both stable; never changed after),
-            // as Relaxed stores: the `count.store(1, Release)` below publishes them.
+            // Novel template: insert and emit one verbatim sample.
+            // key_hash/severity are Relaxed stores (stable, never changed
+            // after) published to the drain by the count Release below.
             slot.key_hash.store(key, Ordering::Relaxed);
             slot.severity.store(severity, Ordering::Relaxed);
-            // Release ordering: the key_hash/severity writes above must be visible
-            // to the drain before it reads count > 0.  The drain does an AcqRel swap
-            // on count; the Acquire half synchronises with this Release store.
+            // Release: the key_hash/severity writes above must be visible to
+            // the drain before it reads count > 0 via its AcqRel swap.
             slot.count.store(1, Ordering::Release);
             slot.sample_emitted.store(true, Ordering::Release);
-            // Return the assigned key so the ring record can carry it for the drain join.
+            // Carry the assigned key so the ring record supports the drain join.
             return CoalesceResult::EmitVerbatim { template_hash: key };
         }
 
         if slot_key == key && slot.severity.load(Ordering::Relaxed) == severity {
-            // Existing entry — bump the count.  Do NOT emit again this interval
-            // UNLESS sample_emitted is false (drain reset it; re-emit one sample).
+            // Existing entry: bump the count. Re-emit a sample only if the
+            // drain reset sample_emitted last interval.
             let already_emitted = slot.sample_emitted.load(Ordering::Acquire);
             slot.count.fetch_add(1, Ordering::Relaxed);
             if already_emitted {
                 return CoalesceResult::Coalesced;
             } else {
-                // Drain reset sample_emitted in the previous interval; re-emit.
-                // The existing key is slot_key (== key); carry it for the drain join.
                 slot.sample_emitted.store(true, Ordering::Release);
                 return CoalesceResult::EmitVerbatim { template_hash: key };
             }
@@ -352,30 +343,27 @@ pub const fn coalesce_table_bytes() -> usize {
 /// returns `(key_hash, severity, count)` for every slot that had `count > 0`.
 ///
 /// # Per-drain eviction
-/// Every occupied slot is **evicted** after its count is collected: `key_hash`,
-/// `severity`, and `sample_emitted` are all cleared (written to 0/false).  This
-/// prevents the table from accumulating lifetime templates that fill the 256-slot
-/// capacity permanently — the failure mode that rendered coalescing permanently
-/// off after 256 distinct templates were ever seen.
+/// Every occupied slot is **evicted** after its count is collected — `key_hash`,
+/// `severity`, and `sample_emitted` are all cleared. Without this the table
+/// accumulates lifetime templates and permanently fills its 256-slot capacity,
+/// the failure mode that once turned coalescing permanently off after 256
+/// distinct templates were ever seen.
 ///
-/// After the drain, the table is empty.  Writers re-register templates at the
-/// first occurrence in the next interval, emitting one verbatim sample each —
-/// identical behaviour to the previously-working first-interval case.
+/// After the drain the table is empty; writers re-register templates on next
+/// occurrence, emitting one verbatim sample each — same as the first interval.
 ///
-/// **Concurrency at the interval boundary:** a writer that probes a slot
+/// **Concurrency at the interval boundary:** a writer probing a slot
 /// concurrently with the drain's eviction may find a stale non-zero `key_hash`
-/// (before the drain's `Release` propagates) and increment `count` on a slot
-/// the drain just zeroed.  This is bounded to ≤ 1 lost observation per slot
-/// per interval-boundary race — within the coalescer's best-effort contract.
+/// and increment `count` on a slot the drain just zeroed. Bounded to ≤ 1 lost
+/// observation per slot per boundary race — within the best-effort contract.
 ///
 /// # Memory ordering
-/// - `count.swap(0, AcqRel)`: Acquire half synchronises with the
-///   `count.store(1, Release)` in the writer's novel-insert path, making
-///   `key_hash`/`severity` visible before we read them.
-/// - `key_hash.store(0, Release)`: Release ensures subsequent writer probes
-///   see the cleared slot (don't alias the evicted template on strongly-ordered
-///   hardware; Relaxed would also be safe here in practice but Release is
-///   cheaper than SeqCst and clearer in intent).
+/// - `count.swap(0, AcqRel)`: Acquire half synchronises with the writer's
+///   novel-insert `count.store(1, Release)`, making `key_hash`/`severity`
+///   visible before we read them.
+/// - `key_hash.store(0, Release)`: ensures subsequent writer probes see the
+///   cleared slot; Release is cheaper than SeqCst and clearer in intent than
+///   Relaxed here.
 ///
 /// # Safety
 /// `table` must be a valid, non-null pointer to a `[CoalesceSlot; COALESCE_CAPACITY]`
@@ -398,11 +386,10 @@ pub unsafe fn drain_coalesce_table(table: *mut CoalesceSlot) -> std::vec::Vec<(u
         let key_hash = slot.key_hash.load(Ordering::Relaxed);
         let severity = slot.severity.load(Ordering::Relaxed);
 
-        // Evict every slot on drain so the table doesn't fill permanently.
-        // Release on key_hash ensures subsequent writer probes see the cleared slot.
-        // Severity and sample_emitted use Relaxed — they are ordered by the
-        // key_hash Release (a writer inserting in the next interval will first
-        // store key_hash with a paired Release, making severity visible).
+        // Evict so the table doesn't fill permanently. Release on key_hash
+        // ensures subsequent writer probes see the cleared slot; severity and
+        // sample_emitted use Relaxed since they're ordered by that Release
+        // (a writer's next insert stores key_hash with a paired Release first).
         slot.key_hash.store(0, Ordering::Release);
         slot.severity.store(0, Ordering::Relaxed);
         slot.sample_emitted.store(false, Ordering::Relaxed);
@@ -429,9 +416,8 @@ mod tests {
     /// Without correct extraction, dedup is a no-op.
     #[test]
     fn stable_core_ignores_prefix_and_context() {
-        // Simulated nginx error log line with connection context.
         let line1 = b"2024/01/01 12:00:01 [error] 1234#5678: *1 connect() failed (111: Connection refused) while connecting to upstream, client: 1.2.3.4, request: GET / HTTP/1.1\n";
-        // Same core, different timestamp, different conn ID, different client.
+        // Same core, different timestamp, conn ID, and client.
         let line2 = b"2024/01/01 12:00:02 [error] 1234#5678: *2 connect() failed (111: Connection refused) while connecting to upstream, client: 5.6.7.8, request: GET /api HTTP/1.1\n";
 
         let core1 = stable_core(line1);
@@ -443,7 +429,7 @@ mod tests {
             "core must be the message up to ' while '"
         );
 
-        let key1 = coalesce_key(4, core1); // severity 4 = error
+        let key1 = coalesce_key(4, core1); // 4 = error
         let key2 = coalesce_key(4, core2);
         assert_eq!(key1, key2, "same core+severity must produce same key");
     }
@@ -477,8 +463,7 @@ mod tests {
     /// coalesce_key: zero is remapped to 1 (avoid empty-slot sentinel).
     #[test]
     fn coalesce_key_no_zero() {
-        // Run through all single-byte inputs to verify no zero output.
-        // For the FNV-1a parameters, a zero result is extremely rare but
+        // Exhaustive over single-byte inputs; a zero FNV-1a result is rare but
         // we guard against it explicitly.
         for sev in 1u8..=8 {
             for core_byte in 0u8..=255u8 {
@@ -523,7 +508,7 @@ mod tests {
             assert!(matches!(r, CoalesceResult::Coalesced), "flood must coalesce");
         }
 
-        // Verify slot: count = 1 (initial) + n bumps = n + 1.
+        // count = 1 (initial) + n bumps = n + 1.
         let core = stable_core(msg);
         let key = coalesce_key(4, core);
         let start = (key as usize) & (COALESCE_CAPACITY - 1);
@@ -537,7 +522,6 @@ mod tests {
         let mut table = make_table();
         let ptr = table.as_mut_ptr();
 
-        // 5 distinct messages.
         let msgs: &[&[u8]] = &[
             b"2024/01/01 12:00:00 [error] 1#1: connect() failed\n",
             b"2024/01/01 12:00:00 [error] 1#1: recv() failed\n",
@@ -565,7 +549,7 @@ mod tests {
         let ptr = table.as_mut_ptr();
 
         let msg = b"2024/01/01 12:00:00 [crit] 1#1: accept() failed\n";
-        // severity 3 = crit (≤ HIGH_SEVERITY_THRESHOLD)
+        // 3 = crit (≤ HIGH_SEVERITY_THRESHOLD)
 
         for _ in 0..10 {
             // SAFETY: `ptr` is from make_table() — a valid zeroed [CoalesceSlot;
@@ -587,55 +571,45 @@ mod tests {
         );
     }
 
-    /// Table-full degrades to verbatim, never panics.
-    ///
-    /// We fill the table with `COALESCE_CAPACITY` distinct entries, then inject one
-    /// more novel message and verify it returns `EmitVerbatim` (not a panic or incorrect
-    /// `Coalesced`).
+    /// Table-full degrades to verbatim, never panics: fill the table with
+    /// `COALESCE_CAPACITY` distinct entries, then inject one more novel
+    /// message and verify it returns `EmitVerbatim` (not a panic or `Coalesced`).
     #[test]
     fn table_full_falls_back_to_verbatim() {
         let mut table = make_table();
         let ptr = table.as_mut_ptr();
 
-        // Fill the table with COALESCE_CAPACITY distinct entries by
-        // fabricating unique "messages" with distinct hash keys.
-        // We do this by directly populating table slots.
+        // Fabricate distinct keys directly, filling every slot.
         for i in 0..COALESCE_CAPACITY {
-            // Fill every slot with a non-zero key_hash so the table appears full.
             table[i].key_hash.store((i + 1) as u64, Ordering::Relaxed);
             table[i].severity.store(4u8, Ordering::Relaxed);
             table[i].count.store(1, Ordering::Relaxed);
             table[i].sample_emitted.store(true, Ordering::Relaxed);
         }
 
-        // A message that doesn't match any existing slot — table-full path.
-        // The key for this message is unlikely to match any of the fabricated keys.
+        // Unlikely to match any fabricated key — exercises the table-full path.
         let novel = b"2024/01/01 12:00:00 [error] 1#1: a truly novel message that is unique xyz\n";
         // SAFETY: `ptr` is from make_table() — a valid zeroed [CoalesceSlot;
         // COALESCE_CAPACITY]; satisfies coalesce()'s contract. Single-threaded test.
         let r = unsafe { coalesce(ptr, 4, novel, true) };
-        // Must fall back to verbatim — no panic, no silent discard.
         assert!(
             matches!(r, CoalesceResult::EmitVerbatim { .. }),
             "table-full must degrade to verbatim emit, never panic"
         );
     }
 
-    /// After a drain, the table must be empty so new templates can be inserted.
-    /// If `drain_coalesce_table()` did not clear `key_hash`, then after 256
-    /// distinct templates the table would be permanently full, and every
-    /// subsequent novel template would fall back to verbatim with
-    /// `template_hash = 0` (coalescing silently off forever).
-    ///
-    /// This test exercises that path: a post-drain table that was still full
-    /// (all slots occupied) makes `coalesce()` return `EmitVerbatim{
-    /// template_hash: 0}` rather than a real slot assignment.
+    /// After a drain, the table must be empty so new templates can be
+    /// inserted. If `drain_coalesce_table` did not clear `key_hash`, the table
+    /// fills permanently after 256 distinct templates, and every subsequent
+    /// novel template falls back to verbatim with `template_hash = 0`
+    /// (coalescing silently off forever). This pins: full-before-drain
+    /// (`template_hash = 0`) → drain empties every slot → novel-after-drain
+    /// gets a real slot (`template_hash != 0`).
     #[test]
     fn f4_drain_evicts_all_slots_allowing_new_templates() {
         let mut table = make_table();
         let ptr = table.as_mut_ptr();
 
-        // Step 1: Fill the table with COALESCE_CAPACITY distinct templates.
         for i in 0..COALESCE_CAPACITY {
             table[i].key_hash.store((i as u64) + 1, Ordering::Relaxed);
             table[i].severity.store(4, Ordering::Relaxed);
@@ -643,8 +617,6 @@ mod tests {
             table[i].sample_emitted.store(true, Ordering::Relaxed);
         }
 
-        // Step 2: Confirm table is full — a novel message must fall back to verbatim
-        // with template_hash=0 (no slot can be assigned).
         let novel = b"2024/01/01 12:00:00 [error] 1#1: novel message before drain xyz\n";
         // SAFETY: `ptr` from make_table(); satisfies coalesce() contract.
         let pre_drain = unsafe { coalesce(ptr, 4, novel, true) };
@@ -653,13 +625,10 @@ mod tests {
             "precondition: full table must return template_hash=0 (no slot assigned)"
         );
 
-        // Step 3: Drain the table.
         // SAFETY: `ptr` from make_table(); satisfies drain_coalesce_table() contract.
         let drained = unsafe { drain_coalesce_table(ptr) };
-        // All 256 slots had count=1, so all should be collected.
         assert_eq!(drained.len(), COALESCE_CAPACITY, "all filled slots must be drained");
 
-        // Step 4: After drain, every slot must be empty (key_hash == 0).
         for i in 0..COALESCE_CAPACITY {
             assert_eq!(
                 table[i].key_hash.load(Ordering::Relaxed),
@@ -668,8 +637,6 @@ mod tests {
             );
         }
 
-        // Step 5: A new novel message must now get a real slot (template_hash ≠ 0).
-        // The drain evicted all slots, so the novel template gets assigned.
         // SAFETY: `ptr` from make_table(); satisfies coalesce() contract.
         let post_drain = unsafe { coalesce(ptr, 4, novel, true) };
         assert!(

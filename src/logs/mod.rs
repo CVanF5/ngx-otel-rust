@@ -5,29 +5,20 @@
 
 //! OTel Logs producer/consumer.
 //!
-//! This module is the top-level home for all log-emission infrastructure:
+//! Top-level home for log-emission infrastructure: `severity` (level mapping),
+//! `ring` (per-worker SPSC byte ring), `access`/`error_writer`/`coalesce`
+//! (record producers), and the [`LogProducer`] trait — the API for pushing
+//! records into the ring.
 //!
-//! - `severity` — nginx log level → OTel SeverityNumber mapping.
-//! - `ring`     — per-worker SPSC lock-free byte ring.
-//! - `access`   — access-record formatter.
-//! - [`LogProducer`] trait — the platform-axis API for pushing records into
-//!   the ring.
+//! Workers push fixed-shape records into their own per-worker ring (no locks,
+//! no syscalls, no allocation on the hot path); the central exporter process
+//! drains all rings each tick and encodes a [`crate::data_model::LogsBatch`].
+//! This is the central dedicated-exporter model — do NOT pivot to per-worker
+//! export.
 //!
-//! # Architecture
-//! Workers push fixed-shape records into their own per-worker ring buffer
-//! (no locks, no syscalls, no allocation on the hot path).  The central
-//! `nginx: otel exporter` process drains all worker rings each tick,
-//! encodes a [`crate::data_model::LogsBatch`], and sends it over the
-//! selected transport.
-//!
-//! This is the **central dedicated-exporter model**; do
-//! NOT pivot to per-worker export.
-//!
-//! # Future — MPSC concern
-//! There are two single-context producers (access: log-phase handler,
-//! error: `ngx_log_writer_pt` callback).  Each producer writes to its own
-//! ring.  Multi-module MPSC sharing would need a per-ring mutex
-//! or a lock-free MPSC ring; that complexity is deferred.
+//! Each producer (access log-phase handler, error `ngx_log_writer_pt`) writes
+//! to its own ring, so today there is no MPSC sharing; a future multi-module
+//! producer would need a per-ring mutex or a lock-free MPSC ring.
 
 pub mod access;
 pub mod coalesce;
@@ -50,9 +41,9 @@ pub mod severity;
 ///   error-log writer).
 ///
 /// # Wire format per record
-/// `[u8 ngx_level][u64 ts_unix_nano_be][u8 kind][payload...]`
-/// where `kind = 0` is access, `kind = 1` is error.  The outer
-/// [`ring::WorkerSignalRing`] prepends its own 4-byte length prefix.
+/// `[u8 ngx_level][u64 ts_unix_nano_be][u8 kind][payload...]`; `kind = 0` is
+/// access, `kind = 1` is error. The outer [`ring::WorkerSignalRing`] prepends
+/// its own 4-byte length prefix.
 pub trait LogProducer {
     /// Push a pre-formatted record into the ring for the current worker.
     ///
@@ -65,9 +56,8 @@ pub trait LogProducer {
 
 /// A thin [`LogProducer`] wrapper around a [`ring::WorkerSignalRing`].
 ///
-/// Constructed by `LogPhaseHandler` on each request and by the
-/// error-log writer on each error event.  Zero cost: just an
-/// opaque view (raw pointer) into the ring in shm.
+/// Constructed by `LogPhaseHandler` on each request and by the error-log
+/// writer on each error event. Zero cost: just a pointer view into shm.
 pub struct WorkerRingProducer {
     /// View of the calling worker's ring (a raw pointer into shm).
     pub ring: ring::WorkerSignalRing,

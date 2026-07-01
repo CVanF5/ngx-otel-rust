@@ -50,7 +50,6 @@ mod tests {
     /// Assert the full 8-level nginx → OTel severity mapping.
     #[test]
     fn nginx_to_otel_table_matches_spec() {
-        // (nginx_level, expected_severity_number, expected_severity_text)
         let table: &[(u32, SeverityNumber, &str)] = &[
             (1, SeverityNumber::Fatal4, "emerg"),
             (2, SeverityNumber::Fatal2, "alert"),

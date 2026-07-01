@@ -5,49 +5,29 @@
 
 //! Per-worker SPSC (single-producer, single-consumer) byte ring buffer.
 //!
-//! # Design
-//!
 //! One ring per worker per signal type (access, error) lives in the logs shm
-//! zone.  Each ring is split into a fixed-size header and a variable-length
-//! payload region that immediately follows in memory:
+//! zone: a fixed-size [`WorkerSignalRingHeader`] followed immediately by a
+//! `cap`-byte payload region. [`WorkerSignalRing`] is a lightweight view (a
+//! pointer to the header), not a container — it owns no memory. The type is
+//! signal-agnostic: it also backs the trace-span signal (in its own shm zone).
 //!
-//! ```text
-//! [ WorkerSignalRingHeader (32 bytes) ][ payload (cap bytes) ]
-//! ```
-//!
-//! `WorkerSignalRingHeader` carries the three atomic counters plus the runtime
-//! `cap` field.  The `cap` is set once at zone-init time (from
-//! [`crate::config::MainConfig::log_ring_cap`]), then read by both push and pop
-//! on every call.
-//!
-//! [`WorkerSignalRing`] is a lightweight view (a pointer to the header) obtained
-//! from a raw shm pointer; it is NOT a container and does not own memory.  The
-//! type is signal-agnostic: the same ring backs the access-log and error-log
-//! signals here and the trace-span signal (the spans ring lives in its own shm
-//! zone), so the name is deliberately not signal-specific.
-//!
-//! # Default capacity
-//!
-//! `DEFAULT_LOG_RING_CAP` is 512 KiB per ring.  Memory = `cap × 2 × N` where
-//! `N` = worker count (one access ring + one error ring per worker).  This is a
-//! fixed default with no operator-facing tuning directive.
+//! `DEFAULT_LOG_RING_CAP` is 512 KiB per ring (fixed; no operator-facing
+//! tuning directive). Memory = `cap × 2 × N` workers (one access + one error
+//! ring per worker).
 //!
 //! # Wire format per record
 //! `[u32 record_len big-endian][payload bytes...]`
 //!
 //! # Invariants
-//! - NO allocation on the producer path.
-//! - NO locks on the producer path — atomic-only.
+//! - NO allocation, NO locks on the producer path — atomic-only.
 //! - `push` never blocks; increments `dropped` on full.
 //! - Read/write offsets are **monotonically increasing `u64`** stored in the
 //!   header in shm, so a fresh exporter resumes across SIGHUP.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-/// Default ring capacity in bytes per worker per signal type.
-///
-/// 512 KiB.  Memory = `cap × 2 × N` workers.  This is the fixed per-worker ring
-/// size; there is no operator-facing tuning directive.
+/// Default ring capacity in bytes per worker per signal type (512 KiB; fixed,
+/// no operator-facing tuning directive).
 pub const DEFAULT_LOG_RING_CAP: usize = 512 * 1024;
 
 /// Fixed-size header for a per-worker log ring.
@@ -66,10 +46,9 @@ pub struct WorkerSignalRingHeader {
     /// Ring payload capacity in bytes (set once at zone-init from
     /// [`crate::config::MainConfig::log_ring_cap`], before any worker forks).
     ///
-    /// `AtomicU64` rather than a plain `u64`: the header lives in cross-process
-    /// shm and `cap` is read on every push/pop.  The write happens-before the
-    /// fork so there is no live race, but the atomic closes the memory-model
-    /// hole (a shared field read on the hot path) at zero runtime cost.
+    /// `AtomicU64` rather than a plain `u64`: closes the cross-process
+    /// memory-model hole for this hot-path-read shared field at zero runtime
+    /// cost, even though the write happens-before the fork.
     pub cap: AtomicU64,
 }
 
@@ -85,12 +64,9 @@ pub fn ring_size_bytes(cap: usize) -> usize {
 /// A lightweight view over a per-worker log ring in shm.
 ///
 /// Does NOT own the memory — it is a pointer to a [`WorkerSignalRingHeader`]
-/// that lives in the logs shm zone.  The payload immediately follows the
-/// header.
-///
-/// `Copy + Clone` because it is just a pointer — copying it produces a second
-/// view into the same ring, which is intentional (worker writes via one view,
-/// exporter reads via another view of the same shm region).
+/// in the logs shm zone (payload immediately follows). `Copy + Clone`
+/// because copying it just produces a second view into the same ring
+/// (worker writes via one view, exporter reads via another).
 ///
 /// # Safety invariant
 /// Only one writer and one reader may operate concurrently (SPSC).
@@ -99,14 +75,13 @@ pub struct WorkerSignalRing {
     header: *mut WorkerSignalRingHeader,
 }
 
-// SAFETY: `WorkerSignalRing` is just a pointer into shared memory accessible from
-// multiple processes (workers + exporter). All header fields it touches are
-// atomics, and the caller upholds the SPSC single-writer/single-reader
+// SAFETY: `WorkerSignalRing` is just a pointer into shared memory accessible
+// from multiple processes (workers + exporter). All header fields it touches
+// are atomics, and the caller upholds the SPSC single-writer/single-reader
 // invariant, so it is sound to move across threads/processes.
 unsafe impl Send for WorkerSignalRing {}
-// SAFETY: as for the `Send` impl above — shared access goes through atomic
-// header fields under the SPSC invariant, so concurrent `&WorkerSignalRing` use
-// is sound.
+// SAFETY: as for `Send` above — shared access goes through atomic header
+// fields under the SPSC invariant, so concurrent `&WorkerSignalRing` is sound.
 unsafe impl Sync for WorkerSignalRing {}
 
 impl WorkerSignalRing {
@@ -166,8 +141,8 @@ impl WorkerSignalRing {
 
         let base = self.payload_ptr();
         let len_bytes = (record_len as u32).to_be_bytes();
-        // `write_off as usize`: safe on 64-bit targets (usize == u64); 32-bit
-        // targets are rejected by the compile_error! guard in lib.rs.
+        // `as usize` safe on 64-bit targets (usize == u64); 32-bit is rejected
+        // by the compile_error! guard in lib.rs.
         write_wrap(base, cap, write_off as usize, &len_bytes);
         write_wrap(base, cap, write_off as usize + 4, record);
 
@@ -198,8 +173,8 @@ impl WorkerSignalRing {
 
         let base = self.payload_ptr();
         let mut len_buf = [0u8; 4];
-        // `read_off as usize`: safe on 64-bit targets (usize == u64); 32-bit
-        // targets are rejected by the compile_error! guard in lib.rs.
+        // `as usize` safe on 64-bit targets (usize == u64); 32-bit is rejected
+        // by the compile_error! guard in lib.rs.
         read_wrap(base, cap, read_off as usize, &mut len_buf);
         let record_len = u32::from_be_bytes(len_buf) as usize;
 
@@ -233,11 +208,11 @@ fn write_wrap(base: *mut u8, cap: usize, offset: usize, data: &[u8]) {
     }
     let start = offset % cap;
     let end_space = cap - start;
-    // SAFETY: `base` is the start of the `cap`-byte payload region (callers pass
-    // `payload_ptr()` with the matching `cap`). `start < cap`, and each copy
-    // length is bounded by `end_space` or `data.len() - end_space`, so both
-    // copies stay within `[base, base + cap)`; `data` is a valid readable slice.
-    // The split implements ring wrap-around.
+    // SAFETY: `base` is the start of the `cap`-byte payload region (callers
+    // pass `payload_ptr()` with matching `cap`). `start < cap`, and each copy
+    // is bounded by `end_space` or `data.len() - end_space`, so both stay
+    // within `[base, base + cap)`; `data` is a valid readable slice. The
+    // split implements ring wrap-around.
     unsafe {
         if data.len() <= end_space {
             core::ptr::copy_nonoverlapping(data.as_ptr(), base.add(start), data.len());
@@ -259,11 +234,11 @@ fn read_wrap(base: *const u8, cap: usize, offset: usize, dst: &mut [u8]) {
     }
     let start = offset % cap;
     let end_space = cap - start;
-    // SAFETY: `base` is the start of the `cap`-byte payload region (callers pass
-    // `payload_ptr()` with the matching `cap`). `start < cap`, and each copy
-    // length is bounded by `end_space` or `dst.len() - end_space`, so both reads
-    // stay within `[base, base + cap)`; `dst` is a valid writable slice. The
-    // split implements ring wrap-around.
+    // SAFETY: `base` is the start of the `cap`-byte payload region (callers
+    // pass `payload_ptr()` with matching `cap`). `start < cap`, and each read
+    // is bounded by `end_space` or `dst.len() - end_space`, so both stay
+    // within `[base, base + cap)`; `dst` is a valid writable slice. The split
+    // implements ring wrap-around.
     unsafe {
         if dst.len() <= end_space {
             core::ptr::copy_nonoverlapping(base.add(start), dst.as_mut_ptr(), dst.len());
@@ -287,19 +262,17 @@ pub(crate) mod tests {
 
     const TEST_CAP: usize = 1024;
 
-    /// Allocate a ring with the given capacity on the heap.
-    ///
-    /// Simulates what the shm zone-init path does: allocates space for the
-    /// header + payload, zero-inits, and sets `header.cap`.
+    /// Allocate a ring with the given capacity on the heap, simulating the shm
+    /// zone-init path (header + payload, zero-init, set `header.cap`).
     pub fn make_ring_with_cap(cap: usize) -> (Box<[u8]>, WorkerSignalRing) {
         let total = ring_size_bytes(cap);
         let mut buf = vec![0u8; total].into_boxed_slice();
         let ptr = buf.as_mut_ptr();
         // SAFETY: `ptr` is the start of a freshly-allocated, zero-initialised
         // `ring_size_bytes(cap)` buffer. The global allocator returns memory
-        // aligned well above `WorkerSignalRingHeader`'s 8-byte requirement, so the
-        // cast and atomic store are well-defined in this test helper (the
-        // production path lives in 8-byte-aligned slab memory).
+        // aligned well above `WorkerSignalRingHeader`'s 8-byte requirement, so
+        // the cast and atomic store are well-defined here (production lives
+        // in 8-byte-aligned slab memory).
         unsafe {
             let hdr = ptr.cast::<WorkerSignalRingHeader>();
             (*hdr).cap.store(cap as u64, Ordering::Relaxed);
@@ -396,22 +369,14 @@ pub(crate) mod tests {
         assert_eq!(out.as_slice(), data.as_slice());
     }
 
-    /// Dual-consumer documents the SPSC ring's load-then-store contract.
-    ///
-    /// `pop_into` reads `read_offset` with `Acquire`, copies the record, then
-    /// advances `read_offset` with `Release` — there is NO compare-exchange.
-    /// Two concurrent consumers can both load the same offset before either
-    /// stores, producing duplicate records (total > N).
-    ///
-    /// This test verifies that ONE consumer reads exactly N records (the
-    /// positive case); the dual-consumer violation is demonstrated in
-    /// `b1_dual_consumer_violation` below.
+    /// Positive case for the SPSC load-then-store contract: `pop_into` reads
+    /// `read_offset` (Acquire), copies, then advances it (Release) — no
+    /// compare-exchange, so two concurrent consumers could double-read the
+    /// same offset (total > N). This test pins the single-consumer case
+    /// (total == N exactly); `b1_dual_consumer_violation` below demonstrates
+    /// the violation.
     #[test]
     fn b1_single_consumer_reads_exactly_n_records() {
-        // Positive case: one consumer, one ring, N records → total == N.
-        // The corresponding dual-consumer violation evidence (total != N) is
-        // captured by `b1_dual_consumer_violation` below — see its doc comment
-        // for the expected failure mode.
         const N: usize = 500;
         const RECORD_BYTES: usize = 8;
         let cap = N * (4 + RECORD_BYTES) * 2;
@@ -433,18 +398,14 @@ pub(crate) mod tests {
         );
     }
 
-    /// Documents the dual-consumer violation: TWO concurrent threads
-    /// calling `pop_into` on the same ring, each asserting exclusivity.
+    /// Dual-consumer violation evidence: two threads call `pop_into` on the
+    /// same ring concurrently. Since `pop_into` uses load → read → store (not
+    /// compare-exchange), both can load the same `read_offset`, copy the same
+    /// slot, and store the same advanced offset — a duplicate record, so the
+    /// total popped exceeds N.
     ///
-    /// `pop_into` uses load → read → store, NOT compare-exchange.  Two threads
-    /// on separate cores can both load the same `read_offset` value, both copy
-    /// the same record slot, and both store the same advanced offset — producing
-    /// a DUPLICATE record.  The total popped will exceed N.
-    ///
-    /// This test is `#[ignore]` because it is expected to FAIL (the violation
-    /// IS the evidence).  Run explicitly with `cargo test -- --ignored
-    /// b1_dual_consumer_violation` to capture the FAIL output.
-    ///
+    /// `#[ignore]`: expected to FAIL (the violation IS the evidence). Run
+    /// explicitly with `cargo test -- --ignored b1_dual_consumer_violation`.
     /// On a single-core machine the race may not manifest.
     #[test]
     #[ignore = "expected to FAIL — run explicitly for mutation evidence"]
@@ -452,9 +413,8 @@ pub(crate) mod tests {
         use std::sync::{Arc, Barrier};
         use std::thread;
 
-        // 5 000 records × (4-byte length + 8-byte payload) = 60 KB per pass.
-        // Two threads spinning at ~ns per pop → thousands of load/store windows
-        // → very high probability of at least one duplicate on a multi-core CPU.
+        // 5 000 records at ~ns/pop gives thousands of load/store windows — high
+        // probability of at least one duplicate on a multi-core CPU.
         const N: usize = 5_000;
         const RECORD_BYTES: usize = 8;
 
@@ -466,16 +426,15 @@ pub(crate) mod tests {
         }
         // ring is Copy (pointer-only view) — no drop needed; ring_ptr remains valid.
 
-        // Extract the raw data pointer BEFORE wrapping in Arc so both threads
-        // get the same address.  The Arc clones keep the buffer alive while the
-        // threads run.
+        // Extract the raw pointer before wrapping in Arc so both threads share
+        // the same address; the Arc clones keep the buffer alive for each thread.
         // SAFETY: `buf` was just returned by `make_ring_with_cap`; the pointer
         // is valid for the ring's full memory region.  We cast to *mut u8 to
         // satisfy `from_shm_ptr`'s contract.
-        let ring_ptr: usize = buf.as_ptr() as usize; // store as usize — Send-safe
+        let ring_ptr: usize = buf.as_ptr() as usize; // usize — Send-safe
         let buf_arc = Arc::new(buf);
-        let _buf_guard1 = Arc::clone(&buf_arc); // keep alive for thread 1
-        let _buf_guard2 = Arc::clone(&buf_arc); // keep alive for thread 2
+        let _buf_guard1 = Arc::clone(&buf_arc);
+        let _buf_guard2 = Arc::clone(&buf_arc);
 
         let barrier = Arc::new(Barrier::new(2));
         let b1 = Arc::clone(&barrier);
@@ -523,9 +482,9 @@ pub(crate) mod tests {
         let total = count1.load(core::sync::atomic::Ordering::Relaxed)
             + count2.load(core::sync::atomic::Ordering::Relaxed);
 
-        // This assertion FAILS when the race fires: both threads read the same
-        // slot → total > N.  That is the expected outcome and the evidence that
-        // the ring is SPSC-only.  The single-consumer gate prevents this in production.
+        // FAILS when the race fires (total > N) — that is the expected outcome
+        // and the evidence the ring is SPSC-only; production is protected by
+        // the single-consumer gate.
         assert_eq!(
             total,
             N,
