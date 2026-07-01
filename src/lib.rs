@@ -3,61 +3,29 @@
 // This source code is licensed under the Apache License, Version 2.0 license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! # Zero-cost-when-disabled invariant
+//! Crate root: nginx module descriptor, config-time hooks, and process
+//! lifecycle callbacks for the OpenTelemetry module.
 //!
-//! Loading this module without an `otel_exporter { endpoint ... }` directive
-//! MUST impose zero per-request overhead.  The invariant is maintained at
-//! exactly two gating points — both checked against
-//! `config::MainConfig::is_configured()`:
-//!
-//! 1. **Log-phase handler gate** (`src/lib.rs` — `postconfiguration`):
-//!    `add_phase_handler` is called **only** when `amcf.is_configured()` is
-//!    true.  If the exporter is not configured the phase handler is never
-//!    registered and no per-request code runs.
-//!    See `HttpOtelModule::postconfiguration` — the `if amcf.is_configured()`
-//!    block surrounding the `add_phase_handler` call.
-//!
-//! 2. **Export-task gate** (`src/lib.rs` — `ngx_otel_init_process`):
-//!    The async export loop is spawned **only** when `amcf.is_configured()` is
-//!    true.  If the exporter is not configured the process hook returns early
-//!    with no allocation, no task spawn, and no background activity.
-//!    See `ngx_otel_init_process` — the `if !amcf.is_configured()` early
-//!    return that precedes any `ngx::async_::spawn` or `Pool::allocate` call.
-//!
-//! **Invariant contract:**
-//! - No per-request allocation on the disabled path.
-//! - No per-request locking on the disabled path.
-//! - No background tasks on the disabled path.
-//!
-//! This is the load-bearing claim for upstream acceptance: a module that is
-//! loaded but unconfigured must be indistinguishable from one that is not
-//! loaded at all.
+//! Zero-cost-when-disabled invariant: an unconfigured module imposes zero
+//! per-request overhead, gated at two points against `is_configured()` (the
+//! log-phase handler in `postconfiguration`, the exporter in `init_module` /
+//! `init_process`). See `docs/ARCHITECTURE.md` § "Zero-cost-when-disabled".
 
 #![no_std]
-// Doc-comment hygiene: every intra-doc link (`[`Type`]`) must resolve, so a
-// broken reference fails the `cargo doc` build instead of silently shipping a
-// dead link to docs.rs.  Enforced via `make doc-check`
-// (RUSTDOCFLAGS="-D warnings" cargo doc) — `cargo clippy` does not run rustdoc
-// lints.  Bare URLs are warned so they get wrapped in `<...>` for rendering.
+// Broken intra-doc links fail the build (via `make doc-check`); bare URLs warn.
 #![deny(rustdoc::broken_intra_doc_links)]
 #![warn(rustdoc::bare_urls)]
-// Require a 64-bit target: the shm rings use monotonically-increasing u64
-// byte offsets cast to `usize` on every push/pop, and stub_status treats
-// `ngx_atomic_t` (c_ulong) as `u64`. Both assumptions break silently on
-// 32-bit targets (usize truncation after 4 GiB; c_ulong == u32 != u64).
-// Enforced below by the compile_error! guard. The cfg rejects ALL non-64-bit
-// targets (16-bit, 32-bit, or any exotic width), not merely the 32-bit case,
-// since the u64 assumptions only hold on a 64-bit pointer/atomic width.
+// Require a 64-bit target: shm rings cast monotonic u64 offsets to `usize` and
+// stub_status treats `ngx_atomic_t` (c_ulong) as `u64` — both break silently on
+// narrower widths.
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!(
     "ngx-otel-rust requires a 64-bit target: 64-bit atomics are assumed \
      throughout (shm rings, stub_status)."
 );
 
-// Pull all `std` macros (format!, vec!, assert!, etc.) into global scope.
-// The crate is no_std but links to std, so this is safe — it only affects
-// name resolution, not the binary.  Required because generated tonic client
-// stubs use bare `format!` which is not in scope in a no_std crate.
+// no_std crate that links std: pull std macros into scope for generated tonic
+// stubs that use bare `format!`.
 #[macro_use]
 extern crate std;
 
@@ -133,20 +101,14 @@ pub static mut ngx_http_otel_module: ngx_module_t = ngx_module_t {
     ..ngx_module_t::default()
 };
 
-// SAFETY: the `MainConf` associated type matches the `create_main_conf` /
-// `init_main_conf` hooks in `NGX_HTTP_OTEL_MODULE_CTX`, which allocate and
-// initialise a `config::MainConfig` in this module's main-conf slot. The trait
-// contract — that `MainConf` is the exact type nginx stores at our module's
-// `ctx_index` — therefore holds, so the downcast in `main_conf()` is valid.
+// SAFETY: `MainConf` is the exact type our `create_main_conf` / `init_main_conf`
+// hooks store at this module's `ctx_index`, so the `main_conf()` downcast is valid.
 unsafe impl HttpModuleMainConf for HttpOtelModule {
     type MainConf = config::MainConfig;
 }
 
-// SAFETY: the `LocationConf` associated type matches the `create_loc_conf` /
-// `merge_loc_conf` hooks wired in `NGX_HTTP_OTEL_MODULE_CTX`, which allocate
-// and default-initialize a `metric_source::location_conf::LocationConf` in this
-// module's loc-conf slot.  The trait contract — exact type at `ctx_index` —
-// holds, so the downcast in `location_conf()` / `location_conf_mut()` is valid.
+// SAFETY: `LocationConf` is the exact type our `create_loc_conf` / `merge_loc_conf`
+// hooks store at this module's `ctx_index`, so the loc-conf downcast is valid.
 unsafe impl HttpModuleLocationConf for HttpOtelModule {
     type LocationConf = metric_source::location_conf::LocationConf;
 }
@@ -202,30 +164,15 @@ fn spawn_exporter_for_cycle(
 // ── Zone-sizing validation ──────────────────────────────────────────────────
 
 /// Detect the pre-daemon context where the first-generation exporter will be
-/// orphaned.
-///
-/// Returns `true` when ALL of:
-///   - `ccf->daemon == 1` (the `daemon on` directive — default)
-///   - `ngx_daemonized == 0` (we have NOT yet forked the daemon master;
-///     nginx sets this flag in `main()` AFTER `ngx_daemon()` returns —
-///     `nginx/src/core/nginx.c` line 354; at `init_module` time it is still 0)
-///   - `ngx_inherited == 0` (not a USR2 binary-upgrade child, where nginx
-///     sets `ngx_daemonized = 1` unconditionally — `nginx/src/core/nginx.c`
-///     line 358)
-///
-/// When this function returns `true`, `ngx_spawn_process` is about to fork E
-/// from the pre-daemon P0.  After `ngx_daemon()` forks the long-lived master M
-/// and P0 exits, E's PPID reparents to 1 (init).  M inherits the
-/// `ngx_processes[]` entry but `waitpid(-1, WNOHANG)` in M's SIGCHLD handler
-/// (`ngx_process_get_status` in `ngx_process.c`) never reaps E — only E's
-/// REAL parent (init, PID 1) receives SIGCHLD when E exits.
-/// Consequence: crash-respawn and the backoff loop are inoperative for the
-/// gen-1 exporter under `daemon on`.
+/// orphaned (spawned before `ngx_daemon()` forks the master, so its PPID
+/// reparents to init and crash-respawn is inoperative for gen-1 under
+/// `daemon on`). True when `ccf->daemon == 1 && ngx_daemonized == 0 &&
+/// ngx_inherited == 0`. See LIFECYCLE.md § "Known limitation: gen-1 exporter
+/// under daemon on".
 ///
 /// # Safety
 /// `cycle` must be a valid non-null `ngx_cycle_t` pointer.
 unsafe fn is_pre_daemon_initial_start(cycle: *const nginx_sys::ngx_cycle_t) -> bool {
-    // Check ccf->daemon first (cheapest).
     // SAFETY: caller guarantees `cycle` is valid and non-null.
     let cycle_ref = unsafe { &*cycle };
     let core_idx = nginx_sys::ngx_core_module.index;
@@ -240,11 +187,10 @@ unsafe fn is_pre_daemon_initial_start(cycle: *const nginx_sys::ngx_cycle_t) -> b
     if daemon_flag == 0 {
         return false; // daemon off — no double-fork
     }
-    // SAFETY: `ngx_daemonized` and `ngx_inherited` are nginx globals written
-    // by `main()` before re-entering `init_module` on SIGHUP, and never mutated
-    // concurrently.  The plain reads are race-free at init_module time.
+    // SAFETY: `ngx_daemonized` / `ngx_inherited` are nginx globals set by `main()`
+    // before init_module and not mutated concurrently, so these reads are race-free.
     let daemonized = unsafe { nginx_sys::ngx_daemonized };
-    // SAFETY: same as ngx_daemonized above — process-lifetime global, read-only here.
+    // SAFETY: process-lifetime global, read-only here (see above).
     let inherited = unsafe { nginx_sys::ngx_inherited };
     daemonized == 0 && inherited == 0
 }
@@ -278,23 +224,11 @@ unsafe fn worker_processes_from_cycle(cycle: *const nginx_sys::ngx_cycle_t) -> O
     }
 }
 
-/// Zone-sizing validation at init_module time.
-///
-/// Computes the RESERVED capacity (from each zone's registered size) and
-/// compares it against the ACTUAL (post-parse, final) `worker_processes`.
-///
-/// - Normal case: actual_workers ≤ reserved → `amcf.n_active_workers` is set
-///   and the exporter uses it to drain only active slots.
-/// - Residual error case: actual_workers > reserved — this happens when an
-///   explicit large count appears after `http{}` on a box where ncpu < count.
-///   The operator gets a clear error and nginx refuses to start/reload.
-///
-/// Zones are sized for `max(ngx_ncpu, actual_workers)` at parse time,
-/// so the typical `worker_processes N;` after `http{}` succeeds as long as
-/// N ≤ ncpu.
-///
-/// `nginx -t` skips `init_module` (ngx_test_config is set, caller returns
-/// early), so this check does not apply during config-test runs.
+/// Zone-sizing validation at init_module time: compare each zone's reserved
+/// capacity against the final `worker_processes`. On fit, record
+/// `n_active_workers`; otherwise refuse to start with a clear error (the case
+/// where an explicit large count follows `http{}` on a box with fewer CPUs).
+/// Skipped under `nginx -t` (caller returns early on `ngx_test_config`).
 ///
 /// # Safety
 /// `cycle` and `amcf` must be valid non-null pointers.
@@ -350,18 +284,13 @@ unsafe fn check_zone_sizing(
     let min_reserved = res_metrics.min(res_logs).min(res_spans);
 
     if actual_workers <= min_reserved {
-        // All zones have sufficient capacity.  Record the active count so the
-        // exporter drains only active slots (not reserved-but-inactive ones).
+        // Record the active count so the exporter drains only active slots.
         // SAFETY: amcf is valid per the `unsafe fn` contract.
         amcf.n_active_workers.store(actual_workers, Ordering::Relaxed);
         return Ok(());
     }
 
-    // actual_workers > reserved — the residual error case.
-    // This happens when an explicit large count (e.g. `worker_processes 64`)
-    // appears AFTER `http{}` on a box where ncpu (= reserved capacity) < 64.
-    // Refuse to start so the operator gets a clear message.
-    //
+    // actual_workers > reserved: refuse to start with a clear operator message.
     // SAFETY: `cycle` is valid; `.log` is non-null.
     let log = unsafe { (*cycle).log };
     emerg!(
@@ -378,26 +307,14 @@ unsafe fn check_zone_sizing(
 
 // ── init_module callback ──────────────────────────────────────────────────────
 
-/// Called by nginx from `ngx_init_modules` (via `ngx_init_cycle`) — once at
-/// initial start and again on each SIGHUP reload.
+/// Called by nginx once at initial start and again on each SIGHUP reload.
 ///
-/// Forks the `nginx: otel exporter` child process from master, gated on
-/// `MainConfig::is_configured()`. Uses `NGX_PROCESS_RESPAWN` for initial
-/// start (auto-respawn on crash) and `NGX_PROCESS_JUST_RESPAWN` for SIGHUP
-/// reloads (skipped on the first signal fan-out so old+new exporter coexist
-/// briefly — same pattern as `ngx_start_cache_manager_processes`).
-///
-/// Note on `daemon on` vs `daemon off`: nginx's `init_master` hook is defined
-/// in the module API but is NOT called by nginx 1.31.x. All exporter spawning
-/// is therefore done here for both modes. The USR2 integration test uses
-/// `daemon off` and launches nginx from a subshell that exits immediately, so
-/// nginx gets reparented to init (getppid()==1) before the USR2 signal, which
-/// allows nginx to honour it. With `daemon off` the exporter is a direct child
-/// of the master (no double-fork), so SIGCHLD and graceful-quit work correctly.
-///
-/// The exporter runs as a dedicated child process so that async I/O (tokio) is
-/// fully isolated from nginx's event loop; process separation means a tokio
-/// panic or network-stack freeze cannot stall nginx worker request handling.
+/// Forks the dedicated `nginx: otel exporter` child from master (isolating
+/// export I/O from the worker event loop), gated on `MainConfig::is_configured()`.
+/// `NGX_PROCESS_RESPAWN` on initial start (auto-respawn on crash),
+/// `NGX_PROCESS_JUST_RESPAWN` on reload (old+new coexist briefly). All spawning
+/// happens here because nginx 1.31.x never calls the `init_master` hook; see
+/// LIFECYCLE.md for the `daemon on`/`daemon off` fork behaviour.
 extern "C" fn ngx_otel_init_module(cycle: *mut nginx_sys::ngx_cycle_t) -> nginx_sys::ngx_int_t {
     // SAFETY: `ngx_process` is a nginx global written once by the master before
     // any module init hook runs and thereafter read-only within a process, so this
@@ -425,52 +342,29 @@ extern "C" fn ngx_otel_init_module(cycle: *mut nginx_sys::ngx_cycle_t) -> nginx_
         return Status::NGX_OK.into();
     }
 
-    // Fail-fast: verify every shm zone was sized for the actual
-    // worker_processes count.  Catches the directive ordering where
-    // `worker_processes N;` appears after `http{}` — postconfiguration sees
-    // NGX_CONF_UNSET and sizes for 1, then workers 1..N-1 would write past the
-    // zone end.  We refuse to start with a clear error instead.
-    //
-    // SAFETY: `cycle` is valid (verified above); `amcf` is the main conf for
-    // this cycle.
+    // Fail-fast: verify every shm zone was sized for the actual worker count
+    // (see check_zone_sizing for the directive-ordering hazard).
+    // SAFETY: `cycle` is valid (verified above); `amcf` is this cycle's main conf.
     if unsafe { check_zone_sizing(cycle, amcf) }.is_err() {
         return Status::NGX_ERROR.into();
     }
 
     // Detect SIGHUP reload vs initial start via old_cycle->conf_ctx.
-    // See existing comment above for the IMPORTANT note about ngx_is_init_cycle.
-    // SAFETY: `cycle` is valid (above). `old_cycle` is a pointer nginx initialises
-    // for every cycle (null on first start, the prior cycle on SIGHUP); both it and
-    // its `conf_ctx` are null-checked before any further deref, so no invalid read.
+    // SAFETY: `cycle` is valid (above); `old_cycle` (null on first start) and its
+    // `conf_ctx` are null-checked before any further deref.
     let is_reload = unsafe {
         let old = (*cycle).old_cycle;
         !old.is_null() && !(*old).conf_ctx.is_null()
     };
 
-    // On reload, announce the successor BEFORE forking the new exporter.
-    // This runs in the master process, sequentially before `ngx_spawn_process`
-    // is called.  The channel message (NGX_CMD_QUIT) sent to the old exporter
-    // by the master AFTER this point provides the happens-before ordering: by
-    // the time the old exporter's channel handler fires and sets ngx_quit, the
-    // Release store below is already visible.
-    //
-    // Old exporter snapshot: `my_gen` captured at startup.
-    // `current_gen > my_gen` → reload → abdicate ring pops (new exporter owns).
-    // `current_gen == my_gen` → pure shutdown → full drain (sole consumer).
-    //
-    // The increment MUST happen before the fork below, not after: the new
-    // exporter reads `successor_gen` once at startup (`export_loop`'s `my_gen`
-    // snapshot) and the fork() in `ngx_spawn_process` is the happens-before
-    // edge that makes this store visible to that child read.  Incrementing
-    // after the fork would race the child's snapshot.  Because the increment
-    // therefore precedes the (fallible) spawn, a failed fork would otherwise
-    // leave `successor_gen` permanently bumped with NO new exporter present:
-    // the OLD exporter — still the sole live consumer — would then observe
-    // `current_gen > my_gen`, latch `periodic_abdicated = true` forever, and
-    // stop popping the log/span rings (rings fill → permanent telemetry loss
-    // after a failed reload).  We roll the increment back on the spawn-error
-    // path below to keep `successor_gen` consistent with the set of live
-    // exporters: incremented iff a successor was actually forked.
+    // On reload, announce the successor BEFORE the fork: the fork() is the
+    // happens-before edge that makes this Release store visible to the new
+    // exporter's one-shot `successor_gen` snapshot, so incrementing after would
+    // race it. Because the increment precedes the fallible spawn, a failed fork
+    // would leave `successor_gen` bumped with no successor — the old (still sole)
+    // consumer would latch `periodic_abdicated` forever and stop popping the
+    // rings. The spawn-error path below rolls it back: incremented iff a
+    // successor was actually forked.
     let mut announced_successor_ctrl: *const exporter::control_shm::ControlShm = core::ptr::null();
     if is_reload {
         if let Some(ctrl_ptr) = amcf.control_shm_ptr_mut() {
@@ -485,22 +379,9 @@ extern "C" fn ngx_otel_init_module(cycle: *mut nginx_sys::ngx_cycle_t) -> nginx_
         }
     }
 
-    // Warn when the first-generation exporter will be orphaned after daemonize.
-    //
-    // nginx/src/core/nginx.c call order:
-    //   line 293: ngx_init_cycle() → ngx_init_modules() → this callback
-    //   line 350: ngx_daemon() — forks M, P0 exits → exporter PPID becomes 1
-    //   line 354: ngx_daemonized = 1 — set AFTER daemon fork, in M only
-    //
-    // When is_pre_daemon_initial_start() returns true we are in P0 (the
-    // pre-daemon spawner that will exit).  After ngx_spawn_process(E) below:
-    //   - E is a child of P0; after ngx_daemon P0 exits; E's PPID → 1 (init).
-    //   - M inherits E's ngx_processes[] entry, but SIGCHLD from E goes to
-    //     init → ngx_process_get_status's waitpid(-1) in M never reaps E →
-    //     crash-respawn is dead for this generation.
-    // No fix in this loop iteration — the self-supervising wrapper (Option B)
-    // is designed and deferred post-review (LIFECYCLE.md §"Known limitation").
-    //
+    // Warn when the gen-1 exporter will be orphaned after daemonize (spawned in
+    // the pre-daemon P0, reparents to init once master forks — crash-respawn
+    // dead for this generation; see LIFECYCLE.md § "Known limitation").
     // SAFETY: `cycle` is valid (verified above).
     if !is_reload && unsafe { is_pre_daemon_initial_start(cycle) } {
         alert!(
@@ -515,13 +396,10 @@ extern "C" fn ngx_otel_init_module(cycle: *mut nginx_sys::ngx_cycle_t) -> nginx_
     // Spawn the exporter for both initial start and SIGHUP reload.
     let spawn_status = spawn_exporter_for_cycle(cycle, is_reload);
 
-    // Roll back the successor announcement if the fork failed (NGX_INVALID_PID
-    // from RLIMIT_NPROC / ENOMEM).  No successor exists, so the old exporter
-    // must remain the sole consumer and keep draining the rings; leaving
-    // `successor_gen` bumped would latch its `periodic_abdicated` permanently
-    // (see the increment comment above).  This is a single Release decrement,
-    // mirroring the increment; the master is the sole writer of this field, so
-    // the round-trip leaves the counter at its pre-reload value.
+    // Roll back the successor announcement on fork failure: no successor exists,
+    // so leaving `successor_gen` bumped would permanently latch the old (sole)
+    // consumer's `periodic_abdicated` (see the increment comment above). The
+    // master is the sole writer, so this mirroring decrement restores the value.
     let ok: nginx_sys::ngx_int_t = Status::NGX_OK.into();
     if spawn_status != ok && !announced_successor_ctrl.is_null() {
         // SAFETY: `announced_successor_ctrl` is non-null only when set from a
@@ -675,20 +553,16 @@ unsafe extern "C" fn otel_var_get_trace_id(
 ) -> nginx_sys::ngx_int_t {
     use crate::traces::ctx::SpanCtx;
 
-    // SAFETY: `r` is the non-null `ngx_http_request_t*` nginx passes to variable
-    // get-handlers; `Request::from_ngx_http_request` reinterprets it as the
-    // ngx-rust request wrapper (same repr) and yields a valid `&mut Request`.
+    // SAFETY: `r` is the non-null request nginx passes to a variable get-handler;
+    // `from_ngx_http_request` reinterprets it (same repr) as `&mut Request`.
     let request = unsafe { ngx::http::Request::from_ngx_http_request(r) };
-    // SAFETY: `ngx_http_otel_module` is a `static` module descriptor valid for
-    // the full process lifetime; `addr_of!` yields a valid pointer.
+    // SAFETY: `ngx_http_otel_module` is a process-lifetime static descriptor.
     let module = unsafe { &*::core::ptr::addr_of!(ngx_http_otel_module) };
-    // Recover the SpanCtx from the pool-cleanup anchor when the module-ctx
-    // slot was cleared by an internal redirect (recovery walks only on NULL slot
-    // + r->internal/filter_finalize; otherwise this is a single pointer load).
+    // Recover the SpanCtx from the pool-cleanup anchor when an internal redirect
+    // cleared the module-ctx slot (recovery walks only on NULL slot).
     let ctx: Option<&SpanCtx> = match request.get_module_ctx::<SpanCtx>(module) {
         Some(c) => Some(c),
-        // SAFETY: `r` is the live request pointer nginx passed; `module` is the
-        // process-lifetime descriptor; the recovered pointer (if non-null) is a
+        // SAFETY: `r`/`module` are valid; a non-null recovered pointer is a
         // pool-anchored SpanCtx valid for the request lifetime.
         None => unsafe {
             crate::traces::ctx::recover_span_ctx(r, module, ::core::ptr::null_mut()).as_ref()
@@ -699,10 +573,9 @@ unsafe extern "C" fn otel_var_get_trace_id(
     let vv = unsafe { &mut *v };
     match ctx {
         Some(span_ctx) => {
-            // SAFETY: `r` is valid; `(*r).pool` is the per-request pool.
+            // SAFETY: `r` valid; `(*r).pool` is the per-request pool.
             let pool = unsafe { (*r).pool };
-            // SAFETY: `pool` is a valid nginx pool pointer; `ngx_pcalloc` returns
-            // a pointer to pool memory valid for the request lifetime (or null).
+            // SAFETY: `pool` is valid; `ngx_pcalloc` yields request-lifetime memory or null.
             let buf = unsafe { nginx_sys::ngx_pcalloc(pool, 32) } as *mut u8;
             if buf.is_null() {
                 vv.set_not_found(1);
@@ -739,17 +612,14 @@ unsafe extern "C" fn otel_var_get_span_id(
 ) -> nginx_sys::ngx_int_t {
     use crate::traces::ctx::SpanCtx;
 
-    // SAFETY: `r` is the non-null `ngx_http_request_t*` nginx passes to variable
-    // get-handlers; `Request::from_ngx_http_request` reinterprets it as the
-    // ngx-rust request wrapper (same repr) and yields a valid `&mut Request`.
+    // SAFETY: `r` is the non-null request nginx passes to a variable get-handler;
+    // `from_ngx_http_request` reinterprets it (same repr) as `&mut Request`.
     let request = unsafe { ngx::http::Request::from_ngx_http_request(r) };
-    // SAFETY: `ngx_http_otel_module` is a `static` module descriptor valid for
-    // the full process lifetime; `addr_of!` yields a valid pointer.
+    // SAFETY: `ngx_http_otel_module` is a process-lifetime static descriptor.
     let module = unsafe { &*::core::ptr::addr_of!(ngx_http_otel_module) };
     let ctx: Option<&SpanCtx> = match request.get_module_ctx::<SpanCtx>(module) {
         Some(c) => Some(c),
-        // SAFETY: `r` is the live request pointer nginx passed; `module` is the
-        // process-lifetime descriptor; the recovered pointer (if non-null) is a
+        // SAFETY: `r`/`module` are valid; a non-null recovered pointer is a
         // pool-anchored SpanCtx valid for the request lifetime.
         None => unsafe {
             crate::traces::ctx::recover_span_ctx(r, module, ::core::ptr::null_mut()).as_ref()
@@ -760,9 +630,9 @@ unsafe extern "C" fn otel_var_get_span_id(
     let vv = unsafe { &mut *v };
     match ctx {
         Some(span_ctx) => {
-            // SAFETY: `r` is valid; `(*r).pool` is the per-request pool.
+            // SAFETY: `r` valid; `(*r).pool` is the per-request pool.
             let pool = unsafe { (*r).pool };
-            // SAFETY: `pool` is a valid nginx pool pointer; 16 bytes for the hex string.
+            // SAFETY: `pool` is valid; 16 bytes of request-lifetime memory (or null).
             let buf = unsafe { nginx_sys::ngx_pcalloc(pool, 16) } as *mut u8;
             if buf.is_null() {
                 vv.set_not_found(1);
@@ -800,17 +670,14 @@ unsafe extern "C" fn otel_var_get_parent_id(
 ) -> nginx_sys::ngx_int_t {
     use crate::traces::ctx::SpanCtx;
 
-    // SAFETY: `r` is the non-null `ngx_http_request_t*` nginx passes to variable
-    // get-handlers; `Request::from_ngx_http_request` reinterprets it as the
-    // ngx-rust request wrapper (same repr) and yields a valid `&mut Request`.
+    // SAFETY: `r` is the non-null request nginx passes to a variable get-handler;
+    // `from_ngx_http_request` reinterprets it (same repr) as `&mut Request`.
     let request = unsafe { ngx::http::Request::from_ngx_http_request(r) };
-    // SAFETY: `ngx_http_otel_module` is a `static` module descriptor valid for
-    // the full process lifetime; `addr_of!` yields a valid pointer.
+    // SAFETY: `ngx_http_otel_module` is a process-lifetime static descriptor.
     let module = unsafe { &*::core::ptr::addr_of!(ngx_http_otel_module) };
     let ctx: Option<&SpanCtx> = match request.get_module_ctx::<SpanCtx>(module) {
         Some(c) => Some(c),
-        // SAFETY: `r` is the live request pointer nginx passed; `module` is the
-        // process-lifetime descriptor; the recovered pointer (if non-null) is a
+        // SAFETY: `r`/`module` are valid; a non-null recovered pointer is a
         // pool-anchored SpanCtx valid for the request lifetime.
         None => unsafe {
             crate::traces::ctx::recover_span_ctx(r, module, ::core::ptr::null_mut()).as_ref()
@@ -821,9 +688,9 @@ unsafe extern "C" fn otel_var_get_parent_id(
     let vv = unsafe { &mut *v };
     match ctx {
         Some(span_ctx) => {
-            // SAFETY: `r` is valid; `(*r).pool` is the per-request pool.
+            // SAFETY: `r` valid; `(*r).pool` is the per-request pool.
             let pool = unsafe { (*r).pool };
-            // SAFETY: `pool` is a valid nginx pool pointer; 16 bytes for the hex string.
+            // SAFETY: `pool` is valid; 16 bytes of request-lifetime memory (or null).
             let buf = unsafe { nginx_sys::ngx_pcalloc(pool, 16) } as *mut u8;
             if buf.is_null() {
                 vv.set_not_found(1);
@@ -861,18 +728,14 @@ unsafe extern "C" fn otel_var_get_parent_sampled(
 ) -> nginx_sys::ngx_int_t {
     use crate::traces::ctx::SpanCtx;
 
-    // SAFETY: `r` is the non-null `ngx_http_request_t*` nginx passes to variable
-    // get-handlers; same contract as `otel_var_get_trace_id`.
+    // SAFETY: same contract as `otel_var_get_trace_id` — `r` is the non-null
+    // request; reinterpreted (same repr) as `&mut Request`.
     let request = unsafe { ngx::http::Request::from_ngx_http_request(r) };
-    // SAFETY: `ngx_http_otel_module` is a `static` module descriptor valid for
-    // the full process lifetime; `addr_of!` yields a valid pointer.
+    // SAFETY: `ngx_http_otel_module` is a process-lifetime static descriptor.
     let module = unsafe { &*::core::ptr::addr_of!(ngx_http_otel_module) };
-    // Recover the SpanCtx from the pool-cleanup anchor when the module-ctx
-    // slot was cleared by an internal redirect (see otel_var_get_trace_id).
     let ctx: Option<&SpanCtx> = match request.get_module_ctx::<SpanCtx>(module) {
         Some(c) => Some(c),
-        // SAFETY: `r` is the live request pointer nginx passed; `module` is the
-        // process-lifetime descriptor; the recovered pointer (if non-null) is a
+        // SAFETY: `r`/`module` are valid; a non-null recovered pointer is a
         // pool-anchored SpanCtx valid for the request lifetime.
         None => unsafe {
             crate::traces::ctx::recover_span_ctx(r, module, ::core::ptr::null_mut()).as_ref()
@@ -916,11 +779,8 @@ unsafe extern "C" fn otel_var_get_parent_sampled(
 /// not run in production builds (no allocation, no task spawn).
 extern "C" fn ngx_otel_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
     // ── Wire error-writer shm pointers ──────────────────────────────────────
-    //
-    // Gate: Worker only + logs shm mapped.  Exporter and master contexts must
-    // fall through to core error_log; the process-role guard in
-    // ngx_otel_error_writer enforces this at call time; the null pointers here
-    // are the belt to that suspenders.
+    // Worker-only + logs-shm-mapped; master/exporter fall through to core
+    // error_log (the process-role guard in ngx_otel_error_writer enforces this).
     {
         // SAFETY: `cycle` is the non-null, valid cycle nginx passes into
         // `init_process`; the worker is single-threaded at this point so the `&mut`
@@ -987,16 +847,11 @@ extern "C" fn ngx_otel_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
     }
 
     // ── Eager, fallible trace-DRBG seed (off the request path) ───────────────
-    //
-    // Seed this worker's ChaCha20 trace-ID DRBG here, at worker init, so the
-    // single `getrandom(2)` syscall happens off the per-request hot path.  On a
-    // persistent OS-RNG failure (e.g. seccomp denying getrandom) we MUST NOT
-    // panic — a panic in the `extern "C"` REWRITE handler aborts the worker and
-    // every respawn re-aborts on its first traced request (a crash loop).
-    // Instead `eager_seed_drbg()` sets a worker-local tracing-disabled flag and
-    // returns Err; we log ONE `NGX_LOG_EMERG` line and keep serving traffic
-    // (span-start treats the flag as unsampled — no spans, no weak IDs).  Run
-    // in worker processes only; master/exporter never trace.
+    // Seed the ChaCha20 trace-ID DRBG at worker init so the `getrandom(2)` call
+    // stays off the hot path. On persistent OS-RNG failure we must NOT panic (a
+    // panic in the extern "C" REWRITE handler crash-loops the worker); instead
+    // `eager_seed_drbg()` disables tracing worker-locally and returns Err, we log
+    // one EMERG line, and keep serving. Workers only; master/exporter never trace.
     if matches!(crate::exporter::ngx_process(), crate::exporter::NgxProcess::Worker(_)) {
         if let Err(e) = crate::traces::ctx::eager_seed_drbg() {
             // SAFETY: `cycle` is the non-null, valid cycle nginx passes into
@@ -1012,15 +867,11 @@ extern "C" fn ngx_otel_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
         }
     }
 
-    // ── In-worker unary gRPC viability harness ──────────────────────────────
-    //
-    // Only compiled when the `test-support` feature is enabled.  When set,
-    // and the `otel_grpc_smoke_endpoint` directive carries a non-empty value,
-    // fire one unary OTLP/gRPC export from Worker 0 via
-    // `NgxExecutor` + `SendRequestService` + `NgxConnIo` — the real
-    // production stack — to verify viability on the nginx event loop under
-    // `--with-debug`.  Result is logged at NOTICE; the integration test in
-    // `tests/integration/run_grpc_smoke.sh` greps for the success line.
+    // ── In-worker gRPC viability harnesses (test-support only) ───────────────
+    // When a `otel_grpc_*_smoke_endpoint` directive is set, fire one export from
+    // Worker 0 over the real production stack (NgxExecutor + NgxConnIo) to verify
+    // viability on the nginx event loop. Result logged at NOTICE; the integration
+    // scripts under tests/integration/ grep for the exact lines.
     #[cfg(any(test, feature = "test-support"))]
     {
         // SAFETY: `ngx_process` is set by the master before the fork and read-only
@@ -1214,12 +1065,9 @@ fn run_grpc_smoke_harness<Fut>(
 /// into the shared ring before exit, ensuring the exporter picks up the tail
 /// records.
 unsafe extern "C" fn ngx_otel_exit_process(cycle: *mut ngx_cycle_t) {
-    // Set the cleanup flag on our error-log writer node so that any
-    // late emissions after this point are dropped instead of touching the ring.
-    // The ring itself is in shm; the exporter drains it on its next tick.
-    //
-    // This mirrors `ngx_syslog_cleanup`: stop producer emissions before the
-    // cycle tears down the log chain.
+    // Set the cleanup flag so late emissions are dropped instead of touching the
+    // ring (which the exporter still drains from shm). Mirrors `ngx_syslog_cleanup`:
+    // stop producer emissions before the cycle tears down the log chain.
     if !cycle.is_null() {
         // SAFETY: `cycle` is non-null (just checked) and is the valid cycle nginx
         // passes to `exit_process`; `set_cleanup_flag` only reads our writer node
@@ -1250,11 +1098,8 @@ pub(crate) unsafe extern "C" fn otel_status_content_handler(
     use ngx::core::{Buffer, Pool};
     use ngx::http::HttpModuleMainConf as _;
 
-    // Read control_shm fields via the request's module conf.
-    // ngx_http_request_t implements HttpModuleConfExt, so main_conf() works directly.
-    // SAFETY: nginx invokes a content handler with a non-null, valid request `r`;
-    // `as_ref()` additionally null-checks, yielding a shared borrow valid for the
-    // handler's duration.
+    // SAFETY: nginx invokes a content handler with a valid request `r`; `as_ref()`
+    // null-checks, yielding a shared borrow valid for the handler's duration.
     let amcf_opt = unsafe { r.as_ref() }.and_then(HttpOtelModule::main_conf);
     let (version, last_beat_msec, successor_gen) = amcf_opt
         .and_then(|amcf| amcf.control_shm_ptr())
@@ -1419,15 +1264,11 @@ mod nginx_test_stubs {
     #[no_mangle]
     pub static mut ngx_current_msec: nginx_sys::ngx_msec_t = 0;
 
-    // `ngx_cached_time` is a `*mut ngx_time_t`; `ngx_timeofday()` dereferences
-    // it. The log-phase handler's request-duration calc calls `ngx_timeofday()`
-    // (since the metrics-correctness fix `9e2138e`), so this data symbol must be
-    // stubbed too — otherwise macOS dyld aborts loading the debug
-    // `cargo test --lib` binary on the unresolved `_ngx_cached_time`. Points at
-    // a zeroed `ngx_time_t` (sec = msec = 0 → duration clamps to 0 in tests).
-    // SAFETY: `ngx_time_t` is a plain `#[repr(C)]` struct of integer fields, for
-    // which the all-zero bit pattern is a valid inhabitant; this stub is only ever
-    // read (sec = msec = 0) by tests, never written.
+    // `ngx_timeofday()` (in the log-phase duration calc) dereferences this
+    // `*mut ngx_time_t`, so it must be a real data symbol. Points at a zeroed
+    // `ngx_time_t` (duration clamps to 0 in tests).
+    // SAFETY: `ngx_time_t` is a `#[repr(C)]` integer struct whose all-zero pattern
+    // is valid; read-only in tests, never written.
     static mut STUB_CACHED_TIME: nginx_sys::ngx_time_t = unsafe { core::mem::zeroed() };
 
     #[no_mangle]
@@ -1465,13 +1306,8 @@ mod nginx_test_stubs {
     #[no_mangle]
     pub static mut ngx_test_config: nginx_sys::ngx_uint_t = 0;
 
-    // `is_pre_daemon_initial_start` reads these two globals to
-    // decide whether the orphaned-exporter warning should fire.  Unit tests never
-    // exercise init_module, but the symbols must exist in the flat namespace on
-    // macOS (dyld resolves all data symbols eagerly at load time).
-    // Stub values: 0 = "not yet daemonized, not an inherited binary-upgrade
-    // child" — the safe initial state; the actual value is irrelevant because no
-    // unit test drives the init_module path.
+    // Read by `is_pre_daemon_initial_start`; must exist in the macOS flat
+    // namespace. 0 = safe initial state; init_module is never driven in tests.
     #[no_mangle]
     pub static mut ngx_daemonized: nginx_sys::ngx_uint_t = 0;
 

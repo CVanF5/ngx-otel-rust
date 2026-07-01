@@ -99,6 +99,26 @@ When `otel_exporter` is not configured the Log-phase handler is not registered
 and the exporter process is not spawned — no work runs on the request path, no
 background process runs. This is the "zero-cost-when-disabled" invariant.
 
+### Zero-cost-when-disabled: the two gating points
+
+Loading the module without an `otel_exporter { endpoint ... }` directive imposes
+zero per-request overhead. The invariant is maintained at exactly two gating
+points, both checked against `config::MainConfig::is_configured()`:
+
+1. **Log-phase handler gate** (`src/lib.rs`, `HttpOtelModule::postconfiguration`):
+   `add_phase_handler` is called only when `amcf.is_configured()` is true. If the
+   exporter is unconfigured the phase handler is never registered and no
+   per-request code runs.
+2. **Export-task gate** (`src/lib.rs`, `ngx_otel_init_process` /
+   `ngx_otel_init_module`): the async export loop / exporter process is started
+   only when `amcf.is_configured()` is true; otherwise the hook returns early
+   with no allocation, no task spawn, and no background activity.
+
+Contract on the disabled path: no per-request allocation, no per-request
+locking, no background tasks. A loaded-but-unconfigured module must be
+indistinguishable from one that is not loaded at all — the load-bearing claim
+for upstream acceptance.
+
 [hyper]: https://hyper.rs/
 
 ## Design invariants

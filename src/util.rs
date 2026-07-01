@@ -5,24 +5,17 @@
 
 //! Shared utility helpers used across crate modules.
 
-/// Return the current wall-clock time as Unix nanoseconds.
+/// Return the current wall-clock time as Unix nanoseconds (OTLP timestamps).
 ///
-/// Used by the exporter and metric-source modules to stamp OTLP timestamps.
-/// All callers run on the exporter process (not the hot request path), so
-/// `std::time` is appropriate — `ngx_timeofday()` is not needed here.
-///
-/// Single-homed here so that a future change to the clock source (e.g.
-/// switching to `ngx_cached_time` for monotonic-safety) is a one-place edit.
+/// Callers run on the exporter process, not the hot request path, so `std::time`
+/// is used rather than `ngx_timeofday()`.
 #[inline]
 pub(crate) fn now_unix_nano() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64
 }
 
-/// Return the current wall-clock time as Unix seconds.
-///
-/// Used by the crash-loop backoff window check (whole-second granularity is
-/// sufficient for a 60 s window comparison; no OTLP timestamp involved).
+/// Return the current wall-clock time as Unix seconds (crash-loop backoff window).
 #[inline]
 pub(crate) fn now_unix_secs() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
