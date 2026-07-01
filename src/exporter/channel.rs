@@ -6,17 +6,10 @@
 //! Rust-side channel event handler for the `nginx: otel exporter` process.
 //!
 //! Ports the QUIT / TERMINATE / REOPEN arms of the static C
-//! `ngx_channel_handler` (`nginx/src/os/unix/ngx_process_cycle.c:1000-1085`)
-//! to Rust. The OPEN_CHANNEL / CLOSE_CHANNEL sibling-tracking arms are
-//! intentionally omitted — the exporter does not peer with workers via
-//! channels; it communicates only with master.
-//!
-//! The handler is registered via `nginx_sys::ngx_add_channel_event` in
-//! `otel_exporter_cycle` (`src/exporter/mod.rs`).
-//!
-//! Bindings for `ngx_channel_t`, `ngx_read_channel`, and
-//! `ngx_add_channel_event` come from `nginx_sys::*` via the
-//! `ngx-rust/nginx-sys/build/wrapper.h` `#include <ngx_channel.h>`.
+//! `ngx_channel_handler` (`nginx/src/os/unix/ngx_process_cycle.c:1000-1085`);
+//! OPEN_CHANNEL / CLOSE_CHANNEL are omitted as the exporter only talks to
+//! master, never peers with workers via channels. Registered via
+//! `nginx_sys::ngx_add_channel_event` in `otel_exporter_cycle`.
 
 use core::mem;
 
@@ -28,22 +21,13 @@ use nginx_sys::{
 
 /// Channel event handler registered on the exporter's `ngx_channel` fd.
 ///
-/// Called by nginx's event loop when the master writes a command byte to the
-/// exporter's channel end. Drains the channel in a loop until `NGX_AGAIN`
-/// (no more data) or `NGX_ERROR` (channel closed / read error).
+/// Drains the channel in a loop until `NGX_AGAIN` (no more data) or
+/// `NGX_ERROR` (channel closed / read error, e.g. `kill -9` master).
 ///
-/// On `NGX_ERROR` (master channel EOF or read error — e.g. `kill -9` master):
-/// closes the connection via `ngx_close_connection` (deregisters the
-/// level-triggered fd from epoll/kqueue AND closes the socket; mirrors
-/// `ngx_channel_handler` at `nginx/src/os/unix/ngx_process_cycle.c:1022-1029`)
-/// and sets `ngx_terminate = 1` so the cycle loop exits immediately.
-///
-/// Closing `c` here is required: returning without closing it would leave the
-/// EOF-firing fd still registered on the level-triggered event queue → every
-/// subsequent `ngx_process_events_and_timers` call woke immediately and
-/// re-fired the handler → exporter at 100% CPU until manual SIGKILL.  With
-/// `kill -9` the master never sends SIGTERM/SIGQUIT, so the "cycle loop will
-/// exit on the next signal" assumption was wrong for that path.
+/// On `NGX_ERROR`, closing `c` is required: leaving the EOF-firing fd
+/// registered on the level-triggered event queue would spin the exporter at
+/// 100% CPU (re-fires every loop tick), and `kill -9` never sends a signal to
+/// fall back on.
 ///
 /// # Safety
 ///
@@ -69,20 +53,10 @@ pub unsafe extern "C" fn otel_exporter_channel_handler(ev: *mut ngx_event_t) {
             return;
         }
         if n == NGX_ERROR as ngx_int_t {
-            // Channel EOF or read error: master has closed its end (e.g.
-            // master killed with SIGKILL) or the channel fd is broken.
-            //
-            // Mirror ngx_channel_handler
-            // (ngx_process_cycle.c:1022-1029):
-            //   1. ngx_close_connection(c) — deregisters `c` from
-            //      epoll/kqueue (calling ngx_del_conn internally with
-            //      NGX_CLOSE_EVENT) and closes the underlying socket fd.
-            //      This stops the level-triggered EOF from re-firing every
-            //      event loop tick (the 100% CPU symptom).
-            //   2. ngx_terminate = 1 — the cycle loop sees this and calls
-            //      std::process::exit(0) on the next check.  Without this,
-            //      the exporter would idle indefinitely as an orphan (master
-            //      is dead and will never send SIGTERM/SIGQUIT).
+            // Channel EOF/error (master gone): mirror ngx_channel_handler
+            // (ngx_process_cycle.c:1022-1029) — deregister + close the fd so
+            // the level-triggered EOF stops re-firing, then request exit
+            // since master will never send SIGTERM/SIGQUIT for us.
             //
             // SAFETY: `c` is the valid channel connection obtained from
             // `ev.data` at the top of this handler; it has not been freed
@@ -97,9 +71,7 @@ pub unsafe extern "C" fn otel_exporter_channel_handler(ev: *mut ngx_event_t) {
             return;
         }
 
-        // Dispatch on the command byte. We handle only the QUIT / TERMINATE /
-        // REOPEN arms. The OPEN_CHANNEL / CLOSE_CHANNEL sibling-tracking arms
-        // are skipped — the exporter doesn't peer with workers via channels.
+        // Dispatch on the command byte; only QUIT / TERMINATE / REOPEN are handled.
         match ch.command as u32 {
             // SAFETY: set nginx's global graceful-quit flag. The exporter runs
             // single-threaded on the nginx event loop, so writing this static is
@@ -110,18 +82,10 @@ pub unsafe extern "C" fn otel_exporter_channel_handler(ev: *mut ngx_event_t) {
             // SAFETY: as above — nginx's global log-reopen flag.
             NGX_CMD_REOPEN => unsafe { ngx_reopen = 1 },
             _ => {
-                // OPEN_CHANNEL / CLOSE_CHANNEL / any future command — not acted
-                // on (the exporter does not peer with workers via channels).
-                //
-                // NGX_CMD_OPEN_CHANNEL carries a received file descriptor in
-                // `ch.fd` (master sends a sibling's channel[0] via SCM_RIGHTS;
-                // `ngx_read_channel` recvmsg's it into our table —
-                // `nginx/src/os/unix/ngx_channel.c`).  nginx's own
-                // `ngx_channel_handler` stores that fd into the sibling slot or
-                // closes it on CLOSE_CHANNEL; if we silently drop the command
-                // the recvmsg'd fd would leak, accumulating toward
-                // RLIMIT_NOFILE if the master ever sent these to the exporter.
-                // Close it here to match nginx's fd-lifecycle discipline.
+                // OPEN_CHANNEL / CLOSE_CHANNEL / future commands: not acted on.
+                // NGX_CMD_OPEN_CHANNEL can carry a received fd in `ch.fd` (via
+                // SCM_RIGHTS); close it here rather than silently leaking it
+                // toward RLIMIT_NOFILE.
                 if ch.fd >= 0 {
                     // SAFETY: `ch.fd` is an fd just received by `ngx_read_channel`
                     // (>= 0 checked); closing it is sound and the exporter never

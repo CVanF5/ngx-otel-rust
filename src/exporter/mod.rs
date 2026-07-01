@@ -29,29 +29,18 @@ use ngx::http::HttpModuleMainConf;
 use crate::HttpOtelModule;
 
 /// Process-local flag set by `otel_exporter_cycle` immediately after fork.
-///
-/// Reading this flag is a single `Relaxed` atomic load — zero cost in
-/// non-exporter processes (the load is only on the cold path inside
-/// `ngx_process()`). The flag is set once and never cleared.
+/// Reading it is a single `Relaxed` atomic load — zero cost outside the
+/// exporter process. Set once, never cleared.
 pub(crate) static IS_OTEL_EXPORTER: AtomicBool = AtomicBool::new(false);
 
 /// Default upper bound on the graceful-drain wait after `ngx_quit` before the
 /// exporter force-exits. The export loop normally signals `EXPORT_LOOP_DONE`
-/// within ~`SHUTDOWN_POLL_INTERVAL` (250 ms) of `ngx_quit`; this backstop only
-/// caps the pathological case (a wedged send).
-///
-/// When `worker_shutdown_timeout` is set in the nginx config its value is used
-/// instead if it is smaller (see `effective_drain_backstop`).
+/// within ~`SHUTDOWN_POLL_INTERVAL` (250 ms); this only caps a wedged send.
+/// Overridden by `worker_shutdown_timeout` if smaller — see `effective_drain_backstop`.
 const GRACEFUL_DRAIN_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// Compute the effective drain backstop duration, honouring `worker_shutdown_timeout`.
-///
-/// If `shutdown_timeout_ms` is 0 (nginx default, meaning "no timeout") the
-/// operator has not set `worker_shutdown_timeout`, so the module's own default
-/// cap (`GRACEFUL_DRAIN_BACKSTOP`) is used unchanged.  If the operator did set a
-/// timeout, the exporter respects it: `min(GRACEFUL_DRAIN_BACKSTOP, timeout)`.
-///
-/// This is a pure function and unit-testable without any nginx FFI context.
+/// Effective drain backstop, honouring `worker_shutdown_timeout` when set
+/// (0 = unset, use the default unchanged): `min(GRACEFUL_DRAIN_BACKSTOP, timeout)`.
 pub(crate) fn effective_drain_backstop(
     default_backstop: std::time::Duration,
     shutdown_timeout_ms: u64,
@@ -65,42 +54,25 @@ pub(crate) fn effective_drain_backstop(
 
 // ── Crash-loop backoff constants ─────────────────────────────────────────────
 
-/// Rolling window for the crash counter (seconds). Crashes older than this are
-/// forgotten; a healthy-enough gap resets the counter automatically.
-///
-/// `pub(crate)` so that `export/mod.rs` can reference it for the healthy-reset
-/// comparison (keep the constant single-homed here).
+/// Rolling window for the crash counter (seconds); `pub(crate)` so
+/// `control_shm` tests can cross-check the authoritative constant.
 pub(crate) const CRASH_WINDOW_SECS: u64 = 60;
 
-/// Maximum exporter restarts within `CRASH_WINDOW_SECS` before the exporter
-/// self-disables via `exit(2)` (enters degraded mode). Workers continue serving;
-/// telemetry is silently dropped into the bounded shm rings.
-///
-/// `pub(crate)` so that cross-module unit tests (control_shm) can reference
-/// the authoritative constant rather than duplicating the literal.
+/// Maximum exporter restarts within `CRASH_WINDOW_SECS` before it self-disables
+/// via `exit(2)` (degraded mode: workers keep serving, telemetry drops into
+/// the bounded shm rings). `pub(crate)` for `control_shm` test cross-check.
 pub(crate) const MAX_CRASH_RESTARTS: u64 = 5;
 
-/// Base backoff sleep before continuing init after a crash restart.
-/// Doubles with each restart: `BASE * 2^(count-1)`, capped at `BACKOFF_CAP_MS`.
-///
-/// `pub(crate)` for cross-module unit-test cross-check (control_shm).
+/// Base backoff sleep before continuing init after a crash restart; doubles
+/// each restart (`BASE * 2^(count-1)`, capped at `CRASH_BACKOFF_CAP_MS`).
 pub(crate) const CRASH_BACKOFF_BASE_MS: u64 = 100;
 
-/// Maximum backoff sleep before continuing init. Prevents a crash loop from
-/// sleeping indefinitely while still throttling the re-crash rate appreciably.
-///
-/// `pub(crate)` for cross-module unit-test cross-check (control_shm).
+/// Maximum backoff sleep before continuing init.
 pub(crate) const CRASH_BACKOFF_CAP_MS: u64 = 5_000;
 
-/// Compute the bounded exponential backoff duration (milliseconds) for the given
-/// restart count.
-///
-/// `count` is the crash_count **after** incrementing (1 = first start, no
-/// backoff; 2 = first restart, 100 ms; 3 = second restart, 200 ms; …).
-///
-/// Formula: `min(BASE * 2^(count-1), CAP)`.  Overflow-safe via `saturating_mul`.
-///
-/// `pub(crate)` for unit-test access.
+/// Bounded exponential backoff (ms) for `count` = crash_count **after**
+/// incrementing (1 = first start → 0; 2 = first restart → 100ms; …).
+/// `min(BASE * 2^(count-1), CAP)`, overflow-safe via `saturating_mul`.
 pub(crate) fn crash_backoff_ms(count: u64) -> u64 {
     if count <= 1 {
         return 0;
@@ -109,12 +81,9 @@ pub(crate) fn crash_backoff_ms(count: u64) -> u64 {
     CRASH_BACKOFF_BASE_MS.saturating_mul(1u64 << shift).min(CRASH_BACKOFF_CAP_MS)
 }
 
-/// Process identity as seen from inside the `ngx-otel-rust` crate.
-///
-/// Mirrors [`nginx-acme/src/util.rs`](../../../nginx-acme/src/util.rs)
-/// `NgxProcess` but adds the `Exporter` variant that distinguishes the
-/// dedicated `nginx: otel exporter` child from a generic helper. The
-/// distinction is tracked via the process-local `IS_OTEL_EXPORTER` flag.
+/// Process identity as seen from inside the `ngx-otel-rust` crate. Mirrors
+/// `nginx-acme/src/util.rs`'s `NgxProcess` plus an `Exporter` variant,
+/// distinguished from a generic helper via `IS_OTEL_EXPORTER`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NgxProcess {
     Single,
@@ -126,12 +95,8 @@ pub(crate) enum NgxProcess {
     Exporter,
 }
 
-/// Returns the current process identity.
-///
-/// Reads the nginx global `ngx_process` and, for the `NGX_PROCESS_HELPER`
-/// case, the process-local `IS_OTEL_EXPORTER` flag. This is a cold-path
-/// helper — it is only called from gating predicates, never from the
-/// request hot path.
+/// Returns the current process identity. Cold-path only (gating predicates),
+/// never called from the request hot path.
 pub(crate) fn ngx_process() -> NgxProcess {
     // SAFETY: `ngx_process` is an nginx `static mut` set during process init and
     // only read thereafter; this cold-path read runs on the single-threaded
@@ -164,9 +129,9 @@ pub(crate) fn ngx_process() -> NgxProcess {
 /// `ngx_spawn_proc_pt` function pointer registered in `ngx_otel_init_module`.
 ///
 /// Sequence mirrors `ngx_cache_manager_process_cycle`
-/// (`nginx/src/os/unix/ngx_process_cycle.c:1088-1136`) with the addition of
-/// signal-handler installation (needed at initial start because `init_module`
-/// fires before `ngx_init_signals` in master).
+/// (`nginx/src/os/unix/ngx_process_cycle.c:1088-1136`) plus signal-handler
+/// installation (needed at initial start: `init_module` fires before
+/// `ngx_init_signals` in master).
 ///
 /// # Sequencing constraints (order is load-bearing)
 /// 1. `ngx_init_signals` BEFORE `sigprocmask` clears the mask.
@@ -190,46 +155,35 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
     // routines on the single-threaded event loop before any other task runs, so
     // the static-mut writes are race-free. Per-step rationale is inline below.
     unsafe {
-        // 0. Update ngx_cycle to point to the new cycle. At the time of fork,
-        //    the master's ngx_cycle still points to the previous init cycle
-        //    (nginx.c:335 sets it AFTER ngx_init_cycle returns, but our hook
-        //    fires during ngx_init_cycle:649). Updating it here ensures that
-        //    ngx_get_connection (and friends) read the correct connection_n.
+        // 0. Update ngx_cycle to the new cycle: at fork time master's ngx_cycle
+        //    still points at the previous init cycle (nginx.c:335 sets it AFTER
+        //    ngx_init_cycle returns, but our hook fires during ngx_init_cycle:649).
         nginx_sys::ngx_cycle = cycle;
 
-        // 1. Identify as exporter: set the nginx process-type global and our
-        //    own process-local flag. This lets ngx_process() return Exporter
-        //    rather than Helper for this process.
+        // 1. Identify as exporter so ngx_process() returns Exporter, not Helper.
         nginx_sys::ngx_process = nginx_sys::NGX_PROCESS_HELPER as nginx_sys::ngx_uint_t;
         IS_OTEL_EXPORTER.store(true, Ordering::Relaxed);
 
-        // 1.5. Crash-loop backoff: detect rapid restarts and throttle / self-disable.
-        //
-        //      Runs before any risky init (module init_process fan-out at step 5a,
-        //      transport setup in the async task). The shm zone was mapped by nginx
-        //      before fork, so the control-shm pointer is valid here.
+        // 1.5. Crash-loop backoff: detect rapid restarts and throttle / self-disable
+        //      before any risky init. The control-shm zone was mapped by nginx
+        //      before fork, so the pointer is valid here.
         //
         //      Algorithm (matches the unit-tested `simulate_startup` in control_shm):
-        //        a) If now − window_start > WINDOW (or window is 0): reset counter+window.
+        //        a) Outside the crash window (or uninitialized): reset counter+window.
         //        b) Increment crash_count.
-        //        c) If crash_count > MAX_CRASH_RESTARTS: log ALERT + exit(2) (degraded).
-        //        d) If crash_count > 1: sleep bounded-exponential backoff before continuing.
-        //
-        //      On exit(2) the master marks the slot non-respawnable (same mechanism used
-        //      for setup failures in steps 5a/7 above). Workers continue unaffected:
-        //      their bump-and-defer into bounded shm rings succeeds regardless; records
-        //      are silently dropped from the shm head once the ring fills.
+        //        c) count > MAX_CRASH_RESTARTS: log ALERT + exit(2) (degrade; workers
+        //           keep serving, telemetry silently drops once shm rings fill).
+        //        d) count > 1: sleep bounded-exponential backoff before continuing.
         //
         //      RELOAD SAFETY: `control_shm_zone_init` zeroes crash_count and
-        //      window_start_unix when old_data != null (SIGHUP reload path), so a
-        //      legitimate operator reload always starts from a clean slate.
+        //      window_start_unix on SIGHUP reload, so an operator reload always
+        //      starts from a clean slate.
         //
         // SAFETY: `cycle` is the valid non-null cycle passed by nginx; all field reads
         // below are through shared references to Atomic types, which are safe.
         //
-        // test_crash_count: captured in step 1.5, consumed by the test-support crash
-        // hook at step 10.  None when the control-shm pointer is unavailable (hook
-        // is skipped).  Declared here so it survives to step 10.
+        // test_crash_count: captured here, consumed by the test-support crash hook
+        // at step 10 (None if the control-shm pointer is unavailable).
         #[cfg(feature = "test-support")]
         let mut test_crash_count: Option<u64> = None;
         if let Some(amcf) = crate::HttpOtelModule::main_conf(&*cycle) {
@@ -238,16 +192,13 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
                 let now = crate::util::now_unix_secs();
                 let window = ctrl.window_start_unix.load(Ordering::Acquire);
 
-                // (a) Reset counter if outside the crash window or uninitialized.
                 if window == 0 || now.saturating_sub(window) > CRASH_WINDOW_SECS {
                     ctrl.crash_count.store(0, Ordering::Relaxed);
                     ctrl.window_start_unix.store(now, Ordering::Release);
                 }
 
-                // (b) Increment crash_count atomically.
                 let count = ctrl.crash_count.fetch_add(1, Ordering::AcqRel) + 1;
 
-                // (c) Give-up: too many crashes in this window → degrade + exit.
                 if count > MAX_CRASH_RESTARTS {
                     alert!(
                         (*cycle).log,
@@ -261,7 +212,6 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
                     std::process::exit(2);
                 }
 
-                // (d) Backoff: throttle the re-crash rate before risky init.
                 if count > 1 {
                     let backoff_ms = crash_backoff_ms(count);
                     warn!(
@@ -272,12 +222,11 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
                     );
                     std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
 
-                    // Publish the restart count so the self-metric is visible on
-                    // the first export tick (count - 1 = prior crashes in window).
+                    // Publish so the self-metric is visible on the first export tick
+                    // (count - 1 = prior crashes in window).
                     crate::drain::EXPORTER_RESTARTS.store(count - 1, Ordering::Relaxed);
                 }
 
-                // Capture crash count for the test-support hook at step 10.
                 #[cfg(feature = "test-support")]
                 {
                     test_crash_count = Some(count);
@@ -285,24 +234,18 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
             }
         }
 
-        // 2. Install signal handlers. This call is idempotent on the SIGHUP
-        //    path (signals are already installed in master). It is REQUIRED at
-        //    initial start: init_module fires before ngx_init_signals in master
-        //    (nginx.c:293 vs :345), so the forked child inherits SIG_DFL.
+        // 2. Install signal handlers. Idempotent on the SIGHUP path (already
+        //    installed in master); REQUIRED at initial start because
+        //    init_module fires before ngx_init_signals in master (nginx.c:293
+        //    vs :345), so the forked child inherits SIG_DFL.
         let _ = nginx_sys::ngx_init_signals((*cycle).log);
 
-        // 2a. Drop privileges and chdir, matching ngx_worker_process_init, which
-        //     does setgid/setuid (:799-851) and chdir (:872-879) BEFORE
-        //     sigprocmask, the module init_process fan-out, and
-        //     ngx_add_channel_event. Dropping here — rather than last — ensures
-        //     the init_process fan-out (step 5a), channel registration (step 7),
-        //     and the export-task spawn run UNPRIVILEGED, exactly as nginx
-        //     workers do (least privilege; a privileged-init third-party module
-        //     would otherwise run its init_process as root). Nothing between here
-        //     and the end of init needs root: closing fds, epoll_create via the
-        //     event module's init_process, and ngx_add_channel_event are all
-        //     unprivileged. Reads only cycle->conf_ctx (set at startup) and
-        //     cycle->log. No-op when not started as root (geteuid() != 0).
+        // 2a. Drop privileges and chdir, matching ngx_worker_process_init
+        //     (setgid/setuid :799-851, chdir :872-879) BEFORE sigprocmask, the
+        //     module init_process fan-out, and ngx_add_channel_event — so
+        //     steps 5a/6/7 and the export-task spawn all run UNPRIVILEGED,
+        //     same least-privilege ordering as nginx workers. No-op when not
+        //     started as root (geteuid() != 0).
         drop_privileges_and_chdir(cycle);
 
         // 3. Clear the blocked-signal mask inherited from master.
@@ -317,18 +260,13 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
         // 5. Modest connection pool — same as cache_manager (line :1105).
         (*cycle).connection_n = 512;
 
-        // 5a. Initialise the event system: call each module's init_process.
-        //     This must happen before ngx_add_channel_event because the event
-        //     module's init_process allocates cycle->connections/read_events/
-        //     write_events. Mirrors ngx_worker_process_init:891-898.
-        //
-        //     Our own module's init_process (ngx_otel_init_process) is safe:
-        //     it returns early because ngx_process = NGX_PROCESS_HELPER (not
-        //     WORKER or SINGLE), so it never spawns the export task here.
-        //     Fanning out to ALL modules (not a curated subset) is intentional:
-        //     it mirrors nginx's own ngx_worker_process_init, which calls every
-        //     module's init_process and relies on each one self-gating on
-        //     ngx_process — the same contract this process depends on.
+        // 5a. Call each module's init_process before ngx_add_channel_event —
+        //     the event module's init_process allocates
+        //     cycle->connections/read_events/write_events (mirrors
+        //     ngx_worker_process_init:891-898). Our own init_process returns
+        //     early on NGX_PROCESS_HELPER (never spawns the export task here);
+        //     fanning out to all modules mirrors nginx's own worker init,
+        //     which relies on each module self-gating on ngx_process.
         let mut i = 0usize;
         let modules: *mut *mut nginx_sys::ngx_module_t = (*cycle).modules;
         while !(*modules.add(i)).is_null() {
@@ -384,24 +322,17 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
         nginx_sys::ngx_setproctitle(c"otel exporter".as_ptr().cast_mut());
 
         // ── Test-support crash hook (after setproctitle) ──────────────────────
-        // Fires here — AFTER step 10 — so the process is visible as
-        // "nginx: otel exporter" in `ps` when the abort() happens. The crash
-        // counter was already incremented and the backoff sleep already applied
-        // at step 1.5; by the time we reach here the master has entered its
-        // event loop and the SIGCHLD handler is installed (timing safe).
-        //
-        // A 300ms sleep before the first crash ensures the master has left
-        // ngx_init_cycle and entered ngx_master_process_cycle + sigsuspend,
-        // making SIGCHLD delivery deterministic even on slow CI hosts.
-        //
-        // Enabled only with `--features test-support`; zero code in production.
+        // Fires AFTER step 10 so "nginx: otel exporter" is already visible in
+        // `ps` when abort() happens; by now the master has entered its event
+        // loop with SIGCHLD installed (timing safe). Enabled only with
+        // `--features test-support`; zero code in production.
         // search: NGX_OTEL_CRASH_ON_STARTUP
         #[cfg(feature = "test-support")]
         if let Some(tcc) = test_crash_count {
             if std::env::var_os("NGX_OTEL_CRASH_ON_STARTUP").is_some() {
-                // Sleep so the process is visible as "nginx: otel exporter" in
-                // ps for at least one 500ms poll cycle.  For crash #1, also gives
-                // the master time to enter ngx_master_process_cycle + sigsuspend.
+                // For crash #1, the longer sleep also gives the master time to
+                // enter ngx_master_process_cycle + sigsuspend (deterministic
+                // SIGCHLD delivery even on slow CI hosts).
                 let sleep_ms: u64 = if tcc == 1 { 500 } else { 300 };
                 std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
                 warn!(
@@ -417,22 +348,19 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
             }
         }
 
-        // 11. Spawn the async export task. The task lives for the process
-        //     lifetime; allocating it on the exporter's pool keeps it pinned
-        //     until the cycle tears down. The task reads the shm rings written
-        //     by workers via fork-shared pages. The exporter owns the export loop.
+        // 11. Spawn the async export task, pinned on the exporter's pool for
+        //     the process lifetime. Reads the shm rings workers write via
+        //     fork-shared pages.
         let amcf =
             HttpOtelModule::main_conf(&*cycle).expect("exporter cycle: missing otel main conf");
         let task = ngx::async_::spawn(crate::drain::export_loop(amcf));
         let pool = Pool::from_ngx_pool((*cycle).pool);
-        // `Pool::allocate` returns null when the underlying pool alloc OR the
-        // cleanup-handler registration fails; on null it has already dropped
-        // the value (here: the `Task` handle).  Dropping the Task cancels the
-        // export future, but the heartbeat timer set up below keeps stamping
-        // `last_beat_msec`, so workers would see a "live" exporter that exports
-        // nothing — telemetry silently off with no diagnostic.  Refuse to run
-        // in that state: log EMERG and abort so the master's crash-respawn
-        // (NGX_PROCESS_RESPAWN) restarts the exporter cleanly.
+        // `Pool::allocate` returns null (and has already dropped the Task) on
+        // alloc/cleanup-registration failure. Dropping the Task cancels the
+        // export future, but the heartbeat timer below keeps stamping
+        // `last_beat_msec` — workers would see a "live" exporter exporting
+        // nothing. Refuse that silent-failure state: abort so the master's
+        // crash-respawn restarts the exporter cleanly.
         if pool.allocate(task).is_null() {
             emerg!(
                 (*cycle).log,
@@ -446,28 +374,20 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
             libc::abort();
         }
 
-        // 11.5. Dedicated liveness heartbeat timer.
+        // 11.5. Dedicated liveness heartbeat timer: a self-rearming
+        //     `ngx_event_t` stamps `ngx_current_msec` into
+        //     `ControlShm::last_beat_msec` every `HEARTBEAT_PERIOD_MS`. Workers
+        //     read it on their ring-full drop path to distinguish a
+        //     saturated-but-alive exporter from a silent one.
         //
-        //     A self-rearming `ngx_event_t` timer stamps the exporter's
-        //     `ngx_current_msec` into `ControlShm::last_beat_msec` every
-        //     `HEARTBEAT_PERIOD_MS`.  Workers read it on their ring-full drop
-        //     path to distinguish a saturated-but-alive exporter (beats
-        //     normally → no alert) from a silent one (beats stop → one latched
-        //     ALERT per worker per generation).
-        //
-        //     INDEPENDENCE FROM DRAIN/SEND PROGRESS (hard requirement): the
-        //     timer fires from `ngx_event_expire_timers` inside the
-        //     `ngx_process_events_and_timers(cycle)` call in the main loop
-        //     below (step 12).  The export task's sends are async futures
-        //     driven by this same event loop over NON-BLOCKING IO
-        //     (transport/grpc/transport.rs: NgxExecutor + ngx::async_::spawn —
-        //     no block_on; ngx-rust async_/spawn.rs: wakes are deferred via
-        //     ngx_post_event, never re-polled synchronously).  A
-        //     blackholed-collector send stall merely parks the send future; the
-        //     event loop keeps expiring timers, so beats continue.
-        //
-        //     The event is allocated from the cycle pool (stable address for
-        //     the process lifetime); the timer dies with the process.
+        //     INDEPENDENCE FROM DRAIN/SEND PROGRESS (hard requirement): this
+        //     timer fires from the same `ngx_process_events_and_timers` call
+        //     (step 12) that drives the export task's async sends over
+        //     non-blocking IO (NgxExecutor, no block_on; wakes deferred via
+        //     ngx_post_event, never re-polled synchronously) — a
+        //     blackholed-collector send only parks its future, so beats
+        //     continue regardless. Allocated from the cycle pool (stable
+        //     address, process lifetime); the timer dies with the process.
         if let Some(ctrl_ptr) = amcf.control_shm_ptr_mut() {
             let hb_ev =
                 nginx_sys::ngx_pcalloc((*cycle).pool, mem::size_of::<nginx_sys::ngx_event_t>())
@@ -501,9 +421,7 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
         }
 
         // Copy the Copy-typed mutable statics into locals first: formatting
-        // them directly would create shared refs to a `static mut`
-        // (static_mut_refs). We're already in an unsafe fn, so the reads need
-        // no extra unsafe block.
+        // them directly would create shared refs to a `static mut` (static_mut_refs).
         let pid = nginx_sys::ngx_pid;
         let parent = nginx_sys::ngx_parent;
         notice!(
@@ -524,41 +442,26 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
                 std::process::exit(0);
             }
             if nginx_sys::ngx_quit != 0 {
-                // Keep driving the event loop until the export task completes
-                // its graceful drain and sets EXPORT_LOOP_DONE, or until a
-                // hard deadline is reached.
+                // Drive the event loop until the export task's graceful drain
+                // sets EXPORT_LOOP_DONE or the backstop deadline is reached.
+                // The exporter is not subject to ngx_event_no_timers_left, so
+                // cancelable sleep timers fire normally and the export loop
+                // detects ngx_quit within SHUTDOWN_POLL_INTERVAL (250 ms).
                 //
-                // The exporter is not a worker and is not subject to
-                // ngx_event_no_timers_left. Cancelable sleep timers fire
-                // normally, so the export loop detects ngx_quit within at most
-                // SHUTDOWN_POLL_INTERVAL (250 ms) and runs graceful_drain.
+                // Ring-drain ownership on reload uses successor_gen abdication
+                // (not a time-based dedup, which races on log/span ring
+                // `pop_into`): the master bumps successor_gen before forking
+                // the new exporter; the old one checks it here and skips ring
+                // pops when a successor is present. See graceful_drain in
+                // export/mod.rs for the abdication logic.
                 //
-                // Dedup-via-time_unix_nano was valid only for cumulative metrics
-                // and FALSE for log/span rings (concurrent pop_into races on
-                // read_offset with no CAS → garbage record lengths). Instead we
-                // use successor_gen abdication: the master writes
-                // successor_gen = N+1 before forking the new exporter; the old
-                // exporter checks it here and skips ring pops when a successor is
-                // present.  See graceful_drain in export/mod.rs for the
-                // abdication logic.
-                // Drive the event loop until the export loop signals it finished
-                // draining, or the backstop elapses. `ngx_process_events_and_timers`
-                // BLOCKS on epoll/kqueue (the same call as the main loop below) —
-                // this is not a busy-spin; the deadline just prevents a wedged send
-                // from stalling shutdown forever.
-                //
-                // Backstop timer (layer 2): register an nginx timer that
-                // fires at GRACEFUL_DRAIN_BACKSTOP ms, ensuring
-                // ngx_process_events_and_timers ALWAYS returns by the deadline.
-                // Pre-fix: if export_loop aborted early (bad endpoint / transport
-                // construction failure) there were no active fds or timers, so
-                // epoll/kqueue blocked forever inside ngx_process_events_and_timers
-                // and the deadline check in the while condition was never reached →
-                // nginx -s quit hung until manual SIGTERM.
-                //
-                // The timer's noop handler simply returns; after it fires,
-                // ngx_process_events_and_timers returns to this loop, and the
-                // `now() < drain_deadline` condition becomes false → exit.
+                // `ngx_process_events_and_timers` BLOCKS on epoll/kqueue, so
+                // the backstop timer (fires at GRACEFUL_DRAIN_BACKSTOP ms) is
+                // required to guarantee the call always returns by the
+                // deadline — without it, an early export_loop abort (bad
+                // endpoint) leaves no active fds/timers and the block would
+                // never return, hanging `nginx -s quit`. The noop handler just
+                // returns, letting the `now() < drain_deadline` check re-run.
                 //
                 // SAFETY (mem::zeroed): `ngx_event_t` is a C POD struct; an
                 // all-zero bit-pattern is a valid initial state for an unarmed
@@ -570,11 +473,8 @@ pub(crate) unsafe extern "C" fn otel_exporter_cycle(
                 // SAFETY ((*cycle).log): cycle is the valid non-null cycle
                 // pointer established by the outer SAFETY contract.
                 backstop_ev.log = (*cycle).log;
-                // The backstop_ev is NOT moved while armed — this block stays on
-                // the call stack until the del_timer below completes.
-                // Read worker_shutdown_timeout from the nginx core config so the
-                // exporter honours the operator's shutdown budget.
-                // Pattern mirrors drop_privileges_and_chdir (~line 725 in this file).
+                // backstop_ev is NOT moved while armed — stays on the call
+                // stack until del_timer below completes.
                 // SAFETY: cycle is the valid non-null cycle pointer established by
                 // the outer SAFETY contract; conf_ctx indexing uses the same pattern
                 // as lib.rs:232-234 and drop_privileges_and_chdir.
@@ -723,32 +623,24 @@ unsafe fn close_sibling_channels(cycle: *mut nginx_sys::ngx_cycle_t) {
 /// Drop privileges to the configured nginx user and chdir to the working
 /// directory.
 ///
-/// Drops privileges in the order `setgid` → `initgroups` → `setuid`, then
-/// `chdir`. Mirrors `ngx_worker_process_init:799-879`.
+/// Order: `setgid` → `initgroups` → `setuid` → `chdir`, mirroring
+/// `ngx_worker_process_init:799-879`. Skipped when `geteuid() != 0` (same
+/// guard as the C source at :799) — on macOS dev machines this branch always
+/// skips since the exporter isn't running as root.
 ///
-/// Skipped when `geteuid() != 0` (not running as root), mirroring the same
-/// guard in the C source (`ngx_worker_process_init:799`). On macOS developer
-/// machines this branch is always taken (user is not root); the exporter then
-/// runs as the developer's current user, which is not root — the privilege
-/// drop invariant is satisfied.
-///
-/// The `NGX_HAVE_CAPABILITIES` + `transparent` branch is intentionally
-/// omitted: the exporter does not proxy with transparent addresses.
-/// `TODO:` if future requirements change, add it here.
-///
-/// `prctl(PR_SET_DUMPABLE)` is also omitted (nice-to-have for coredumps;
-/// not required for correctness — can be added later).
+/// Omits the `NGX_HAVE_CAPABILITIES` + `transparent` branch (no transparent
+/// proxying here) and `prctl(PR_SET_DUMPABLE)` (coredump nice-to-have, not
+/// correctness-required); add either if requirements change.
 ///
 /// # Safety
 ///
 /// Accesses `ngx_core_module` and dereferences `cycle->conf_ctx`. Called
 /// exclusively from `otel_exporter_cycle` in the forked child.
 unsafe fn drop_privileges_and_chdir(cycle: *mut nginx_sys::ngx_cycle_t) {
-    // Resolve ngx_core_conf_t via ngx_get_conf(cycle->conf_ctx, ngx_core_module).
-    // Same pattern as config.rs::register_shm_zone:292-305.
-    //
-    // conf_ctx is *mut *mut *mut *mut c_void; indexing by core_module.index
-    // gives the *mut *mut *mut c_void that points to ngx_core_conf_t.
+    // Resolve ngx_core_conf_t via ngx_get_conf(cycle->conf_ctx, ngx_core_module)
+    // (same pattern as config.rs::register_shm_zone:292-305). conf_ctx is
+    // *mut *mut *mut *mut c_void; indexing by core_module.index gives the
+    // *mut *mut *mut c_void that points to ngx_core_conf_t.
     let core_idx = nginx_sys::ngx_core_module.index;
     // Safety: conf_ctx is a valid array of pointers set by nginx at startup.
     let raw_conf: *mut *mut *mut c_void = *(*cycle).conf_ctx.add(core_idx);
@@ -784,17 +676,10 @@ unsafe fn drop_privileges_and_chdir(cycle: *mut nginx_sys::ngx_cycle_t) {
         alert!((*cycle).log, "otel exporter: initgroups() failed (non-fatal)");
     }
 
-    // TODO: skip NGX_HAVE_CAPABILITIES + transparent branch.
-    // The exporter does not proxy with transparent addresses today.
-
     if libc::setuid((*ccf).user as libc::uid_t) == -1 {
         emerg!((*cycle).log, "otel exporter: setuid({}) failed", (*ccf).user);
         std::process::exit(2);
     }
-
-    // TODO: skip prctl(PR_SET_DUMPABLE) reset. Nice-to-have for
-    // coredumps after setuid; not required for correctness. Add here if
-    // production diagnostics demand it.
 
     if (*ccf).working_directory.len > 0 && libc::chdir((*ccf).working_directory.data.cast()) == -1 {
         alert!((*cycle).log, "otel exporter: chdir() failed");
@@ -823,18 +708,14 @@ mod tests {
     fn ngx_process_returns_helper_when_not_exporter() {
         let _guard = global_state_lock().lock().unwrap();
         IS_OTEL_EXPORTER.store(false, Ordering::SeqCst);
-        // SAFETY: the test holds `global_state_lock`, serialising all nginx
-        // process-global mutation; these writes set/reset `ngx_process` (and
-        // `ngx_worker`) in a single-threaded test and are reset before asserting.
+        // SAFETY: `global_state_lock` serialises all nginx process-global
+        // mutation across tests; single-threaded test, reset before asserting.
         unsafe {
             nginx_sys::ngx_process = nginx_sys::NGX_PROCESS_HELPER as nginx_sys::ngx_uint_t;
         }
         let result = ngx_process();
-        // Reset globals before the assert so the state is clean even if the
-        // assert panics and unwinds past the mutex guard.
-        // SAFETY: the test holds `global_state_lock`, serialising all nginx
-        // process-global mutation; these writes set/reset `ngx_process` (and
-        // `ngx_worker`) in a single-threaded test and are reset before asserting.
+        // Reset before the assert so state is clean even if it panics.
+        // SAFETY: see above.
         unsafe {
             nginx_sys::ngx_process = nginx_sys::NGX_PROCESS_SINGLE as nginx_sys::ngx_uint_t;
         }
@@ -847,19 +728,15 @@ mod tests {
     fn ngx_process_returns_exporter_when_flag_set() {
         let _guard = global_state_lock().lock().unwrap();
         IS_OTEL_EXPORTER.store(false, Ordering::SeqCst); // reset first
-                                                         // SAFETY: the test holds `global_state_lock`, serialising all nginx
-                                                         // process-global mutation; these writes set/reset `ngx_process` (and
-                                                         // `ngx_worker`) in a single-threaded test and are reset before asserting.
+                                                         // SAFETY: `global_state_lock` serialises all nginx process-global
+                                                         // mutation across tests; single-threaded test, reset before asserting.
         unsafe {
             nginx_sys::ngx_process = nginx_sys::NGX_PROCESS_HELPER as nginx_sys::ngx_uint_t;
         }
         IS_OTEL_EXPORTER.store(true, Ordering::SeqCst);
         let result = ngx_process();
-        // Reset globals and flag before the assert.
         IS_OTEL_EXPORTER.store(false, Ordering::SeqCst);
-        // SAFETY: the test holds `global_state_lock`, serialising all nginx
-        // process-global mutation; these writes set/reset `ngx_process` (and
-        // `ngx_worker`) in a single-threaded test and are reset before asserting.
+        // SAFETY: see above.
         unsafe {
             nginx_sys::ngx_process = nginx_sys::NGX_PROCESS_SINGLE as nginx_sys::ngx_uint_t;
         }
@@ -872,18 +749,14 @@ mod tests {
     fn ngx_process_returns_worker_zero() {
         let _guard = global_state_lock().lock().unwrap();
         IS_OTEL_EXPORTER.store(false, Ordering::SeqCst);
-        // SAFETY: the test holds `global_state_lock`, serialising all nginx
-        // process-global mutation; these writes set/reset `ngx_process` (and
-        // `ngx_worker`) in a single-threaded test and are reset before asserting.
+        // SAFETY: `global_state_lock` serialises all nginx process-global
+        // mutation across tests; single-threaded test, reset before asserting.
         unsafe {
             nginx_sys::ngx_process = nginx_sys::NGX_PROCESS_WORKER as nginx_sys::ngx_uint_t;
             nginx_sys::ngx_worker = 0;
         }
         let result = ngx_process();
-        // Reset globals before the assert.
-        // SAFETY: the test holds `global_state_lock`, serialising all nginx
-        // process-global mutation; these writes set/reset `ngx_process` (and
-        // `ngx_worker`) in a single-threaded test and are reset before asserting.
+        // SAFETY: see above.
         unsafe {
             nginx_sys::ngx_process = nginx_sys::NGX_PROCESS_SINGLE as nginx_sys::ngx_uint_t;
         }
@@ -891,15 +764,12 @@ mod tests {
     }
 
     // ── Direct tests of the REAL `crash_backoff_ms()` function ───────────────
-    //
-    // These tests call the production function, not a simulation.  They guard
-    // against the "duplicate-logic" masking pattern that previously hid a real
-    // histogram bug in this project: the control_shm `simulate_startup` tests
-    // re-implement the backoff formula locally; if the formula in
-    // `crash_backoff_ms` changed silently those tests would not catch it.
+    // Call the production function, not a simulation — guards against the
+    // "duplicate-logic" masking pattern (control_shm's `simulate_startup`
+    // re-implements the formula locally; a silent drift there wouldn't be
+    // caught without this cross-check).
 
     /// count = 0: first start (pre-increment value), no backoff expected.
-    /// count <= 1 returns 0 per the contract comment.
     #[test]
     fn backoff_count_zero_is_no_backoff() {
         assert_eq!(crash_backoff_ms(0), 0, "count=0 must return 0ms");
@@ -936,17 +806,13 @@ mod tests {
         assert_eq!(crash_backoff_ms(5), 1_600, "count=5 must return 1600ms");
     }
 
-    /// count = MAX_CRASH_RESTARTS (5) — the give-up boundary.  The exporter
-    /// calls exit(2) at count > MAX_CRASH_RESTARTS, so count == MAX_CRASH_RESTARTS
-    /// is the last value that still produces a backoff rather than an exit.
-    /// Verified identical to the count=5 case above.
+    /// count = MAX_CRASH_RESTARTS (5) — the give-up boundary; the exporter's
+    /// exit(2) branch fires at count > MAX_CRASH_RESTARTS, so this is the last
+    /// count that still produces a backoff. `crash_backoff_ms` itself has no
+    /// knowledge of that threshold — just returns the capped formula.
     #[test]
     fn backoff_at_max_crash_restarts_boundary() {
-        // MAX_CRASH_RESTARTS = 5; count == 5 is still a backoff (not give-up).
-        // count == 6 would be give-up (exit(2)), but crash_backoff_ms itself has
-        // no knowledge of that threshold — it just returns the capped formula.
         let at_boundary = crash_backoff_ms(MAX_CRASH_RESTARTS);
-        // Formula: 100 * 2^(5-1) = 100 * 16 = 1600ms (below the 5000ms cap).
         assert_eq!(at_boundary, 1_600, "backoff at MAX_CRASH_RESTARTS must be 1600ms");
     }
 

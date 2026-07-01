@@ -3,13 +3,10 @@
 // This source code is licensed under the Apache License, Version 2.0 license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! Control-plane shared-memory zone — scaffold.
-//!
-//! This zone is the plumbing for future dynamic reconfiguration delivered via
-//! a bidi control channel from the collector side. It currently establishes
-//! the zone registration, heartbeat counter, and a hot-path load placeholder;
-//! the control channel is not yet wired into it for real dynamic-reconfig
-//! delivery.
+//! Control-plane shared-memory zone — scaffold for a future collector-side
+//! bidi control channel. Today it carries the crash-loop counter, successor-
+//! generation abdication sentinel, and liveness heartbeat; the `flags` word is
+//! a placeholder for dynamic reconfiguration, not yet wired up.
 //!
 //! Layout (relative to `ngx_shm_zone_t.shm.addr`):
 //!
@@ -17,9 +14,9 @@
 //! [ slab-pool header (data_offset() bytes) | ControlShm (64 bytes) | padding ]
 //! ```
 //!
-//! The slab-pool header is written by `ngx_init_zone_pool` before our
-//! init callback runs. We must not touch the first `data_offset()` bytes
-//! (same constraint as in [`crate::shm`]).
+//! The slab-pool header is written by `ngx_init_zone_pool` before our init
+//! callback runs; the first `data_offset()` bytes must not be touched (same
+//! constraint as [`crate::shm`]).
 
 use core::ptr;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -27,13 +24,11 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use nginx_sys::{ngx_int_t, ngx_shm_zone_t};
 use ngx::core::Status;
 
-/// Control-plane shared-memory zone. Establishes the plumbing for a future
-/// bidi control channel that will deliver dynamic reconfiguration from the
-/// collector side.
+/// Control-plane shared-memory zone. Scaffold for a future bidi control
+/// channel delivering dynamic reconfiguration from the collector side.
 ///
-/// Mapped at `data_offset()` bytes into the zone (after the slab-pool
-/// header that `ngx_init_zone_pool` writes — same pattern as
-/// [`crate::shm::WorkerSlots`]).
+/// Mapped at `data_offset()` bytes into the zone, after the slab-pool header
+/// `ngx_init_zone_pool` writes (same pattern as [`crate::shm::WorkerSlots`]).
 ///
 /// ## Layout
 /// ```text
@@ -50,75 +45,60 @@ use ngx::core::Status;
 /// `control_shm_struct_size` unit test.
 #[repr(C)]
 pub struct ControlShm {
-    /// Monotonic version counter. Exporter increments once per drain
-    /// cycle as a liveness heartbeat AND as a future reconfig-delivery
-    /// sentinel (after applying a reconfig the exporter increments so
-    /// the collector can observe convergence).
+    /// Monotonic version counter. Exporter increments once per drain cycle as
+    /// a liveness heartbeat and as a future reconfig-convergence sentinel.
     pub version: AtomicU64,
-    /// Reserved flag word; layout to be defined. Workers load this on
-    /// the hot path but currently discard the value — it is the
-    /// placeholder for a future dynamic-reconfig fast-path check.
+    /// Reserved flag word for a future dynamic-reconfig fast-path check.
+    /// Workers load it on the hot path but currently discard the value.
     pub flags: AtomicU64,
-    /// Crash-loop backoff counter: number of times the exporter has started
-    /// within the current `window_start_unix` + `CRASH_WINDOW_SECS` window.
+    /// Crash-loop backoff counter: exporter starts within the current
+    /// `window_start_unix` + `CRASH_WINDOW_SECS` window.
     ///
-    /// Written by the exporter at startup (before any risky init); read and
-    /// compared against `MAX_CRASH_RESTARTS`. Cross-process: master maps the
-    /// zone before fork; exporter writes here after fork. Zeroed on fresh start
-    /// and on SIGHUP reload (so a legitimate operator reload clears the state).
+    /// Written by the exporter at startup (before any risky init); compared
+    /// against `MAX_CRASH_RESTARTS`. Zeroed on fresh start and on SIGHUP
+    /// reload so a legitimate operator reload clears prior crash history.
     pub crash_count: AtomicU64,
-    /// Unix timestamp (seconds) of the start of the current crash window.
-    /// When `now − window_start_unix > CRASH_WINDOW_SECS` the counter resets,
-    /// clearing transient crash history for a long-lived healthy exporter.
-    /// Zero means no window has been established yet (treat as "window expired").
+    /// Unix timestamp (seconds) marking the start of the current crash
+    /// window. `now − window_start_unix > CRASH_WINDOW_SECS` resets the
+    /// counter. Zero means no window established yet (treat as expired).
     pub window_start_unix: AtomicU64,
-    /// Reload successor generation counter.
+    /// Reload successor generation counter — drives the old exporter's
+    /// ring-drain abdication decision on reload.
     ///
-    /// **Written exclusively by the master** in `ngx_otel_init_module` (which
-    /// runs in the master process) via `fetch_add(1, Release)` on each SIGHUP
-    /// reload, **before** `ngx_spawn_process` forks the new exporter.  The
-    /// channel message (`NGX_CMD_QUIT`) sent to the old exporter provides the
-    /// happens-before ordering: by the time the old exporter's channel handler
-    /// fires and sets `ngx_quit`, the master's `Release` store is visible.
+    /// **Written only by the master**, `fetch_add(1, Release)` on each SIGHUP
+    /// reload, before `ngx_spawn_process` forks the new exporter; the
+    /// `NGX_CMD_QUIT` channel message to the old exporter is the
+    /// happens-before edge (by the time its channel handler sets `ngx_quit`,
+    /// the master's `Release` store is visible).
     ///
-    /// **Read by the old exporter** at `ngx_quit` time.  If
-    /// `current > my_gen` (snapshot taken at startup) a successor has been
-    /// announced and the exporter abdicates mutating ring drains (log/span
-    /// `pop_into` and coalesce-table reset), handing them to the new exporter.
-    /// On pure shutdown (`current == my_gen`) the old exporter is the sole
-    /// consumer and performs a full drain.
+    /// **Read by the old exporter** at `ngx_quit`: if `current > my_gen`
+    /// (its startup snapshot) a successor exists and it abdicates the mutating
+    /// ring drains (log/span `pop_into`, coalesce-table reset) to the new
+    /// exporter; if `current == my_gen` (pure shutdown) it performs a full
+    /// drain as sole consumer.
     ///
-    /// **Read by the new exporter** at startup to initialise its own `my_gen`
-    /// snapshot.
+    /// **Read by the new exporter** at startup to set its own `my_gen`.
     ///
-    /// On reload nginx reuses the same physical shm pages (same zone name +
-    /// size), so both old and new exporters see the same `successor_gen` value.
-    /// On USR2 binary upgrade the new master allocates fresh anon-mmap pages;
-    /// each exporter is sole consumer of its own zones (see
-    /// `ngx_master_process_cycle` in nginx's `ngx_process_cycle.c`).
+    /// Reload reuses the same physical shm pages, so old/new exporters agree
+    /// on the value; on USR2 binary upgrade the new master maps fresh pages
+    /// and each exporter is sole consumer of its own zone.
     pub successor_gen: AtomicU64,
     /// Exporter liveness heartbeat timestamp.
     ///
-    /// **Written by the exporter** from a dedicated, self-rearming
-    /// `ngx_event_t` timer (`heartbeat_timer_handler` in `exporter/mod.rs`)
-    /// every [`crate::liveness::HEARTBEAT_PERIOD_MS`] ms.  The value is the
-    /// exporter's `ngx_current_msec` (nginx's cached **monotonic** millisecond
-    /// clock, derived from `CLOCK_MONOTONIC` — NOT wall-clock).  The timer is
-    /// independent of drain/send progress: a blackholed-collector send stall
-    /// parks the async send future but the nginx event loop keeps expiring
-    /// timers, so beats continue.
+    /// **Written by the exporter** from a self-rearming `ngx_event_t` timer
+    /// (`heartbeat_timer_handler`) every [`crate::liveness::HEARTBEAT_PERIOD_MS`]
+    /// ms, storing `ngx_current_msec` (monotonic, `CLOCK_MONOTONIC`-based —
+    /// not wall-clock). Independent of drain/send progress: a blackholed send
+    /// only parks its future; the event loop keeps expiring timers.
     ///
-    /// **Read by workers** on the ring-full drop path only (symptom path —
-    /// never per-request).  A worker compares its own `ngx_current_msec`
-    /// against this value; both sides share the `CLOCK_MONOTONIC` basis, so
-    /// the comparison is meaningful across processes.  See
-    /// [`crate::liveness::heartbeat_is_stale`].
+    /// **Read by workers** only on the ring-full drop path (never
+    /// per-request), comparing against their own `ngx_current_msec` on the
+    /// same clock basis. See [`crate::liveness::heartbeat_is_stale`].
     ///
-    /// `0` means "exporter has never beaten" (fresh zone) and is treated as
-    /// not-stale (startup grace: don't alert before the exporter's first beat).
+    /// `0` means the exporter has never beaten (fresh zone); treated as
+    /// not-stale (startup grace before the first beat).
     pub last_beat_msec: AtomicU64,
-    /// Reserved padding for forward-compatible additions.
-    /// Reserved payload budget: 2 × AtomicU64 = 16 bytes.
+    /// Reserved payload budget for forward-compatible additions: 2 × AtomicU64.
     pub _reserved: [AtomicU64; 2],
 }
 
@@ -127,31 +107,26 @@ impl ControlShm {
     pub const ZONE_SIZE: usize = 4096;
 
     /// Byte extent past `data_offset()` written by the SIGHUP-reload branch of
-    /// [`control_shm_zone_init`], which stores `crash_count` (struct offset 16)
-    /// and `window_start_unix` (offset 24).  The accessed range is therefore
-    /// `[offset, offset + RELOAD_WRITE_EXTENT)`; the reload guard checks the
-    /// FULL extent so a smaller-than-expected zone cannot produce an OOB store.
+    /// [`control_shm_zone_init`] (`crash_count` + `window_start_unix`). The
+    /// reload guard checks this full extent, not just `size > offset`, so a
+    /// smaller-than-expected zone cannot produce an OOB store.
     pub const RELOAD_WRITE_EXTENT: usize = 32;
 
     /// Announce a reload successor: bump `successor_gen` (Release) so the old
-    /// exporter abdicates and the about-to-be-forked new exporter snapshots the
-    /// new value.  Called by the master in `ngx_otel_init_module` BEFORE
-    /// `ngx_spawn_process` — the fork is the happens-before edge for the
-    /// child's snapshot.  Master is the sole writer of this field.
+    /// exporter abdicates ring draining once the new one starts. Called by the
+    /// master in `ngx_otel_init_module` before `ngx_spawn_process` — the fork
+    /// is the happens-before edge for the child's snapshot.
     pub fn announce_successor(&self) {
         self.successor_gen.fetch_add(1, Ordering::Release);
     }
 
     /// Roll back a successor announcement after a FAILED reload-spawn.
     ///
-    /// If `ngx_spawn_process` returns `NGX_INVALID_PID` (RLIMIT_NPROC / ENOMEM)
-    /// no successor exists, so the old exporter must remain the sole live
-    /// consumer and keep draining the rings.  Leaving `successor_gen` bumped
-    /// would make the old exporter observe `current > my_gen` and latch
-    /// `periodic_abdicated = true` permanently (stopping log/span ring pops →
-    /// permanent telemetry loss).  Restores the counter to its pre-reload value
-    /// (master is the sole writer, so [`announce_successor`] + this call form an
-    /// exact round-trip).
+    /// If `ngx_spawn_process` fails (`NGX_INVALID_PID`), no successor exists,
+    /// so the old exporter must stay sole consumer. Leaving `successor_gen`
+    /// bumped would make it observe `current > my_gen` and abdicate ring pops
+    /// permanently (telemetry loss). This restores the pre-reload value —
+    /// [`announce_successor`] + this call is an exact round-trip.
     ///
     /// [`announce_successor`]: Self::announce_successor
     pub fn rollback_successor(&self) {
@@ -159,24 +134,19 @@ impl ControlShm {
     }
 }
 
-/// Zone initialisation callback, called by nginx on each (re)start.
+/// Zone initialisation callback, called by nginx on each (re)start. Mirrors
+/// [`crate::shm::otel_shm_zone_init`] for the control zone.
 ///
-/// Mirrors [`crate::shm::otel_shm_zone_init`] for the control zone.
-///
-/// - On a fresh start: zero the `ControlShm` area so `version` and
-///   `flags` start at 0, preserving the heartbeat integration test
-///   assertion that `V_AFTER > V_INITIAL` starting from a known baseline.
-/// - On a SIGHUP reload (`old_data != null`): carry over existing values.
-///   The new exporter inherits the zone and continues incrementing
-///   `version` monotonically — no gap in the heartbeat timeline.
+/// - Fresh start: zero the `ControlShm` area (`version`/`flags` start at 0).
+/// - SIGHUP reload (`old_data != null`): carry over existing values so
+///   `version` keeps incrementing monotonically with no heartbeat gap.
 ///
 /// # IMPORTANT — do NOT touch the slab-pool header
 ///
 /// nginx calls `ngx_init_zone_pool` immediately before this callback,
-/// writing an `ngx_slab_pool_t` header at `shm.addr[0..]`. When any
-/// worker exits, the master's SIGCHLD handler calls `ngx_unlock_mutexes`
-/// which dereferences `sp->mutex.lock`. Our data begins at `data_offset()`
-/// bytes past `shm.addr`, safely beyond the header.
+/// writing an `ngx_slab_pool_t` header at `shm.addr[0..]` that the master's
+/// SIGCHLD handler later dereferences (`ngx_unlock_mutexes`). Our data begins
+/// at `data_offset()` bytes past `shm.addr`, safely beyond the header.
 ///
 /// # Safety
 /// nginx guarantees the callback args are valid non-null pointers.
@@ -185,25 +155,16 @@ pub unsafe extern "C" fn control_shm_zone_init(
     old_data: *mut core::ffi::c_void,
 ) -> ngx_int_t {
     if !old_data.is_null() {
-        // SIGHUP reload: same physical pages re-mapped. Carry over `version`
-        // and `flags` so the heartbeat counter remains monotonically increasing.
-        //
-        // Reset `crash_count` and `window_start_unix` so a legitimate operator
-        // reload does NOT inherit a crash-loop disable from the previous cycle.
-        // Without this reset a reloaded exporter would see the old crash_count
-        // and self-disable even though the crash loop ended when the old
-        // exporter exited with code 2 (which disables automatic respawn).
+        // SIGHUP reload: same physical pages re-mapped; `version`/`flags`
+        // carry over unchanged. Reset `crash_count`/`window_start_unix` so a
+        // legitimate operator reload doesn't inherit a stale crash-loop
+        // disable from the previous cycle.
         // SAFETY: `shm_zone` is a valid non-null `ngx_shm_zone_t` (fn contract);
         // the same zone is re-mapped on reload, so `shm.addr` is the live mapping.
         let zone = unsafe { &*shm_zone };
         let offset = crate::shm::data_offset();
-        // This branch dereferences `ControlShm` to write `crash_count`
-        // (struct offset 16) and `window_start_unix` (offset 24), so the
-        // accessed extent is `[offset, offset + 32)`.  Guard the FULL write
-        // extent, not merely `size > offset`: with a smaller-than-expected
-        // zone the latter would pass and the stores would write out of bounds.
-        // Today `ZONE_SIZE == 4096` masks this, but the bound is made exact so
-        // it cannot regress if the zone is ever resized.
+        // Guard the FULL write extent (not merely `size > offset`): a
+        // smaller-than-expected zone must not pass and produce an OOB store.
         if zone.shm.size >= offset + ControlShm::RELOAD_WRITE_EXTENT {
             // SAFETY: `offset == data_offset()` past the slab-pool header;
             // `zone.shm.size >= offset + RELOAD_WRITE_EXTENT` was checked above,
@@ -218,9 +179,9 @@ pub unsafe extern "C" fn control_shm_zone_init(
     }
 
     // Fresh start: zero the ControlShm area only — never the slab-pool header.
-    // Explicit zeroing (rather than relying on the OS zero-filling fresh mmap
-    // pages) because the same zone can be reused — e.g. across a binary upgrade
-    // where `old_data` is null yet the pages are recycled.
+    // Explicit zeroing (not just relying on OS zero-filled mmap) because the
+    // same zone can be reused (e.g. binary upgrade) with `old_data` null yet
+    // pages recycled.
     // SAFETY: nginx invokes this callback with a valid, non-null
     // `ngx_shm_zone_t` (fn contract); the reference does not outlive the call.
     let zone = unsafe { &*shm_zone };
@@ -288,8 +249,6 @@ mod tests {
             "version must be 1 after one increment"
         );
 
-        // crash_count, flags, successor_gen, last_beat_msec and _reserved must
-        // be unaffected by the version increment.
         assert_eq!(ctrl.flags.load(Ordering::Relaxed), 0, "flags must be unaffected");
         assert_eq!(ctrl.crash_count.load(Ordering::Relaxed), 0, "crash_count unaffected");
         assert_eq!(ctrl.last_beat_msec.load(Ordering::Relaxed), 0, "last_beat_msec unaffected");
@@ -322,13 +281,10 @@ mod tests {
         );
     }
 
-    /// The `ControlShm` struct is `#[repr(C)]` with 8 × AtomicU64 = 64
-    /// bytes. This test pins that expectation so a future field addition
+    /// Pins the `#[repr(C)]` size at 8 × AtomicU64 so a future field addition
     /// is flagged at compile time.
     #[test]
     fn control_shm_struct_size() {
-        // 8 × AtomicU64 (version + flags + crash_count + window_start_unix +
-        // successor_gen + last_beat_msec + 2 × _reserved) = 64 bytes.
         assert_eq!(
             mem::size_of::<ControlShm>(),
             8 * mem::size_of::<AtomicU64>(),
@@ -336,10 +292,8 @@ mod tests {
         );
     }
 
-    /// Abdication logic is driven by `successor_gen`.
-    ///
-    /// Verifies the sentinel semantics that drive `graceful_drain` abdication
-    /// decisions.
+    /// Pins the `successor_gen` sentinel semantics that drive `graceful_drain`
+    /// abdication decisions.
     #[test]
     fn b1_successor_gen_abdication_logic() {
         let buf = std::vec![0u8; mem::size_of::<ControlShm>()];
@@ -370,18 +324,9 @@ mod tests {
         assert!(current3 <= shutdown_gen, "no successor on pure shutdown");
     }
 
-    /// Regression: a FAILED reload-spawn must NOT leave the old exporter
-    /// abdicating forever.
-    ///
-    /// On SIGHUP the master increments `successor_gen` BEFORE forking the new
-    /// exporter (the fork is the happens-before edge for the child's snapshot).
-    /// If the fork fails (NGX_INVALID_PID from RLIMIT_NPROC / ENOMEM) no
-    /// successor exists, yet the old exporter — still the sole live consumer —
-    /// would observe `current > my_gen`, latch `periodic_abdicated = true`, and
-    /// stop popping the log/span rings forever (permanent telemetry loss).
-    /// `ngx_otel_init_module` rolls the increment back on the spawn-error path;
-    /// this test models the announce → failed-spawn → rollback round-trip and
-    /// asserts the old exporter does NOT abdicate afterwards.
+    /// Regression: a FAILED reload-spawn (fork returns `NGX_INVALID_PID`) must
+    /// NOT leave the old exporter abdicating ring drains forever — models the
+    /// announce → failed-spawn → rollback round-trip from `ngx_otel_init_module`.
     #[test]
     fn failed_reload_spawn_rolls_back_successor_gen() {
         let buf = std::vec![0u8; mem::size_of::<ControlShm>()];
@@ -472,7 +417,7 @@ mod tests {
         backoff_base_ms: u64,
         backoff_cap_ms: u64,
     ) -> (u64, StartupAction) {
-        // Step 1: reset window if expired.
+        // Reset window if expired, then increment, then give-up or backoff.
         let (effective_count, effective_window) =
             if window_start == 0 || now.saturating_sub(window_start) > window_secs {
                 (0u64, now)
@@ -481,10 +426,8 @@ mod tests {
             };
         let _ = effective_window; // used for state update in real code
 
-        // Step 2: increment.
         let new_count = effective_count + 1;
 
-        // Step 3: give-up or backoff.
         if new_count > max_restarts {
             return (new_count, StartupAction::Exit);
         }
@@ -530,10 +473,9 @@ mod tests {
         assert_eq!(action, StartupAction::Exit);
     }
 
-    /// Window expired → counter resets → count=1, no backoff.
+    /// Window expired (now - window_start = 120 > 60s) → counter resets → count=1, no backoff.
     #[test]
     fn crash_logic_window_expired_resets_counter() {
-        // count=4 restarts but window expired (now - window_start = 120 > 60s).
         let (count, action) = simulate_startup(4, 800, 920, 60, 5, 100, 5_000);
         assert_eq!(count, 1, "counter must reset after window expires");
         assert_eq!(action, StartupAction::Ok);
